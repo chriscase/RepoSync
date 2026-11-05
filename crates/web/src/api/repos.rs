@@ -3186,6 +3186,14 @@ struct CreateBranchPairRequest {
     /// Alias for dry_run. When true, forces preview mode.
     #[serde(default)]
     preview: Option<bool>,
+    /// Explicit v2 contract; it never falls back to legacy publication.
+    #[serde(default)]
+    reconciliation: bool,
+    #[serde(default)]
+    include_parent: bool,
+    review_pin: Option<String>,
+    operation_id: Option<String>,
+    action: Option<String>,
     /// Auto-create the SVN branch via `svn copy` from the parent's branch.
     /// Ignored in preview; this slice does not copy.
     auto_create_svn_branch: Option<bool>,
@@ -3333,6 +3341,173 @@ async fn create_branch_pair(
         compatibility_skip_import: body.compatibility_skip_import,
         dry_run,
     };
+    if body.reconciliation {
+        use reposync_core::late_pair_publish as publisher;
+        let action = body
+            .action
+            .as_deref()
+            .unwrap_or(if dry_run { "preview" } else { "publish" });
+        let svn_password = db
+            .resolve_credential_chain(&parent.id, "secret_svn_password")
+            .unwrap_or_default();
+        let git_workdir = state
+            .config
+            .daemon
+            .data_dir
+            .join("repos")
+            .join(&parent.id)
+            .join("git-repo");
+        if matches!(action, "status" | "resume" | "cancel") {
+            let operation = match body.operation_id.as_deref() {
+                Some(operation_id) => db.get_late_pair_publish_operation(&parent.id, operation_id),
+                None if action == "status" => db.latest_late_pair_publish_operation(&parent.id),
+                None => return Err(AppError::BadRequest("operation_id is required".into())),
+            }
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("late-pair operation not found".into()))?;
+            let operation_id = operation.id.clone();
+            if operation.version != 2
+                || operation.initiator_id != _user_id
+                || operation.git_branch != git_branch
+                || operation.svn_branch != svn_branch
+            {
+                return Err(AppError::BadRequest(
+                    "late-pair operation actor, version or branch identity differs".into(),
+                ));
+            }
+            let mut action_error = None;
+            let current = match action {
+                "cancel" => publisher::cancel_reviewed_reconciliation(
+                    db,
+                    &parent.id,
+                    &operation_id,
+                    &_user_id,
+                )
+                .map_err(|e| AppError::BadRequest(redact_vcs_error_detail(&format!("{e:#}"))))?,
+                "resume" => {
+                    publisher::continue_reviewed_reconciliation(
+                        db,
+                        &parent.id,
+                        &operation_id,
+                        &_user_id,
+                        body.review_pin.as_deref().unwrap_or(""),
+                    )
+                    .map_err(|e| {
+                        AppError::BadRequest(redact_vcs_error_detail(&format!("{e:#}")))
+                    })?;
+                    // Errors retain a durable held operation; return its
+                    // truthful state instead of inventing a published result.
+                    if let Err(error) = publisher::reviewed::run(
+                        db,
+                        &state.config,
+                        &parent,
+                        &svn_password,
+                        &git_workdir,
+                        &operation_id,
+                        &_user_id,
+                    )
+                    .await
+                    {
+                        action_error = Some(redact_vcs_error_detail(&format!("{error:#}")));
+                    }
+                    db.get_late_pair_publish_operation(&parent.id, &operation_id)
+                        .map_err(|e| AppError::Internal(e.to_string()))?
+                        .ok_or_else(|| AppError::Internal("operation disappeared".into()))?
+                }
+                _ => operation,
+            };
+            let mut view = late_pair_reconciliation_view(
+                &current
+                    .reconciliation
+                    .as_ref()
+                    .ok_or_else(|| AppError::Internal("v2 progress absent".into()))?
+                    .plan,
+                Some(&current),
+            );
+            if let Some(error) = action_error {
+                view["action_error"] = serde_json::json!(error);
+            }
+            return Ok(Json(view));
+        }
+        if !matches!(action, "preview" | "publish") {
+            return Err(AppError::BadRequest("unknown late-pair action".into()));
+        }
+        if existing_children
+            .iter()
+            .any(|child| child.git_branch == git_branch || child.svn_branch == svn_branch)
+        {
+            return Err(AppError::BadRequest(
+                "branch pair already registered; inspect its existing operation".into(),
+            ));
+        }
+        let mappings = collect_verified_mappings(db, &parent.id)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let token = db.resolve_credential_chain(&parent.id, "secret_git_token");
+        let admission = evaluate_admission(
+            &mappings,
+            Some(&git_workdir),
+            None,
+            &request,
+            token.as_deref(),
+        )
+        .map_err(|e| AppError::BadRequest(e.error_message()))?;
+        let prepare = || reposync_core::late_pair::reconciliation::PrepareContext {
+            db,
+            parent: &parent,
+            git_workdir: &git_workdir,
+            request: &request,
+            admission: &admission,
+            svn_password: &svn_password,
+            actor: &_user_id,
+            include_parent: body.include_parent,
+        };
+        if action == "preview" {
+            let plan = reposync_core::late_pair::reconciliation::prepare(prepare())
+                .await
+                .map_err(|e| AppError::BadRequest(redact_vcs_error_detail(&format!("{e:#}"))))?;
+            return Ok(Json(late_pair_reconciliation_view(&plan, None)));
+        }
+        if dry_run {
+            return Err(AppError::BadRequest(
+                "publish requires explicit dry_run=false and preview=false".into(),
+            ));
+        }
+        let operation = publisher::begin_reviewed_reconciliation(
+            prepare(),
+            body.review_pin.as_deref().unwrap_or(""),
+            &Uuid::new_v4().to_string(),
+        )
+        .await
+        .map_err(|e| AppError::BadRequest(redact_vcs_error_detail(&format!("{e:#}"))))?;
+        let action_error = publisher::reviewed::run(
+            db,
+            &state.config,
+            &parent,
+            &svn_password,
+            &git_workdir,
+            &operation.id,
+            &_user_id,
+        )
+        .await
+        .err();
+        let current = db
+            .get_late_pair_publish_operation(&parent.id, &operation.id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .ok_or_else(|| AppError::Internal("operation disappeared".into()))?;
+        let mut view = late_pair_reconciliation_view(
+            &current
+                .reconciliation
+                .as_ref()
+                .ok_or_else(|| AppError::Internal("v2 progress absent".into()))?
+                .plan,
+            Some(&current),
+        );
+        if let Some(error) = action_error {
+            view["action_error"] =
+                serde_json::json!(redact_vcs_error_detail(&format!("{error:#}")));
+        }
+        return Ok(Json(view));
+    }
     let mappings = collect_verified_mappings(db, &parent.id)
         .map_err(|e| AppError::Internal(format!("failed to read verified mappings: {e}")))?;
     let git_workdir = state
@@ -3507,6 +3682,38 @@ async fn create_branch_pair(
     Ok(Json(serde_json::to_value(&published).map_err(|e| {
         AppError::Internal(format!("serialization error: {}", e))
     })?))
+}
+
+fn late_pair_reconciliation_view(
+    plan: &reposync_core::late_pair::reconciliation::PreparedPlan,
+    operation: Option<&reposync_core::db::late_pair_publish_operations::LatePairPublishOperation>,
+) -> serde_json::Value {
+    use reposync_core::db::late_pair_publish_operations::LatePairPublishState;
+    let published = operation.is_some_and(|op| op.state == LatePairPublishState::Completed);
+    let progress = operation.and_then(|op| op.reconciliation.as_deref());
+    serde_json::json!({
+        "mode":if published {"published"} else if operation.is_some() {"durable_operation"} else {"review"},
+        "published":published,"admitted":plan.conflicts.is_empty(),
+        "pair_state":operation.map(|op|serde_json::to_value(&op.state).unwrap_or_default()).unwrap_or(serde_json::json!("preview")),
+        "scheduler_active":published,"policy_version":plan.policy,"parent_id":plan.parent_id,
+        "git_branch":plan.git_branch,"svn_branch":plan.svn_branch,"git_tip":plan.git_tip,
+        "svn_source_revision":plan.parent_revision,"svn_target_revision":progress.and_then(|p|p.svn_revision).or(plan.target_revision),
+        "verified_baseline":{"git_sha":plan.baseline_git_sha,"svn_revision":plan.baseline_svn_revision,"evidence":"scoped producer and exact tree"},
+        "baseline_missing_reason":null,"inherited_work":[plan.baseline_git_sha],
+        "pending_git":{"count":plan.pending_git_shas.len(),"summary":plan.pending_git_shas},
+        "pending_svn":{"knowable":true,"parent_head_revision":plan.parent_revision,"baseline_revision":plan.baseline_svn_revision,
+            "note":if plan.include_parent {"Parent advancement explicitly included"} else {"Parent advancement remains outside this pairing"}},
+        "conflicts":plan.conflicts.iter().map(|c|format!("{}: {}",c.path,c.reason)).collect::<Vec<_>>(),
+        "unknowns":operation.and_then(|op|op.outcome_detail.as_ref()).into_iter().collect::<Vec<_>>(),
+        "proposed_svn_copy_source_revision":if plan.target_revision.is_none() {Some(plan.baseline_svn_revision)} else {None},
+        "existing_svn_target":{"exists":plan.target_revision.is_some(),"equivalent":false,"uuid":plan.svn_uuid,
+            "revision":plan.target_revision,"url":plan.target_url,"note":"Independent target work is retained by the pinned reconciliation"},
+        "skip_import_requested":false,"skip_import_applied":false,"skip_import_note":"Every pending Git commit is accounted for; no start-from-now acknowledgement",
+        "review_pin":plan.review_pin,"include_parent":plan.include_parent,"result_git_sha":plan.intended_git_sha,
+        "result_tree_digest":plan.intended_tree_digest,"operation_id":operation.map(|op|&op.id),
+        "updated_at":operation.map(|op|&op.updated_at),"observation":if operation.is_some() {"durable state; remote tips are checked before effects"} else {"fresh captured source and result"},
+        "handled_steps":progress.map(|p|p.receipts.len()).unwrap_or(0),"total_steps":plan.steps.len(),
+    })
 }
 
 async fn attach_svn_probe(
@@ -4303,6 +4510,11 @@ async fn acquire_skip_commit_writer<'db>(
         )
         .map_err(|error| AppError::Conflict(error.to_string()))?;
         if let Some(busy) = reposync_core::busy::try_acquire(id) {
+            reposync_core::db::late_pair_publish_operations::require_no_reconciliation_hold(
+                &db.conn(),
+                id,
+            )
+            .map_err(AppError::Conflict)?;
             if let Some(window) = db
                 .try_begin_ordinary_writer_window(Some(id))
                 .map_err(|error| AppError::Conflict(error.to_string()))?

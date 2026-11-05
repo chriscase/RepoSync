@@ -1003,6 +1003,19 @@ impl SyncEngine {
             } else {
                 false
             };
+            if let Some(handled) = kv.as_deref() {
+                if column.as_deref() == Some(handled)
+                    && crate::db::late_pair_publish_operations::verified_reconciliation_frontier(
+                        &self.db.conn(),
+                        rid,
+                        handled,
+                        &self.no_target_projection(),
+                    )?
+                {
+                    self.reject_missing_checkpoint_object(handled)?;
+                    return Ok(Some(handled.to_owned()));
+                }
+            }
             if column.is_some() && kv.is_some() && column != kv {
                 let (applied_outbound, svn_origin) = {
                     let conn = self.db.conn();
@@ -1030,7 +1043,13 @@ impl SyncEngine {
                     self.allowed_paths.is_empty() && self.blocked_patterns.is_empty();
                 let kv_handled_proved = applied_outbound > 0
                     || (old_import_projection && svn_origin > 0)
-                    || kv_no_target;
+                    || kv_no_target
+                    || crate::db::late_pair_publish_operations::verified_reconciliation_frontier(
+                        &self.db.conn(),
+                        rid,
+                        kv.as_deref().unwrap(),
+                        &self.no_target_projection(),
+                    )?;
                 let column_sha = column.as_deref().unwrap();
                 let column_emit_proved = self.proved_svn_emitted_column_git_sha(rid, column_sha)?;
                 let column_stale_receipt_only =

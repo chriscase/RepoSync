@@ -1,38 +1,35 @@
-# #67 slice: late-pair publish and baseline replay
+# Late-pair v2 publication and recovery
 
-This slice follows [67-late-pair-admission.md](67-late-pair-admission.md). It does **not** close #67 or #61.
+The v2 protocol extends the existing `late_pair_publish_v1` journal family with an explicit `version: 2` document and `late_pair_reconciliation_v2` policy. It does not relabel incompatible data as version 1. Existing v1 documents remain readable and serialized without a v2 payload; v1/v2 policy or field blending refuses.
 
-## What shipped
+## Durable ordering
 
-`POST /api/repos/{id}/branches` with `dry_run=false` / `preview=false` on an admitted plan:
+The operation claims the parent under an IMMEDIATE transaction, comparing the captured parent/credential generation and reserving the active journal before effects. The existing repository busy guard excludes ordinary in-process work during capture/claim and execution. The child remains disabled while reconciliation is incomplete.
 
-1. Refuses publish when the SVN target already exists (`existing_svn_target_blocks_publish`), except when resuming an in-flight `late_pair_publish` journal for the same fingerprint (journaled `svn_copy_pending` intent verified via copyfrom path/rev, or later phases).
-2. Persists `svn_copy_pending` (target branch + copy-from path/rev) **before** `svn copy`, then copies a **new** SVN branch from the verified baseline revision (`proposed_svn_copy_source_revision`), not parent HEAD.
-3. Inserts a child repository with baseline Git/SVN watermarks (not the feature tip), `enabled=false` until replay completes.
-4. Replays pending Git commits through the production `SyncEngine` Git→SVN path.
-5. Validates Git reachability (credential chain + `git ls-remote` for HTTP(S) remotes) **before** any SVN copy.
-6. Clones the child Git workdir from the parent’s derived remote URL with credentials applied like normal sync (never uses the token as a URL host).
-7. Records a durable `late_pair_publish` operation (`late_pair_publish_v1` journal) with resumable phases through `svn_copy_pending` / `svn_copied` / `child_registered` / `replay_in_progress` (replay errors stay `replay_in_progress` with redacted `outcome_detail`, not terminal `failed`).
-8. Enables the child (`scheduler_active=true` in the response plan) only after the pinned Git tip is handled, in the **same database transaction** as journal finalize (so a crash cannot leave an enabled child with a non-terminal journal). Finalize refuses inside that transaction when `new_work_blocked(child_id)` (removed/tombstoned child) or the child `UPDATE` changes zero rows; the child stays disabled, the journal moves to terminal `reconciliation_required` (not `completed`), and the active publish key is cleared.
+For a new target, copy intent precedes `svn copy`. Recovery inspects the exact copy-from path/revision, SVN identity and full stop-on-copy history and verifies its tree. An absent, modified or ambiguous pending outcome is held; it is not an instruction to issue another copy.
 
-HTTP(S) Git authentication uses one shared CLI helper (`git_cli_output` / `build_git_cli_command` in `subprocess_auth`): for `clone`, `ls-remote`, `fetch`, `push`, and `pull`, when a token is available it is applied only via `GIT_CONFIG_*` `http.extraHeader` (never argv); other git subprocesses get `GIT_TERMINAL_PROMPT=0` only. Libgit2 clone uses `Cred` callbacks with the same token-in-memory rule.
+The server constructs private Git reconciliation objects matching the captured SVN tree and each intended intermediate result. Every changed replay uses the existing #64 Git-to-SVN intent producer before committing. Its source object, parent/tree, changed paths, message, SVN identity, pre-write revision and tree are pinned. The server verifies the actual committed bytes and modes before confirming the native producer and retaining its completed document in the v2 receipt. Unchanged steps retain their original revision without inventing an SVN commit.
 
-**Authenticated (clean URL + env/callback token):** late-pair publish preflight `git ls-remote`; child workdir `git fetch`/`checkout` after clone; import/setup/web preview push and `ls-remote`; `GitClient::fetch` / `push` / `ls-remote`; `inspect_fetched_history` (`git ls-remote` + `git fetch` during team `run_sync_cycle` and personal `inspect_personal_history`); late-pair `replay_pending_git` child `SyncEngine` (`set_git_credential_apply_clean(true)` + `sync_git_http_auth_from_resolution` from the scoped `secret_git_token` chain so `inspect_team_history` reads freshly resolved `stored_http_auth_token`); personal-mode daemon/import restart (`sync_git_http_auth_from_resolution` with config token and/or chain — tokens are never written at rest under `.git`); same-process personal startup `clone_repo` may hand off HTTP auth in memory until the next chain/config resolution; `SyncEngine` missing-checkpoint probe (`git ls-remote` + `git fetch`); `pair_refresh::observe_branch` and late-pair `resolve_candidate_tip` preview fetches when callers pass the resolved `secret_git_token` chain.
+The final Git result preserves the published development tip and the reconciliation chain. Publication proves ancestry, uses an exact expected-tip lease for the one configured ref, and retains the existing #64 SVN-to-Git publication intent before pushing. It never updates an unrelated ref or rewrites published history. A result already present remotely is observed explicitly. Confirmation requires the exact intended SHA/tree and SVN coordinate.
 
-**Not authenticated via the clean helper (RS-11 embed path):** scheduler/daemon `SyncEngine` reload still uses `apply_git_credential_chain_state_for_sync` to embed `x-access-token` in `remote.origin.url`. Late-pair replay sets `set_git_credential_apply_clean(true)` and `apply_git_credential_chain_state` on the child engine so replay does not re-embed; team history inspection and checkpoint probes on that engine use the in-memory token through the shared CLI helper.
+Completion atomically validates the real native producers, current child incarnation and checkpoints, advances the proven covered inbound frontier, enables the child and completes the journal. The covered-frontier record references the immutable completed v2 document and exact retained producer/mapping evidence, child scope, echo generation and projection. It is not an Applied/no-target audit row and grants no effect permission. Missing, duplicate, contradictory, pruned, stale-generation or foreign evidence refuses rather than becoming an old-import baseline. Ordinary continuation consumes this authority through the strict reader; it does not rediscover already covered A1/A2 work.
 
-Git/SVN stderr stored in the journal or returned to clients is passed through shared `redact_vcs_error_detail`.
+## State and cancellation
 
-Policy identity for published plans: `late_pair_publish_v1`.
+The typed phases are `prepared`, `copy_pending`, `source_ready`, `applying`, `publishing`, `checkpointing`, `completed`, `cancelled` and `held`. Contradictory outer state/frontier, out-of-order receipts and publication before replay completion refuse decoding. A held v2 operation uses nonterminal `reconciliation_held`, preserving scheduler isolation and the active reservation. Existing legacy states retain their interpretation.
 
-## Still later
+Cancellation before any intent is terminal and retains its document. After an intent, cancellation does not undo a remote effect or release uncertainty. Ordered actor/pin-bound cancellation and explicit continuation requests remain in the journal. Continuation cannot authorize blind replay: a pending native intent must have a uniquely matching actual result before it is finished. If the outcome is absent or uncertain, the hold remains. A pre-effect cancelled operation requires a fresh review/new request.
 
-- Dual-side reconcile for an existing SVN target (R07)
-- Overlapping/binary conflict stop
-- Cancel/restart after partial replay with live engine recovery proofs beyond operation phase resume
-- Parent SVN-ahead retention into Git
-- Closing #67 / #61
+Recovery can finish an already-consumed copy, replay commit or Git publication after reopening the database. It does not infer collection from a missing PID, an empty registry or an HTTP timeout. The native intent and independently observed repository result determine whether completion is possible. Original error/failure records are retained; the status view distinguishes its last durable observation from fresh remote evidence.
 
-## Tests
+## Foreign consumers and scope
 
-Named cases: `R06_LATE_PAIR_PUBLISH_REPLAY`, `R06_LATE_PAIR_PUBLISH_HTTPS_CREDENTIALS_REFUSE` (mapped test asserts `git_credentials_missing` and unchanged SVN youngest before mutation — see `https_validate_preflight_refuses_missing_and_revoked_tokens_quickly` for revoked tokens and `preflight_ls_remote_command_argv_has_no_token` for argv), `R06_NO_ACTIVE_ON_PARTIAL` (foreign existing target blocks publish). Core integration tests cover publish replay, mid-replay resume (commit-count guard), journaled SVN copy revision, and SVN-copy error resume.
+The refresh consumer keeps its separate active-pointer refusal and all other journal arms. Its exact late-pair arm delegates to a strict decoder that admits only genuine completed legacy v1 or coherent completed v2 evidence with matching document ID/owner/type. Cancelled, partial, held, malformed, unknown-version and blended records do not become completion proof. Any later #69 composition must carry the accepted helper and consumer together.
+
+A held operation is exposed as held in status and cannot authorize Skip or another ordinary mutation. Existing writer fences, removal checks, refresh holds, session isolation, projection rules and unknown-evidence refusals stay in force. This protocol changes no schema, migration, daemon process ownership, deployment configuration, main-promotion gate or #69 execution/AC7 authority.
+
+## Qualification requirements
+
+Real local SVN/Git cases must prove baseline A1/A2 replay exactly once, explicit parent advancement, existing-target nonoverlap with both trees retained, overlapping/binary refusal, full and snapshot-derived ancestry, unrelated/rewritten/ambiguous/stale/out-of-scope refusal, and reopened recovery after copy, one replay and remote publication before checkpoint persistence. Assertions cover intermediate/final bytes and modes, Git ancestry, real journal producers, mappings/checkpoints, disabled-to-active ordering and a reconstructed-engine quiet repeat.
+
+Production HTTP and UI checks must distinguish a preview from publication, reject stale reviewed inputs without mutation, preserve branch/session ownership, expose held outcomes and errors, and retain selected input. Final source requires independent review and exact-revision CI before qualified epic integration. None of these requirements asserts production deployment or whole-epic qualification.

@@ -34,6 +34,871 @@ use std::sync::Arc;
 
 pub const PUBLISH_POLICY_VERSION: &str = "late_pair_publish_v1";
 
+/// Recapture the entire source/result before claiming a reviewed operation.
+/// The HTTP caller supplies only the opaque pin, never a serialized plan.
+pub async fn begin_reviewed_reconciliation(
+    context: crate::late_pair::reconciliation::PrepareContext<'_>,
+    review_pin: &str,
+    request_id: &str,
+) -> anyhow::Result<LatePairPublishOperation> {
+    anyhow::ensure!(!review_pin.is_empty(), "a fresh reviewed pin is required");
+    let db = context.db;
+    let _busy = crate::busy::try_acquire(&context.parent.id)
+        .ok_or_else(|| anyhow::anyhow!("parent repository is busy"))?;
+    let plan = crate::late_pair::reconciliation::prepare(context).await?;
+    anyhow::ensure!(
+        plan.review_pin == review_pin,
+        "stale late-pair review; capture and review both sides again"
+    );
+    Ok(db.claim_late_pair_reconciliation(plan, request_id)?)
+}
+
+/// The v2 producer shares the existing #64 durable SVN/Git effect journals.
+/// It never re-enters the legacy replay loop with a partially handled plan.
+pub mod reviewed {
+    use super::*;
+    use crate::db::late_pair_publish_operations::{
+        CopyEvidence, ReconciliationPhase as Phase, ReconciliationStepReceipt,
+    };
+    use crate::late_pair::reconciliation::{self as model, PreparedPlan, Tree};
+    use anyhow::{bail, ensure, Context, Result};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum Fault {
+        AfterCopy,
+        AfterSvnCommit(usize),
+        AfterGitPublication,
+    }
+    #[cfg(debug_assertions)]
+    static FAULTS: LazyLock<Mutex<HashMap<String, Fault>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    #[cfg(debug_assertions)]
+    pub fn set_fault(parent: &str, fault: Fault) {
+        FAULTS.lock().unwrap().insert(parent.into(), fault);
+    }
+    fn fault(parent: &str, point: Fault) -> Result<()> {
+        #[cfg(debug_assertions)]
+        {
+            let mut faults = FAULTS.lock().unwrap();
+            if faults.get(parent) == Some(&point) {
+                faults.remove(parent);
+                bail!("controlled late-pair interruption at {point:?}");
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = (parent, point);
+        }
+        Ok(())
+    }
+
+    fn progress(
+        op: &LatePairPublishOperation,
+    ) -> Result<&crate::db::late_pair_publish_operations::ReconciliationProgress> {
+        ensure!(op.version == 2, "operation requires explicit v2 recovery");
+        op.reconciliation.as_deref().context("v2 progress absent")
+    }
+
+    fn save(
+        db: &Database,
+        op: &mut LatePairPublishOperation,
+        mut next: LatePairPublishOperation,
+    ) -> Result<()> {
+        let p = progress(&next)?.clone();
+        next.state = match p.phase {
+            Phase::Prepared => LatePairPublishState::Queued,
+            Phase::CopyPending => LatePairPublishState::SvnCopyPending,
+            Phase::Completed => LatePairPublishState::Completed,
+            Phase::Cancelled => LatePairPublishState::Cancelled,
+            Phase::Held => LatePairPublishState::ReconciliationHeld,
+            _ => LatePairPublishState::ReplayInProgress,
+        };
+        next.svn_branch_head_rev = p.svn_revision;
+        next.replayed_git_shas = p
+            .receipts
+            .iter()
+            .filter_map(|receipt| match &p.plan.steps[receipt.index].source {
+                model::StepSource::Git { sha, .. } => Some(sha.clone()),
+                _ => None,
+            })
+            .collect();
+        *op = db.transition_late_pair_reconciliation(op, next)?;
+        Ok(())
+    }
+
+    async fn check_svn(
+        target: &SvnClient,
+        plan: &PreparedPlan,
+        revision: i64,
+        tree: &Tree,
+    ) -> Result<()> {
+        let info = target.info().await?;
+        ensure!(
+            info.uuid == plan.svn_uuid
+                && info.url.trim_end_matches('/') == plan.target_url.trim_end_matches('/')
+                && info.root_url == plan.svn_root_url
+                && info.latest_rev == revision,
+            "stale or foreign SVN target"
+        );
+        ensure!(
+            model::capture_svn_tree(target, revision).await? == *tree,
+            "SVN target bytes or modes differ from durable intent"
+        );
+        Ok(())
+    }
+
+    fn check_parent(db: &Database, plan: &PreparedPlan) -> Result<()> {
+        ensure!(
+            model::parent_generation(db, &plan.parent_id)? == plan.parent_generation,
+            "parent registration, policy or credentials changed; reconciliation is held"
+        );
+        Ok(())
+    }
+
+    async fn check_parent_source(
+        parent: &Repository,
+        password: &str,
+        plan: &PreparedPlan,
+    ) -> Result<()> {
+        let source = SvnClient::new(&plan.source_url, &parent.svn_username, password);
+        let info = source.info().await?;
+        ensure!(
+            info.uuid == plan.svn_uuid && info.latest_rev >= plan.parent_revision,
+            "parent SVN identity changed"
+        );
+        ensure!(
+            model::tree_digest(&model::capture_svn_tree(&source, info.latest_rev).await?)?
+                == plan.parent_tree_digest,
+            "parent SVN work changed after review"
+        );
+        if info.latest_rev > plan.parent_revision {
+            let root = SvnClient::new(&plan.svn_root_url, &parent.svn_username, password);
+            for entry in root.log(plan.parent_revision + 1, info.latest_rev).await? {
+                ensure!(
+                    !entry.changed_paths.iter().any(|path| {
+                        let name = path.path.trim_start_matches('/');
+                        name == plan.source_path
+                            || name.starts_with(&format!("{}/", plan.source_path))
+                    }),
+                    "parent SVN history changed after review"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn git_client(db: &Database, parent: &Repository, workdir: &Path) -> Result<GitClient> {
+        model::verify_git_remote(workdir, parent)?;
+        let git = GitClient::new(workdir)?;
+        let state = db.resolve_credential_chain_state(&parent.id, "secret_git_token");
+        apply_git_credential_chain_state(&git, "origin", &state)?;
+        Ok(git)
+    }
+
+    // Starting another effect requires the reviewed source, regardless of the
+    // outer journal phase. Inspecting an existing native intent is separate:
+    // in particular, a consumed Git publication legitimately changed this ref.
+    fn check_git_before_new_effect(
+        db: &Database,
+        parent: &Repository,
+        workdir: &Path,
+        plan: &PreparedPlan,
+    ) -> Result<()> {
+        ensure!(
+            git_client(db, parent, workdir)?
+                .ls_remote_ref("origin", &plan.git_branch)?
+                .as_deref()
+                == Some(plan.git_tip.as_str()),
+            "Git tip changed before effects"
+        );
+        Ok(())
+    }
+
+    async fn copy_evidence(
+        target: &SvnClient,
+        parent: &Repository,
+        password: &str,
+        plan: &PreparedPlan,
+    ) -> Result<CopyEvidence> {
+        let revision = verify_existing_svn_target_matches_copy_intent(
+            parent,
+            password,
+            &plan.svn_branch,
+            &plan.source_path,
+            plan.baseline_svn_revision,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e.error_message()))?;
+        check_svn(target, plan, revision, &plan.initial_target_tree).await?;
+        // A copied target with any independent subsequent commit is not the
+        // one pending copy outcome. Examine its complete stop-on-copy history.
+        let entries = target.copy_history_at_rev(revision).await?;
+        ensure!(
+            entries.len() == 1,
+            "pending copy has additional or ambiguous target history"
+        );
+        let entry = &entries[0];
+        ensure!(
+            entry.revision == revision
+                && entry
+                    .changed_paths
+                    .iter()
+                    .any(|path| path.path.trim_start_matches('/') == plan.target_path
+                        && path.action == "A"
+                        && path
+                            .copy_from_path
+                            .as_deref()
+                            .map(|p| p.trim_start_matches('/'))
+                            == Some(plan.source_path.as_str())
+                        && path.copy_from_rev == Some(plan.baseline_svn_revision)),
+            "pending copy lineage differs"
+        );
+        Ok(CopyEvidence {
+            revision,
+            uuid: plan.svn_uuid.clone(),
+            source_path: plan.source_path.clone(),
+            source_revision: plan.baseline_svn_revision,
+            target_path: plan.target_path.clone(),
+            tree_digest: model::tree_digest(&plan.initial_target_tree)?,
+        })
+    }
+
+    fn register_child(
+        db: &Database,
+        parent: &Repository,
+        op: &mut LatePairPublishOperation,
+    ) -> Result<Repository> {
+        let plan = progress(op)?.plan.clone();
+        if op.child_repo_id.is_none() {
+            let mut next = op.clone();
+            next.child_repo_id = Some(crate::db::repo_scope_identity::new_human_repository_id());
+            save(db, op, next)?;
+        }
+        let id = op
+            .child_repo_id
+            .as_deref()
+            .context("child reservation absent")?;
+        if let Some(child) = db.get_repository(id)? {
+            let expected_scope = progress(op)?
+                .child_scope_uuid
+                .as_deref()
+                .context("child registration outcome was not durably captured; held")?;
+            ensure!(
+                crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), id)?
+                    == expected_scope,
+                "child registration incarnation changed"
+            );
+            ensure!(
+                !child.enabled
+                    && child.parent_id.as_deref() == Some(&parent.id)
+                    && child.git_branch == plan.git_branch
+                    && child.svn_branch == plan.svn_branch
+                    && child.svn_url == parent.svn_url
+                    && child.git_repo == parent.git_repo,
+                "child registration was replaced or activated before completion"
+            );
+            return Ok(child);
+        }
+        let mut child = parent.clone();
+        child.id = id.into();
+        child.name = format!("{} / {}", parent.name, plan.git_branch);
+        child.parent_id = Some(parent.id.clone());
+        child.git_branch = plan.git_branch.clone();
+        child.svn_branch = plan.svn_branch.clone();
+        child.enabled = false;
+        child.sync_status = "reconciling".into();
+        child.last_git_sha = plan.baseline_git_sha.clone();
+        child.last_svn_rev = progress(op)?
+            .svn_revision
+            .context("initial SVN observation absent")?;
+        child.last_sync_at = None;
+        child.total_syncs = 0;
+        child.total_errors = 0;
+        child.consecutive_errors = 0;
+        child.created_at = chrono::Utc::now().to_rfc3339();
+        child.updated_at = child.created_at.clone();
+        db.insert_repository(&child)?;
+        let scope = crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), &child.id)?;
+        let mut next = op.clone();
+        next.reconciliation.as_deref_mut().unwrap().child_scope_uuid = Some(scope);
+        save(db, op, next)?;
+        Ok(child)
+    }
+
+    async fn stage(svn: &SvnClient, wc: &Path, before: &Tree, after: &Tree) -> Result<()> {
+        let confined = crate::svn::working_copy::ConfinedWorkingCopy::open(wc)?;
+        let paths = model::producer_changed_paths(before, after);
+        for path in &paths {
+            confined.inspect_file(path.path.trim_start_matches('/'))?;
+        }
+        for path in &paths {
+            let name = path.path.trim_start_matches('/');
+            match after.get(name) {
+                None => {
+                    svn.rm(wc, &[name]).await?;
+                }
+                Some(file) => {
+                    confined.write_file(name, &file.bytes)?;
+                    if !before.contains_key(name) {
+                        svn.add(wc, &[name]).await?;
+                    }
+                    if file.mode == 0o100755 {
+                        svn.run_svn_in_dir_public(wc, &["propset", "svn:executable", "*", name])
+                            .await?;
+                    } else if before.get(name).is_some_and(|prior| prior.mode == 0o100755) {
+                        svn.run_svn_in_dir_public(wc, &["propdel", "svn:executable", name])
+                            .await?;
+                    }
+                }
+            }
+        }
+        ensure!(
+            model::capture_export_tree(wc)? == *after,
+            "staged bytes or executable modes differ from pinned result"
+        );
+        svn.require_supported_working_copy(wc).await?;
+        Ok(())
+    }
+
+    async fn apply_step(
+        db: &Database,
+        parent: &Repository,
+        workdir: &Path,
+        target: &SvnClient,
+        op: &mut LatePairPublishOperation,
+    ) -> Result<()> {
+        use crate::db::svn_commit_operations::{
+            svn_commit_target_fingerprint, SvnCommitIntent, SvnCommitOperationState,
+        };
+        let p = progress(op)?.clone();
+        let plan = &p.plan;
+        let index = p.receipts.len();
+        let step = plan.steps.get(index).context("no next replay step")?;
+        let before = if index == 0 {
+            &plan.initial_target_tree
+        } else {
+            &plan.steps[index - 1].intended_tree
+        };
+        let revision = p.svn_revision.context("SVN frontier absent")?;
+        let child_id = op.child_repo_id.clone().context("child absent")?;
+        let child = child_id.as_str();
+        let orphan = db
+            .latest_svn_commit_operation(child)?
+            .filter(|producer| producer.request_id == format!("{}:{index}", op.id));
+        let producer = if let Some(id) = p.pending_svn_operation.as_deref() {
+            db.get_svn_commit_operation(child, id)?
+                .context("pending native SVN intent absent")?
+        } else if let Some(producer) = orphan {
+            let mut next = op.clone();
+            next.reconciliation
+                .as_deref_mut()
+                .unwrap()
+                .pending_svn_operation = Some(producer.id.clone());
+            save(db, op, next)?;
+            producer
+        } else {
+            check_git_before_new_effect(db, parent, workdir, plan)?;
+            check_svn(target, plan, revision, before).await?;
+            check_parent(db, plan)?;
+            if step.before_digest == step.intended_digest {
+                let mut next = op.clone();
+                let q = next.reconciliation.as_deref_mut().unwrap();
+                q.phase = Phase::Applying;
+                q.receipts.push(ReconciliationStepReceipt {
+                    index,
+                    svn_revision: revision,
+                    tree_digest: step.intended_digest.clone(),
+                    svn_operation: None,
+                });
+                save(db, op, next)?;
+                return Ok(());
+            }
+            let fingerprint = svn_commit_target_fingerprint(
+                child,
+                &plan.svn_uuid,
+                &plan.target_url,
+                &plan.target_path,
+                model::POLICY,
+            );
+            let producer = db.begin_git_to_svn_commit(SvnCommitIntent {
+                repo_id: child,
+                initiator_id: &op.initiator_id,
+                request_id: &format!("{}:{index}", op.id),
+                target_fingerprint: &fingerprint,
+                source_git_sha: &step.git_result.sha,
+                source_git_parent: step.git_result.parent.as_deref(),
+                source_git_tree: &step.git_result.tree,
+                target_svn_uuid: &plan.svn_uuid,
+                target_svn_path: &plan.target_url,
+                target_svn_root_url: &plan.svn_root_url,
+                target_svn_branch_path: &plan.target_path,
+                pre_write_svn_rev: revision,
+                pre_write_svn_tree: &model::producer_tree_digest(before),
+                projection: model::POLICY,
+                intended_changed_paths: model::producer_changed_paths(before, &step.intended_tree),
+                intended_svn_tree: &model::producer_tree_digest(&step.intended_tree),
+                author: &parent.svn_username,
+                source_message: &step.message,
+            })?;
+            let mut next = op.clone();
+            let q = next.reconciliation.as_deref_mut().unwrap();
+            q.phase = Phase::Applying;
+            q.pending_svn_operation = Some(producer.id.clone());
+            save(db, op, next)?;
+            let temporary = tempfile::tempdir()?;
+            let wc = temporary.path().join("wc");
+            target
+                .checkout_full_pinned_without_externals(&wc, revision)
+                .await?;
+            ensure!(
+                model::capture_export_tree(&wc)? == *before,
+                "fresh checkout differs from pre-write intent"
+            );
+            stage(target, &wc, before, &step.intended_tree).await?;
+            check_parent(db, plan)?;
+            check_svn(target, plan, revision, before).await?;
+            check_git_before_new_effect(db, parent, workdir, plan)?;
+            let message = crate::svn_commit::operation_commit_message(
+                &step.message,
+                &step.git_result.sha,
+                &producer.id,
+            );
+            let result = target.commit(&wc, &message, &parent.svn_username).await;
+            if let Err(error) = result {
+                db.hold_git_to_svn_reconciliation(
+                    child,
+                    &producer.id,
+                    "late-pair SVN outcome requires native inspection",
+                )?;
+                return Err(error.into());
+            }
+            fault(&parent.id, Fault::AfterSvnCommit(index + 1))?;
+            producer
+        };
+        ensure!(
+            producer.repo_id == child
+                && producer.source_git_sha == step.git_result.sha
+                && producer.source_git_parent == step.git_result.parent
+                && producer.source_git_tree == step.git_result.tree
+                && producer.pre_write_svn_rev == revision
+                && producer.pre_write_svn_tree == model::producer_tree_digest(before)
+                && producer.intended_svn_tree == model::producer_tree_digest(&step.intended_tree)
+                && producer.intended_changed_paths
+                    == model::producer_changed_paths(before, &step.intended_tree)
+                && producer.target_svn_uuid == plan.svn_uuid
+                && producer.target_svn_path == plan.target_url
+                && producer.projection == model::POLICY
+                && producer.source_message == step.message
+                && producer.initiator_id == op.initiator_id
+                && producer.request_id == format!("{}:{index}", op.id),
+            "native SVN intent does not match this exact replay step"
+        );
+        // Both the live and recovered path prove the server result before a
+        // mapping/checkpoint is acknowledged. Absence never authorizes replay.
+        let completed = if producer.state == SvnCommitOperationState::Completed {
+            producer
+        } else {
+            let observed = crate::svn_commit::inspect_git_to_svn_commit(target, &producer).await;
+            match observed {
+                crate::svn_commit::SvnCommitInspect::UniqueMatch {
+                    svn_rev, svn_tree, ..
+                } => {
+                    ensure!(
+                        model::capture_svn_tree(target, svn_rev).await? == step.intended_tree,
+                        "confirmed SVN modes or bytes differ"
+                    );
+                    if producer.state == SvnCommitOperationState::Running {
+                        db.confirm_git_to_svn_commit(child, &producer.id, svn_rev, &svn_tree)?
+                    } else {
+                        db.finalize_verified_svn_commit(
+                            child,
+                            &producer.id,
+                            svn_rev,
+                            &svn_tree,
+                            &producer.target_fingerprint,
+                        )?
+                        .operation
+                    }
+                }
+                other => bail!("late-pair native SVN outcome remains held: {other:?}"),
+            }
+        };
+        let revision = completed
+            .last_confirmed_svn_rev
+            .context("completed SVN producer lacks revision")?;
+        check_svn(target, plan, revision, &step.intended_tree).await?;
+        let mut next = op.clone();
+        let q = next.reconciliation.as_deref_mut().unwrap();
+        q.phase = Phase::Applying;
+        q.pending_svn_operation = None;
+        q.svn_revision = Some(revision);
+        q.receipts.push(ReconciliationStepReceipt {
+            index,
+            svn_revision: revision,
+            tree_digest: step.intended_digest.clone(),
+            svn_operation: Some(completed),
+        });
+        save(db, op, next)
+    }
+
+    async fn publish_git(
+        db: &Database,
+        parent: &Repository,
+        workdir: &Path,
+        target: &SvnClient,
+        op: &mut LatePairPublishOperation,
+    ) -> Result<()> {
+        use crate::db::git_push_operations::{
+            git_push_target_fingerprint, GitPushIntent, GitPushOperationState,
+        };
+        let p = progress(op)?.clone();
+        let plan = &p.plan;
+        let child_id = op.child_repo_id.clone().context("child absent")?;
+        let child = child_id.as_str();
+        let revision = p.svn_revision.context("SVN revision absent")?;
+        check_parent(db, plan)?;
+        check_svn(target, plan, revision, &plan.intended_tree).await?;
+        let intended = plan
+            .intended_git_sha
+            .as_deref()
+            .context("blocked intended Git result")?;
+        let tree = plan
+            .intended_git_tree
+            .as_deref()
+            .context("intended Git tree absent")?;
+        ensure!(
+            model::capture_git_tree(workdir, intended)? == plan.intended_tree,
+            "private Git result is unavailable or changed"
+        );
+        let git = git_client(db, parent, workdir)?;
+        let orphan = db
+            .latest_git_push_operation(child)?
+            .filter(|producer| producer.request_id == op.id);
+        let mut producer = if let Some(id) = &p.git_push_operation {
+            db.get_git_push_operation(child, id)?
+                .context("native Git intent absent")?
+        } else if let Some(producer) = orphan {
+            let mut next = op.clone();
+            next.reconciliation
+                .as_deref_mut()
+                .unwrap()
+                .git_push_operation = Some(producer.id.clone());
+            save(db, op, next)?;
+            producer
+        } else {
+            ensure!(
+                git.ls_remote_ref("origin", &plan.git_branch)?.as_deref()
+                    == Some(plan.git_tip.as_str()),
+                "Git remote changed before publication intent"
+            );
+            let fingerprint =
+                git_push_target_fingerprint(child, &plan.git_remote_url, &plan.git_branch);
+            let producer = db.begin_svn_to_git_push(GitPushIntent {
+                repo_id: child,
+                initiator_id: &op.initiator_id,
+                request_id: &op.id,
+                target_fingerprint: &fingerprint,
+                source_svn_rev: revision,
+                source_svn_author: &parent.svn_username,
+                source_svn_message: "Verified late-pair reconciliation",
+                pre_push_git_remote: &plan.git_remote_url,
+                pre_push_git_branch: &plan.git_branch,
+                pre_push_git_sha: &plan.git_tip,
+                pre_push_git_tree: Some(
+                    &git2::Repository::open(workdir)?
+                        .find_commit(git2::Oid::from_str(&plan.git_tip)?)?
+                        .tree_id()
+                        .to_string(),
+                ),
+                intended_local_git_sha: intended,
+                intended_local_git_parent: plan.intended_git_parents.first().map(String::as_str),
+                intended_local_git_tree: tree,
+            })?;
+            let mut next = op.clone();
+            let q = next.reconciliation.as_deref_mut().unwrap();
+            q.phase = Phase::Publishing;
+            q.git_push_operation = Some(producer.id.clone());
+            save(db, op, next)?;
+            if intended != plan.git_tip {
+                let repository = git2::Repository::open(workdir)?;
+                ensure!(
+                    repository.graph_descendant_of(
+                        git2::Oid::from_str(intended)?,
+                        git2::Oid::from_str(&plan.git_tip)?
+                    )?,
+                    "publication would rewrite Git history"
+                );
+                let token = db.resolve_credential_chain(&parent.id, "secret_git_token");
+                let refspec = format!("{intended}:refs/heads/{}", plan.git_branch);
+                // Exact expected-tip lease closes the ref race. The proven
+                // ancestry above still forbids every non-fast-forward result.
+                let lease = format!(
+                    "--force-with-lease=refs/heads/{}:{}",
+                    plan.git_branch, plan.git_tip
+                );
+                let output = crate::git::subprocess_auth::git_cli_output(
+                    workdir,
+                    &["push", &lease, "origin", &refspec],
+                    token.as_deref(),
+                )?;
+                if !output.status.success() {
+                    db.hold_svn_to_git_reconciliation(
+                        child,
+                        &producer.id,
+                        "late-pair Git publication requires native inspection",
+                    )?;
+                    bail!("Git publication did not report success; durable intent retained");
+                }
+            }
+            fault(&parent.id, Fault::AfterGitPublication)?;
+            producer
+        };
+        ensure!(
+            producer.repo_id == child
+                && producer.request_id == op.id
+                && producer.initiator_id == op.initiator_id
+                && producer.source_svn_rev == revision
+                && producer.pre_push_git_sha == plan.git_tip
+                && producer.pre_push_git_branch == plan.git_branch
+                && producer.pre_push_git_remote == plan.git_remote_url
+                && producer.intended_local_git_sha == intended
+                && producer.intended_local_git_tree == tree,
+            "native Git intent does not match this exact publication"
+        );
+        ensure!(
+            git.ls_remote_ref("origin", &plan.git_branch)?.as_deref() == Some(intended),
+            "native Git outcome remains held; no blind republication"
+        );
+        if producer.state != GitPushOperationState::Completed {
+            producer = if producer.state == GitPushOperationState::Running {
+                db.confirm_svn_to_git_push(child, &producer.id, intended, tree)?
+            } else {
+                db.finalize_verified_svn_to_git_push(
+                    child,
+                    &producer.id,
+                    intended,
+                    tree,
+                    &producer.target_fingerprint,
+                )?
+                .operation
+            };
+        }
+        let mut next = op.clone();
+        let q = next.reconciliation.as_deref_mut().unwrap();
+        q.publication = Some(producer);
+        q.phase = Phase::Checkpointing;
+        save(db, op, next)
+    }
+
+    /// Continue one actor-owned native journal. A restart may finish a proven
+    /// consumed effect, but cannot reissue an intent with an unknown outcome.
+    pub async fn run(
+        db: &Database,
+        config: &AppConfig,
+        parent: &Repository,
+        password: &str,
+        workdir: &Path,
+        operation_id: &str,
+        actor: &str,
+    ) -> Result<LatePairPublishOperation> {
+        let _busy = crate::busy::try_acquire(&parent.id).context("parent repository is busy")?;
+        model::require_registered_parent(db, parent)?;
+        let mut op = db
+            .get_late_pair_publish_operation(&parent.id, operation_id)?
+            .context("late-pair operation absent")?;
+        ensure!(
+            op.initiator_id == actor,
+            "operation belongs to a different actor"
+        );
+        let plan = progress(&op)?.plan.clone();
+        if matches!(
+            op.state,
+            LatePairPublishState::Completed | LatePairPublishState::Cancelled
+        ) {
+            return Ok(op);
+        }
+        ensure!(
+            !progress(&op)?.cancel_requested,
+            "cancellation retains this operation's uncertainty hold"
+        );
+        check_parent(db, &plan)?;
+        check_parent_source(parent, password, &plan).await?;
+        let target = SvnClient::new(&plan.target_url, &parent.svn_username, password);
+        let result: Result<()> = async {
+            if progress(&op)?.phase == Phase::Prepared {
+                check_git_before_new_effect(db, parent, workdir, &plan)?;
+                let mut next = op.clone();
+                next.reconciliation.as_deref_mut().unwrap().phase =
+                    if plan.target_revision.is_some() {
+                        Phase::SourceReady
+                    } else {
+                        Phase::CopyPending
+                    };
+                save(db, &mut op, next)?;
+                if plan.target_revision.is_none() {
+                    svn_copy_at_baseline(
+                        parent,
+                        password,
+                        &plan.svn_branch,
+                        plan.baseline_svn_revision,
+                        &plan.source_path,
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.error_message()))?;
+                    fault(&parent.id, Fault::AfterCopy)?;
+                }
+            }
+            if plan.target_revision.is_none() && progress(&op)?.copy_evidence.is_none() {
+                let evidence = copy_evidence(&target, parent, password, &plan).await?;
+                let mut next = op.clone();
+                let p = next.reconciliation.as_deref_mut().unwrap();
+                p.svn_revision = Some(evidence.revision);
+                p.copy_evidence = Some(evidence);
+                p.phase = Phase::SourceReady;
+                save(db, &mut op, next)?;
+            }
+            if progress(&op)?.child_scope_uuid.is_none() {
+                check_git_before_new_effect(db, parent, workdir, &plan)?;
+            }
+            register_child(db, parent, &mut op)?;
+            while progress(&op)?.receipts.len() < plan.steps.len() {
+                check_parent_source(parent, password, &plan).await?;
+                apply_step(db, parent, workdir, &target, &mut op).await?;
+            }
+            check_parent_source(parent, password, &plan).await?;
+            if progress(&op)?.publication.is_none() {
+                publish_git(db, parent, workdir, &target, &mut op).await?;
+            }
+            let revision = progress(&op)?
+                .svn_revision
+                .context("completed source revision absent")?;
+            check_svn(&target, &plan, revision, &plan.intended_tree).await?;
+            ensure!(
+                git_client(db, parent, workdir)?.ls_remote_ref("origin", &plan.git_branch)?
+                    == plan.intended_git_sha,
+                "Git changed before checkpoint finalization"
+            );
+            ensure_child_git_workdir(
+                &config.daemon.data_dir,
+                op.child_repo_id.as_deref().context("child absent")?,
+                parent,
+                &plan.git_branch,
+                db,
+            )
+            .map_err(|error| anyhow::anyhow!(error.error_message()))?;
+            let mut next = op.clone();
+            let p = next.reconciliation.as_deref_mut().unwrap();
+            p.phase = Phase::Completed;
+            p.checkpoint_verified = true;
+            save(db, &mut op, next)?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            let mut next = op.clone();
+            next.reconciliation.as_deref_mut().unwrap().phase = Phase::Held;
+            let detail = redact_vcs_error_detail(&format!("{error:#}"));
+            next.outcome_detail = Some(detail.chars().take(2048).collect());
+            save(db, &mut op, next)?;
+            return Err(error);
+        }
+        Ok(op)
+    }
+}
+
+/// Cancel only an unstarted claim. Once an effect intent exists, retain the
+/// active reservation until native reconciliation can establish its outcome.
+pub fn cancel_reviewed_reconciliation(
+    db: &Database,
+    parent_id: &str,
+    operation_id: &str,
+    actor: &str,
+) -> anyhow::Result<LatePairPublishOperation> {
+    use crate::db::late_pair_publish_operations::{
+        ControlKind, ReconciliationControl, ReconciliationPhase,
+    };
+    let expected = db
+        .get_late_pair_publish_operation(parent_id, operation_id)?
+        .ok_or_else(|| anyhow::anyhow!("late-pair operation absent"))?;
+    anyhow::ensure!(
+        expected.version == 2 && expected.initiator_id == actor,
+        "late-pair actor or version mismatch"
+    );
+    if matches!(
+        expected.state,
+        LatePairPublishState::Completed | LatePairPublishState::Cancelled
+    ) {
+        return Ok(expected);
+    }
+    let mut next = expected.clone();
+    let progress = next
+        .reconciliation
+        .as_deref_mut()
+        .ok_or_else(|| anyhow::anyhow!("v2 progress absent"))?;
+    if progress.cancel_requested {
+        return Ok(expected);
+    }
+    progress.cancel_requested = true;
+    progress.controls.push(ReconciliationControl {
+        kind: ControlKind::Cancel,
+        actor: actor.into(),
+        review_pin: progress.plan.review_pin.clone(),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+    });
+    if progress.phase == ReconciliationPhase::Prepared {
+        progress.phase = ReconciliationPhase::Cancelled;
+        next.state = LatePairPublishState::Cancelled;
+    } else {
+        progress.phase = ReconciliationPhase::Held;
+        next.state = LatePairPublishState::ReconciliationHeld;
+        next.outcome_detail=Some("Cancellation requested after intent; effects remain held pending native reconciliation".into());
+    }
+    Ok(db.transition_late_pair_reconciliation(&expected, next)?)
+}
+
+/// Explicit actor continuation records the prior cancellation rather than
+/// deleting it. It grants no replay of an uncertain native effect: `run`
+/// still performs all current-source and consumed-producer checks.
+pub fn continue_reviewed_reconciliation(
+    db: &Database,
+    parent_id: &str,
+    operation_id: &str,
+    actor: &str,
+    review_pin: &str,
+) -> anyhow::Result<LatePairPublishOperation> {
+    use crate::db::late_pair_publish_operations::{ControlKind, ReconciliationControl};
+    let expected = db
+        .get_late_pair_publish_operation(parent_id, operation_id)?
+        .ok_or_else(|| anyhow::anyhow!("operation absent"))?;
+    let p = expected
+        .reconciliation
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("v2 progress absent"))?;
+    anyhow::ensure!(
+        expected.version == 2 && expected.initiator_id == actor && p.plan.review_pin == review_pin,
+        "continuation requires the same actor and reviewed intended result"
+    );
+    anyhow::ensure!(
+        expected.state != LatePairPublishState::Cancelled,
+        "pre-effect cancellation is terminal; request a fresh review"
+    );
+    if !p.cancel_requested {
+        return Ok(expected);
+    }
+    let mut next = expected.clone();
+    let p = next.reconciliation.as_deref_mut().unwrap();
+    p.cancel_requested = false;
+    p.controls.push(ReconciliationControl {
+        kind: ControlKind::Continue,
+        actor: actor.into(),
+        review_pin: review_pin.into(),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+    });
+    Ok(db.transition_late_pair_reconciliation(&expected, next)?)
+}
+
 /// Debug-only hooks for integration tests (keyed by parent repository id).
 #[cfg(debug_assertions)]
 #[derive(Debug, Clone, Default)]
@@ -1312,6 +2177,7 @@ mod tests {
             svn_branch_head_rev: None,
             replayed_git_shas: Vec::new(),
             outcome_detail: None,
+            reconciliation: None,
         };
         assert!(!publish_resuming(&op));
         let mut copied = op.clone();
