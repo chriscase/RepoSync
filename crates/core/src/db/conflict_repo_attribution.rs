@@ -233,4 +233,59 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn malformed_unattributed_rows_are_not_silently_dropped() {
+        use rusqlite::types::Value;
+        for malformed_id in [true, false] {
+            let db = setup_db();
+            {
+                let conn = db.conn();
+                insert_repo(&conn, "one");
+                insert_repo(&conn, "two");
+                let id = if malformed_id {
+                    Value::Blob(vec![0x80])
+                } else {
+                    Value::Text("retained-id".into())
+                };
+                let path = if malformed_id {
+                    Value::Text("retained.txt".into())
+                } else {
+                    Value::Blob(vec![0x80])
+                };
+                conn.execute(
+                    "INSERT INTO conflicts (id,file_path,conflict_type,status,created_at,repo_id)
+                     VALUES (?1,?2,'content','detected','2020-01-01T00:00:00Z',NULL)",
+                    params![id, path],
+                )
+                .unwrap();
+            }
+            assert_eq!(db.attribute_null_conflict_repo_ids().unwrap(), 0);
+            assert!(db.unattributed_null_conflict_rows_blocking_apply().is_err());
+            if malformed_id {
+                assert!(db.unattributed_null_conflict_ids_blocking_apply().is_err());
+            } else {
+                assert_eq!(
+                    db.unattributed_null_conflict_ids_blocking_apply().unwrap(),
+                    vec!["retained-id"]
+                );
+            }
+            for repo in ["one", "two"] {
+                assert_eq!(db.count_conflicts_blocking_apply_for_repo(repo).unwrap(), 1);
+            }
+            let retained: (i64, i64) = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*), SUM(repo_id IS NULL) FROM conflicts WHERE status='detected'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                retained,
+                (1, 1),
+                "a decode failure cannot discard or attribute evidence"
+            );
+        }
+    }
 }
