@@ -154,8 +154,10 @@ fn add_operation<T: Serialize>(
             }
             let state = text(&value, "state").unwrap_or_else(|| "unknown".into());
             let visible = admin || text(&value, "initiator_id").as_deref() == Some(actor);
-            let held =
-                state == "reconciliation_required" || (kind == "removal" && state != "completed");
+            let held = matches!(
+                state.as_str(),
+                "reconciliation_required" | "reconciliation_held"
+            ) || (kind == "removal" && state != "completed");
             observation.operations.push(Lifecycle {
                 repository_id: observation.repository_id.clone().unwrap_or_default(),
                 kind: kind.into(),

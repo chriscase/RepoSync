@@ -1239,3 +1239,1608 @@ async fn replay_pending_git_inspect_team_history_http_auth() {
     let after = db.get_repository(CHILD_ID).unwrap().unwrap();
     assert_eq!(after.last_git_sha, tip);
 }
+
+fn rs67_create_independent_target(fx: &PublishFixture, file: &str, bytes: &[u8]) {
+    let command = |args: &[&str], cwd: &Path| {
+        let result = Command::new("svn")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    command(
+        &[
+            "mkdir",
+            &format!("{}/branches", fx.svn_url),
+            "-m",
+            "branches",
+            "--non-interactive",
+        ],
+        fx.tmp.path(),
+    );
+    command(
+        &[
+            "copy",
+            "-r",
+            "2",
+            &format!("{}/trunk@2", fx.svn_url),
+            &fx.target_url,
+            "-m",
+            "copy proven B",
+            "--non-interactive",
+        ],
+        fx.tmp.path(),
+    );
+    let wc = fx.tmp.path().join("existing-target");
+    command(
+        &[
+            "checkout",
+            &fx.target_url,
+            wc.to_str().unwrap(),
+            "--non-interactive",
+        ],
+        fx.tmp.path(),
+    );
+    std::fs::write(wc.join(file), bytes).unwrap();
+    command(&["add", file], &wc);
+    command(
+        &[
+            "commit",
+            "-m",
+            "independent SVN target work",
+            "--non-interactive",
+        ],
+        &wc,
+    );
+}
+
+async fn rs67_prepare(
+    fx: &PublishFixture,
+    include_parent: bool,
+) -> anyhow::Result<reposync_core::late_pair::reconciliation::PreparedPlan> {
+    reposync_core::late_pair::reconciliation::prepare(
+        reposync_core::late_pair::reconciliation::PrepareContext {
+            db: &fx.db,
+            parent: &fx.parent,
+            git_workdir: &fx.tmp.path().join("repos/parent/git-repo"),
+            request: &fx.request,
+            admission: &fx.plan,
+            svn_password: "",
+            actor: "fixture-admin",
+            include_parent,
+        },
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_existing_target_plan_pins_both_sides_without_publishing() {
+    let _guard = replay_publish_67_guard().await;
+    assert!(svn_available());
+    let fx = build_publish_fixture().await;
+    rs67_create_independent_target(&fx, "svn-only.txt", b"independent SVN\n");
+    let refs = Command::new("git")
+        .args(["--git-dir", fx._bare.to_str().unwrap(), "show-ref"])
+        .output()
+        .unwrap()
+        .stdout;
+    let before = SvnClient::new(&fx.target_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    let plan = rs67_prepare(&fx, false).await.unwrap();
+    assert!(plan.conflicts.is_empty());
+    assert_eq!(plan.pending_git_shas.len(), 2);
+    assert_eq!(plan.steps.len(), 2);
+    assert_eq!(
+        plan.steps[0].intended_tree["feature.txt"].bytes,
+        b"step one\n"
+    );
+    assert_eq!(
+        plan.steps[1].intended_tree["feature.txt"].bytes,
+        b"step two\n"
+    );
+    assert_eq!(
+        plan.intended_tree["svn-only.txt"].bytes,
+        b"independent SVN\n"
+    );
+    assert_eq!(
+        plan.intended_tree["origin.txt"].bytes, b"SVN origin\n",
+        "unselected parent advancement must stay outside the intended pair"
+    );
+    assert_eq!(
+        rs67_prepare(&fx, false).await.unwrap().review_pin,
+        plan.review_pin,
+        "fresh repeated capture is deterministic"
+    );
+    let with_parent = rs67_prepare(&fx, true).await.unwrap();
+    assert!(with_parent.conflicts.is_empty());
+    assert_eq!(with_parent.steps.len(), 3);
+    assert_eq!(
+        with_parent.intended_tree["origin.txt"].bytes,
+        b"SVN origin v2\n"
+    );
+    assert_eq!(
+        with_parent.intended_tree["svn-only.txt"].bytes,
+        b"independent SVN\n"
+    );
+    assert_ne!(with_parent.review_pin, plan.review_pin);
+    let bridge = fx.tmp.path().join("repos/parent/git-repo");
+    let repository = git2::Repository::open(&bridge).unwrap();
+    let intended = git2::Oid::from_str(plan.intended_git_sha.as_ref().unwrap()).unwrap();
+    assert!(repository
+        .graph_descendant_of(intended, git2::Oid::from_str(&fx.tip).unwrap())
+        .unwrap());
+    assert_eq!(plan.intended_git_parents[0], fx.tip);
+    assert_eq!(
+        plan.intended_git_parents[1],
+        plan.steps.last().unwrap().git_result.sha
+    );
+    for step in &plan.steps {
+        assert_eq!(
+            reposync_core::late_pair::reconciliation::capture_git_tree(
+                &bridge,
+                &step.git_result.sha
+            )
+            .unwrap(),
+            step.intended_tree
+        );
+    }
+    assert_eq!(
+        Command::new("git")
+            .args(["--git-dir", fx._bare.to_str().unwrap(), "show-ref"])
+            .output()
+            .unwrap()
+            .stdout,
+        refs
+    );
+    assert_eq!(
+        SvnClient::new(&fx.target_url, "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        before
+    );
+    assert!(fx
+        .db
+        .list_child_repositories(&fx.parent_id)
+        .unwrap()
+        .is_empty());
+    assert!(fx
+        .db
+        .latest_late_pair_publish_operation(&fx.parent_id)
+        .unwrap()
+        .is_none());
+    let mut tampered = plan.clone();
+    tampered
+        .intended_tree
+        .get_mut("svn-only.txt")
+        .unwrap()
+        .bytes
+        .push(b'!');
+    assert!(tampered.validate().is_err());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"RS67_PINNED_EXISTING_TARGET_PLAN","git_pending":2,"svn_independent_work_retained":true,"parent_selection_explicit":true,"remote_refs_and_svn_unchanged":true,"review_pin":plan.review_pin})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_existing_target_overlap_plan_is_blocked_without_publishable_result() {
+    let _guard = replay_publish_67_guard().await;
+    assert!(svn_available());
+    let fx = build_publish_fixture().await;
+    rs67_create_independent_target(&fx, "feature.txt", b"independent conflicting SVN\n");
+    let plan = rs67_prepare(&fx, false).await.unwrap();
+    assert_eq!(plan.conflicts.len(), 1);
+    assert_eq!(plan.conflicts[0].path, "feature.txt");
+    assert!(plan.intended_git_sha.is_none());
+    assert!(plan.steps.is_empty());
+    assert!(fx
+        .db
+        .list_child_repositories(&fx.parent_id)
+        .unwrap()
+        .is_empty());
+    assert!(fx
+        .db
+        .latest_late_pair_publish_operation(&fx.parent_id)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_new_target_plan_reuses_original_git_objects_without_duplicate_history() {
+    let _guard = replay_publish_67_guard().await;
+    assert!(svn_available());
+    let fx = build_publish_fixture().await;
+    let plan = rs67_prepare(&fx, false).await.unwrap();
+    assert!(plan.target_revision.is_none());
+    assert_eq!(plan.initial_target_git.sha, fx._base_sha);
+    assert_eq!(plan.intended_git_sha.as_deref(), Some(fx.tip.as_str()));
+    assert!(plan.conflicts.is_empty());
+    assert_eq!(plan.steps.len(), 2);
+    for step in &plan.steps {
+        let reposync_core::late_pair::reconciliation::StepSource::Git { sha, .. } = &step.source
+        else {
+            panic!("unexpected parent replay")
+        };
+        assert_eq!(
+            sha, &step.git_result.sha,
+            "new target must reuse original A1/A2 objects"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_reviewed_claim_is_exclusive_actor_bound_and_cancellable_before_effects() {
+    let _guard = replay_publish_67_guard().await;
+    assert!(svn_available());
+    let fx = build_publish_fixture().await;
+    let plan = rs67_prepare(&fx, false).await.unwrap();
+    let bridge = fx.tmp.path().join("repos/parent/git-repo");
+    let fixture = &fx;
+    let bridge_path = bridge.as_path();
+    let begin = |pin: String| async move {
+        reposync_core::late_pair_publish::begin_reviewed_reconciliation(
+            reposync_core::late_pair::reconciliation::PrepareContext {
+                db: &fixture.db,
+                parent: &fixture.parent,
+                git_workdir: bridge_path,
+                request: &fixture.request,
+                admission: &fixture.plan,
+                svn_password: "",
+                actor: "fixture-admin",
+                include_parent: false,
+            },
+            &pin,
+            "reviewed-request",
+        )
+        .await
+    };
+    assert!(begin("unreviewed".into()).await.is_err());
+    assert!(fx
+        .db
+        .latest_late_pair_publish_operation(&fx.parent_id)
+        .unwrap()
+        .is_none());
+    let op = begin(plan.review_pin.clone()).await.unwrap();
+    assert_eq!(op.version, 2);
+    assert_eq!(op.state, LatePairPublishState::Queued);
+    assert!(!op.state.is_terminal());
+    assert!(
+        begin(plan.review_pin.clone()).await.is_err(),
+        "exclusive parent claim"
+    );
+    assert!(
+        reposync_core::late_pair_publish::cancel_reviewed_reconciliation(
+            &fx.db,
+            &fx.parent_id,
+            &op.id,
+            "foreign-actor"
+        )
+        .is_err()
+    );
+    assert_eq!(
+        fx.db
+            .get_late_pair_publish_operation(&fx.parent_id, &op.id)
+            .unwrap()
+            .unwrap(),
+        op
+    );
+    let cancelled = reposync_core::late_pair_publish::cancel_reviewed_reconciliation(
+        &fx.db,
+        &fx.parent_id,
+        &op.id,
+        "fixture-admin",
+    )
+    .unwrap();
+    assert_eq!(cancelled.state, LatePairPublishState::Cancelled);
+    assert_eq!(
+        reposync_core::late_pair_publish::cancel_reviewed_reconciliation(
+            &fx.db,
+            &fx.parent_id,
+            &op.id,
+            "fixture-admin"
+        )
+        .unwrap(),
+        cancelled
+    );
+    assert!(fx
+        .db
+        .list_child_repositories(&fx.parent_id)
+        .unwrap()
+        .is_empty());
+    assert!(SvnClient::new(&fx.target_url, "", "").info().await.is_err());
+    let resumed = begin(plan.review_pin).await.unwrap();
+    assert_ne!(
+        resumed.id, op.id,
+        "cancelled pre-effect claim releases its reservation without deleting history"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_reviewed_existing_target_publishes_both_histories_and_repeats_quietly() {
+    rs67_native_continuation_case(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_reviewed_filtered_pair_continues_with_later_git_and_svn_work() {
+    rs67_native_continuation_case(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_reviewed_explicit_parent_advancement_is_published_with_both_sides() {
+    rs67_native_continuation_case(false, true).await;
+}
+
+async fn rs67_native_continuation_case(filtered: bool, include_parent: bool) {
+    let _guard = replay_publish_67_guard().await;
+    assert!(svn_available());
+    let mut fx = build_publish_fixture().await;
+    fx.identity = Arc::new(
+        IdentityMapper::new(&IdentityConfig {
+            email_domain: Some("fixture.invalid".into()),
+            ..IdentityConfig::default()
+        })
+        .unwrap(),
+    );
+    let allowed = if filtered {
+        vec![
+            "feature.txt".to_owned(),
+            "svn-only.txt".into(),
+            "first-svn.txt".into(),
+            "later-git.txt".into(),
+            "later-svn.txt".into(),
+        ]
+    } else {
+        Vec::new()
+    };
+    if filtered {
+        let encoded = serde_json::to_string(&allowed).unwrap();
+        fx.db
+            .conn()
+            .execute(
+                "UPDATE repositories SET allowed_paths=?1 WHERE id=?2",
+                rusqlite::params![encoded, fx.parent_id],
+            )
+            .unwrap();
+        fx.parent = fx.db.get_repository(&fx.parent_id).unwrap().unwrap();
+    }
+    rs67_create_independent_target(&fx, "svn-only.txt", b"independent SVN\n");
+    let plan = rs67_prepare(&fx, include_parent).await.unwrap();
+    let bridge = fx.tmp.path().join("repos/parent/git-repo");
+    let operation = reposync_core::late_pair_publish::begin_reviewed_reconciliation(
+        reposync_core::late_pair::reconciliation::PrepareContext {
+            db: &fx.db,
+            parent: &fx.parent,
+            git_workdir: &bridge,
+            request: &fx.request,
+            admission: &fx.plan,
+            svn_password: "",
+            actor: "fixture-admin",
+            include_parent,
+        },
+        &plan.review_pin,
+        "existing-target-native",
+    )
+    .await
+    .unwrap();
+    let completed = reposync_core::late_pair_publish::reviewed::run(
+        &fx.db,
+        &fx.config,
+        &fx.parent,
+        "",
+        &bridge,
+        &operation.id,
+        "fixture-admin",
+    )
+    .await
+    .unwrap();
+    assert_eq!(completed.state, LatePairPublishState::Completed);
+    let progress = completed.reconciliation.as_ref().unwrap();
+    assert_eq!(progress.receipts.len(), if include_parent { 3 } else { 2 });
+    assert!(progress.receipts.iter().all(|r| r.svn_operation.is_some()));
+    assert!(progress.publication.is_some());
+    let child = fx
+        .db
+        .get_repository(completed.child_repo_id.as_deref().unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(child.enabled);
+    assert_eq!(Some(child.last_svn_rev), progress.svn_revision);
+    assert_eq!(
+        Some(child.last_git_sha.as_str()),
+        plan.intended_git_sha.as_deref()
+    );
+    let svn = SvnClient::new(&fx.target_url, "", "");
+    assert_eq!(
+        reposync_core::late_pair::reconciliation::capture_svn_tree(&svn, child.last_svn_rev)
+            .await
+            .unwrap(),
+        plan.intended_tree
+    );
+    for (index, receipt) in progress.receipts.iter().enumerate() {
+        assert_eq!(
+            reposync_core::late_pair::reconciliation::capture_svn_tree(&svn, receipt.svn_revision)
+                .await
+                .unwrap(),
+            plan.steps[index].intended_tree
+        );
+    }
+    let result = Command::new("git")
+        .args([
+            "--git-dir",
+            fx._bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/feature",
+        ])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap().trim(),
+        child.last_git_sha
+    );
+    let repository = git2::Repository::open_bare(&fx._bare).unwrap();
+    assert!(repository
+        .graph_descendant_of(
+            git2::Oid::from_str(&child.last_git_sha).unwrap(),
+            git2::Oid::from_str(&fx.tip).unwrap()
+        )
+        .unwrap());
+    let revision = svn.info().await.unwrap().latest_rev;
+    let count: i64 = fx
+        .db
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM sync_records WHERE repo_id=?1",
+            [&child.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reposync_core::late_pair_publish::reviewed::run(
+            &fx.db,
+            &fx.config,
+            &fx.parent,
+            "",
+            &bridge,
+            &operation.id,
+            "fixture-admin"
+        )
+        .await
+        .unwrap(),
+        completed
+    );
+    assert_eq!(svn.info().await.unwrap().latest_rev, revision);
+    assert_eq!(
+        fx.db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sync_records WHERE repo_id=?1",
+                [&child.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        count
+    );
+    let child_git = fx.tmp.path().join("repos").join(&child.id).join("git-repo");
+    drop(fx.db);
+    let reopened = Database::new(fx.tmp.path().join("reposync.db")).unwrap();
+    let mut configuration = fx.config.clone();
+    configuration.github.default_branch = "feature".into();
+    let mut engine = SyncEngine::new(
+        configuration,
+        reopened,
+        svn,
+        GitClient::new(&child_git).unwrap(),
+        fx.identity.clone(),
+    );
+    engine.set_repo_id(child.id.clone());
+    engine.set_path_rules(allowed.clone(), Vec::new());
+    let quiet = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(quiet.git_to_svn_count, 0);
+    assert_eq!(quiet.svn_to_git_count, 0);
+    assert_eq!(quiet.conflicts_detected, 0);
+    let target = SvnClient::new(&fx.target_url, "", "");
+    assert_eq!(target.info().await.unwrap().latest_rev, revision);
+    assert_eq!(
+        engine
+            .db()
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sync_records WHERE repo_id=?1",
+                [&child.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        count
+    );
+    let first_wc = fx.tmp.path().join("svn-first-after-pair");
+    let writer = SvnClient::new(&fx.target_url, "fixture-svn", "");
+    writer.checkout_head(&first_wc).await.unwrap();
+    std::fs::write(
+        first_wc.join("first-svn.txt"),
+        b"SVN advances before any later Git work\n",
+    )
+    .unwrap();
+    writer.add(&first_wc, &["first-svn.txt"]).await.unwrap();
+    let first_revision = writer
+        .commit(&first_wc, "SVN-first continuation", "fixture-svn")
+        .await
+        .unwrap();
+    assert_eq!(first_revision, revision + 1);
+    let first_cycle = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(first_cycle.svn_to_git_count, 1);
+    assert_eq!(first_cycle.git_to_svn_count, 0);
+    let first_quiet = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(first_quiet.svn_to_git_count, 0);
+    assert_eq!(first_quiet.git_to_svn_count, 0);
+    let work = fx.tmp.path().join("git-work");
+    git_cmd(&work, &["pull", "--ff-only", "origin", "feature"]);
+    std::fs::write(
+        work.join("later-git.txt"),
+        b"ordinary Git after paired completion\n",
+    )
+    .unwrap();
+    git_cmd(&work, &["add", "later-git.txt"]);
+    git_cmd(&work, &["commit", "-m", "later ordinary Git"]);
+    git_cmd(&work, &["push", "origin", "feature"]);
+    let git_cycle = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(git_cycle.git_to_svn_count, 1);
+    assert_eq!(git_cycle.svn_to_git_count, 0);
+    let after_git = target.info().await.unwrap().latest_rev;
+    assert_eq!(after_git, first_revision + 1);
+    assert_eq!(
+        reposync_core::late_pair::reconciliation::capture_svn_tree(&target, after_git)
+            .await
+            .unwrap()["later-git.txt"]
+            .bytes,
+        b"ordinary Git after paired completion\n"
+    );
+    let wc = fx.tmp.path().join("later-svn-work");
+    target.checkout_head(&wc).await.unwrap();
+    std::fs::write(
+        wc.join("later-svn.txt"),
+        b"ordinary SVN after paired completion\n",
+    )
+    .unwrap();
+    target.add(&wc, &["later-svn.txt"]).await.unwrap();
+    let writer = SvnClient::new(&fx.target_url, "fixture-svn", "");
+    let after_svn = writer
+        .commit(&wc, "later ordinary SVN", "fixture-svn")
+        .await
+        .unwrap();
+    assert_eq!(after_svn, after_git + 1);
+    let svn_cycle = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(svn_cycle.svn_to_git_count, 1);
+    assert_eq!(svn_cycle.git_to_svn_count, 0);
+    assert_eq!(
+        Command::new("git")
+            .args([
+                "--git-dir",
+                fx._bare.to_str().unwrap(),
+                "show",
+                "feature:later-svn.txt"
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+        b"ordinary SVN after paired completion\n"
+    );
+    let final_count: i64 = engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM sync_records WHERE repo_id=?1",
+            [&child.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(engine);
+    let reopened = Database::new(fx.tmp.path().join("reposync.db")).unwrap();
+    let mut configuration = fx.config.clone();
+    configuration.github.default_branch = "feature".into();
+    let mut engine = SyncEngine::new(
+        configuration,
+        reopened,
+        SvnClient::new(&fx.target_url, "", ""),
+        GitClient::new(&child_git).unwrap(),
+        fx.identity.clone(),
+    );
+    engine.set_repo_id(child.id.clone());
+    engine.set_path_rules(allowed, Vec::new());
+    let quiet = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(quiet.git_to_svn_count, 0);
+    assert_eq!(quiet.svn_to_git_count, 0);
+    assert_eq!(quiet.conflicts_detected, 0);
+    assert_eq!(target.info().await.unwrap().latest_rev, after_svn);
+    assert_eq!(
+        engine
+            .db()
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sync_records WHERE repo_id=?1",
+                [&child.id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        final_count
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_reviewed_restart_finishes_consumed_copy_replay_and_publication_once() {
+    use reposync_core::late_pair_publish::reviewed::{self, Fault};
+    let _guard = replay_publish_67_guard().await;
+    assert!(svn_available());
+    for point in [
+        Fault::AfterCopy,
+        Fault::AfterSvnCommit(1),
+        Fault::AfterGitPublication,
+    ] {
+        let fx = build_publish_fixture().await;
+        let plan = rs67_prepare(&fx, false).await.unwrap();
+        let bridge = fx.tmp.path().join("repos/parent/git-repo");
+        let op = reposync_core::late_pair_publish::begin_reviewed_reconciliation(
+            reposync_core::late_pair::reconciliation::PrepareContext {
+                db: &fx.db,
+                parent: &fx.parent,
+                git_workdir: &bridge,
+                request: &fx.request,
+                admission: &fx.plan,
+                svn_password: "",
+                actor: "fixture-admin",
+                include_parent: false,
+            },
+            &plan.review_pin,
+            "controlled-restart",
+        )
+        .await
+        .unwrap();
+        reviewed::set_fault(&fx.parent_id, point.clone());
+        let error = reviewed::run(
+            &fx.db,
+            &fx.config,
+            &fx.parent,
+            "",
+            &bridge,
+            &op.id,
+            "fixture-admin",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("controlled late-pair interruption"),
+            "{point:?}: {error:#}"
+        );
+        let held = fx
+            .db
+            .get_late_pair_publish_operation(&fx.parent_id, &op.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.state, LatePairPublishState::ReconciliationHeld);
+        assert!(
+            !held.state.is_terminal(),
+            "uncertain work must retain scheduler isolation"
+        );
+        if let Some(child) = held.child_repo_id.as_deref() {
+            assert!(!fx.db.get_repository(child).unwrap().unwrap().enabled);
+        }
+        let cancelled = reposync_core::late_pair_publish::cancel_reviewed_reconciliation(
+            &fx.db,
+            &fx.parent_id,
+            &op.id,
+            "fixture-admin",
+        )
+        .unwrap();
+        assert_eq!(cancelled.state, LatePairPublishState::ReconciliationHeld);
+        assert!(cancelled.reconciliation.as_ref().unwrap().cancel_requested);
+        assert!(reviewed::run(
+            &fx.db,
+            &fx.config,
+            &fx.parent,
+            "",
+            &bridge,
+            &op.id,
+            "fixture-admin"
+        )
+        .await
+        .is_err());
+        assert!(
+            reposync_core::late_pair_publish::continue_reviewed_reconciliation(
+                &fx.db,
+                &fx.parent_id,
+                &op.id,
+                "foreign",
+                &plan.review_pin
+            )
+            .is_err()
+        );
+        reposync_core::late_pair_publish::continue_reviewed_reconciliation(
+            &fx.db,
+            &fx.parent_id,
+            &op.id,
+            "fixture-admin",
+            &plan.review_pin,
+        )
+        .unwrap();
+        // A separate DB handle consumes only durable producer evidence.
+        drop(fx.db);
+        let reopened = Database::new(&fx.tmp.path().join("reposync.db")).unwrap();
+        let done = reviewed::run(
+            &reopened,
+            &fx.config,
+            &fx.parent,
+            "",
+            &bridge,
+            &op.id,
+            "fixture-admin",
+        )
+        .await
+        .unwrap();
+        assert_eq!(done.state, LatePairPublishState::Completed, "{point:?}");
+        let progress = done.reconciliation.as_ref().unwrap();
+        assert_eq!(progress.receipts.len(), 2);
+        assert_eq!(
+            progress.controls.len(),
+            2,
+            "cancel and explicit continuation are retained"
+        );
+        assert!(progress.receipts[0].svn_revision < progress.receipts[1].svn_revision);
+        let svn = SvnClient::new(&fx.target_url, "", "");
+        let log = svn
+            .copy_history_at_rev(progress.svn_revision.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            log.len(),
+            3,
+            "one copy and exactly two replay commits: {point:?}"
+        );
+        assert_eq!(
+            reposync_core::late_pair::reconciliation::capture_svn_tree(
+                &svn,
+                progress.svn_revision.unwrap()
+            )
+            .await
+            .unwrap(),
+            plan.intended_tree
+        );
+        assert_eq!(
+            reviewed::run(
+                &reopened,
+                &fx.config,
+                &fx.parent,
+                "",
+                &bridge,
+                &op.id,
+                "fixture-admin"
+            )
+            .await
+            .unwrap(),
+            done
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_contract_completed_v2_requires_exact_retained_producers_and_unique_mappings() {
+    use reposync_core::db::late_pair_publish_operations::{
+        completed_for_foreign_journal, verified_reconciliation_frontier,
+    };
+    let _guard = replay_publish_67_guard().await;
+    let fx = build_publish_fixture().await;
+    let plan = rs67_prepare(&fx, false).await.unwrap();
+    let bridge = fx.tmp.path().join("repos/parent/git-repo");
+    let op = reposync_core::late_pair_publish::begin_reviewed_reconciliation(
+        reposync_core::late_pair::reconciliation::PrepareContext {
+            db: &fx.db,
+            parent: &fx.parent,
+            git_workdir: &bridge,
+            request: &fx.request,
+            admission: &fx.plan,
+            svn_password: "",
+            actor: "fixture-admin",
+            include_parent: false,
+        },
+        &plan.review_pin,
+        "native-frontier-contract",
+    )
+    .await
+    .unwrap();
+    let completed = reposync_core::late_pair_publish::reviewed::run(
+        &fx.db,
+        &fx.config,
+        &fx.parent,
+        "",
+        &bridge,
+        &op.id,
+        "fixture-admin",
+    )
+    .await
+    .unwrap();
+    let raw = serde_json::to_string(&completed).unwrap();
+    assert!(completed_for_foreign_journal(&raw, &op.id, &fx.parent_id).unwrap());
+    assert!(!completed_for_foreign_journal(&raw, "wrong-id", &fx.parent_id).unwrap());
+    assert!(!completed_for_foreign_journal(&raw, &op.id, "foreign-parent").unwrap());
+    for field in [
+        "version",
+        "policy_version",
+        "child_repo_id",
+        "reconciliation",
+    ] {
+        let mut malformed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        malformed[field] = serde_json::Value::Null;
+        assert!(
+            completed_for_foreign_journal(&malformed.to_string(), &op.id, &fx.parent_id).is_err(),
+            "{field}"
+        );
+    }
+    let mut partial = completed.clone();
+    partial
+        .reconciliation
+        .as_deref_mut()
+        .unwrap()
+        .receipts
+        .pop();
+    assert!(completed_for_foreign_journal(
+        &serde_json::to_string(&partial).unwrap(),
+        &op.id,
+        &fx.parent_id
+    )
+    .is_err());
+    let mut blended = completed.clone();
+    blended.version = 1;
+    assert!(completed_for_foreign_journal(
+        &serde_json::to_string(&blended).unwrap(),
+        &op.id,
+        &fx.parent_id
+    )
+    .is_err());
+    let child = completed.child_repo_id.as_deref().unwrap();
+    let sha = plan.intended_git_sha.as_deref().unwrap();
+    assert!(verified_reconciliation_frontier(&fx.db.conn(), child, sha, &plan.projection).unwrap());
+    assert!(
+        verified_reconciliation_frontier(&fx.db.conn(), child, sha, "changed projection").is_err()
+    );
+    assert!(!verified_reconciliation_frontier(
+        &fx.db.conn(),
+        child,
+        &"e".repeat(40),
+        &plan.projection
+    )
+    .unwrap());
+    let journal_key = format!("late_pair_publish_v1:document:{}", completed.id);
+    let original_journal = fx.db.get_state(&journal_key).unwrap().unwrap();
+    let mut altered = completed.clone();
+    altered.outcome_detail = Some("changed immutable completion".into());
+    fx.db
+        .set_state(&journal_key, &serde_json::to_string(&altered).unwrap())
+        .unwrap();
+    assert!(verified_reconciliation_frontier(&fx.db.conn(), child, sha, &plan.projection).is_err());
+    fx.db.set_state(&journal_key, &original_journal).unwrap();
+    let scope = reposync_core::db::repo_scope_identity::repository_scope_uuid(&fx.db.conn(), child)
+        .unwrap();
+    let generation_key = format!("repo_echo_generation_{scope}");
+    let previous_generation = fx.db.get_state(&generation_key).unwrap();
+    fx.db.set_state(&generation_key, "99").unwrap();
+    assert!(verified_reconciliation_frontier(&fx.db.conn(), child, sha, &plan.projection).is_err());
+    if let Some(value) = previous_generation {
+        fx.db.set_state(&generation_key, &value).unwrap();
+    } else {
+        fx.db.delete_kv_state(&generation_key).unwrap();
+    }
+    fx.db
+        .conn()
+        .execute(
+            "UPDATE repositories SET scope_uuid=?1 WHERE id=?2",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), child],
+        )
+        .unwrap();
+    assert!(verified_reconciliation_frontier(&fx.db.conn(), child, sha, &plan.projection).is_err());
+    fx.db
+        .conn()
+        .execute(
+            "UPDATE repositories SET scope_uuid=?1 WHERE id=?2",
+            rusqlite::params![scope, child],
+        )
+        .unwrap();
+    let producer = completed.reconciliation.as_ref().unwrap().receipts[0]
+        .svn_operation
+        .as_ref()
+        .unwrap();
+    let key = format!("git_to_svn_commit_v1:document:{}", producer.id);
+    let original = fx.db.get_state(&key).unwrap().unwrap();
+    fx.db.set_state(&key, "{}").unwrap();
+    assert!(verified_reconciliation_frontier(&fx.db.conn(), child, sha, &plan.projection).is_err());
+    fx.db.set_state(&key, &original).unwrap();
+    let mapping_id:String=fx.db.conn().query_row("SELECT id FROM sync_records WHERE repo_id=?1 AND git_sha=?2 AND direction='git_to_svn'",rusqlite::params![child,producer.source_git_sha],|r|r.get(0)).unwrap();
+    fx.db.conn().execute("INSERT INTO sync_records (id,repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status) SELECT 'duplicate-proof',repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status FROM sync_records WHERE id=?1",[&mapping_id]).unwrap();
+    assert!(
+        verified_reconciliation_frontier(&fx.db.conn(), child, sha, &plan.projection).is_err(),
+        "duplicates must never be silently selected"
+    );
+    fx.db
+        .conn()
+        .execute("DELETE FROM sync_records WHERE id='duplicate-proof'", [])
+        .unwrap();
+    assert!(verified_reconciliation_frontier(&fx.db.conn(), child, sha, &plan.projection).unwrap());
+    fx.db
+        .conn()
+        .execute("DELETE FROM sync_records WHERE id=?1", [mapping_id])
+        .unwrap();
+    assert!(
+        verified_reconciliation_frontier(&fx.db.conn(), child, sha, &plan.projection).is_err(),
+        "loss of retained proof is not old-import authority"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_contract_foreign_endpoint_and_stale_registered_source_refuse_before_journal() {
+    let _guard = replay_publish_67_guard().await;
+    let fx = build_publish_fixture().await;
+    let bridge = fx.tmp.path().join("repos/parent/git-repo");
+    let original = git2::Repository::open(&bridge)
+        .unwrap()
+        .find_remote("origin")
+        .unwrap()
+        .url()
+        .unwrap()
+        .to_owned();
+    let other = fx.tmp.path().join("foreign.git");
+    git2::Repository::init_bare(&other).unwrap();
+    git_cmd(
+        &bridge,
+        &["remote", "set-url", "origin", other.to_str().unwrap()],
+    );
+    assert!(format!("{:#}", rs67_prepare(&fx, false).await.unwrap_err()).contains("origin differs"));
+    assert!(fx
+        .db
+        .latest_late_pair_publish_operation(&fx.parent_id)
+        .unwrap()
+        .is_none());
+    git_cmd(&bridge, &["remote", "set-url", "origin", &original]);
+    let plan = rs67_prepare(&fx, false).await.unwrap();
+    fx.db
+        .conn()
+        .execute(
+            "UPDATE repositories SET updated_at='changed-after-review' WHERE id=?1",
+            [&fx.parent_id],
+        )
+        .unwrap();
+    let error = reposync_core::late_pair_publish::begin_reviewed_reconciliation(
+        reposync_core::late_pair::reconciliation::PrepareContext {
+            db: &fx.db,
+            parent: &fx.parent,
+            git_workdir: &bridge,
+            request: &fx.request,
+            admission: &fx.plan,
+            svn_password: "",
+            actor: "fixture-admin",
+            include_parent: false,
+        },
+        &plan.review_pin,
+        "stale-registration",
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("current registered source"));
+    assert!(fx
+        .db
+        .latest_late_pair_publish_operation(&fx.parent_id)
+        .unwrap()
+        .is_none());
+    assert!(fx
+        .db
+        .list_child_repositories(&fx.parent_id)
+        .unwrap()
+        .is_empty());
+    assert!(SvnClient::new(&fx.target_url, "", "").info().await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_contract_valid_covered_frontier_cannot_authorize_unproved_unrelated_or_missing_column(
+) {
+    let _guard = replay_publish_67_guard().await;
+    for case in [
+        "unproved_descendant",
+        "unrelated_emitted_column",
+        "missing_object",
+    ] {
+        let mut fx = build_publish_fixture().await;
+        let allowed = vec!["feature.txt".to_string(), "svn-only.txt".into()];
+        fx.db
+            .conn()
+            .execute(
+                "UPDATE repositories SET allowed_paths=?1 WHERE id=?2",
+                rusqlite::params![serde_json::to_string(&allowed).unwrap(), fx.parent_id],
+            )
+            .unwrap();
+        fx.parent = fx.db.get_repository(&fx.parent_id).unwrap().unwrap();
+        rs67_create_independent_target(&fx, "svn-only.txt", b"retained SVN\n");
+        let plan = rs67_prepare(&fx, false).await.unwrap();
+        let bridge = fx.tmp.path().join("repos/parent/git-repo");
+        let op = reposync_core::late_pair_publish::begin_reviewed_reconciliation(
+            reposync_core::late_pair::reconciliation::PrepareContext {
+                db: &fx.db,
+                parent: &fx.parent,
+                git_workdir: &bridge,
+                request: &fx.request,
+                admission: &fx.plan,
+                svn_password: "",
+                actor: "fixture-admin",
+                include_parent: false,
+            },
+            &plan.review_pin,
+            "invalid-column-contract",
+        )
+        .await
+        .unwrap();
+        let done = reposync_core::late_pair_publish::reviewed::run(
+            &fx.db,
+            &fx.config,
+            &fx.parent,
+            "",
+            &bridge,
+            &op.id,
+            "fixture-admin",
+        )
+        .await
+        .unwrap();
+        let child = done.child_repo_id.as_deref().unwrap();
+        let child_git = fx.tmp.path().join("repos").join(child).join("git-repo");
+        assert!(
+            reposync_core::db::late_pair_publish_operations::verified_reconciliation_frontier(
+                &fx.db.conn(),
+                child,
+                plan.intended_git_sha.as_deref().unwrap(),
+                &plan.projection
+            )
+            .unwrap()
+        );
+        let original = plan.intended_git_sha.as_deref().unwrap();
+        if case == "missing_object" {
+            std::fs::rename(
+                &child_git,
+                child_git.with_file_name("preserved-real-git-repo"),
+            )
+            .unwrap();
+            let repo = git2::Repository::init(&child_git).unwrap();
+            repo.remote("origin", &plan.git_remote_url).unwrap();
+            let tree = repo
+                .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+                .unwrap();
+            let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+            repo.commit(
+                Some("refs/heads/feature"),
+                &signature,
+                &signature,
+                "unrelated local fixture without handled object",
+                &tree,
+                &[],
+            )
+            .unwrap();
+            repo.set_head("refs/heads/feature").unwrap();
+        } else {
+            let repo = git2::Repository::open(&child_git).unwrap();
+            let parent = repo
+                .find_commit(git2::Oid::from_str(original).unwrap())
+                .unwrap();
+            let tree = parent.tree().unwrap();
+            let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+            let parents = if case == "unproved_descendant" {
+                vec![&parent]
+            } else {
+                Vec::new()
+            };
+            let column = repo
+                .commit(None, &signature, &signature, case, &tree, &parents)
+                .unwrap()
+                .to_string();
+            fx.db
+                .conn()
+                .execute(
+                    "UPDATE repositories SET last_git_sha=?1 WHERE id=?2",
+                    rusqlite::params![column, child],
+                )
+                .unwrap();
+            if case == "unrelated_emitted_column" {
+                // Deliberately invalid durable fixture evidence must not turn
+                // the valid old M proof into authority for unrelated U.
+                let now = Utc::now();
+                fx.db
+                    .insert_sync_record(&SyncRecord {
+                        id: "unrelated-column-fixture".into(),
+                        repo_id: Some(child.into()),
+                        svn_revision: done.reconciliation.as_ref().unwrap().svn_revision,
+                        git_hash: Some(column),
+                        direction: SyncDirection::SvnToGit,
+                        author: "fixture".into(),
+                        message: "unrelated invalid column fixture".into(),
+                        timestamp: now,
+                        synced_at: now,
+                        status: SyncRecordStatus::Applied,
+                    })
+                    .unwrap();
+            }
+        }
+        let prior = fx.db.get_repository(child).unwrap().unwrap();
+        let records: i64 = fx
+            .db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sync_records WHERE repo_id=?1",
+                [child],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let refs = Command::new("git")
+            .args(["--git-dir", fx._bare.to_str().unwrap(), "show-ref"])
+            .output()
+            .unwrap()
+            .stdout;
+        let svn = SvnClient::new(&fx.target_url, "", "");
+        let revision = svn.info().await.unwrap().latest_rev;
+        drop(fx.db);
+        let reopened = Database::new(fx.tmp.path().join("reposync.db")).unwrap();
+        let mut config = fx.config.clone();
+        config.github.default_branch = "feature".into();
+        let mut engine = SyncEngine::new(
+            config,
+            reopened,
+            svn,
+            GitClient::new(&child_git).unwrap(),
+            fx.identity.clone(),
+        );
+        engine.set_repo_id(child.into());
+        engine.set_path_rules(allowed, Vec::new());
+        let error = engine.run_sync_cycle().await.unwrap_err();
+        let detail = error.to_string();
+        assert!(
+            detail.contains(if case == "missing_object" {
+                "missing_checkpoint_object"
+            } else {
+                "ambiguous_checkpoint"
+            }),
+            "{case}: {detail}"
+        );
+        let after = engine.db().get_repository(child).unwrap().unwrap();
+        assert_eq!(after.last_git_sha, prior.last_git_sha);
+        assert_eq!(after.last_svn_rev, prior.last_svn_rev);
+        assert_eq!(
+            engine
+                .db()
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM sync_records WHERE repo_id=?1",
+                    [child],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            records
+        );
+        assert_eq!(
+            SvnClient::new(&fx.target_url, "", "")
+                .info()
+                .await
+                .unwrap()
+                .latest_rev,
+            revision
+        );
+        assert_eq!(
+            Command::new("git")
+                .args(["--git-dir", fx._bare.to_str().unwrap(), "show-ref"])
+                .output()
+                .unwrap()
+                .stdout,
+            refs
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_contract_binary_overlap_is_blocked_and_missing_copy_is_never_reissued() {
+    use reposync_core::late_pair_publish::reviewed::{self, Fault};
+    let _guard = replay_publish_67_guard().await;
+    let fx = build_publish_fixture().await;
+    rs67_create_independent_target(&fx, "feature.txt", b"\0independent binary SVN\n");
+    let plan = rs67_prepare(&fx, false).await.unwrap();
+    assert!(!plan.conflicts.is_empty());
+    assert!(plan.intended_git_sha.is_none());
+    let revision = SvnClient::new(&fx.target_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    let bridge = fx.tmp.path().join("repos/parent/git-repo");
+    assert!(
+        reposync_core::late_pair_publish::begin_reviewed_reconciliation(
+            reposync_core::late_pair::reconciliation::PrepareContext {
+                db: &fx.db,
+                parent: &fx.parent,
+                git_workdir: &bridge,
+                request: &fx.request,
+                admission: &fx.plan,
+                svn_password: "",
+                actor: "fixture-admin",
+                include_parent: false
+            },
+            &plan.review_pin,
+            "binary-blocked"
+        )
+        .await
+        .is_err()
+    );
+    assert!(fx
+        .db
+        .latest_late_pair_publish_operation(&fx.parent_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        SvnClient::new(&fx.target_url, "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        revision
+    );
+    drop(fx);
+    let fx = build_publish_fixture().await;
+    let plan = rs67_prepare(&fx, false).await.unwrap();
+    let bridge = fx.tmp.path().join("repos/parent/git-repo");
+    let op = reposync_core::late_pair_publish::begin_reviewed_reconciliation(
+        reposync_core::late_pair::reconciliation::PrepareContext {
+            db: &fx.db,
+            parent: &fx.parent,
+            git_workdir: &bridge,
+            request: &fx.request,
+            admission: &fx.plan,
+            svn_password: "",
+            actor: "fixture-admin",
+            include_parent: false,
+        },
+        &plan.review_pin,
+        "missing-copy-held",
+    )
+    .await
+    .unwrap();
+    reviewed::set_fault(&fx.parent_id, Fault::AfterCopy);
+    assert!(reviewed::run(
+        &fx.db,
+        &fx.config,
+        &fx.parent,
+        "",
+        &bridge,
+        &op.id,
+        "fixture-admin"
+    )
+    .await
+    .is_err());
+    let result = Command::new("svn")
+        .args([
+            "delete",
+            &fx.target_url,
+            "-m",
+            "external fixture removes uncertain target",
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let root = SvnClient::new(&fx.svn_url, "", "");
+    let revision = root.info().await.unwrap().latest_rev;
+    assert!(reviewed::run(
+        &fx.db,
+        &fx.config,
+        &fx.parent,
+        "",
+        &bridge,
+        &op.id,
+        "fixture-admin"
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        root.info().await.unwrap().latest_rev,
+        revision,
+        "unknown/absent outcome is not permission to copy again"
+    );
+    assert!(SvnClient::new(&fx.target_url, "", "").info().await.is_err());
+    let held = fx
+        .db
+        .get_late_pair_publish_operation(&fx.parent_id, &op.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.state, LatePairPublishState::ReconciliationHeld);
+    assert!(!held.state.is_terminal());
+    assert!(fx
+        .db
+        .list_child_repositories(&fx.parent_id)
+        .unwrap()
+        .is_empty());
+}
+
+#[path = "fixtures/pair_refresh_job.rs"]
+mod rs67_refresh_storage;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_contract_foreign_refresh_reader_keeps_active_refusal_and_admits_real_completed_versions(
+) {
+    let _guard = replay_publish_67_guard().await;
+    let mut documents = Vec::new();
+    {
+        let fx = build_publish_fixture().await;
+        publish_admitted_late_pair(
+            &fx.db,
+            &fx.config,
+            &PublishCredentials {
+                svn_password: String::new(),
+            },
+            &fx.parent,
+            &fx.request,
+            &fx.plan,
+            &fx.probe,
+            "foreign-journal-legacy-child",
+            "fixture-admin",
+            "legacy-native-completion",
+            &fx.identity,
+        )
+        .await
+        .unwrap();
+        let completed = fx
+            .db
+            .latest_late_pair_publish_operation(&fx.parent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.version, 1);
+        assert_eq!(completed.state, LatePairPublishState::Completed);
+        documents.push(completed);
+    }
+    {
+        let fx = build_publish_fixture().await;
+        let plan = rs67_prepare(&fx, false).await.unwrap();
+        let bridge = fx.tmp.path().join("repos/parent/git-repo");
+        let op = reposync_core::late_pair_publish::begin_reviewed_reconciliation(
+            reposync_core::late_pair::reconciliation::PrepareContext {
+                db: &fx.db,
+                parent: &fx.parent,
+                git_workdir: &bridge,
+                request: &fx.request,
+                admission: &fx.plan,
+                svn_password: "",
+                actor: "fixture-admin",
+                include_parent: false,
+            },
+            &plan.review_pin,
+            "v2-native-completion",
+        )
+        .await
+        .unwrap();
+        documents.push(
+            reposync_core::late_pair_publish::reviewed::run(
+                &fx.db,
+                &fx.config,
+                &fx.parent,
+                "",
+                &bridge,
+                &op.id,
+                "fixture-admin",
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    // Only storage admission is tested here. The retained fixture's synthetic
+    // refresh pins do not start a worker, authorize effects or prove remotes.
+    for completed in documents {
+        let f = rs67_refresh_storage::Fixture::new();
+        assert!(f.dir.path().exists());
+        let raw = serde_json::to_string(&completed).unwrap();
+        let document = format!("late_pair_publish_v1:document:{}", completed.id);
+        f.db.set_state(&document, &raw).unwrap();
+        f.db.set_state("late_pair_publish_v1:latest:parent", &completed.id)
+            .unwrap();
+        f.db.set_state("late_pair_publish_v1:active:parent", &completed.id)
+            .unwrap();
+        let pins = f.pins();
+        let digest = pins.approval_digest().unwrap();
+        let busy = f.busy();
+        let refusal =
+            f.db.admit_pair_refresh(
+                "admin",
+                "fixture-storage-request",
+                &digest,
+                pins.clone(),
+                &busy,
+            )
+            .unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("another operation owns the repository"),
+            "{refusal}"
+        );
+        assert!(f.no_hold(None));
+        f.db.delete_kv_state("late_pair_publish_v1:active:parent")
+            .unwrap();
+        f.db.set_state(&document, "{}").unwrap();
+        assert!(f
+            .db
+            .admit_pair_refresh(
+                "admin",
+                "fixture-storage-request",
+                &digest,
+                pins.clone(),
+                &busy
+            )
+            .is_err());
+        assert!(f.no_hold(None));
+        f.db.set_state(&document, &raw).unwrap();
+        let id = f.admit(pins, &busy);
+        assert!(!f.no_hold(Some("parent")));
+        assert!(!f.no_hold(Some("child")));
+        assert!(
+            f.db.get_state(&format!("pair_refresh_execution_v3:document:{id}"))
+                .unwrap()
+                .is_none(),
+            "storage-only test does not create authenticated execution authority"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_missing_ambiguous_rewritten_and_out_of_scope_sources_refuse_without_effects() {
+    let _guard = replay_publish_67_guard().await;
+    for case in [
+        "missing_mapping",
+        "ambiguous_mapping",
+        "rewritten_history",
+        "out_of_scope",
+    ] {
+        let mut fx = build_publish_fixture().await;
+        let bridge = fx.tmp.path().join("repos/parent/git-repo");
+        match case {
+            "missing_mapping" => {
+                fx.db
+                    .conn()
+                    .execute("DELETE FROM sync_records WHERE repo_id=?1", [&fx.parent_id])
+                    .unwrap();
+            }
+            "ambiguous_mapping" => {
+                fx.db.conn().execute("INSERT INTO sync_records (id,repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status) SELECT 'ambiguous-baseline',repo_id,svn_rev+1,git_sha,direction,author,message,timestamp,synced_at,status FROM sync_records WHERE repo_id=?1 AND git_sha=?2", rusqlite::params![fx.parent_id,fx._base_sha]).unwrap();
+            }
+            "rewritten_history" => {
+                let remote = git2::Repository::open_bare(&fx._bare).unwrap();
+                let tree = remote
+                    .find_commit(git2::Oid::from_str(&fx.tip).unwrap())
+                    .unwrap()
+                    .tree()
+                    .unwrap();
+                let signature =
+                    git2::Signature::now("synthetic-rewrite", "fixture@invalid").unwrap();
+                let orphan = remote
+                    .commit(
+                        None,
+                        &signature,
+                        &signature,
+                        "Unrelated replacement root",
+                        &tree,
+                        &[],
+                    )
+                    .unwrap();
+                remote
+                    .find_reference("refs/heads/feature")
+                    .unwrap()
+                    .set_target(orphan, "synthetic test rewrite")
+                    .unwrap();
+            }
+            "out_of_scope" => {
+                fx.db
+                    .conn()
+                    .execute(
+                        "UPDATE repositories SET allowed_paths='[\"origin.txt\"]' WHERE id=?1",
+                        [&fx.parent_id],
+                    )
+                    .unwrap();
+                fx.parent = fx.db.get_repository(&fx.parent_id).unwrap().unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let mappings = collect_verified_mappings(&fx.db, &fx.parent_id).unwrap();
+        let parent_before = serde_json::to_value(&fx.parent).unwrap();
+        let counts_before: (i64, i64) = fx
+            .db
+            .conn()
+            .query_row(
+                "SELECT (SELECT count(*) FROM sync_records),(SELECT count(*) FROM kv_state)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let refs_before = Command::new("git")
+            .args(["--git-dir", fx._bare.to_str().unwrap(), "show-ref"])
+            .output()
+            .unwrap();
+        assert!(refs_before.status.success());
+        let svn_before = SvnClient::new(&fx.svn_url, "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev;
+        if case == "missing_mapping" {
+            let refusal =
+                evaluate_admission(&mappings, Some(&bridge), None, &fx.request, None).unwrap_err();
+            assert_eq!(refusal.reason, "missing_baseline");
+        } else {
+            let error = format!("{:#}", rs67_prepare(&fx, false).await.unwrap_err());
+            assert!(
+                error.contains(match case {
+                    "ambiguous_mapping" => "ambiguous SVN revision",
+                    "rewritten_history" => "Git tip differs from fresh remote observation",
+                    _ => "out_of_scope_path",
+                }),
+                "{case}: {error}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(fx.db.get_repository(&fx.parent_id).unwrap().unwrap()).unwrap(),
+            parent_before,
+            "{case}"
+        );
+        let counts_after: (i64, i64) = fx
+            .db
+            .conn()
+            .query_row(
+                "SELECT (SELECT count(*) FROM sync_records),(SELECT count(*) FROM kv_state)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts_after, counts_before, "{case}");
+        assert!(
+            fx.db
+                .list_child_repositories(&fx.parent_id)
+                .unwrap()
+                .is_empty(),
+            "{case}"
+        );
+        assert!(
+            fx.db
+                .latest_late_pair_publish_operation(&fx.parent_id)
+                .unwrap()
+                .is_none(),
+            "{case}"
+        );
+        let refs_after = Command::new("git")
+            .args(["--git-dir", fx._bare.to_str().unwrap(), "show-ref"])
+            .output()
+            .unwrap();
+        assert!(refs_after.status.success());
+        assert_eq!(refs_after.stdout, refs_before.stdout, "{case}");
+        assert_eq!(
+            SvnClient::new(&fx.svn_url, "", "")
+                .info()
+                .await
+                .unwrap()
+                .latest_rev,
+            svn_before,
+            "{case}"
+        );
+        assert!(
+            SvnClient::new(&fx.target_url, "", "").info().await.is_err(),
+            "{case}"
+        );
+    }
+}

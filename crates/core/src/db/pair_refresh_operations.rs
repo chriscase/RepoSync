@@ -833,12 +833,11 @@ fn require_other_journals_quiet(tx: &Connection, repo_id: &str) -> Result<(), Da
                     repo_id,
                     ["team_cycle_mapping"]
                 ),
-                "late_pair_publish_v1" => completed!(
-                    late_pair_publish_operations,
-                    LatePairPublishOperation,
-                    parent_repo_id,
-                    ["late_pair_publish"]
-                ),
+                "late_pair_publish_v1" => {
+                    super::late_pair_publish_operations::completed_for_foreign_journal(
+                        &raw, &id, repo_id,
+                    )?
+                }
                 "managed_remove_v1" => completed!(
                     managed_remove,
                     ManagedRemoveOperation,

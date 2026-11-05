@@ -344,16 +344,24 @@ function RepositoryDetailEditor() {
     },
   });
 
+  const [branchIncludeParent, setBranchIncludeParent] = useState(false);
+  const branchPlanMatches = !!branchPlan && branchPlan.git_branch === branchForm.git_branch
+    && branchPlan.svn_branch === branchForm.svn_branch && branchPlan.include_parent === branchIncludeParent;
   const branchMutation = useMutation({
-    mutationFn: (data: { svn_branch: string; git_branch: string; skip_import: boolean; auto_create_svn_branch: boolean; auto_create_git_branch: boolean }) =>
+    mutationFn: (data: { svn_branch: string; git_branch: string; skip_import: boolean; auto_create_svn_branch: boolean; auto_create_git_branch: boolean;
+      action?: 'preview' | 'publish' | 'status' | 'resume' | 'cancel'; review_pin?: string; operation_id?: string }) =>
       api.createBranchPair(id!, {
         ...data,
-        dry_run: true,
-        preview: true,
+        reconciliation: true,
+        include_parent: branchIncludeParent,
+        dry_run: !data.action || data.action === 'preview' || data.action === 'status',
+        preview: !data.action || data.action === 'preview' || data.action === 'status',
       }),
     onSuccess: (plan) => {
       setBranchPlan(plan);
       setBranchSuccess(true);
+      if (plan.operation_id) setBranchIncludeParent(plan.include_parent ?? false);
+      for (const queryKey of repoDetailQueryKeys(id!)) queryClient.invalidateQueries({ queryKey });
     },
   });
 
@@ -1542,10 +1550,9 @@ function RepositoryDetailEditor() {
         </div>
         {branchSuccess && branchPlan && (
           <div className="mx-6 mb-3 bg-blue-900/30 border border-blue-700 rounded-lg p-3 text-blue-200 text-sm">
-            Preview only — pair stays preparing. Git tip {branchPlan.git_tip?.slice(0, 8) || 'unknown'},
-            SVN baseline r{branchPlan.svn_source_revision ?? '?'},
-            {branchPlan.pending_git.count} pending Git commit{branchPlan.pending_git.count === 1 ? '' : 's'}.
-            Replay/publish is not enabled in this slice.
+            {branchPlan.published ? 'Pair publication completed.' : branchPlan.operation_id ? `Pair operation: ${branchPlan.pair_state}.` : 'Preview only; no repository changes.'}
+            {' '}Git tip {branchPlan.git_tip?.slice(0, 8) || 'unknown'}, baseline r{branchPlan.verified_baseline?.svn_revision ?? '?'},
+            {' '}{branchPlan.pending_git.count} pending Git commits. Scheduler {branchPlan.scheduler_active ? 'active' : 'inactive'}.
           </div>
         )}
         {(branchPairs ?? []).length > 0 ? (
@@ -1634,7 +1641,7 @@ function RepositoryDetailEditor() {
 
       {/* Add Branch Pair Modal */}
       {showBranchModal && (
-        <Dialog title="Preview Branch Pair" description="Review the branch identity and pairing mode before requesting a preview." onClose={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: false, auto_create_svn_branch: true, auto_create_git_branch: true }); setBranchPlan(null); branchMutation.reset(); }} busy={branchMutation.isPending}>
+        <Dialog title="Review Branch Pair" description="Capture both sides, inspect the intended result, then explicitly publish or recover the pinned operation." onClose={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: false, auto_create_svn_branch: true, auto_create_git_branch: true }); setBranchPlan(null); branchMutation.reset(); }} busy={branchMutation.isPending}>
           <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
             <div className="flex items-center justify-between p-6 border-b border-gray-700">
 
@@ -1653,12 +1660,19 @@ function RepositoryDetailEditor() {
               )}
               {branchPlan && (
                 <div className="bg-gray-900/70 border border-gray-600 rounded-lg p-3 text-xs text-gray-300 space-y-1 font-mono">
-                  <div>mode: {branchPlan.mode} · state: {branchPlan.pair_state}</div>
+                  <div role="status">mode: {branchPlan.mode} · state: {branchPlan.pair_state}</div>
+                  <div>intended Git result: {branchPlan.result_git_sha || 'blocked'}</div>
+                  <div>result digest: {branchPlan.result_tree_digest || 'unknown'}</div>
+                  <div>handled steps: {branchPlan.handled_steps ?? 0}/{branchPlan.total_steps ?? 0}</div>
+                  <div>{branchPlan.observation}</div>
+                  {branchPlan.conflicts.map((conflict) => <div key={conflict} role="alert" className="text-red-300">{conflict}</div>)}
+                  {branchPlan.unknowns.map((unknown) => <div key={unknown} role="alert" className="text-amber-300">{unknown}</div>)}
+                  {branchPlan.action_error && <div role="alert">{branchPlan.action_error}</div>}
                   <div>git tip: {branchPlan.git_tip || 'unknown'}</div>
                   <div>SVN source: r{branchPlan.svn_source_revision ?? 'unknown'} · copy from r{branchPlan.proposed_svn_copy_source_revision ?? 'n/a'}</div>
                   <div>pending Git: {branchPlan.pending_git.count} · published: {String(branchPlan.published)} · scheduler: {String(branchPlan.scheduler_active)}</div>
                   {branchPlan.existing_svn_target.exists && (
-                    <div className="text-amber-300">existing SVN target is not equivalent</div>
+                    <div className="text-amber-300">Independent SVN work will be reconciled against the verified baseline</div>
                   )}
                   {branchPlan.skip_import_note && <div className="text-amber-200">{branchPlan.skip_import_note}</div>}
                 </div>
@@ -1677,9 +1691,11 @@ function RepositoryDetailEditor() {
                 <input
                   type="text"
                   className={inputClass}
+                  disabled={branchMutation.isPending || !!branchPlan?.operation_id}
                   value={branchForm.git_branch}
                   maxLength={200}
                   onChange={(e) => {
+                    setBranchPlan(null);
                     const name = e.target.value;
                     setBranchForm(prev => ({
                       ...prev,
@@ -1698,9 +1714,10 @@ function RepositoryDetailEditor() {
                 <input
                   type="text"
                   className={inputClass}
+                  disabled={branchMutation.isPending || !!branchPlan?.operation_id}
                   value={branchForm.svn_branch}
                   maxLength={200}
-                  onChange={(e) => setBranchForm(prev => ({ ...prev, svn_branch: e.target.value }))}
+                  onChange={(e) => { setBranchPlan(null); setBranchForm(prev => ({ ...prev, svn_branch: e.target.value })); }}
                   placeholder="branches/fix-123" id={`${fieldId}-6`}
                   aria-invalid={svnBranchValidation.error ? true : undefined}
                   aria-describedby={svnBranchValidation.error ? `${fieldId}-svn-branch-error` : undefined}
@@ -1708,27 +1725,13 @@ function RepositoryDetailEditor() {
                 {svnBranchValidation.error && <p id={`${fieldId}-svn-branch-error`} role="alert" className="mt-1 text-xs text-red-400">{svnBranchValidation.error}</p>}
               </div>
 
-              {/* Auto-create options */}
-              <div className="space-y-2">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={branchForm.auto_create_svn_branch}
-                    onChange={(e) => setBranchForm(prev => ({ ...prev, auto_create_svn_branch: e.target.checked }))}
-                    className="rounded border-gray-600 bg-gray-700 text-blue-600"
-                  />
-                  <span className="text-sm text-gray-300">Create SVN branch <span className="text-gray-300">(svn copy)</span></span>
-                </label>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={branchForm.auto_create_git_branch}
-                    onChange={(e) => setBranchForm(prev => ({ ...prev, auto_create_git_branch: e.target.checked }))}
-                    className="rounded border-gray-600 bg-gray-700 text-purple-600"
-                  />
-                  <span className="text-sm text-gray-300">Create Git branch <span className="text-gray-300">(from {repo?.git_branch || 'main'})</span></span>
-                </label>
-              </div>
+              <label className="flex items-center gap-2 text-sm text-gray-300">
+                <input type="checkbox" checked={branchIncludeParent}
+                  disabled={branchMutation.isPending || !!branchPlan?.operation_id}
+                  onChange={(event) => { setBranchIncludeParent(event.target.checked); setBranchPlan(null); }} />
+                Include parent SVN advancement in this reviewed result
+              </label>
+              <p className="text-xs text-gray-400">The Git branch must already exist. A missing SVN target is copied at the proven baseline; an existing related target keeps its independent work.</p>
 
               {/* Import mode */}
               <div>
@@ -1738,18 +1741,20 @@ function RepositoryDetailEditor() {
                     <input
                       type="radio"
                       name="importMode"
+                      disabled={branchMutation.isPending || !!branchPlan?.operation_id}
                       checked={!branchForm.skip_import}
-                      onChange={() => setBranchForm(prev => ({ ...prev, skip_import: false }))}
+                      onChange={() => { setBranchPlan(null); setBranchForm(prev => ({ ...prev, skip_import: false })); }}
                       className="text-blue-600"
                     />
-                    <span className="text-sm text-gray-300">Preview from verified SVN baseline <span className="text-gray-300">(this slice)</span></span>
+                    <span className="text-sm text-gray-300">Reconcile from the verified SVN baseline</span>
                   </label>
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
                       type="radio"
                       name="importMode"
+                      disabled={branchMutation.isPending || !!branchPlan?.operation_id}
                       checked={branchForm.skip_import}
-                      onChange={() => setBranchForm(prev => ({ ...prev, skip_import: true }))}
+                      onChange={() => { setBranchPlan(null); setBranchForm(prev => ({ ...prev, skip_import: true })); }}
                       className="text-blue-600"
                     />
                     <span className="text-sm text-gray-300">Start from now <span className="text-amber-400">(unsafe — refused)</span></span>
@@ -1757,7 +1762,7 @@ function RepositoryDetailEditor() {
                 </div>
               </div>
             </div>
-            <div className="flex items-center justify-end gap-3 p-6 border-t border-gray-700">
+            <div className="flex flex-wrap items-center justify-end gap-3 p-6 border-t border-gray-700">
               <button
                 onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: false, auto_create_svn_branch: true, auto_create_git_branch: true }); setBranchPlan(null); branchMutation.reset(); }}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
@@ -1765,13 +1770,29 @@ function RepositoryDetailEditor() {
                 Cancel
               </button>
               <button
-                onClick={() => branchMutation.mutate(branchForm)}
-                disabled={branchMutation.isPending || gitBranchValidation.previewRefused || svnBranchValidation.previewRefused}
+                onClick={() => branchMutation.mutate({ ...branchForm, action: 'preview' })}
+                disabled={branchMutation.isPending || !!branchPlan?.operation_id || gitBranchValidation.previewRefused || svnBranchValidation.previewRefused}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
                 <GitBranch className="w-4 h-4" />
-                {branchMutation.isPending ? 'Previewing...' : 'Preview Pair'}
+                {branchMutation.isPending ? 'Working...' : 'Preview Pair'}
               </button>
+              {!branchPlan?.operation_id && <button
+                onClick={() => branchMutation.mutate({ ...branchForm, action: 'publish', review_pin: branchPlan?.review_pin })}
+                disabled={branchMutation.isPending || !branchPlanMatches || !branchPlan?.review_pin || !branchPlan.admitted || branchPlan.conflicts.length > 0 || branchForm.skip_import}
+                className="px-4 py-2 rounded bg-green-700 disabled:opacity-50 text-white text-sm">Publish reviewed result</button>}
+              <button disabled={branchMutation.isPending || gitBranchValidation.previewRefused || svnBranchValidation.previewRefused}
+                onClick={() => branchMutation.mutate({ ...branchForm, action: 'status', operation_id: branchPlan?.operation_id ?? undefined })}
+                className="px-3 py-2 rounded border border-gray-600 text-sm">Inspect operation</button>
+              {branchPlan?.operation_id && !branchPlan.published && branchPlan.pair_state !== 'cancelled' && <>
+                <button disabled={branchMutation.isPending}
+                  onClick={() => branchMutation.mutate({ ...branchForm, action: 'resume', operation_id: branchPlan.operation_id!, review_pin: branchPlan.review_pin })}
+                  className="px-3 py-2 rounded border border-gray-600 text-sm">Reconcile / resume</button>
+                <button disabled={branchMutation.isPending}
+                  onClick={() => branchMutation.mutate({ ...branchForm, action: 'cancel', operation_id: branchPlan.operation_id! })}
+                  className="px-3 py-2 rounded border border-gray-600 text-sm">Cancel operation</button>
+                <p className="text-xs text-amber-200">Cancellation after intent retains the hold; it does not undo remote work.</p>
+              </>}
             </div>
           </div>
         </Dialog>

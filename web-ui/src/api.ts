@@ -118,6 +118,16 @@ export interface SyncRecordResponse {
 }
 
 export interface LatePairPlan {
+  review_pin?: string;
+  include_parent?: boolean;
+  result_git_sha?: string | null;
+  result_tree_digest?: string;
+  operation_id?: string | null;
+  observation?: string;
+  updated_at?: string | null;
+  handled_steps?: number;
+  total_steps?: number;
+  action_error?: string;
   mode: string;
   published: boolean;
   admitted: boolean;
@@ -612,6 +622,11 @@ export const api = {
     return body;
   },
   createBranchPair: (repoId: string, data: {
+    reconciliation?: boolean;
+    include_parent?: boolean;
+    review_pin?: string;
+    operation_id?: string;
+    action?: 'preview' | 'publish' | 'status' | 'resume' | 'cancel';
     svn_branch: string;
     git_branch: string;
     skip_import?: boolean;
