@@ -1,6 +1,6 @@
 {
   "schema": "reposync.acceptance-lab.qualification-plan.v1",
-  "source_head": "1e4de1de99012c5c879d4e73d3700e6ea39df81d",
+  "source_head": "bcb9a96d6efff63ffc7835a6e4134f9bf294c626",
   "design_note": "Retained obligation union introduced by this accounting correction; not a recovered historical 40-test contract. Additions in executor/matrix catalogs remain included. Retiring or replacing a required id requires explicit reviewed plan changes.",
   "required_case_ids": [
     "64A_AUTH",
@@ -237,6 +237,7 @@
     "R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP",
     "R01_SVNSERVE_FAILED_APPLY_BARRIER",
     "R01_SVNSERVE_FAILED_APPLY_RETRY",
+    "R01_SVNSERVE_LARGE_MESSAGE_RETRY",
     "R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN",
     "R01_SVNSERVE_MULTI_COMMIT_SVN_TO_GIT",
     "R01_SVNSERVE_PERSONAL_ROUNDTRIP",
@@ -386,6 +387,7 @@
     "R66_PERSONAL_LINEAR_OVER_1000",
     "R66_PERSONAL_MERGE_DAG",
     "R66_TEAM_CONTINUATION_RESTART",
+    "R70_DELETE_NAVIGATION",
     "RS05_DIRECT_FINALIZE_ADVANCES_GLOBAL",
     "RS05_ERROR_PAUSED_STATUS_ROUNDTRIP",
     "RS05_LATE_PAIR_BC_PENDING",
@@ -443,6 +445,9 @@
     "RS11_TEAM_CREDENTIAL_MISSED_LOOKUP_PRESERVED",
     "RS11_TEAM_CREDENTIAL_REVOCATION",
     "RS11_TEAM_CREDENTIAL_ROTATION_RELOAD",
+    "RS63_LEGACY_RECEIPT_NOT_AUTHORITATIVE",
+    "RS63_SCOPE_UUID_MIGRATION_IDEMPOTENT",
+    "RS63_SCOPE_UUID_REREGISTER",
     "RS_C02_CONTENT_CONFLICT_STOP",
     "RS_C02_EMPTY_RULES_RENAME_CONFLICT_STOP",
     "RS_C02_FILTERED_THEN_ALLOWED",
@@ -1213,6 +1218,9 @@
     "R01_SVNSERVE_FAILED_APPLY_RETRY": [
       "R01"
     ],
+    "R01_SVNSERVE_LARGE_MESSAGE_RETRY": [
+      "R01"
+    ],
     "R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN": [
       "R01"
     ],
@@ -1660,6 +1668,9 @@
     "R66_TEAM_CONTINUATION_RESTART": [
       "R66"
     ],
+    "R70_DELETE_NAVIGATION": [
+      "R20"
+    ],
     "RS05_DIRECT_FINALIZE_ADVANCES_GLOBAL": [
       "RS0"
     ],
@@ -1830,6 +1841,15 @@
     ],
     "RS11_TEAM_CREDENTIAL_ROTATION_RELOAD": [
       "RS1"
+    ],
+    "RS63_LEGACY_RECEIPT_NOT_AUTHORITATIVE": [
+      "R09"
+    ],
+    "RS63_SCOPE_UUID_MIGRATION_IDEMPOTENT": [
+      "R09"
+    ],
+    "RS63_SCOPE_UUID_REREGISTER": [
+      "R09"
     ],
     "RS_C02_CONTENT_CONFLICT_STOP": [
       "RS_"
