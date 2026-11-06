@@ -1330,20 +1330,42 @@ run_playwright() {
 }
 
 run_engine() {
-  local summary ec
+  local before after ec graph selected
+  before="$(mktemp)"
+  after="$(mktemp)"
+  if [ -d "$REPO_ROOT/artifacts/real-engine-scenarios" ]; then
+    find "$REPO_ROOT/artifacts/real-engine-scenarios" -name summary.json -type f | sort > "$before"
+  else
+    : > "$before"
+  fi
   log "starting real-engine suite without the lab compose stack"
   set +e
   "$REPO_ROOT/scripts/real-engine-scenario-suite.sh"
   ec=$?
   set -e
   log "real-engine exit $ec"
-  printf 'engine_exit=%s\n' "$ec" > "$EVIDENCE/engine-exit.txt"
-  summary="$(find "$REPO_ROOT/artifacts/real-engine-scenarios" -name summary.json -type f 2>/dev/null | sort | tail -n 1 || true)"
-  if [ -n "$summary" ]; then
-    cp "$summary" "$EVIDENCE/engine-summary.json"
+  if [ -d "$REPO_ROOT/artifacts/real-engine-scenarios" ]; then
+    find "$REPO_ROOT/artifacts/real-engine-scenarios" -name summary.json -type f | sort > "$after"
   else
-    log "real-engine suite did not write summary.json"
+    : > "$after"
   fi
+  graph="absent"
+  if [ -s "$EVIDENCE/build-graph/Cargo.lock.sha256" ]; then
+    graph="$(awk 'NR==1 { print $1 }' "$EVIDENCE/build-graph/Cargo.lock.sha256")"
+  fi
+  mkdir -p "$EVIDENCE"
+  set +e
+  node "$LAB_DIR/src/engine-invocation.mjs" \
+    --before "$before" --after "$after" --exit "$ec" \
+    --candidate "$CANDIDATE" --run-id "$RUN_ID" --build-graph "$graph" \
+    --out "$EVIDENCE/engine-summary.json" --exit-out "$EVIDENCE/engine-exit.txt"
+  selected=$?
+  set -e
+  rm -f "$before" "$after"
+  if [ "$selected" -ne 0 ]; then
+    log "current engine invocation was not adopted (exit $selected); preexisting summaries were left in place"
+  fi
+  return "$selected"
 }
 
 run_aggregate() {
@@ -1428,13 +1450,20 @@ publish_outputs() {
     mkdir -p "$publish/build-graph"
     cp -R "$EVIDENCE/build-graph/." "$publish/build-graph/"
   fi
-  if [ -f "$RUN_DIR/scan.json" ] && python3 - "$RUN_DIR/scan.json" <<'PY'
-import json, sys
-sys.exit(0 if json.load(open(sys.argv[1])).get("ok") else 1)
-PY
-  then
+  if [ -d "$EVIDENCE" ]; then
     mkdir -p "$publish/evidence"
-    cp -R "$EVIDENCE/." "$publish/evidence/"
+    set +e
+    node "$LAB_DIR/src/scan.mjs" --root "$EVIDENCE" --dest "$publish/evidence" \
+      --secrets-file "$RUN_DIR/secret-values.txt" --out "$RUN_DIR/materialize.json"
+    local materialized=$?
+    set -e
+    if [ "$materialized" -gt 1 ]; then
+      log "publish materialize failed"
+      return 1
+    fi
+    if [ "$materialized" -ne 0 ]; then
+      log "compressed archives were withheld; only scanned extracted diagnostics were eligible to publish"
+    fi
   fi
   set +e
   node "$LAB_DIR/src/scan.mjs" --root "$publish" --secrets-file "$RUN_DIR/secret-values.txt" --out "$RUN_DIR/publish-scan.json"
@@ -1614,7 +1643,7 @@ cmd_test() {
   if [ "$ec" -eq 0 ]; then
     run_playwright || ec=1
     if [ "$SUITE" != "smoke" ] && [ "${ACCEPTANCE_LAB_SKIP_ENGINE:-}" != "1" ]; then
-      run_engine || true
+      run_engine || ec=1
     fi
   fi
   printf 'elapsed_before_report=%s\n' "$(( $(date +%s) - started ))" >> "$EVIDENCE/timings.txt"

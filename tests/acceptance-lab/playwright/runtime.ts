@@ -977,6 +977,101 @@ svn commit --non-interactive --username ${user} --password "${password}" -m "lab
     return this.observer(`set -eu\nsvn cat -r ${revision} --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" ${svnTarget(pair)}/${safeRelativePath(path)}@${revision}\n`);
   }
 
+  async svnInventory(pair: Pair): Promise<string[]> {
+    const output = await this.observer(`set -eu\nexport LC_ALL=C\nsvn list -R --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" ${svnTarget(pair)}\n`);
+    return output.split("\n").map(line => line.trim()).filter(line => line.length > 0 && !line.endsWith("/")).sort();
+  }
+
+  async gitInventory(pair: Pair): Promise<string[]> {
+    const branch = safe(pair.gitBranch || "main", "ref");
+    const dir = `/work/read-${safe(pair.id, "repo id")}`;
+    const output = await this.observer(`
+set -eu
+auth=$(printf '%s:%s' "$GIT_USER" "$GIT_TOKEN" | base64 | tr -d '\\n')
+if [ ! -d ${dir}/.git ]; then
+  git -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca.crt \
+    clone --branch ${branch} https://gitea:3000/${pair.gitRepo}.git ${dir}
+fi
+git -C ${dir} -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca.crt fetch origin ${branch}
+git -C ${dir} ls-tree -r --name-only FETCH_HEAD
+`);
+    return output.split("\n").map(line => line.trim()).filter(line => line.length > 0).sort();
+  }
+
+  async svnSha256(pair: Pair, path: string): Promise<string | null> {
+    const rel = safeRelativePath(path);
+    const output = (await this.observer(`
+set -eu
+export LC_ALL=C
+data=$(mktemp); err=$(mktemp)
+trap 'rm -f "$data" "$err"' EXIT
+if svn cat --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" \
+  ${svnTarget(pair)}/${rel} >"$data" 2>"$err"; then
+  sha256sum "$data" | awk '{print $1}'
+elif grep -q "W160013:.*path not found" "$err" && ! grep -E '(E|W)[0-9]{6}' "$err" | grep -Ev '(W160013|E200009)' >/dev/null; then
+  printf 'LAB_SHA_ABSENT\\n'
+else
+  cat "$err" >&2; exit 1
+fi
+`)).trim();
+    if (output === "LAB_SHA_ABSENT") return null;
+    if (!/^[0-9a-f]{64}$/.test(output)) throw new Error(`svn sha256 for ${path} was not a hash`);
+    return output;
+  }
+
+  async appliedGitToSvn(pair: Pair): Promise<Array<{git_sha: string; svn_rev: string}>> {
+    const rows = await this.sqlRows(`SELECT git_sha, svn_rev FROM sync_records WHERE repo_id='${safe(pair.id, "repo id")}' AND direction='git_to_svn' AND status='applied' ORDER BY CAST(svn_rev AS INTEGER), git_sha;`);
+    return rows.map(row => {
+      const gitSha = String(row.git_sha || "");
+      const svnRev = String(row.svn_rev || "");
+      if (!/^[0-9a-f]{40}$/.test(gitSha) || !/^[0-9]+$/.test(svnRev)) throw new Error("invalid git-to-svn receipt");
+      return {git_sha: gitSha, svn_rev: svnRev};
+    });
+  }
+
+  async svnBytesForRevisions(pair: Pair, path: string, revisions: string[]): Promise<Array<string | null>> {
+    if (revisions.some(revision => !/^[0-9]+$/.test(revision))) throw new Error("invalid SVN read revision");
+    const rel = safeRelativePath(path);
+    const output = await this.observer(`
+set -eu
+export LC_ALL=C
+for rev in ${revisions.join(" ")}; do
+  data=$(mktemp); err=$(mktemp)
+  if svn cat -r "$rev" --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" \
+    ${svnTarget(pair)}/${rel}@"$rev" >"$data" 2>"$err"; then
+    printf 'LAB_REV %s %s\\n' "$rev" "$(wc -c < "$data" | tr -d ' ')"
+    cat "$data"
+  elif grep -q "W160013:.*path not found" "$err" && ! grep -E '(E|W)[0-9]{6}' "$err" | grep -Ev '(W160013|E200009)' >/dev/null; then
+    printf 'LAB_REV %s ABSENT\\n' "$rev"
+  else
+    cat "$err" >&2; exit 1
+  fi
+  rm -f "$data" "$err"
+done
+`);
+    const values: Array<string | null> = [];
+    let rest = output;
+    for (const revision of revisions) {
+      const newline = rest.indexOf("\n");
+      if (newline < 0) throw new Error("truncated revision read");
+      const header = rest.slice(0, newline);
+      rest = rest.slice(newline + 1);
+      const absent = header.match(/^LAB_REV ([0-9]+) ABSENT$/);
+      if (absent) {
+        if (absent[1] !== revision) throw new Error("revision read order changed");
+        values.push(null);
+        continue;
+      }
+      const present = header.match(/^LAB_REV ([0-9]+) ([0-9]+)$/);
+      if (!present || present[1] !== revision) throw new Error("revision read order changed");
+      const size = Number(present[2]);
+      values.push(rest.slice(0, size));
+      rest = rest.slice(size);
+    }
+    if (rest.length) throw new Error("revision read had trailing bytes");
+    return values;
+  }
+
   async commitGit(pair: Pair, script: string, ref = pair.gitBranch || "main", publish = true): Promise<string> {
     const dir = `/work/git-${pair.name}-${randomBytes(3).toString("hex")}`;
     const branch = safe(ref, "ref");

@@ -28,6 +28,8 @@ export default defineConfig({
   use: {
     baseURL: process.env.LAB_UI_URL || "http://127.0.0.1:9",
     ignoreHTTPSErrors: false,
+    // Failure traces stay in the local output directory. Publication withholds
+    // trace.zip until scan.mjs unpacks, sanitizes, and scans the entries.
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "off",

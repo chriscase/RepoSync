@@ -1,5 +1,6 @@
 import { expect } from "@playwright/test";
-import { assertAuthRefusal, assertCompletedPublishRefusal, assertLdapUser, assertReplayEndpoints, importOperationId, loginError, readFaultStats, Lab, sharedPair, type LabOp, type Pair } from "./runtime.ts";
+import { cancelOutcome, contentIntegrityOutcome, egressOutcome, generationOutcome, linearPublicationOutcome, NUL_SAMPLE_SHA256, restorePrewriteOutcome, type Outcome } from "./oracles.ts";
+import { assertAuthRefusal, assertCompletedPublishRefusal, assertLdapUser, assertReplayEndpoints, importOperationId, loginError, readFaultStats, Lab, sharedPair, type LabOp, type Pair, type Snap } from "./runtime.ts";
 
 function slug(id: string): string {
   return id.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 24);
@@ -24,11 +25,65 @@ async function own(lab: Lab, op: LabOp): Promise<Pair> {
   return sharedPair(lab, labPairKey(op.id));
 }
 
+function settle(lab: Lab, outcome: Outcome): void {
+  if (outcome.status === "PASS") lab.pass(outcome.reason);
+  else lab.mark(outcome.status, outcome.reason, outcome.qualification);
+}
+
+function requirePass(outcome: Outcome): void {
+  if (outcome.status !== "PASS") throw new Error(outcome.reason);
+}
+
 export async function requireRepeatIdle(lab: Lab, pair: Pair): Promise<void> {
   await lab.expectNoWrite(pair, async () => {
     const status = await lab.triggerGit(pair.gitRepo);
     if (status !== 200) throw new Error(`repeat webhook ${status}`);
   });
+}
+
+async function requireLinearPublication(lab: Lab, pair: Pair, before: Snap, commits: string[], path: string, expectedIntermediates: string[], timeout = 90_000): Promise<void> {
+  const tip = commits[commits.length - 1] || "";
+  if (commits.length === expectedIntermediates.length && commits.length > 0) {
+    await lab.waitUntil(async () => {
+      const now = await lab.snap(pair);
+      if (now.git !== tip || now.gitWatermark !== tip || now.gitColumn !== tip) return false;
+      const rows = await lab.appliedGitToSvn(pair);
+      const have = new Set(rows.map(row => row.git_sha));
+      return commits.every(sha => have.has(sha));
+    }, timeout);
+  }
+  const rows = commits.length ? await lab.appliedGitToSvn(pair) : [];
+  const revisionBySha = new Map(rows.map(row => [row.git_sha, row.svn_rev]));
+  const receipts: Record<string, number> = {};
+  const revisions: string[] = [];
+  for (const sha of commits) {
+    const revision = revisionBySha.get(sha);
+    receipts[sha] = revision ? 1 : 0;
+    if (revision) revisions.push(revision);
+  }
+  const intermediates = revisions.length === commits.length && commits.length > 0
+    ? await lab.svnBytesForRevisions(pair, path, revisions)
+    : commits.map(() => null);
+  const after = await lab.snap(pair);
+  let idle = false;
+  try {
+    await requireRepeatIdle(lab, pair);
+    idle = true;
+  } catch {
+    idle = false;
+  }
+  const outcome = linearPublicationOutcome({
+    commits,
+    receipts,
+    intermediates,
+    expectedIntermediates,
+    finalBytes: intermediates.length ? intermediates[intermediates.length - 1] : null,
+    expectedFinal: expectedIntermediates[expectedIntermediates.length - 1] || "",
+    checkpoints: { git: after.git, watermark: after.gitWatermark, column: after.gitColumn },
+    idle,
+  });
+  requirePass(outcome);
+  lab.pass(outcome.reason);
 }
 
 async function cancelLiveImport(lab: Lab, op: LabOp): Promise<{pair: Pair; operation: string}> {
@@ -257,11 +312,44 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       return;
     }
     case "LAB_EGRESS_REJECTED": {
-      const output = await lab.observer("curl --silent --show-error --max-time 8 https://example.com/ || true");
-      if (output.includes("200 OK") || output.includes("<html")) {
-        throw new Error("external egress returned a page");
-      }
-      lab.pass("example.com was not reachable from the internal network");
+      const output = await lab.sh("reposync", `
+set +e
+if ! command -v curl >/dev/null 2>&1; then
+  printf 'LAB_EGRESS_TOOL:absent\\n'
+  exit 0
+fi
+printf 'LAB_EGRESS_TOOL:present\\n'
+printf 'LAB_EGRESS_CONTEXT:application\\n'
+body=$(mktemp)
+meta=$(mktemp)
+curl --silent --show-error --output "$body" --max-time 8 \\
+  --write-out 'LAB_EGRESS_HTTP:%{http_code}\\nLAB_EGRESS_CONNECTS:%{num_connects}\\n' \\
+  https://example.com/ >"$meta" 2>"$body.err"
+printf 'LAB_EGRESS_EXIT:%s\\n' "$?"
+cat "$meta"
+printf 'LAB_EGRESS_BODY_B64:'
+base64 "$body" | tr -d '\\n'
+printf '\\n'
+rm -f "$body" "$body.err" "$meta"
+`, "root");
+      const tool = output.includes("LAB_EGRESS_TOOL:present") ? "present" : "absent";
+      const http = output.match(/LAB_EGRESS_HTTP:([0-9]+)/);
+      const connects = output.match(/LAB_EGRESS_CONNECTS:([0-9]+)/);
+      const exitCode = output.match(/LAB_EGRESS_EXIT:(-?[0-9]+)/);
+      const bodyMatch = output.match(/LAB_EGRESS_BODY_B64:([A-Za-z0-9+/=]*)/);
+      const body = bodyMatch ? Buffer.from(bodyMatch[1], "base64").toString("utf8") : "";
+      const outcome = egressOutcome({
+        tool,
+        context: output.includes("LAB_EGRESS_CONTEXT:application") ? "application" : "unknown",
+        exitCode: exitCode ? Number(exitCode[1]) : null,
+        httpStatus: http ? Number(http[1]) : null,
+        connects: connects ? Number(connects[1]) : null,
+        body,
+      });
+      lab.observation("egress-rejected", {
+        tool, context: outcome.reason, http: http?.[1] || "", connects: connects?.[1] || "", exit: exitCode?.[1] || "",
+      });
+      settle(lab, outcome);
       return;
     }
     case "LAB_CANARY_DETECTS_CONTACT": {
@@ -351,18 +439,34 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
         await lab.syncSvnChange(pair, `printf 'keep\\n' > ${keep}; printf 'drop\\n' > ${drop}; svn add ${keep} ${drop}\n`);
         await lab.syncSvnChange(pair, `svn rm ${drop}\n`);
       }
+      const inventory = op.id.startsWith("GIT") ? await lab.svnInventory(pair) : await lab.gitInventory(pair);
       const kept = op.id.startsWith("GIT") ? await lab.svnBytes(pair, keep) : await lab.gitBytes(pair, keep);
-      if (!kept.includes("keep")) throw new Error("sibling bytes changed");
-      lab.pass("deleted one path and kept the sibling");
+      const outcome = contentIntegrityOutcome({
+        inventory,
+        expectedPresent: [{ path: keep, bytes: "keep\n" }],
+        expectedAbsent: [drop],
+        observedBytes: { [keep]: kept },
+        observedSha256: {},
+      });
+      requirePass(outcome);
+      lab.pass(outcome.reason);
       return;
     }
     case "GIT-RENAME-REGULAR": {
       const pair = await team(lab);
       await lab.syncGitChange(pair, "printf 'renamed\\n' > from.txt\ngit add from.txt\ngit commit -m 'from'\n");
       await lab.syncGitChange(pair, "git mv from.txt to.txt\ngit commit -m 'mv'\n");
+      const inventory = await lab.svnInventory(pair);
       const bytes = await lab.svnBytes(pair, "to.txt");
-      if (bytes.trim() !== "renamed") throw new Error(`rename bytes ${bytes}`);
-      lab.pass("rename bytes arrived at the new path");
+      const outcome = contentIntegrityOutcome({
+        inventory,
+        expectedPresent: [{ path: "to.txt", bytes: "renamed\n" }],
+        expectedAbsent: ["from.txt"],
+        observedBytes: { "to.txt": bytes },
+        observedSha256: {},
+      });
+      requirePass(outcome);
+      lab.pass(outcome.reason);
       return;
     }
     case "GIT-COPY-EQUIVALENT-ADD": {
@@ -377,9 +481,17 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       const pair = await team(lab);
       const path = "binary.bin";
       await lab.syncGitChange(pair, `printf 'a\\0b\\n' > ${path}\ngit add ${path}\ngit commit -m 'bin'\n`);
-      const svn = await lab.svnBytes(pair, path);
-      if (!svn.includes("a") || !svn.includes("b")) throw new Error("binary bytes missing");
-      lab.pass("NUL file bytes matched");
+      const inventory = await lab.svnInventory(pair);
+      const hash = await lab.svnSha256(pair, path);
+      const outcome = contentIntegrityOutcome({
+        inventory,
+        expectedPresent: [{ path, sha256: NUL_SAMPLE_SHA256 }],
+        expectedAbsent: [],
+        observedBytes: {},
+        observedSha256: { [path]: hash },
+      });
+      requirePass(outcome);
+      lab.pass(outcome.reason);
       return;
     }
     case "GIT-DOTFILE": {
@@ -395,12 +507,9 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       const pair = await own(lab, op);
       const before = await lab.snap(pair);
       await lab.commitGit(pair, "printf 'A\\n' > seq.txt\ngit add seq.txt\ngit commit -m A\nprintf 'B\\n' > seq.txt\ngit add seq.txt\ngit commit -m B\nprintf 'C\\n' > seq.txt\ngit add seq.txt\ngit commit -m C\n");
+      const commits = await lab.gitCommitsSince(pair, before.git);
       await lab.triggerGit(pair.gitRepo);
-      await lab.waitUntil(async () => (await lab.svnBytesOrMissing(pair, "seq.txt"))?.includes("C") || false);
-      const after = await lab.snap(pair);
-      if (Number(after.svn) < Number(before.svn) + 1) throw new Error("no svn revision for the sequence");
-      await requireRepeatIdle(lab, pair);
-      lab.pass("three commits reached the final tree and the repeat was idle");
+      await requireLinearPublication(lab, pair, before, commits, "seq.txt", ["A\n", "B\n", "C\n"]);
       return;
     }
     case "GIT-EXECUTABLE":
@@ -622,10 +731,10 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       const limit = op.id === "GIT-OVER-1000" ? 1001 : 5;
       const before = await lab.snap(pair);
       await lab.commitGit(pair, `i=0\nwhile [ "$i" -lt ${limit} ]; do printf '%s\\n' "$i" > n.txt; git add n.txt; git commit -m "n $i"; i=$((i+1)); done\n`);
+      const commits = await lab.gitCommitsSince(pair, before.git);
       await lab.triggerGit(pair.gitRepo);
-      await lab.waitUntil(async () => (await lab.snap(pair)).svn !== before.svn, 600_000);
-      const after = await lab.snap(pair);
-      lab.pass(`${limit} commits were submitted; svn moved from ${before.svn} to ${after.svn}`);
+      const expected = Array.from({ length: limit }, (_, index) => `${index}\n`);
+      await requireLinearPublication(lab, pair, before, commits, "n.txt", expected, 600_000);
       return;
     }
     case "GIT-CONFLICT-BOTH":
@@ -782,7 +891,13 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
     case "PAIR-CANCEL-RESTART-GENERATION": {
       const cancelled = await cancelLiveImport(lab, op);
       if (op.id === "PAIR-CANCEL-IMPORT") {
-        lab.pass(`cancelled import ${cancelled.operation}`);
+        settle(lab, cancelOutcome({
+          acknowledged: true,
+          phaseBarrier: false,
+          finalState: "cancel_requested",
+          childCleanup: false,
+          checkpointPreserved: false,
+        }));
         return;
       }
       const heldByOriginal = async (when: string) => {
@@ -804,7 +919,14 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
         throw new Error(`${op.id} restart of ${cancelled.operation} returned ${again.status} without the documented 400 refusal: ${detail.slice(0, 220)}`);
       }
       await heldByOriginal("after");
-      lab.pass(`cancelled ${cancelled.operation}; a new import was refused with 400 while ${cancelled.operation} still held the active import`);
+      const held = cancelOutcome({
+        acknowledged: true,
+        phaseBarrier: false,
+        finalState: "cancel_requested",
+        childCleanup: false,
+        checkpointPreserved: false,
+      });
+      lab.mark("PARTIAL", `${held.reason}; restart of ${cancelled.operation} stayed a 400 while that operation held the import`, "UNQUALIFIED");
       return;
     }
     case "PAIR-REFRESH-PREVIEW":
@@ -891,7 +1013,13 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
         await lab.sh("reposync", "sqlite3 \"file:/var/lib/reposync/reposync.db?mode=ro\" \".backup /tmp/prewrite.db\"", "root");
         const copy = await lab.sh("reposync", "sqlite3 /tmp/prewrite.db 'SELECT COUNT(*) FROM commit_map;'", "root");
         if (!copy.trim()) throw new Error("backup was empty");
-        lab.pass("read a pre-write backup without applying it to a remote");
+        settle(lab, restorePrewriteOutcome({
+          backupRead: true,
+          oldDatabaseRestored: false,
+          oldBinaryRestored: false,
+          restoredBeforeExternalWrite: false,
+          preservationAsserted: false,
+        }));
         return;
       }
       if (op.id === "LAB_DAEMON_RESTART") {
@@ -939,7 +1067,12 @@ cat "$output"
         lab.mark("PARTIAL", "Healthy scoped OPTIONS forwarded, then exactly one response to an SVN read was dropped; snapshots stayed unchanged. Write recovery, held restart and in-process hooks were not injected.", "UNQUALIFIED");
         return;
       }
-      lab.pass("generation probe kept the snapshot stable");
+      settle(lab, generationOutcome({
+        generationChanged: false,
+        staleReceiptChecked: false,
+        echoReceiptChecked: false,
+        preservationAsserted: false,
+      }));
       return;
     }
     case "LDAP-AUTH-INVALID":

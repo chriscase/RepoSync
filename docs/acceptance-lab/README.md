@@ -79,23 +79,13 @@ Until those steps have a recorded run id and report, Cursor Cloud is not qualifi
 
 ## Workflow
 
-`.github/workflows/acceptance-lab.yml` is optional. It does not change required checks. Pull requests that touch the lab paths run `smoke` on `ubuntu-24.04`. `workflow_dispatch` can run `smoke`, `full`, or `soak`. The pull request path stays on `smoke`.
+The Acceptance lab workflow is absent under the known hold. `.github/workflows/acceptance-lab.yml` is not in this tree. Nothing in this document claims that a pull request runs the lab, that `workflow_dispatch` is registered, or that smoke, full, or soak execute in GitHub Actions. Do not add, change, or dispatch a workflow to bypass that hold.
 
-GitHub registers `workflow_dispatch` from the workflow file on the default branch. Until this file is on the default branch, a dispatched run is unavailable. The pull request run is the smoke path. This lab does not merge in order to enable dispatch.
+Full-lab, Docker, soak, native, live, and `workflow_dispatch` qualification stay **NOT_RUN**.
 
-The daemon image is built in one job and loaded in the browser job (`ACCEPTANCE_LAB_SKIP_REPOSYNC_BUILD=1`). The entrypoint is passed as its own Docker build context. The root `.dockerignore` on main omits `tests/`, so a copy from the repository context cannot see that file. The build job uploads `acceptance-lab-build-graph-<run id>-<attempt>` after prepare. A successful image without that graph fails the job. The upload still runs when prepare fails after the base image identity was written. The real-engine job runs only for a dispatched `full` or `soak`, and it does not join the lab Compose network. Evidence upload is limited to the run's `publish/` directory after scrub and scan. A failed scan withholds the bundle.
+Publication withholds compressed archives, including `trace.zip`, until they are unpacked, sanitized, and scanned. The publisher emits only verified extracted diagnostics. A compressed entry that contains a secret fails the scan. Readable diagnostics that do not contain the secret can remain after the archive itself is withheld.
 
-On that dispatched job, the workflow installs the harness Rust pin from `tests/acceptance-lab/pins.env` and removes a rustup toolchain named `stable` when one is present. `scripts/real-engine-scenario-suite.sh` is not edited. It selects `rustup run stable` when that name exists, and otherwise uses `cargo` on `PATH`. The engine job waits for the daemon build and downloads its build graph from the same workflow attempt. `engine-lock.mjs` checks the candidate, immutable image ID and both recorded lockfile hashes before installing that lock into the disposable job checkout. It rejects a different existing root lock. No root lock is committed. The suite retains `--locked`, and a post-run comparison checks that the installed lock did not change. The engine artifact records the selected lock identity, scenario summary and scrubbed scenario logs. A missing summary or failed scan remains a failure. Full and soak are manual dispatch inputs; they are not installed on a schedule.
-
-When the browser job does not produce `identity.json`, the candidate report run id is `gha<github.run_id>a<github.run_attempt>`. It is not the literal `unknown`. Reports already uploaded from earlier attempts stay as they were. A smoke result does not qualify the full suite. `NOT_RUN`, `PARTIAL`, and `UNQUALIFIED` rows block a full PASS. Runtime fault, egress, zero-discovery, artifact, and cleanup controls are not claimed from the synthetic harness self-test.
-
-`GITHUB_TOKEN` for this workflow is `contents: read`. That checks out the repository. The artifact upload action obtains its own Actions runtime token. This workflow does not grant `actions: write`. It does not write repository contents, open or merge pull requests, or close issues.
-
-Dispatch inputs are job environment values. `tests/acceptance-lab/src/ci-gate.mjs` accepts a suite of `smoke`, `full`, or `soak` and an integer seed before the launcher command is built. A quote or shell metacharacter in the seed is rejected there. A pull request cannot select `full` or `soak`.
-
-The browser publish directory must contain `playwright.json`, `self-test.json`, and `report.json`. A dispatched `full` or `soak` must also produce the real-engine `summary.json`. The daemon image upload fails when the image is missing. A missing required runtime artifact fails the workflow with `infrastructure FAIL`. The files that attempt did produce are still uploaded, including `infrastructure-failure.txt` when the required set is absent. A later attempt does not replace that record. A product `FAIL` inside a complete bundle stays a suite failure for the product owner.
-
-Syntax, type, and harness-detector checks do not qualify the services, the browser, or runtime fault detection. Those stay **NOT_RUN** until a GitHub-hosted run records them. A smoke result does not qualify the full suite.
+`scripts/real-engine-scenario-suite.sh` is not edited by this harness. It can still exit at its build step before it writes a summary, and it does not stamp the candidate, run id, or build graph into that summary. `scripts/acceptance-lab.sh` keeps older summaries, adopts only a summary that appeared during the current invocation, binds the candidate, run id, and build-graph hash it has, and returns the process exit. A preexisting passing summary plus a current build failure produces no current PASS rows. That does not make the unreserved suite record the identity itself.
 
 ## Reading a failure
 
