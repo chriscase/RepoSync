@@ -6,7 +6,8 @@
 //! 2. Per-repo sync cycles for every enabled repository in the database,
 //!    each honoring its own `poll_interval_secs` and `last_sync_at`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +26,78 @@ use reposync_core::import::{ImportPhase, ImportProgress};
 use reposync_core::svn::SvnClient;
 use reposync_core::sync_engine::SyncEngine;
 
+/// This repository, or a late-pair child it records, still owns a non-terminal
+/// import or publish. That scope must not open a replacement database. A read
+/// failure closes only this scope. Other repositories stay eligible.
+fn held_scope_blocks_replacement_open(
+    db: &Database,
+    repo_id: &str,
+    parent_id: Option<&str>,
+) -> bool {
+    match db.active_import_operation(repo_id) {
+        Ok(Some(op)) if !op.state.is_terminal() => return true,
+        Err(error) => {
+            error!(
+                repo_id,
+                %error,
+                "cannot establish import hold; refusing this repository's replacement database"
+            );
+            return true;
+        }
+        _ => {}
+    }
+    match db.latest_late_pair_publish_operation(repo_id) {
+        Ok(Some(op)) if !op.state.is_terminal() => return true,
+        Err(error) => {
+            error!(
+                repo_id,
+                %error,
+                "cannot read child admission publish; refusing this repository's replacement database"
+            );
+            return true;
+        }
+        _ => {}
+    }
+    let Some(parent_id) = parent_id else {
+        return false;
+    };
+    match db.latest_late_pair_publish_operation(parent_id) {
+        Ok(Some(op)) if !op.state.is_terminal() && op.child_repo_id.as_deref() == Some(repo_id) => {
+            true
+        }
+        Err(error) => {
+            error!(
+                repo_id,
+                parent_id,
+                %error,
+                "cannot read parent child-admission publish; refusing this repository's replacement database"
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `Database::new` checkpoints WAL. Skip that open while a held scope still
+/// owns the in-process writer. A durable journal whose writer was released
+/// does not block unrelated repositories.
+fn busy_held_writer_blocks_replacement_open(db: &Database) -> bool {
+    let repos = match db.list_repositories() {
+        Ok(repos) => repos,
+        Err(error) => {
+            error!(
+                %error,
+                "cannot read repositories; refusing replacement database opens"
+            );
+            return true;
+        }
+    };
+    repos.iter().any(|repo| {
+        held_scope_blocks_replacement_open(db, &repo.id, repo.parent_id.as_deref())
+            && reposync_core::busy::is_busy(&repo.id)
+    })
+}
+
 /// Tracks aggregate statistics across sync cycles.
 #[allow(dead_code)]
 pub struct SchedulerStats {
@@ -32,6 +105,11 @@ pub struct SchedulerStats {
     pub total_conflicts: AtomicU64,
     pub total_errors: AtomicU64,
     pub consecutive_errors: AtomicU64,
+    /// Completed poll-interval ticks (sync attempts), including those that
+    /// skip work under the memory guard.
+    pub poll_ticks: AtomicU64,
+    /// Periodic DB maintenance passes (retention + audit prune).
+    pub maintenance_runs: AtomicU64,
 }
 
 impl SchedulerStats {
@@ -41,8 +119,66 @@ impl SchedulerStats {
             total_conflicts: AtomicU64::new(0),
             total_errors: AtomicU64::new(0),
             consecutive_errors: AtomicU64::new(0),
+            poll_ticks: AtomicU64::new(0),
+            maintenance_runs: AtomicU64::new(0),
         }
     }
+}
+
+/// Target spacing for periodic DB maintenance (~10 minutes).
+const MAINTENANCE_CADENCE: Duration = Duration::from_secs(600);
+
+/// True when enough monotonic time has passed since the last maintenance pass.
+///
+/// Callers check this on each poll tick. Intervals longer than the cadence
+/// therefore run maintenance at least once per tick, and shorter intervals
+/// stay bounded near ten minutes. Never divides by the poll interval, so a
+/// valid interval above 600 seconds cannot become a zero divisor.
+fn maintenance_due(elapsed_since_last: Duration) -> bool {
+    elapsed_since_last >= MAINTENANCE_CADENCE
+}
+
+/// Closing admission and spawning/registering a child share one synchronous
+/// critical section. No scheduler await can lose the durable stop request.
+#[derive(Default)]
+pub(crate) struct SchedulerShutdownGate {
+    closed: AtomicBool,
+    admission: std::sync::Mutex<()>,
+    join_failures: std::sync::Mutex<Vec<String>>,
+}
+
+impl SchedulerShutdownGate {
+    pub(crate) fn request_stop(&self) {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    fn is_requested(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    fn record_sync_join_failure(&self, failure: String) {
+        self.join_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(failure);
+    }
+
+    pub(crate) fn sync_join_failures(&self) -> Vec<String> {
+        self.join_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+#[cfg(test)]
+struct ReconcileBarrier {
+    entered: Notify,
+    release: Notify,
 }
 
 /// The sync scheduler.
@@ -60,7 +196,7 @@ pub struct Scheduler {
     stats: Arc<SchedulerStats>,
     import_progress: Arc<RwLock<ImportProgress>>,
     /// Database connection for listing repos and reading credentials.
-    db: Database,
+    db: Arc<Database>,
     /// Global config (for data_dir, identity, etc.).
     app_config: AppConfig,
     /// Handles for in-flight sync tasks, for graceful shutdown.
@@ -69,6 +205,13 @@ pub struct Scheduler {
     cached_identity_mapper: std::sync::OnceLock<Arc<IdentityMapper>>,
     /// Maximum RSS in bytes. Sync cycles are skipped when exceeded. 0 = disabled.
     memory_limit_bytes: u64,
+    shutdown_gate: Arc<SchedulerShutdownGate>,
+    #[cfg(test)]
+    reconcile_barrier: std::sync::Mutex<Option<Arc<ReconcileBarrier>>>,
+    #[cfg(test)]
+    repo_cycle_entries: Arc<AtomicU64>,
+    #[cfg(test)]
+    sync_task_spawns: Arc<AtomicU64>,
 }
 
 impl Scheduler {
@@ -89,12 +232,75 @@ impl Scheduler {
             ws_broadcast,
             stats: Arc::new(SchedulerStats::new()),
             import_progress,
-            db,
+            db: Arc::new(db),
             app_config,
             sync_handles: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             cached_identity_mapper: std::sync::OnceLock::new(),
             memory_limit_bytes,
+            shutdown_gate: Arc::new(SchedulerShutdownGate::default()),
+            #[cfg(test)]
+            reconcile_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            repo_cycle_entries: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            sync_task_spawns: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn shutdown_gate(&self) -> Arc<SchedulerShutdownGate> {
+        Arc::clone(&self.shutdown_gate)
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_gate.is_requested()
+    }
+
+    /// The registry lock is acquired before spawning. A stop racing with that
+    /// lock refuses the factory without invoking it. Once admitted, factory
+    /// invocation, spawn and registration contain no await and are serialized
+    /// with closing the gate.
+    async fn spawn_registered_sync<F, M>(&self, make_work: M) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+        M: FnOnce() -> F + Send,
+    {
+        let mut handles = self.sync_handles.lock().await;
+        let mut index = 0;
+        while index < handles.len() {
+            if handles[index].is_finished() {
+                // Keep the handle in its registry until Ready is observed.
+                // Cancellation of this borrowed join leaves it owned here.
+                let end = (&mut handles[index]).await;
+                let observed = handles.swap_remove(index);
+                drop(observed);
+                if let Err(error) = end {
+                    let failure = format!("per-repo sync task join failed: {error}");
+                    error!(%failure);
+                    self.shutdown_gate.record_sync_join_failure(failure);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        let _admission = match self.shutdown_gate.admission.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // An interrupted admission critical section is not permission
+                // to start another writer.
+                self.shutdown_gate.closed.store(true, Ordering::SeqCst);
+                error!("scheduler admission lock poisoned; refusing sync task");
+                return false;
+            }
+        };
+        if self.shutdown_requested() {
+            return false;
+        }
+        handles.reserve(1);
+        let work = make_work();
+        handles.push(tokio::spawn(work));
+        #[cfg(test)]
+        self.sync_task_spawns.fetch_add(1, Ordering::SeqCst);
+        true
     }
 
     /// Main scheduler loop.
@@ -102,6 +308,9 @@ impl Scheduler {
     /// Runs until the `shutdown` notify fires, then returns so the caller
     /// can perform a clean shutdown.
     pub async fn run(&mut self, shutdown: Arc<Notify>) {
+        if self.shutdown_requested() {
+            return;
+        }
         info!(
             poll_interval_secs = self.poll_interval.as_secs(),
             "scheduler started"
@@ -112,56 +321,31 @@ impl Scheduler {
         // time to fully start before the first sync.
         interval.tick().await;
 
-        // Run maintenance (audit pruning, retention) every ~10 minutes.
-        let maintenance_ticks = 600 / self.poll_interval.as_secs().max(1);
-        let mut tick_count: u64 = 0;
+        // Maintenance is driven by a monotonic deadline, not tick-count
+        // division of 600 / poll_interval (that truncated to zero for any
+        // valid interval above ten minutes and panicked on checked_rem).
+        let mut last_maintenance_at = time::Instant::now();
 
         loop {
+            if self.shutdown_requested() {
+                break;
+            }
             tokio::select! {
+                biased;
                 // Shutdown signal takes priority
                 _ = shutdown.notified() => {
+                    self.shutdown_gate.request_stop();
                     info!("scheduler received shutdown signal");
                     break;
                 }
                 // Regular polling interval
                 _ = interval.tick() => {
-                    tick_count += 1;
-
-                    // Memory guard: skip sync cycles if RSS exceeds limit
-                    if self.memory_limit_bytes > 0 {
-                        let rss = crate::memory::process_rss_bytes();
-                        if rss > self.memory_limit_bytes {
-                            warn!(
-                                rss_mb = rss / 1024 / 1024,
-                                limit_mb = self.memory_limit_bytes / 1024 / 1024,
-                                "memory limit exceeded ({} MB > {} MB), skipping sync cycle",
-                                rss / 1024 / 1024,
-                                self.memory_limit_bytes / 1024 / 1024,
-                            );
-                            continue;
-                        }
-                    }
-
-                    // Observe-first auto-reconcile for held import and external-write
-                    // journals, then per-repo sync cycles.
-                    self.maybe_auto_reconcile_held_operations().await;
-                    self.maybe_run_repo_cycles().await;
-                    // Periodic maintenance (every ~10 minutes)
-                    if tick_count.checked_rem(maintenance_ticks).unwrap() == 0 {
-                        if let Err(e) = self.db.run_maintenance(90) {
-                            warn!("periodic maintenance failed: {}", e);
-                        }
-                        if let Err(e) = self.db.prune_audit_log(1000) {
-                            warn!("audit log pruning failed: {}", e);
-                        }
-                    }
+                    self.handle_interval_tick(&mut last_maintenance_at).await;
                 }
                 // Webhook-triggered immediate sync. GitHub `forced` is only a
                 // hint on the webhook; this runs the same inspection as polling.
                 Some(()) = self.sync_rx.recv() => {
-                    info!("immediate sync requested via webhook (same polling inspection)");
-                    self.maybe_auto_reconcile_held_operations().await;
-                    self.maybe_run_repo_cycles().await;
+                    self.handle_webhook_tick().await;
                     // Reset the interval so we don't sync again too soon
                     interval.reset();
                 }
@@ -169,6 +353,72 @@ impl Scheduler {
         }
 
         info!("scheduler stopped");
+    }
+
+    /// One poll-interval tick: optional memory skip, sync, then maintenance
+    /// if the monotonic deadline has been reached.
+    async fn handle_interval_tick(&self, last_maintenance_at: &mut time::Instant) {
+        if self.shutdown_requested() {
+            return;
+        }
+        self.stats.poll_ticks.fetch_add(1, Ordering::SeqCst);
+
+        // Memory guard: skip sync cycles if RSS exceeds limit
+        if self.memory_limit_bytes > 0 {
+            let rss = crate::memory::process_rss_bytes();
+            if rss > self.memory_limit_bytes {
+                warn!(
+                    rss_mb = rss / 1024 / 1024,
+                    limit_mb = self.memory_limit_bytes / 1024 / 1024,
+                    "memory limit exceeded ({} MB > {} MB), skipping sync cycle",
+                    rss / 1024 / 1024,
+                    self.memory_limit_bytes / 1024 / 1024,
+                );
+                return;
+            }
+        }
+
+        // Observe-first auto-reconcile for held import and external-write
+        // journals, then per-repo sync cycles.
+        self.maybe_auto_reconcile_held_operations().await;
+        if self.shutdown_requested() {
+            return;
+        }
+        self.maybe_run_repo_cycles().await;
+        if self.shutdown_requested() {
+            return;
+        }
+
+        let now = time::Instant::now();
+        let elapsed = now
+            .checked_duration_since(*last_maintenance_at)
+            .unwrap_or(MAINTENANCE_CADENCE);
+        if maintenance_due(elapsed) {
+            self.run_periodic_maintenance();
+            *last_maintenance_at = now;
+        }
+    }
+
+    async fn handle_webhook_tick(&self) {
+        if self.shutdown_requested() {
+            return;
+        }
+        info!("immediate sync requested via webhook (same polling inspection)");
+        self.maybe_auto_reconcile_held_operations().await;
+        if self.shutdown_requested() {
+            return;
+        }
+        self.maybe_run_repo_cycles().await;
+    }
+
+    fn run_periodic_maintenance(&self) {
+        self.stats.maintenance_runs.fetch_add(1, Ordering::SeqCst);
+        if let Err(e) = self.db.run_maintenance(90) {
+            warn!("periodic maintenance failed: {}", e);
+        }
+        if let Err(e) = self.db.prune_audit_log(1000) {
+            warn!("audit log pruning failed: {}", e);
+        }
     }
 
     /// Attempt to run a sync cycle for the global engine.
@@ -306,6 +556,24 @@ impl Scheduler {
     /// busy slot: at most one reconcile attempt per tick per repository, and no
     /// attempt while another writer holds the slot.
     async fn maybe_auto_reconcile_held_operations(&self) {
+        if self.shutdown_requested() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            let barrier = self
+                .reconcile_barrier
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(barrier) = barrier {
+                barrier.entered.notify_one();
+                barrier.release.notified().await;
+            }
+        }
+        if self.shutdown_requested() {
+            return;
+        }
         {
             let phase = self.import_progress.read().await.phase.clone();
             if !matches!(
@@ -320,6 +588,9 @@ impl Scheduler {
             }
         }
 
+        if self.shutdown_requested() {
+            return;
+        }
         let repos = match self.db.list_repositories() {
             Ok(r) => r,
             Err(e) => {
@@ -329,6 +600,9 @@ impl Scheduler {
         };
 
         for repo in repos {
+            if self.shutdown_requested() {
+                break;
+            }
             if !repo.enabled {
                 continue;
             }
@@ -365,24 +639,6 @@ impl Scheduler {
                 }
             };
 
-            let svn_password = self
-                .db
-                .resolve_credential_chain(&repo.id, "secret_svn_password");
-            let svn_url = if repo.svn_branch.is_empty() {
-                repo.svn_url.clone()
-            } else {
-                format!(
-                    "{}/{}",
-                    repo.svn_url.trim_end_matches('/'),
-                    repo.svn_branch.trim_start_matches('/')
-                )
-            };
-            let svn_client = SvnClient::new(
-                &svn_url,
-                &repo.svn_username,
-                svn_password.as_deref().unwrap_or(""),
-            );
-
             let git_repo_path = self
                 .app_config
                 .daemon
@@ -391,10 +647,12 @@ impl Scheduler {
                 .join(&repo.id)
                 .join("git-repo");
 
-            let reconciled = reposync_core::auto_reconcile::reconcile_held_external_writes(
+            if self.shutdown_requested() {
+                break;
+            }
+            let reconciled = reposync_core::auto_reconcile::reconcile_held_external_writes_with_resolved_credentials(
                 &self.db,
                 &repo,
-                &svn_client,
                 Some(git_repo_path.as_path()),
             )
             .await;
@@ -473,6 +731,11 @@ impl Scheduler {
     /// Check all enabled repositories and spawn sync cycles for those that
     /// are due (based on `poll_interval_secs` and `last_sync_at`).
     async fn maybe_run_repo_cycles(&self) {
+        if self.shutdown_requested() {
+            return;
+        }
+        #[cfg(test)]
+        self.repo_cycle_entries.fetch_add(1, Ordering::SeqCst);
         // Skip while an import is active.
         {
             let phase = self.import_progress.read().await.phase.clone();
@@ -487,7 +750,9 @@ impl Scheduler {
                 return;
             }
         }
-
+        if self.shutdown_requested() {
+            return;
+        }
         let repos = match self.db.list_repositories() {
             Ok(r) => r,
             Err(e) => {
@@ -499,6 +764,9 @@ impl Scheduler {
         let now = Utc::now();
 
         for repo in repos {
+            if self.shutdown_requested() {
+                break;
+            }
             if !repo.enabled {
                 continue;
             }
@@ -639,6 +907,17 @@ impl Scheduler {
             let repo_id = repo.id.clone();
             let repo_name = repo.name.clone();
 
+            // Keep this repository's held import or late-pair scope. Do not
+            // take its writer capability or open a replacement database for it.
+            // Unrelated repositories continue on the admitted handle's checks.
+            if held_scope_blocks_replacement_open(&self.db, &repo_id, repo.parent_id.as_deref()) {
+                debug!(
+                    repo_id = %repo_id,
+                    "skipping held scope without opening a replacement database"
+                );
+                continue;
+            }
+
             // RS-C07 (#64): acquire exclusive writer ownership before any
             // mutable prep that touches this repo's Git/SVN working tree.
             let busy_guard = match reposync_core::busy::try_acquire(&repo_id) {
@@ -662,6 +941,16 @@ impl Scheduler {
                 }
             };
 
+            // Retain durable exclusion before credentials, clone, checkout or
+            // HEAD preparation, then move this same capability into the worker.
+            let writer_window = match reposync_core::db::ordinary_writer_windows::begin_shared_ordinary_writer_window(self.db.clone(), Some(&repo_id)) {
+                Ok(window) => window,
+                Err(error) => {
+                    debug!(repo_name=%repo_name,%error,"refusing sync preparation: durable writer exclusion");
+                    continue;
+                }
+            };
+
             // Read credentials from kv_state.
             // Chain: repo_id → parent → grandparent → … → global
             let svn_password = self
@@ -681,14 +970,15 @@ impl Scheduler {
             );
 
             // Build SVN URL: repo.svn_url + repo.svn_branch
-            let svn_url = if repo.svn_branch.is_empty() {
-                repo.svn_url.clone()
-            } else {
-                format!(
-                    "{}/{}",
-                    repo.svn_url.trim_end_matches('/'),
-                    repo.svn_branch.trim_start_matches('/')
-                )
+            let svn_url = match reposync_core::svn::operand::configured_branch_url(
+                &repo.svn_url,
+                &repo.svn_branch,
+            ) {
+                Ok(url) => url,
+                Err(error) => {
+                    warn!(repo_id = %repo.id, error = %error, "invalid literal SVN branch; skipping sync");
+                    continue;
+                }
             };
 
             if svn_password.is_none() {
@@ -799,6 +1089,17 @@ impl Scheduler {
                 },
             };
 
+            // A held writer still in this process makes Database::new's startup
+            // WAL checkpoint unsafe. Unrelated work waits for that release
+            // instead of being suppressed by a durable journal alone.
+            if busy_held_writer_blocks_replacement_open(&self.db) {
+                debug!(
+                    repo_id = %repo_id,
+                    "refusing replacement database open while a held writer is busy"
+                );
+                continue;
+            }
+
             // Open a per-engine DB connection.
             let db_path = self.app_config.daemon.data_dir.join("reposync.db");
             let engine_db = match Database::new(&db_path) {
@@ -839,17 +1140,57 @@ impl Scheduler {
                 );
             }
 
-            // Parse and set path validation rules
-            let allowed_paths: Vec<String> = repo
-                .allowed_paths
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
-            let blocked_patterns: Vec<String> = repo
-                .blocked_patterns
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
+            // Parse and set path validation rules. NULL and [] are no
+            // restriction. A value that is not a JSON array of strings must
+            // not become that empty unrestricted list.
+            let allowed_paths: Vec<String> = match repo.allowed_paths.as_deref() {
+                None => Vec::new(),
+                Some(raw) => match serde_json::from_str::<Vec<String>>(raw) {
+                    Ok(paths) => {
+                        #[cfg(test)]
+                        if let Some(seen) = PARSED_ALLOWED_PATHS.get() {
+                            if let Ok(mut seen) = seen.lock() {
+                                seen.push((repo.id.clone(), paths.clone()));
+                            }
+                        }
+                        paths
+                    }
+                    Err(error) => {
+                        error!(
+                            repo_name = %repo.name,
+                            repo_id = %repo.id,
+                            setting = "allowed_paths",
+                            error = %error,
+                            "allowed_paths must be a JSON array of strings ([] means no path restriction); refusing repository sync"
+                        );
+                        continue;
+                    }
+                },
+            };
+            let blocked_patterns: Vec<String> = match repo.blocked_patterns.as_deref() {
+                None => Vec::new(),
+                Some(raw) => match serde_json::from_str::<Vec<String>>(raw) {
+                    Ok(patterns) => {
+                        #[cfg(test)]
+                        if let Some(seen) = PARSED_BLOCKED_PATTERNS.get() {
+                            if let Ok(mut seen) = seen.lock() {
+                                seen.push((repo.id.clone(), patterns.clone()));
+                            }
+                        }
+                        patterns
+                    }
+                    Err(error) => {
+                        error!(
+                            repo_name = %repo.name,
+                            repo_id = %repo.id,
+                            setting = "blocked_patterns",
+                            error = %error,
+                            "blocked_patterns must be a JSON array of strings ([] means no blocked patterns); refusing repository sync"
+                        );
+                        continue;
+                    }
+                },
+            };
             if !allowed_paths.is_empty() || !blocked_patterns.is_empty() {
                 engine.set_path_rules(allowed_paths, blocked_patterns);
                 debug!(repo_name = %repo.name, "path validation rules configured");
@@ -857,115 +1198,132 @@ impl Scheduler {
 
             let ws = self.ws_broadcast.clone();
 
-            info!(repo_name = %repo_name, repo_id = %repo_id, "starting per-repo sync cycle");
+            if self.shutdown_requested() {
+                break;
+            }
+            let make_sync = || {
+                info!(
+                    repo_name = %repo_name,
+                    repo_id = %repo_id,
+                    "starting per-repo sync cycle"
+                );
+                async move {
+                    // Move the busy guard into the task so it's released when
+                    // the cycle finishes (including on panic).
+                    let _busy_guard = busy_guard;
+                    let result = engine
+                        .run_sync_cycle_with_writer_window(writer_window)
+                        .await;
 
-            let sync_handles = self.sync_handles.clone();
-            let handle = tokio::spawn(async move {
-                // Move the busy guard into the task so it's released when
-                // the cycle finishes (including on panic).
-                let _busy_guard = busy_guard;
-                let result = engine.run_sync_cycle().await;
+                    // Access the engine's DB for circuit breaker updates
+                    let engine_db = engine.db();
 
-                // Access the engine's DB for circuit breaker updates
-                let engine_db = engine.db();
+                    match &result {
+                        Ok(sync_stats) => {
+                            // Reset consecutive errors on success
+                            let _ = engine_db.reset_consecutive_errors(&repo_id);
 
-                match &result {
-                    Ok(sync_stats) => {
-                        // Reset consecutive errors on success
-                        let _ = engine_db.reset_consecutive_errors(&repo_id);
-
-                        info!(
-                            repo_name = %repo_name,
-                            svn_to_git = sync_stats.svn_to_git_count,
-                            git_to_svn = sync_stats.git_to_svn_count,
-                            conflicts = sync_stats.conflicts_detected,
-                            "per-repo sync cycle completed"
-                        );
-
-                        let msg = serde_json::json!({
-                            "type": "repo_sync_completed",
-                            "repo_id": repo_id,
-                            "repo_name": repo_name,
-                            "svn_to_git": sync_stats.svn_to_git_count,
-                            "git_to_svn": sync_stats.git_to_svn_count,
-                            "conflicts": sync_stats.conflicts_detected,
-                            "messages": sync_stats.recent_messages,
-                            "commits": sync_stats.synced_commits,
-                        });
-                        let _ = ws.send(msg.to_string());
-                    }
-                    Err(e) => {
-                        error!(
-                            repo_name = %repo_name,
-                            error = %e,
-                            "per-repo sync cycle failed"
-                        );
-
-                        // Circuit breaker: only count permanent errors
-                        if e.is_permanent() {
-                            if let Ok(count) = engine_db.increment_consecutive_errors(&repo_id) {
-                                if count >= 3 {
-                                    warn!(
-                                        repo_name = %repo_name,
-                                        repo_id = %repo_id,
-                                        consecutive_errors = count,
-                                        "circuit breaker triggered: pausing repo after {} permanent errors",
-                                        count
-                                    );
-                                    let _ = engine_db.conn().execute(
-                                        "UPDATE repositories SET sync_status = 'error_paused' WHERE id = ?1",
-                                        rusqlite::params![&repo_id],
-                                    );
-                                }
-                            }
-                        }
-
-                        // Suppress Teams notifications for transient push failures
-                        // (non-fast-forward). These auto-resolve on the next cycle
-                        // after pulling the remote changes. Sending error cards for
-                        // every transient conflict creates noise.
-                        let error_str = e.to_string();
-                        let is_transient = error_str.contains("non-fast-forward")
-                            || error_str.contains("E155011")  // SVN "out of date"
-                            || error_str.contains("E155010")  // SVN "node not found"
-                            || error_str.contains("E150000")  // SVN "can't find parent"
-                            || error_str.contains("out of date")
-                            || error_str.contains("parent directory");
-
-                        if is_transient {
                             info!(
                                 repo_name = %repo_name,
-                                "transient sync error — will retry next cycle: {}",
-                                &error_str[..error_str.len().min(100)]
+                                svn_to_git = sync_stats.svn_to_git_count,
+                                git_to_svn = sync_stats.git_to_svn_count,
+                                conflicts = sync_stats.conflicts_detected,
+                                "per-repo sync cycle completed"
                             );
-                        } else {
-                            let sanitized_error =
-                                reposync_core::errors::sanitize_error_message(&error_str);
+
                             let msg = serde_json::json!({
-                                "type": "repo_sync_failed",
+                                "type": "repo_sync_completed",
                                 "repo_id": repo_id,
                                 "repo_name": repo_name,
-                                "error": sanitized_error,
-                                "is_permanent": e.is_permanent(),
+                                "svn_to_git": sync_stats.svn_to_git_count,
+                                "git_to_svn": sync_stats.git_to_svn_count,
+                                "conflicts": sync_stats.conflicts_detected,
+                                "messages": sync_stats.recent_messages,
+                                "commits": sync_stats.synced_commits,
                             });
                             let _ = ws.send(msg.to_string());
                         }
+                        Err(e) => {
+                            error!(
+                                repo_name = %repo_name,
+                                error = %e,
+                                "per-repo sync cycle failed"
+                            );
+
+                            // Circuit breaker: only count permanent errors
+                            if e.is_permanent() {
+                                if let Ok(count) = engine_db.increment_consecutive_errors(&repo_id)
+                                {
+                                    if count >= 3 {
+                                        warn!(
+                                            repo_name = %repo_name,
+                                            repo_id = %repo_id,
+                                            consecutive_errors = count,
+                                            "circuit breaker triggered: pausing repo after {} permanent errors",
+                                            count
+                                        );
+                                        let _ = engine_db.conn().execute(
+                                            "UPDATE repositories SET sync_status = 'error_paused' WHERE id = ?1",
+                                            rusqlite::params![&repo_id],
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Suppress Teams notifications for transient push failures
+                            // (non-fast-forward). These auto-resolve on the next cycle
+                            // after pulling the remote changes. Sending error cards for
+                            // every transient conflict creates noise.
+                            let error_str = e.to_string();
+                            let is_transient = error_str.contains("non-fast-forward")
+                                || error_str.contains("E155011")  // SVN "out of date"
+                                || error_str.contains("E155010")  // SVN "node not found"
+                                || error_str.contains("E150000")  // SVN "can't find parent"
+                                || error_str.contains("out of date")
+                                || error_str.contains("parent directory");
+
+                            if is_transient {
+                                info!(
+                                    repo_name = %repo_name,
+                                    "transient sync error — will retry next cycle: {}",
+                                    &error_str[..error_str.len().min(100)]
+                                );
+                            } else {
+                                let sanitized_error =
+                                    reposync_core::errors::sanitize_error_message(&error_str);
+                                let msg = serde_json::json!({
+                                    "type": "repo_sync_failed",
+                                    "repo_id": repo_id,
+                                    "repo_name": repo_name,
+                                    "error": sanitized_error,
+                                    "is_permanent": e.is_permanent(),
+                                });
+                                let _ = ws.send(msg.to_string());
+                            }
+                        }
                     }
+
+                    // busy guard drops here, releasing the slot.
                 }
-
-                // busy guard drops here, releasing the slot.
-            });
-
-            // Track the handle for graceful shutdown.
-            {
-                let mut handles = sync_handles.lock().await;
-                // Clean up completed handles while we're here.
-                handles.retain(|h| !h.is_finished());
-                handles.push(handle);
+            };
+            let admitted = self.spawn_registered_sync(make_sync).await;
+            if !admitted {
+                break;
             }
         }
     }
 }
+
+/// Successful `blocked_patterns` parses observed by the loader tests.
+/// Absent unless a test installs it, so other scheduler tests are unchanged.
+#[cfg(test)]
+static PARSED_BLOCKED_PATTERNS: std::sync::OnceLock<std::sync::Mutex<Vec<(String, Vec<String>)>>> =
+    std::sync::OnceLock::new();
+
+/// Successful `allowed_paths` parses observed by the loader tests.
+#[cfg(test)]
+static PARSED_ALLOWED_PATHS: std::sync::OnceLock<std::sync::Mutex<Vec<(String, Vec<String>)>>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
 mod cancellation_tests {
@@ -1062,6 +1420,143 @@ mod cancellation_tests {
         );
     }
 
+    fn insert_due_repo(db: &Database, repo_id: &str, enabled: bool) {
+        let now = Utc::now().to_rfc3339();
+        db.insert_repository(&Repository {
+            id: repo_id.into(),
+            name: repo_id.into(),
+            svn_url: "file:///nonexistent".into(),
+            svn_branch: "trunk".into(),
+            svn_username: "fixture".into(),
+            git_provider: "gitea".into(),
+            git_api_url: "file:///nonexistent".into(),
+            git_repo: format!("local/{repo_id}"),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 1,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 2,
+            last_git_sha: "verified-old".into(),
+            last_sync_at: Some("2000-01-01T00:00:00Z".into()),
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+        db.set_state(&format!("last_svn_rev_{repo_id}"), "2")
+            .unwrap();
+    }
+
+    fn init_git_repo(path: &std::path::Path) {
+        std::fs::create_dir_all(path).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    async fn replay_hold_lets_unrelated_repo_run(enabled_a: bool) {
+        let suffix = if enabled_a { "on" } else { "off" };
+        let repo_a = format!("repo-a-{suffix}");
+        let repo_b = format!("repo-b-{suffix}");
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, _) = scheduler_fixture(&tmp, &repo_b, "2000-01-01T00:00:00Z");
+        init_git_repo(&tmp.path().join("repos").join(&repo_b).join("git-repo"));
+        insert_due_repo(&scheduler.db, &repo_a, enabled_a);
+        init_git_repo(&tmp.path().join("repos").join(&repo_a).join("git-repo"));
+        let mut operation = scheduler
+            .db
+            .create_late_pair_publish_operation(
+                &repo_a,
+                "user",
+                "request-a",
+                "fingerprint-a",
+                "feature-a",
+                "branches/feature-a",
+                &"a".repeat(40),
+                &"b".repeat(40),
+                1,
+                1,
+                "v1",
+            )
+            .unwrap();
+        operation.state =
+            reposync_core::db::late_pair_publish_operations::LatePairPublishState::ReplayInProgress;
+        operation.outcome_detail = Some("replay failed before writer release".into());
+        let operation = scheduler
+            .db
+            .update_late_pair_publish_operation(operation)
+            .unwrap();
+        assert!(reposync_core::busy::try_acquire(&repo_a).is_some());
+        assert!(!super::busy_held_writer_blocks_replacement_open(
+            &scheduler.db
+        ));
+        assert!(super::held_scope_blocks_replacement_open(
+            &scheduler.db,
+            &repo_a,
+            None
+        ));
+
+        for _ in 0..2 {
+            scheduler
+                .db
+                .conn()
+                .execute(
+                    "UPDATE repositories SET last_sync_at=?1, sync_status='idle', consecutive_errors=0 WHERE id=?2",
+                    rusqlite::params!["2000-01-01T00:00:00Z", repo_b],
+                )
+                .unwrap();
+            scheduler.maybe_auto_reconcile_held_operations().await;
+            scheduler.maybe_run_repo_cycles().await;
+            let handles: Vec<_> = scheduler.sync_handles.lock().await.drain(..).collect();
+            assert_eq!(
+                handles.len(),
+                1,
+                "initialized due B should reach execution while A stays held"
+            );
+            for handle in handles {
+                let _ = handle.await;
+            }
+            let held = scheduler
+                .db
+                .latest_late_pair_publish_operation(&repo_a)
+                .unwrap()
+                .unwrap();
+            assert_eq!(held.id, operation.id);
+            assert_eq!(
+                held.state,
+                reposync_core::db::late_pair_publish_operations::LatePairPublishState::ReplayInProgress
+            );
+            assert_eq!(
+                held.outcome_detail.as_deref(),
+                Some("replay failed before writer release")
+            );
+            assert!(reposync_core::busy::try_acquire(&repo_a).is_some());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn released_replay_hold_lets_unrelated_due_repo_execute() {
+        replay_hold_lets_unrelated_repo_run(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disabled_replay_hold_does_not_block_unrelated_due_repo() {
+        replay_hold_lets_unrelated_repo_run(false).await;
+    }
+
     fn scheduler_fixture(
         tmp: &tempfile::TempDir,
         repo_id: &str,
@@ -1140,6 +1635,145 @@ mod cancellation_tests {
             config,
         );
         (scheduler, git_repo_path)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rs113_actual_scheduler_selects_literal_branch_not_decoded_decoy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "rs113-scheduler";
+        let (mut scheduler, git_path) = scheduler_fixture(&tmp, id, "2000-01-01T00:00:00Z");
+        scheduler.app_config.identity.email_domain = Some("example.invalid".into());
+        let repository = tmp.path().join("svn");
+        assert!(std::process::Command::new("svnadmin")
+            .arg("create")
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let root_url = format!("file://{}", repository.display());
+        let svn = SvnClient::new(&root_url, "fixture", "");
+        let wc = tmp.path().join("wc");
+        svn.checkout_head(&wc).await.unwrap();
+        let confined = reposync_core::svn::working_copy::ConfinedWorkingCopy::open(&wc).unwrap();
+        for (name, bytes) in [
+            (
+                "branches/a%40b 雪#?/identity.txt",
+                b"intended before\n".as_slice(),
+            ),
+            (
+                "branches/a@b 雪#?/identity.txt",
+                b"untouched decoy\n".as_slice(),
+            ),
+        ] {
+            confined.write_file(name, bytes).unwrap();
+            svn.add_with_retry(&wc, &[name]).await.unwrap();
+        }
+        let baseline = svn
+            .commit(&wc, "distinct branch identities", "fixture")
+            .await
+            .unwrap();
+        let bare_path = tmp.path().join("local/fixture.git");
+        std::fs::create_dir_all(bare_path.parent().unwrap()).unwrap();
+        fn git_at(path: &std::path::Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .current_dir(path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        }
+        git_at(tmp.path(), &["init", "--bare", bare_path.to_str().unwrap()]);
+        std::fs::create_dir_all(&git_path).unwrap();
+        git_at(&git_path, &["init"]);
+        git_at(&git_path, &["config", "user.name", "Fixture"]);
+        git_at(
+            &git_path,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(git_path.join("identity.txt"), "intended before\n").unwrap();
+        git_at(&git_path, &["add", "--", "identity.txt"]);
+        git_at(&git_path, &["commit", "-m", "verified fixture baseline"]);
+        git_at(&git_path, &["branch", "-M", "main"]);
+        git_at(
+            &git_path,
+            &["remote", "add", "origin", bare_path.to_str().unwrap()],
+        );
+        git_at(&git_path, &["push", "origin", "main"]);
+        let oid = git_at(&git_path, &["rev-parse", "HEAD"]);
+        let mut repo = scheduler.db.get_repository(id).unwrap().unwrap();
+        repo.svn_url = root_url.clone();
+        repo.svn_branch = "branches/a%40b 雪#?".into();
+        repo.git_api_url = format!("file://{}", tmp.path().display());
+        repo.last_svn_rev = baseline;
+        repo.last_git_sha = oid.to_string();
+        scheduler.db.update_repository(&repo).unwrap();
+        let now = Utc::now();
+        reposync_core::echo_receipt_scope::write_scoped_last_git_sha_kv(
+            &scheduler.db.conn(),
+            id,
+            &oid.to_string(),
+            &now.to_rfc3339(),
+        )
+        .unwrap();
+        scheduler
+            .db
+            .set_state(&format!("last_svn_rev_{id}"), &baseline.to_string())
+            .unwrap();
+        scheduler
+            .db
+            .insert_sync_record(&reposync_core::models::SyncRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: Some(id.into()),
+                svn_revision: Some(baseline),
+                git_hash: Some(oid.to_string()),
+                direction: reposync_core::models::SyncDirection::SvnToGit,
+                author: "fixture".into(),
+                message: "verified fixture baseline".into(),
+                timestamp: now,
+                synced_at: now,
+                status: reposync_core::models::SyncRecordStatus::Applied,
+            })
+            .unwrap();
+        confined
+            .write_file("branches/a%40b 雪#?/identity.txt", b"intended after\n")
+            .unwrap();
+        let revision = svn
+            .commit(&wc, "intended branch only", "fixture")
+            .await
+            .unwrap();
+        scheduler.maybe_run_repo_cycles().await;
+        let mut handles = scheduler.sync_handles.lock().await;
+        assert_eq!(handles.len(), 1, "actual scheduler must admit this worker");
+        (&mut handles[0]).await.unwrap();
+        handles.clear();
+        let observed_repo = scheduler.db.get_repository(id).unwrap().unwrap();
+        assert_eq!(
+            observed_repo.total_errors,
+            0,
+            "{observed_repo:?}; audit={:?}",
+            scheduler.db.list_audit_log(10, 0).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(git_path.join("identity.txt")).unwrap(),
+            b"intended after\n"
+        );
+        let checkpoint = scheduler.db.get_repo_watermark(id).unwrap();
+        assert_eq!(checkpoint.0, revision);
+        assert_ne!(checkpoint.1, oid.to_string());
+        let applied: i64 = scheduler.db.conn().query_row("SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND svn_rev=?2 AND git_sha=?3 AND direction='svn_to_git' AND status='applied'",rusqlite::params![id,revision,checkpoint.1],|r|r.get(0)).unwrap();
+        assert_eq!(applied, 1);
+        assert_eq!(
+            svn.cat("branches/a@b 雪#?/identity.txt", revision)
+                .await
+                .unwrap(),
+            "untouched decoy\n"
+        );
+        assert_eq!(svn.info().await.unwrap().latest_rev, revision);
     }
 
     #[tokio::test]
@@ -1563,5 +2197,345 @@ mod cancellation_tests {
             serde_json::json!({"case":"64C07_ACQUIRE_BEFORE_PREP",
             "workdir_created":true,"worker_spawned":true})
         );
+    }
+}
+
+#[cfg(test)]
+#[path = "scheduler/pair_refresh_tests.rs"]
+mod pair_refresh_tests;
+
+#[cfg(test)]
+#[path = "scheduler/maintenance_cadence_tests.rs"]
+mod maintenance_cadence_tests;
+
+#[cfg(test)]
+#[path = "scheduler/blocked_patterns_tests.rs"]
+mod blocked_patterns_tests;
+
+#[cfg(test)]
+#[path = "scheduler/allowed_paths_tests.rs"]
+mod allowed_paths_tests;
+
+/// UNRUN. Source-only regression for BOB-RS216-001. Not executed here.
+#[cfg(test)]
+mod shutdown_admission_tests {
+    use super::*;
+    use reposync_core::config::IdentityConfig;
+    use std::time::Duration;
+
+    fn test_scheduler(
+        poll: Duration,
+        sync_rx: mpsc::Receiver<()>,
+    ) -> (tempfile::TempDir, Scheduler) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            format!(
+                "[daemon]\ndata_dir = \"{}\"\nmemory_limit_mb = 0\n[svn]\nurl = \"file:///nonexistent\"\nusername = \"fixture\"\n[github]\nrepo = \"local/fixture\"\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let config = AppConfig::load_from_file(&config_file).unwrap();
+        let db = Database::new(&tmp.path().join("reposync.db")).unwrap();
+        db.initialize().unwrap();
+        let dummy_git = tmp.path().join("dummy-git");
+        assert!(std::process::Command::new("git")
+            .args(["init", dummy_git.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let engine = SyncEngine::new(
+            config.clone(),
+            Database::in_memory().unwrap(),
+            SvnClient::new("file:///nonexistent", "fixture", ""),
+            GitClient::new(&dummy_git).unwrap(),
+            Arc::new(IdentityMapper::new(&IdentityConfig::default()).unwrap()),
+        );
+        let (ws, _) = broadcast::channel(1);
+        let scheduler = Scheduler::new(
+            Arc::new(engine),
+            poll,
+            sync_rx,
+            ws,
+            Arc::new(RwLock::new(ImportProgress::default())),
+            db,
+            config,
+        );
+        (tmp, scheduler)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_flag_before_run_admits_nothing() {
+        let (_tx, rx) = mpsc::channel(1);
+        let (_tmp, mut scheduler) = test_scheduler(Duration::from_secs(3600), rx);
+        scheduler.shutdown_gate().request_stop();
+        scheduler.run(Arc::new(Notify::new())).await;
+        assert_eq!(scheduler.repo_cycle_entries.load(Ordering::SeqCst), 0);
+        assert_eq!(scheduler.sync_task_spawns.load(Ordering::SeqCst), 0);
+        assert!(scheduler.sync_handles.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cooperative_shutdown_finishes_before_the_deadline() {
+        let (_tx, rx) = mpsc::channel(1);
+        let (_tmp, mut scheduler) = test_scheduler(Duration::from_secs(3600), rx);
+        let gate = scheduler.shutdown_gate();
+        let notify = Arc::new(Notify::new());
+        let notify_run = Arc::clone(&notify);
+        let handles = Arc::clone(&scheduler.sync_handles);
+        let entries = Arc::clone(&scheduler.repo_cycle_entries);
+        let mut task = crate::OwnedShutdownTask::new(
+            "cooperative scheduler",
+            tokio::spawn(async move {
+                scheduler.run(notify_run).await;
+            }),
+        );
+        let mut recorded = Vec::new();
+        let outcome = crate::stop_scheduler_and_drain_sync_tasks(
+            crate::SchedulerStopContext {
+                notify: &notify,
+                gate: &gate,
+                sync_handles: &handles,
+            },
+            &mut task,
+            Duration::from_secs(2),
+            None,
+            &mut |_level, reason| recorded.push(reason.to_string()),
+            &mut || panic!("cooperative shutdown must not time out"),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(outcome.failure.is_none());
+        assert!(!outcome.stop_timeout_recorded);
+        assert!(outcome.terminated_before_drain);
+        assert!(task.join_observed());
+        assert!(recorded.is_empty());
+        assert_eq!(entries.load(Ordering::SeqCst), 0);
+        assert!(handles.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_during_reconcile_does_not_admit_and_drains_after_exit() {
+        let barrier = Arc::new(ReconcileBarrier {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(()).expect("webhook slot");
+        let (_tmp, mut scheduler) = test_scheduler(Duration::from_secs(3600), rx);
+        *scheduler.reconcile_barrier.lock().unwrap() = Some(Arc::clone(&barrier));
+        let gate = scheduler.shutdown_gate();
+        let notify = Arc::new(Notify::new());
+        let notify_run = Arc::clone(&notify);
+        let handles = Arc::clone(&scheduler.sync_handles);
+        let entries = Arc::clone(&scheduler.repo_cycle_entries);
+        let spawns = Arc::clone(&scheduler.sync_task_spawns);
+        let release = Arc::new(Notify::new());
+        let child_release = Arc::clone(&release);
+        handles.lock().await.push(tokio::spawn(async move {
+            child_release.notified().await;
+        }));
+        let mut task = crate::OwnedShutdownTask::new(
+            "reconcile scheduler",
+            tokio::spawn(async move {
+                scheduler.run(notify_run).await;
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified())
+            .await
+            .unwrap();
+        let mut recorded = Vec::new();
+        let outcome = crate::stop_scheduler_and_drain_sync_tasks(
+            crate::SchedulerStopContext {
+                notify: &notify,
+                gate: &gate,
+                sync_handles: &handles,
+            },
+            &mut task,
+            Duration::from_millis(50),
+            None,
+            &mut |_level, reason| recorded.push(reason.to_string()),
+            &mut || {
+                let owned = handles
+                    .try_lock()
+                    .expect("no child snapshot before scheduler join");
+                assert_eq!(owned.len(), 1);
+                assert!(!owned[0].is_finished());
+                drop(owned);
+                barrier.release.notify_one();
+                release.notify_one();
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        let (_, expected) = reposync_web::scheduler_failure_from_stop_timeout();
+        assert_eq!(recorded, vec![expected.clone()]);
+        assert_eq!(outcome.failure.as_deref(), Some(expected.as_str()));
+        assert!(outcome.stop_timeout_recorded);
+        assert!(outcome.terminated_before_drain);
+        assert!(task.join_observed());
+        assert_eq!(outcome.drained_sync_tasks, 1);
+        assert_eq!(outcome.unresolved_sync_tasks, 0);
+        assert_eq!(entries.load(Ordering::SeqCst), 0);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(handles.lock().await.is_empty());
+        drop(tx);
+    }
+
+    async fn stop_inline_reconcile(webhook: bool) {
+        let (_tx, rx) = mpsc::channel(1);
+        let (_tmp, scheduler) = test_scheduler(Duration::from_secs(3600), rx);
+        let barrier = Arc::new(ReconcileBarrier {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        *scheduler.reconcile_barrier.lock().unwrap() = Some(Arc::clone(&barrier));
+        let scheduler = Arc::new(scheduler);
+        let run = Arc::clone(&scheduler);
+        let mut task = crate::OwnedShutdownTask::new(
+            "inline scheduler arm",
+            tokio::spawn(async move {
+                if webhook {
+                    run.handle_webhook_tick().await;
+                } else {
+                    let mut maintenance = time::Instant::now() - MAINTENANCE_CADENCE;
+                    run.handle_interval_tick(&mut maintenance).await;
+                }
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified())
+            .await
+            .unwrap();
+        scheduler.shutdown_gate().request_stop();
+        barrier.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), task.join())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scheduler.repo_cycle_entries.load(Ordering::SeqCst), 0);
+        assert_eq!(scheduler.sync_task_spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(scheduler.stats.maintenance_runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interval_stop_during_inline_reconcile_closes_later_admission() {
+        stop_inline_reconcile(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn webhook_stop_during_inline_reconcile_closes_later_admission() {
+        stop_inline_reconcile(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_while_waiting_for_registry_lock_refuses_unpolled_child() {
+        let (_tx, rx) = mpsc::channel(1);
+        let (_tmp, scheduler) = test_scheduler(Duration::from_secs(3600), rx);
+        let polled = Arc::new(AtomicBool::new(false));
+        let child_polled = Arc::clone(&polled);
+        let prepared = Arc::new(AtomicBool::new(false));
+        let factory_prepared = Arc::clone(&prepared);
+        let locked = scheduler.sync_handles.lock().await;
+        let admission = scheduler.spawn_registered_sync(move || {
+            factory_prepared.store(true, Ordering::SeqCst);
+            async move {
+                child_polled.store(true, Ordering::SeqCst);
+            }
+        });
+        tokio::pin!(admission);
+        tokio::select! {
+            biased;
+            _ = &mut admission => panic!("registry lock must precede spawn"),
+            _ = tokio::task::yield_now() => {}
+        }
+        scheduler.shutdown_gate().request_stop();
+        assert!(!prepared.load(Ordering::SeqCst));
+        assert!(!polled.load(Ordering::SeqCst));
+        drop(locked);
+        assert!(!admission.await);
+        assert!(!prepared.load(Ordering::SeqCst));
+        assert!(!polled.load(Ordering::SeqCst));
+        assert_eq!(scheduler.sync_task_spawns.load(Ordering::SeqCst), 0);
+        assert!(scheduler.sync_handles.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admitted_child_is_registered_before_stop_snapshot() {
+        let (_tx, rx) = mpsc::channel(1);
+        let (_tmp, scheduler) = test_scheduler(Duration::from_secs(3600), rx);
+        let release = Arc::new(Notify::new());
+        let child_release = Arc::clone(&release);
+        let prepared = Arc::new(AtomicBool::new(false));
+        let factory_prepared = Arc::clone(&prepared);
+        let child_prepared = Arc::clone(&prepared);
+        assert!(
+            scheduler
+                .spawn_registered_sync(move || {
+                    factory_prepared.store(true, Ordering::SeqCst);
+                    async move {
+                        assert!(child_prepared.load(Ordering::SeqCst));
+                        child_release.notified().await;
+                    }
+                })
+                .await
+        );
+        assert!(prepared.load(Ordering::SeqCst));
+        scheduler.shutdown_gate().request_stop();
+        assert_eq!(scheduler.sync_handles.lock().await.len(), 1);
+        assert_eq!(scheduler.sync_task_spawns.load(Ordering::SeqCst), 1);
+        release.notify_one();
+        let report = crate::drain_owned_tasks(
+            &scheduler.sync_handles,
+            "registered child regression",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(report.owned, 1);
+        assert!(!report.timed_out);
+        assert_eq!(report.unresolved, 0);
+        assert!(report.join_failures.is_empty());
+    }
+
+    /// Intentional injected panic; the join failure must remain observable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finished_sync_panic_is_observed_before_handle_removal() {
+        let (_tx, rx) = mpsc::channel(1);
+        let (_tmp, scheduler) = test_scheduler(Duration::from_secs(3600), rx);
+        assert!(
+            scheduler
+                .spawn_registered_sync(|| async {
+                    panic!("RS112 expected child panic");
+                })
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if scheduler.sync_handles.lock().await[0].is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(scheduler.spawn_registered_sync(|| async {}).await);
+        let failures = scheduler.shutdown_gate().sync_join_failures();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("panic"));
+        scheduler.shutdown_gate().request_stop();
+        let report = crate::drain_owned_tasks(
+            &scheduler.sync_handles,
+            "post-panic child regression",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(report.owned, 1);
+        assert_eq!(report.unresolved, 0);
+        assert!(report.join_failures.is_empty());
+        assert_eq!(scheduler.shutdown_gate().sync_join_failures(), failures);
     }
 }

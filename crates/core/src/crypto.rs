@@ -130,6 +130,44 @@ pub fn get_or_create_encryption_key(db: &Database) -> Result<[u8; 32], CryptoErr
     Ok(key)
 }
 
+/// Transactional variant for guarded removal/restore. The caller owns the
+/// transaction containing admission, any key creation and the final mutation.
+pub(crate) fn get_or_create_encryption_key_tx(
+    tx: &rusqlite::Connection,
+) -> Result<[u8; 32], CryptoError> {
+    use rusqlite::OptionalExtension;
+    let configured = std::env::var("REPOSYNC_ENCRYPTION_KEY")
+        .ok()
+        .map(|value| value.trim().to_owned());
+    let stored = if configured.is_none() {
+        tx.query_row(
+            "SELECT value FROM kv_state WHERE key='encryption_key'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(DatabaseError::from)?
+    } else {
+        None
+    };
+    if let Some(encoded) = configured.or(stored) {
+        let bytes = hex::decode(encoded).map_err(|_| CryptoError::InvalidKeyLength)?;
+        return bytes.try_into().map_err(|_| CryptoError::InvalidKeyLength);
+    }
+    crate::db::pair_refresh_operations::require_no_pair_refresh_state_mutation(
+        tx,
+        "encryption_key",
+    )?;
+    let mut key = [0_u8; 32];
+    OsRng.fill_bytes(&mut key);
+    tx.execute(
+        "INSERT INTO kv_state(key,value,updated_at) VALUES('encryption_key',?1,?2)",
+        rusqlite::params![hex::encode(key), chrono::Utc::now().to_rfc3339()],
+    )
+    .map_err(DatabaseError::from)?;
+    Ok(key)
+}
+
 // ---------------------------------------------------------------------------
 // Base64 helpers (using the `base64` crate)
 // ---------------------------------------------------------------------------

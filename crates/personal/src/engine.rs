@@ -207,8 +207,7 @@ impl PersonalSyncEngine {
             }
             Err(e) => {
                 self.set_state(PersonalSyncState::Error);
-                let chain = format!("{e:#}");
-                error!(error = %chain, "Git→SVN sync failed");
+                error!(error = %e, "Git→SVN sync failed");
                 self.db
                     .insert_audit_log(
                         "git_to_svn",

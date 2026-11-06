@@ -1,6 +1,6 @@
 //! Rich status dashboard for personal branch mode.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use reposync_core::db::Database;
 use reposync_core::personal_config::PersonalConfig;
@@ -18,24 +18,27 @@ pub fn run_status(config: &PersonalConfig) -> Result<()> {
     println!();
 
     // Daemon status
-    let daemon_status = match reposync_personal::daemon::is_running(data_dir) {
-        Ok(Some(pid)) => format!("{} (PID {})", style::status_running(), pid),
-        _ => style::status_stopped(),
+    let daemon_status = match reposync_personal::daemon::inspect_pid_file(data_dir)
+        .context("failed to inspect Personal PID file; preserve its evidence")?
+    {
+        Some((pid, true)) => format!("{} (PID {})", style::status_running(), pid),
+        Some((pid, false)) => format!("{} (stale PID {})", style::status_stopped(), pid),
+        None => style::status_stopped(),
     };
     println!("  Status     {}", daemon_status);
 
     // Try to open DB for watermarks
     let db_path = data_dir.join("personal.db");
-    if let Ok(db) = Database::new(&db_path) {
+    if db_path.try_exists()? {
+        let db = Database::open_existing_read_only(&db_path)
+            .context("failed to inspect existing Personal database; preserve storage")?;
         let svn_rev = db
             .get_watermark("svn_rev")
-            .ok()
-            .flatten()
+            .context("failed to read Personal SVN checkpoint")?
             .unwrap_or_else(|| "—".to_string());
         let git_sha = db
             .get_watermark("git_sha")
-            .ok()
-            .flatten()
+            .context("failed to read Personal Git checkpoint")?
             .unwrap_or_else(|| "—".to_string());
 
         let git_display = if git_sha.len() > 7 {
@@ -49,7 +52,9 @@ pub fn run_status(config: &PersonalConfig) -> Result<()> {
 
         // Recent activity from audit log
         println!();
-        let recent = db.list_audit_log(10, 0).unwrap_or_default();
+        let recent = db
+            .list_audit_log(10, 0)
+            .context("failed to read Personal audit history")?;
         if !recent.is_empty() {
             println!("  {}", style::header("Recent Activity"));
             println!("  {}", "─".repeat(40));

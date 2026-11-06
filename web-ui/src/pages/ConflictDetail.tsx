@@ -1,14 +1,23 @@
+import { useId } from 'react';
+import { useViewMutation as useMutation } from '../useViewMutation';
 import { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
 import DiffViewer from '../components/DiffViewer';
 
 export default function ConflictDetail() {
   const { id } = useParams<{ id: string }>();
+  return <ConflictEditor key={id} />;
+}
+
+function ConflictEditor() {
+  const fieldId = useId();
+  const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [mergedContent, setMergedContent] = useState('');
+  const [actionError, setActionError] = useState('');
   const [activeTab, setActiveTab] = useState<'diff' | 'edit'>('diff');
 
   const { data: conflict, isLoading } = useQuery({
@@ -18,20 +27,23 @@ export default function ConflictDetail() {
   });
 
   const resolveMutation = useMutation({
-    mutationFn: ({ resolution }: { resolution: string }) =>
-      api.resolveConflict(id!, resolution),
+    mutationFn: ({ resolution, content }: { resolution: string; content?: string }) =>
+      api.resolveConflict(id!, resolution, content),
+    onMutate: () => { setActionError(''); },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['conflicts'] });
       queryClient.invalidateQueries({ queryKey: ['conflict', id] });
       navigate('/conflicts');
     },
     onError: (err: Error) => {
-      alert(`Resolution failed: ${err.message}`);
+      setActionError(`Resolution failed: ${err.message}`);
     },
   });
 
   const deferMutation = useMutation({
     mutationFn: () => api.deferConflict(id!),
+    onMutate: () => { setActionError(''); },
+    onError: (err: Error) => { setActionError(`Deferral failed: ${err.message}`); },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['conflicts'] });
       navigate('/conflicts');
@@ -92,18 +104,19 @@ export default function ConflictDetail() {
       {/* Tabs */}
       {!isResolved && (
         <div className="border-b border-gray-700">
-          <nav className="-mb-px flex space-x-8">
+          <nav aria-label="Conflict view" className="-mb-px flex space-x-8">
             <button
-              onClick={() => setActiveTab('diff')}
+              aria-pressed={activeTab === 'diff'} onClick={() => setActiveTab('diff')}
               className={`py-4 px-1 border-b-2 font-medium text-sm ${
                 activeTab === 'diff'
                   ? 'border-blue-500 text-blue-400'
-                  : 'border-transparent text-gray-500 hover:text-gray-300 hover:border-gray-600'
+                  : 'border-transparent text-gray-300 hover:text-gray-100 hover:border-gray-600'
               }`}
             >
               Side-by-Side Diff
             </button>
             <button
+              aria-pressed={activeTab === 'edit'}
               onClick={() => {
                 setActiveTab('edit');
                 if (!mergedContent) {
@@ -113,7 +126,7 @@ export default function ConflictDetail() {
               className={`py-4 px-1 border-b-2 font-medium text-sm ${
                 activeTab === 'edit'
                   ? 'border-blue-500 text-blue-400'
-                  : 'border-transparent text-gray-500 hover:text-gray-300 hover:border-gray-600'
+                  : 'border-transparent text-gray-300 hover:text-gray-100 hover:border-gray-600'
               }`}
             >
               Manual Edit
@@ -134,31 +147,32 @@ export default function ConflictDetail() {
         </div>
       ) : (
         <div className="bg-gray-800 shadow rounded-lg p-4 border border-gray-700">
-          <label className="block text-sm font-medium text-gray-300 mb-2">
+          <label className="block text-sm font-medium text-gray-300 mb-2" htmlFor={`${fieldId}-1`}>
             Edit merged content:
           </label>
           <textarea
             value={mergedContent}
             onChange={(e) => setMergedContent(e.target.value)}
-            className="w-full h-96 font-mono text-sm border border-gray-600 bg-gray-900 text-gray-200 rounded-md p-3 focus:ring-blue-500 focus:border-blue-500"
+            className="w-full h-96 font-mono text-sm border border-gray-600 bg-gray-900 text-gray-200 rounded-md p-3 focus:ring-blue-500 focus:border-blue-500" id={`${fieldId}-1`}
           />
         </div>
       )}
 
+      {actionError && <p role="alert" className="text-red-300">{actionError}</p>}
       {/* Resolution Actions */}
       {!isResolved && (
         <div className="bg-gray-800 shadow rounded-lg p-4 flex items-center justify-between border border-gray-700">
           <div className="flex space-x-3">
             <button
               onClick={() => resolveMutation.mutate({ resolution: 'accept_svn' })}
-              disabled={resolveMutation.isPending}
+              disabled={resolveMutation.isPending || deferMutation.isPending}
               className="px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:opacity-50 text-sm font-medium"
             >
               Accept SVN
             </button>
             <button
               onClick={() => resolveMutation.mutate({ resolution: 'accept_git' })}
-              disabled={resolveMutation.isPending}
+              disabled={resolveMutation.isPending || deferMutation.isPending}
               className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 text-sm font-medium"
             >
               Accept Git
@@ -166,10 +180,10 @@ export default function ConflictDetail() {
             {activeTab === 'edit' && (
               <button
                 onClick={() =>
-                  resolveMutation.mutate({ resolution: 'custom' })
+                  resolveMutation.mutate({ resolution: 'custom', content: mergedContent })
                 }
-                disabled={resolveMutation.isPending}
-                className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50 text-sm font-medium"
+                disabled={resolveMutation.isPending || deferMutation.isPending}
+                className="px-4 py-2 bg-green-700 text-white rounded-md hover:bg-green-800 disabled:opacity-50 text-sm font-medium"
               >
                 Apply Manual Edit
               </button>
@@ -177,7 +191,7 @@ export default function ConflictDetail() {
           </div>
           <button
             onClick={() => deferMutation.mutate()}
-            disabled={deferMutation.isPending}
+            disabled={resolveMutation.isPending || deferMutation.isPending}
             className="px-4 py-2 bg-gray-700 text-gray-300 rounded-md hover:bg-gray-600 disabled:opacity-50 text-sm"
           >
             Defer

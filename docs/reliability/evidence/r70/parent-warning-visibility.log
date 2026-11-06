@@ -1,0 +1,56 @@
+STDOUT
+
+STDERR
+Error: Timed out: child cleanup warning visible on parent; path=/repos/parent-1; body=RepoSync
+Dashboard
+Repositories
+Conflicts
+Audit Log
+Settings
+Users
+LDAP
+Config
+Setup
+Idle
+fixture
+Logout
+
+Branch pair removed.
+
+Stay Warn Child
+
+Branch pair 'child-stay-warn' deleted
+
+Back to Repositories
+Parent trunk
+Sync enabled
+Turn sync off
+Edit
+Trigger Sync
+SVN Configuration
+Name
+Parent trunk
+URL
+https://svn.test.invalid/repo
+Branch
+trunk
+Username
+fixture
+Password
+Not set
+Git Configuration
+Provider
+github
+API URL
+https://git.test.invalid
+Repository
+test/repo
+Branch
+main
+Token
+Not set
+Sync S
+    at until (file://<fixture>/scripts/branch-pair-delete-browser.mjs:378:11)
+    at async runScenarios (file://<fixture>/scripts/branch-pair-delete-browser.mjs:610:3)
+    at async withUi (file://<fixture>/scripts/branch-pair-delete-browser.mjs:650:12)
+    at async file://<fixture>/scripts/branch-pair-delete-browser.mjs:664:25

@@ -83,26 +83,57 @@ pub struct SvnPathIdentity {
 }
 
 impl SvnPathIdentity {
-    pub fn new(root_url: impl Into<String>, target_url: impl Into<String>) -> Self {
+    pub fn new(
+        root_url: impl Into<String>,
+        target_url: impl Into<String>,
+    ) -> Result<Self, crate::errors::SvnError> {
         svn_path_identity(&root_url.into(), &target_url.into())
     }
 }
 
-/// Derive the canonical branch-relative namespace from pinned SVN URLs.
-pub fn svn_path_identity(root_url: &str, target_url: &str) -> SvnPathIdentity {
-    let root = normalize_svn_url(root_url);
-    let target = normalize_svn_url(target_url);
-    let branch_path = if target == root {
-        String::new()
-    } else if let Some(rest) = target.strip_prefix(&format!("{root}/")) {
-        normalize_policy_path(rest)
+/// Check containment in the encoded URL domain first. Only the suffix's
+/// individual components are then decoded once into SVN XML's literal names.
+/// Invalid/foreign identities never fall back to an unrestricted root.
+pub fn svn_path_identity(
+    root_url: &str,
+    target_url: &str,
+) -> Result<SvnPathIdentity, crate::errors::SvnError> {
+    use crate::svn::operand::{checked_url, decode_url_component, validate_relative_path};
+    let root = checked_url(&normalize_svn_url(root_url))?;
+    let target = checked_url(&normalize_svn_url(target_url))?;
+    let root_text = normalize_svn_url(root.as_str());
+    let target_text = normalize_svn_url(target.as_str());
+    let suffix = if target_text == root_text {
+        ""
     } else {
-        String::new()
+        target_text
+            .strip_prefix(&format!("{root_text}/"))
+            .ok_or_else(|| crate::errors::SvnError::LineageRefused {
+                reason: "svn_target_outside_repository_root".into(),
+                detail: "SVN target does not belong to its reported repository root".into(),
+            })?
     };
-    SvnPathIdentity {
-        root_url: root,
-        branch_path,
+    let branch_path = if suffix.is_empty() {
+        String::new()
+    } else {
+        suffix
+            .split('/')
+            .map(decode_url_component)
+            .collect::<Result<Vec<_>, _>>()?
+            .join("/")
+    };
+    if !branch_path.is_empty() {
+        validate_relative_path(&branch_path)?;
     }
+    Ok(SvnPathIdentity {
+        root_url: root_text,
+        branch_path,
+    })
+}
+
+/// Compatibility Option boundary for callers that classify refusal themselves.
+pub fn checked_svn_path_identity(root_url: &str, target_url: &str) -> Option<SvnPathIdentity> {
+    svn_path_identity(root_url, target_url).ok()
 }
 
 /// Git intent paths are already branch-relative; normalize separators only.
@@ -118,7 +149,14 @@ pub fn svn_log_path_to_branch_relative(
     log_path: &str,
     identity: &SvnPathIdentity,
 ) -> Option<String> {
-    let repo_relative = normalize_policy_path(log_path);
+    // XML paths are already decoded SVN names, never URL- or backslash-
+    // normalized. Unsupported components must not turn into another file.
+    let repo_relative = log_path.trim_start_matches('/');
+    let checked = repo_relative.strip_suffix('/').unwrap_or(repo_relative);
+    if !checked.is_empty() {
+        crate::svn::operand::validate_relative_path(checked).ok()?;
+    }
+    let repo_relative = repo_relative.to_string();
     if identity.branch_path.is_empty() {
         return Some(repo_relative);
     }
@@ -176,6 +214,14 @@ pub fn bash_blocked_pattern_case_arm(pattern: &str) -> String {
     }
     if let Some(suffix) = pattern.strip_prefix('*') {
         return format!("*{}", bash_single_quoted_literal(suffix));
+    }
+    // A trailing star is a string-prefix glob on the normalized path, including
+    // descendants. Quote the stem and leave the star unquoted so the case arm
+    // agrees with path_matches_blocked.
+    if let Some(stem) = pattern.strip_suffix('*') {
+        if !stem.is_empty() {
+            return format!("{}*", bash_single_quoted_literal(stem));
+        }
     }
     let prefix = pattern.trim_end_matches('/');
     if prefix.is_empty() {
@@ -257,17 +303,29 @@ pub fn render_pre_commit_hook_script(allowed: &[String], blocked: &[String]) -> 
     script
 }
 
-/// Blocked-pattern match (suffix glob, directory prefix, or exact/component path).
+/// Blocked-pattern match.
+///
+/// A leading `*` is a suffix. A trailing `*` is a string-prefix glob on the
+/// normalized path, so it also matches descendants. Any other pattern is the
+/// component prefix.
 pub fn path_matches_blocked(path: &str, pattern: &str) -> bool {
     let path = normalize_policy_path(path);
+    let pattern = normalize_policy_path(pattern);
     if pattern.is_empty() {
         return false;
     }
     if let Some(suffix) = pattern.strip_prefix('*') {
-        path.ends_with(suffix)
-    } else {
-        path_matches_prefix(&path, pattern)
+        return path.ends_with(suffix);
     }
+    // A trailing `*` is a string-prefix glob on the normalized path, including
+    // descendants. `secret-*` matches `secret-note.txt` and `secret-note/child`.
+    // It is not the component rule used when the pattern has no star.
+    if let Some(stem) = pattern.strip_suffix('*') {
+        if !stem.is_empty() {
+            return path.starts_with(stem);
+        }
+    }
+    path_matches_prefix(&path, &pattern)
 }
 
 /// Whether `path` is inside the active Git→SVN projection.
@@ -636,6 +694,86 @@ mod tests {
     }
 
     #[test]
+    fn blocked_trailing_star_matches_same_segment_and_bash_arm() {
+        let pattern = "secret-*";
+        assert_eq!(bash_blocked_pattern_case_arm(pattern), "'secret-'*");
+        for path in [
+            "secret-note.txt",
+            "secret-note/child",
+            "secret-note/child/deep",
+            "secret-other/leak.txt",
+        ] {
+            assert!(path_matches_blocked(path, pattern), "{path}");
+        }
+        assert!(!path_matches_blocked("secret-other/leak.txt", "secret"));
+        for path in [
+            "secret/leak.txt",
+            "notsecret-note.txt",
+            "other/secret-note.txt",
+        ] {
+            assert!(!path_matches_blocked(path, pattern), "{path}");
+        }
+        let script = render_pre_commit_hook_script(&[], &[pattern.into()]);
+        assert!(script.contains("'secret-'*"));
+        for path in ["secret-note.txt", "secret-note/child"] {
+            assert!(
+                !run_hook_on_staged_paths(&script, &[(path, "x\n")]).success(),
+                "{path} must be blocked by the same arm"
+            );
+        }
+        assert!(
+            run_hook_on_staged_paths(&script, &[("secret/leak.txt", "x\n")]).success(),
+            "secret/leak.txt is not a secret-* path"
+        );
+    }
+
+    #[test]
+    fn blocked_trailing_star_team_prefix_blocks_team_other_and_team_txt() {
+        // `team*` is a string prefix of the normalized path, not the component
+        // rule for plain `team`. Expect both `team-other/foo` and `team.txt` to
+        // be blocked, while plain `team` still allows `team-other/foo`.
+        let pattern = "team*";
+        assert_eq!(bash_blocked_pattern_case_arm(pattern), "'team'*");
+        assert!(path_matches_blocked("team-other/foo", pattern));
+        assert!(path_matches_blocked("team.txt", pattern));
+        assert!(!path_matches_blocked("team-other/foo", "team"));
+        let script = render_pre_commit_hook_script(&[], &[pattern.into()]);
+        assert!(
+            !run_hook_on_staged_paths(&script, &[("team-other/foo", "x\n")]).success(),
+            "team* blocks team-other/foo"
+        );
+        assert!(
+            !run_hook_on_staged_paths(&script, &[("team.txt", "x\n")]).success(),
+            "team* blocks team.txt"
+        );
+    }
+
+    #[test]
+    fn blocked_trailing_star_normalizes_leading_slash_and_backslash() {
+        // `/secret-*` and `\secret-*` both normalize to `secret-*`.
+        for pattern in ["/secret-*", "\\secret-*"] {
+            assert_eq!(bash_blocked_pattern_case_arm(pattern), "'secret-'*");
+            assert!(
+                path_matches_blocked("secret-note.txt", pattern),
+                "{pattern}"
+            );
+            assert!(
+                path_matches_blocked("secret-note/child", pattern),
+                "{pattern}"
+            );
+            let script = render_pre_commit_hook_script(&[], &[pattern.into()]);
+            assert!(
+                !run_hook_on_staged_paths(&script, &[("secret-note.txt", "x\n")]).success(),
+                "{pattern} blocks secret-note.txt"
+            );
+            assert!(
+                !run_hook_on_staged_paths(&script, &[("secret-note/child", "x\n")]).success(),
+                "{pattern} blocks secret-note/child"
+            );
+        }
+    }
+
+    #[test]
     fn deletes_obey_allow_and_block() {
         let allowed = vec!["keep/".to_string()];
         assert!(path_is_projected("keep/a.txt", &allowed, &[]));
@@ -705,24 +843,30 @@ mod tests {
     #[test]
     fn svn_path_identity_maps_trunk_and_branches() {
         let root = "file:///srv/repo";
-        assert_eq!(svn_path_identity(root, root).branch_path, "");
+        assert_eq!(svn_path_identity(root, root).unwrap().branch_path, "");
         assert_eq!(
-            svn_path_identity(root, "file:///srv/repo/trunk").branch_path,
+            svn_path_identity(root, "file:///srv/repo/trunk")
+                .unwrap()
+                .branch_path,
             "trunk"
         );
         assert_eq!(
-            svn_path_identity(root, "file:///srv/repo/branches/feature").branch_path,
+            svn_path_identity(root, "file:///srv/repo/branches/feature")
+                .unwrap()
+                .branch_path,
             "branches/feature"
         );
         assert_eq!(
-            svn_path_identity(root, "file:///srv/repo/projects/app").branch_path,
+            svn_path_identity(root, "file:///srv/repo/projects/app")
+                .unwrap()
+                .branch_path,
             "projects/app"
         );
     }
 
     #[test]
     fn svn_log_path_maps_into_branch_relative_namespace() {
-        let trunk = SvnPathIdentity::new("file:///repo", "file:///repo/trunk");
+        let trunk = SvnPathIdentity::new("file:///repo", "file:///repo/trunk").unwrap();
         assert_eq!(
             svn_log_path_to_branch_relative("/trunk/feature.txt", &trunk),
             Some("feature.txt".into())
@@ -731,7 +875,7 @@ mod tests {
             svn_log_path_to_branch_relative("trunk/nested/x.txt", &trunk),
             Some("nested/x.txt".into())
         );
-        let branch = SvnPathIdentity::new("file:///repo", "file:///repo/branches/team");
+        let branch = SvnPathIdentity::new("file:///repo", "file:///repo/branches/team").unwrap();
         assert_eq!(
             svn_log_path_to_branch_relative("/branches/team/a.txt", &branch),
             Some("a.txt".into())
@@ -740,11 +884,99 @@ mod tests {
             svn_log_path_to_branch_relative("/branches/team-other/a.txt", &branch),
             None
         );
-        let root = SvnPathIdentity::new("file:///repo", "file:///repo");
+        let root = SvnPathIdentity::new("file:///repo", "file:///repo").unwrap();
         assert_eq!(
             svn_log_path_to_branch_relative("/feature.txt", &root),
             Some("feature.txt".into())
         );
+    }
+
+    #[test]
+    fn checked_svn_identity_196_rejects_outside_and_sibling_urls() {
+        for target in [
+            "file:///repo-other/trunk",
+            "file:///elsewhere/trunk",
+            "file:///Repo/trunk",
+        ] {
+            assert!(
+                checked_svn_path_identity("file:///repo", target).is_none(),
+                "{target}"
+            );
+        }
+        assert!(checked_svn_path_identity("", "file:///repo").is_none());
+        assert!(checked_svn_path_identity("", "").is_none());
+        let root = checked_svn_path_identity("file:///repo/", "file:///repo///").unwrap();
+        assert_eq!(root.branch_path, "");
+        let branch =
+            checked_svn_path_identity("file:///repo/", "file:///repo/branches/team/").unwrap();
+        assert_eq!(branch.branch_path, "branches/team");
+    }
+
+    #[test]
+    fn svn_projection_196_is_component_aware_case_sensitive_and_strips_once() {
+        let identity = checked_svn_path_identity("file:///repo", "file:///repo/trunk/").unwrap();
+        for (raw, expected) in [
+            ("/trunk/a.txt", Some("a.txt")),
+            ("trunk/a.txt", Some("a.txt")),
+            ("///trunk/a.txt", Some("a.txt")),
+            ("/trunk", Some("")),
+            ("/trunk/", Some("")),
+            ("/trunk/trunk/a.txt", Some("trunk/a.txt")),
+            ("/trunk/a/trunk/a.txt", Some("a/trunk/a.txt")),
+            ("/trunk/Trunk/a.txt", Some("Trunk/a.txt")),
+            ("/trunk-other/a.txt", None),
+            ("/trunkish/a.txt", None),
+            ("/Trunk/a.txt", None),
+            ("/branches/trunk/a.txt", None),
+            ("/a.txt", None),
+            ("", None),
+            ("/", None),
+        ] {
+            assert_eq!(
+                svn_log_path_to_branch_relative(raw, &identity).as_deref(),
+                expected,
+                "{raw}"
+            );
+        }
+        let branch =
+            checked_svn_path_identity("file:///repo", "file:///repo/branches/team").unwrap();
+        assert_eq!(
+            svn_log_path_to_branch_relative("/branches/team/trunk/a.txt", &branch).as_deref(),
+            Some("trunk/a.txt")
+        );
+        for outside in [
+            "/branches/team-other/a.txt",
+            "/branches/Team/a.txt",
+            "/other/branches/team/a.txt",
+        ] {
+            assert_eq!(
+                svn_log_path_to_branch_relative(outside, &branch),
+                None,
+                "{outside}"
+            );
+        }
+    }
+
+    #[test]
+    fn svn_projection_196_empty_root_preserves_literal_paths() {
+        let root = checked_svn_path_identity("file:///repo/", "file:///repo").unwrap();
+        for path in [
+            "trunk/a.txt",
+            "a/trunk/a.txt",
+            "Trunk/a.txt",
+            "trunk-other/a.txt",
+        ] {
+            assert_eq!(
+                svn_log_path_to_branch_relative(&format!("/{path}"), &root).as_deref(),
+                Some(path)
+            );
+        }
+        for path in ["", "/", "///"] {
+            assert_eq!(
+                svn_log_path_to_branch_relative(path, &root).as_deref(),
+                Some("")
+            );
+        }
     }
 
     #[test]
@@ -841,7 +1073,7 @@ mod tests {
 
     #[test]
     fn svn_log_path_rejects_sibling_same_basename_prefix() {
-        let allow = SvnPathIdentity::new("file:///repo", "file:///repo/allow");
+        let allow = SvnPathIdentity::new("file:///repo", "file:///repo/allow").unwrap();
         assert_eq!(svn_log_path_to_branch_relative("/allow.txt", &allow), None);
         assert_eq!(
             svn_log_path_to_branch_relative("/allow/x.txt", &allow),

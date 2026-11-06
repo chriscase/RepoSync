@@ -7818,3 +7818,608 @@ async fn test_personal_legacy_receipt_upgrade_path() {
         EchoDisposition::SkipEcho
     );
 }
+
+/// Exercise the real import entry point so API errors cannot silently become create requests.
+mod repo_exists_import {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_personal::initial_import::{ImportMode, InitialImport};
+
+    #[derive(Debug)]
+    struct Request {
+        method: String,
+        path: String,
+        authorization: String,
+        body: String,
+    }
+
+    struct Api {
+        url: String,
+        requests: Arc<Mutex<Vec<Request>>>,
+        stop: Arc<AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Api {
+        fn start(head: u16, get: u16, disconnect: Option<&'static str>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = requests.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = stop.clone();
+            let server = std::thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("fixture accept: {error}"),
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    let mut parts = first.split_whitespace();
+                    let method = parts.next().unwrap().to_string();
+                    let path = parts.next().unwrap().to_string();
+                    let mut authorization = String::new();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        assert!(reader.read_line(&mut line).unwrap() > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        let (name, value) = line.split_once(':').unwrap();
+                        if name.eq_ignore_ascii_case("authorization") {
+                            authorization = value.trim().into();
+                        } else if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    assert!(length < 16_384);
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    seen.lock().unwrap().push(Request {
+                        method: method.clone(),
+                        path,
+                        authorization,
+                        body: String::from_utf8(body).unwrap(),
+                    });
+                    if disconnect == Some(method.as_str()) {
+                        continue;
+                    }
+                    let status = match method.as_str() {
+                        "HEAD" => head,
+                        "GET" => get,
+                        "POST" => 201,
+                        _ => 500,
+                    };
+                    let body = if method == "HEAD" { "" } else { "{}" };
+                    write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            });
+            Self {
+                url,
+                requests,
+                stop,
+                server: Some(server),
+            }
+        }
+
+        fn assert_requests(&self, provider: &GitProvider, methods: &[&str]) {
+            let authorization = match provider {
+                GitProvider::GitHub => "Bearer fixture-token",
+                GitProvider::Gitea => "token fixture-token",
+            };
+            let requests = self.requests.lock().unwrap();
+            assert_eq!(requests.len(), methods.len(), "{requests:?}");
+            for (request, method) in requests.iter().zip(methods) {
+                assert_eq!(request.method, *method);
+                assert_eq!(request.authorization, authorization);
+                if *method == "POST" {
+                    assert_eq!(request.path, "/user/repos");
+                    let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+                    assert_eq!(body["name"], "test-repo");
+                    assert_eq!(body["private"], true);
+                    assert_eq!(body["auto_init"], false);
+                } else {
+                    assert_eq!(request.path, "/repos/test/test-repo");
+                }
+            }
+        }
+    }
+
+    impl Drop for Api {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            self.server.take().unwrap().join().unwrap();
+        }
+    }
+
+    async fn refused_import(api: &Api, auto_create: bool, provider: &GitProvider) -> String {
+        let tmp = TempDir::new().unwrap();
+        let svn_url = format!(
+            "file://{}",
+            tmp.path().join("deliberately-absent-svn").display()
+        );
+        let mut config = make_test_config(&svn_url, tmp.path());
+        config.github.api_url = api.url.clone();
+        config.github.auto_create = auto_create;
+        let db = setup_db(&tmp.path().join("personal.db"));
+        let work = tmp.path().join("git");
+        let git = Arc::new(Mutex::new(GitClient::init(&work).unwrap()));
+        let svn = SvnClient::new(&svn_url, "", "");
+        let github = GitHubClient::new(&api.url, "fixture-token", provider.clone());
+        let formatter = CommitFormatter::new(&config.commit_format);
+        let result = InitialImport {
+            svn_client: &svn,
+            git_client: &git,
+            github_client: &github,
+            db: &db,
+            config: &config,
+            formatter: &formatter,
+        }
+        .import(ImportMode::Snapshot)
+        .await;
+        assert!(db.list_commit_map(10).unwrap().is_empty());
+        assert_eq!(db.get_watermark("svn_rev").unwrap(), None);
+        assert_eq!(db.get_watermark("git_sha").unwrap(), None);
+        assert!(!work.join(".git/index").exists());
+        drop(db.begin_ordinary_writer_window(None).unwrap());
+        format!("{:#}", result.unwrap_err())
+    }
+
+    #[tokio::test]
+    async fn head_200_and_head_405_get_200_import_existing_repo_without_create() {
+        assert!(
+            svn_available(),
+            "svn and svnadmin are required for this regression"
+        );
+        for provider in [GitProvider::GitHub, GitProvider::Gitea] {
+            for fallback in [false, true] {
+                for auto_create in [false, true] {
+                    let tmp = TempDir::new().unwrap();
+                    let svn_url = create_svn_repo(tmp.path());
+                    let wc = tmp.path().join("wc");
+                    svn_checkout(&svn_url, &wc);
+                    svn_commit_file(&wc, "seed.txt", "SVN seed\n", "seed");
+                    let bare = tmp.path().join("origin.git");
+                    git2::Repository::init_bare(&bare).unwrap();
+                    let work = tmp.path().join("git");
+                    let git = GitClient::init(&work).unwrap();
+                    git2::Repository::open(&work)
+                        .unwrap()
+                        .remote("origin", bare.to_str().unwrap())
+                        .unwrap();
+                    git_cmd(&work, &["checkout", "-b", "main"]);
+                    let git = Arc::new(Mutex::new(git));
+                    let api = Api::start(if fallback { 405 } else { 200 }, 200, None);
+                    let mut config = make_test_config(&svn_url, tmp.path());
+                    config.github.api_url = api.url.clone();
+                    config.github.auto_create = auto_create;
+                    let db = setup_db(&tmp.path().join("personal.db"));
+                    let svn = SvnClient::new(&svn_url, "", "");
+                    let github = GitHubClient::new(&api.url, "fixture-token", provider.clone());
+                    let formatter = CommitFormatter::new(&config.commit_format);
+                    let imported = InitialImport {
+                        svn_client: &svn,
+                        git_client: &git,
+                        github_client: &github,
+                        db: &db,
+                        config: &config,
+                        formatter: &formatter,
+                    }
+                    .import(ImportMode::Snapshot)
+                    .await
+                    .unwrap();
+                    assert_eq!(imported, 1);
+                    let remote = git2::Repository::open_bare(&bare).unwrap();
+                    let commit = remote
+                        .find_reference("refs/heads/main")
+                        .unwrap()
+                        .peel_to_commit()
+                        .unwrap();
+                    assert_eq!(commit.parent_count(), 0);
+                    let tree = commit.tree().unwrap();
+                    let entry = tree.get_path(Path::new("seed.txt")).unwrap();
+                    assert_eq!(
+                        remote.find_blob(entry.id()).unwrap().content(),
+                        b"SVN seed\n"
+                    );
+                    assert_eq!(db.list_commit_map(10).unwrap().len(), 1);
+                    assert_eq!(db.get_watermark("svn_rev").unwrap().as_deref(), Some("1"));
+                    assert_eq!(
+                        db.get_watermark("git_sha").unwrap(),
+                        Some(commit.id().to_string())
+                    );
+                    api.assert_requests(
+                        &provider,
+                        if fallback {
+                            &["HEAD", "GET"]
+                        } else {
+                            &["HEAD"]
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_and_fallback_404_create_exactly_once_only_when_enabled() {
+        assert!(
+            svn_available(),
+            "svn and svnadmin are required for this regression"
+        );
+        for provider in [GitProvider::GitHub, GitProvider::Gitea] {
+            for fallback in [false, true] {
+                for auto_create in [false, true] {
+                    let api = Api::start(if fallback { 405 } else { 404 }, 404, None);
+                    let error = refused_import(&api, auto_create, &provider).await;
+                    let mut methods = vec!["HEAD"];
+                    if fallback {
+                        methods.push("GET");
+                    }
+                    if auto_create {
+                        methods.push("POST");
+                        assert!(
+                            error.contains("failed to pin SVN snapshot revision"),
+                            "{error}"
+                        );
+                    } else {
+                        assert!(error.contains("GitHub repository 'test/test-repo' does not exist and auto_create is disabled"), "{error}");
+                    }
+                    api.assert_requests(&provider, &methods);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn head_and_get_api_failures_never_create_or_report_missing() {
+        for provider in [GitProvider::GitHub, GitProvider::Gitea] {
+            for fallback in [false, true] {
+                for auto_create in [false, true] {
+                    for status in [401, 403, 429, 500, 503, 410, 302] {
+                        let api = Api::start(if fallback { 405 } else { status }, status, None);
+                        let error = refused_import(&api, auto_create, &provider).await;
+                        assert!(
+                            error.contains("failed to check if GitHub repo exists"),
+                            "{error}"
+                        );
+                        assert!(
+                            !error.contains("does not exist and auto_create is disabled"),
+                            "{error}"
+                        );
+                        api.assert_requests(
+                            &provider,
+                            if fallback {
+                                &["HEAD", "GET"]
+                            } else {
+                                &["HEAD"]
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn head_and_get_transport_failures_never_create_or_report_missing() {
+        for provider in [GitProvider::GitHub, GitProvider::Gitea] {
+            for fallback in [false, true] {
+                for auto_create in [false, true] {
+                    let method = if fallback { "GET" } else { "HEAD" };
+                    let api = Api::start(405, 200, Some(method));
+                    let error = refused_import(&api, auto_create, &provider).await;
+                    assert!(
+                        error.contains("failed to check if GitHub repo exists"),
+                        "{error}"
+                    );
+                    assert!(error.contains("GitHub HTTP error"), "{error}");
+                    assert!(
+                        !error.contains("does not exist and auto_create is disabled"),
+                        "{error}"
+                    );
+                    api.assert_requests(
+                        &provider,
+                        if fallback {
+                            &["HEAD", "GET"]
+                        } else {
+                            &["HEAD"]
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn rs113_personal_apply_preserves_literal_names_and_refuses_control_set_before_write() {
+    assert!(
+        svn_available(),
+        "SVN tools are required; no skipped evidence"
+    );
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "seed.txt", "seed", "seed");
+    let work = tmp.path().join("git");
+    let git = setup_git_with_bare_origin(&work, &tmp.path().join("origin.git"));
+    let db = Arc::new(setup_db(&tmp.path().join("sync.db")));
+    let names = ["-dash", "name@HEAD", " space 雪 ", "nested/xml&<name>"];
+    for name in names {
+        let path = work.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"exact personal bytes\n").unwrap();
+    }
+    let sha = git
+        .commit(
+            "#113 literal apply",
+            "Test",
+            "test@example.com",
+            "Test",
+            "test@example.com",
+        )
+        .unwrap()
+        .to_string();
+    let sync = personal_git_to_svn(&svn_url, db.clone(), wc.clone(), work.clone(), tmp.path());
+    sync.apply_git_changes_to_svn(&github_commit(sha, "#113 literal apply"))
+        .await
+        .unwrap();
+    for name in names {
+        assert_eq!(
+            std::fs::read(wc.join(name)).unwrap(),
+            b"exact personal bytes\n"
+        );
+    }
+    std::fs::write(work.join("ordinary-new"), b"must not be written").unwrap();
+    std::fs::write(work.join("tab\tname"), b"unsupported").unwrap();
+    let sha = git
+        .commit(
+            "#113 refuse whole set",
+            "Test",
+            "test@example.com",
+            "Test",
+            "test@example.com",
+        )
+        .unwrap()
+        .to_string();
+    let error = sync
+        .apply_git_changes_to_svn(&github_commit(sha, "#113 refuse whole set"))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("confined repository-relative path"),
+        "{error:#}"
+    );
+    assert!(!wc.join("ordinary-new").exists());
+    assert!(!wc.join("tab\tname").exists());
+    for name in names {
+        assert_eq!(
+            std::fs::read(wc.join(name)).unwrap(),
+            b"exact personal bytes\n"
+        );
+    }
+    assert_eq!(svn_youngest(&svn_url), 1);
+    assert!(db.list_commit_map(10).unwrap().is_empty());
+}
+
+/// Exercise the distinct InitialImport::Full caller, including deletion and
+/// destination-only reconciliation before a mapping or push can be accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs88_personal_full_history_reconciles_each_raw_revision_before_mapping() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_personal::initial_import::{ImportMode, InitialImport};
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    assert_eq!(
+        svn_commit_files(
+            &wc,
+            &[
+                ("gone.txt", "gone\n"),
+                ("keep.txt", "before\n"),
+                (".gitattributes", "* text=auto\n\n"),
+                ("omit.tmp", "policy\n")
+            ],
+            "first"
+        ),
+        1
+    );
+    assert!(Command::new("svn")
+        .args(["rm", wc.join("gone.txt").to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(
+        svn_commit_file(&wc, "keep.txt", "after\n", "delete and update"),
+        2
+    );
+    let work = tmp.path().join("git");
+    let bare = tmp.path().join("origin.git");
+    git2::Repository::init_bare(&bare).unwrap();
+    let client = Arc::new(Mutex::new(GitClient::init(&work).unwrap()));
+    git2::Repository::open(&work)
+        .unwrap()
+        .remote("origin", bare.to_str().unwrap())
+        .unwrap();
+    git_cmd(&work, &["checkout", "-b", "main"]);
+    std::fs::write(work.join("destination-only"), b"must not be committed").unwrap();
+    let database = setup_db(&tmp.path().join("db.sqlite"));
+    let (api_url, stub) = spawn_github_exists_stub();
+    let mut config = make_test_config(&svn_url, tmp.path());
+    config.github.api_url = api_url;
+    config.options.ignore_patterns = vec!["*.tmp".into()];
+    let svn = SvnClient::new(&svn_url, "", "");
+    let github = GitHubClient::new(&config.github.api_url, "unused", GitProvider::GitHub);
+    let formatter = CommitFormatter::new(&config.commit_format);
+    let importer = InitialImport {
+        svn_client: &svn,
+        git_client: &client,
+        github_client: &github,
+        db: &database,
+        config: &config,
+        formatter: &formatter,
+    };
+    assert_eq!(importer.import(ImportMode::Full).await.unwrap(), 2);
+    stub.join().unwrap();
+    let maps = database.list_commit_map(10).unwrap();
+    assert_eq!(maps.len(), 2);
+    let remote = git2::Repository::open_bare(&bare).unwrap();
+    let tip = remote
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    for revision in [1, 2] {
+        let mapping = maps.iter().find(|row| row.svn_rev == revision).unwrap();
+        assert_eq!(mapping.repo_id.as_deref(), Some(PERSONAL_SCOPE_KEY));
+        let commit = remote
+            .find_commit(git2::Oid::from_str(&mapping.git_sha).unwrap())
+            .unwrap();
+        let tree = commit.tree().unwrap();
+        let paths: Vec<_> = tree
+            .iter()
+            .map(|entry| entry.name().unwrap().to_owned())
+            .collect();
+        let expected = if revision == 1 {
+            vec![".gitattributes", "gone.txt", "keep.txt"]
+        } else {
+            vec![".gitattributes", "keep.txt"]
+        };
+        assert_eq!(paths, expected);
+        assert_eq!(
+            remote
+                .find_blob(tree.get_name("keep.txt").unwrap().id())
+                .unwrap()
+                .content(),
+            if revision == 1 {
+                b"before\n".as_slice()
+            } else {
+                b"after\n".as_slice()
+            }
+        );
+        assert_eq!(
+            remote
+                .find_blob(tree.get_name(".gitattributes").unwrap().id())
+                .unwrap()
+                .content(),
+            b"* text=auto\n\n"
+        );
+        if revision == 2 {
+            assert_eq!(tip.id(), commit.id());
+        }
+    }
+    assert_eq!(
+        database.get_watermark("svn_rev").unwrap().as_deref(),
+        Some("2")
+    );
+    assert!(!work.join("destination-only").exists());
+    assert!(!work.join("gone.txt").exists());
+    assert!(!work.join("omit.tmp").exists());
+}
+
+#[tokio::test]
+async fn rs88_personal_ordinary_attributes_preserve_raw_bytes_and_mode_with_history() {
+    for historical_marker in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let svn_url = create_svn_repo(tmp.path());
+        let wc = tmp.path().join("wc");
+        svn_checkout(&svn_url, &wc);
+        std::fs::write(wc.join(".gitattributes"), "*.txt text=auto\n\n").unwrap();
+        assert!(Command::new("svn")
+            .args(["add", wc.join(".gitattributes").to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("svn")
+            .args([
+                "propset",
+                "svn:executable",
+                "*",
+                wc.join(".gitattributes").to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let work = tmp.path().join("git");
+        let bare = tmp.path().join("origin.git");
+        let client = Arc::new(Mutex::new(setup_git_with_bare_origin(&work, &bare)));
+        if historical_marker {
+            reposync_core::lfs::ensure_lfs_tracked(&work, "*.historical").unwrap();
+        }
+        let database = Arc::new(setup_db(&tmp.path().join("db.sqlite")));
+        let config = make_test_config(&svn_url, tmp.path());
+        let syncer = SvnToGitSync::new(
+            SvnClient::new(&svn_url, "", ""),
+            client.clone(),
+            database.clone(),
+            config,
+        );
+        for (index, body) in [
+            "*.txt text=auto\n\n",
+            "*.txt text=auto\r\n",
+            "*.txt text=auto",
+            "*.txt text=auto\n*.txt text=auto\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let revision = svn_commit_file(&wc, ".gitattributes", body, "ordinary attributes");
+            assert_eq!(revision, index as i64 + 1);
+            // Bind the assertion to real exported bytes. The *.txt rule does
+            // not apply Git CRLF conversion to .gitattributes itself.
+            let exported = TempDir::new().unwrap();
+            SvnClient::new(&svn_url, "", "")
+                .export("", revision, exported.path())
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(exported.path().join(".gitattributes")).unwrap(),
+                body.as_bytes()
+            );
+            assert_eq!(syncer.sync().await.unwrap(), 1);
+            let repo = git2::Repository::open_bare(&bare).unwrap();
+            let commit = repo
+                .find_reference("refs/heads/main")
+                .unwrap()
+                .peel_to_commit()
+                .unwrap();
+            let tree = commit.tree().unwrap();
+            let attributes = tree.get_name(".gitattributes").unwrap();
+            assert_eq!(attributes.filemode(), 0o100755);
+            assert_eq!(
+                repo.find_blob(attributes.id()).unwrap().content(),
+                body.as_bytes()
+            );
+            assert_eq!(
+                std::fs::read(work.join(".gitattributes")).unwrap(),
+                body.as_bytes()
+            );
+            let mappings = database.list_commit_map(20).unwrap();
+            assert!(mappings
+                .iter()
+                .any(|row| row.svn_rev == revision && row.git_sha == commit.id().to_string()));
+            assert_eq!(syncer.sync().await.unwrap(), 0);
+        }
+    }
+}

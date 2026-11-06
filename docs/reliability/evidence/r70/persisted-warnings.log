@@ -1,0 +1,77 @@
+STDOUT
+
+> reposync-web-ui@0.1.0 test
+> vitest run src/branchPairRemoval.test.ts
+
+
+ RUN  v2.1.9 <fixture>/web-ui
+
+ ❯ src/branchPairRemoval.test.ts (35 tests | 2 failed) 8ms
+   × branch-pair removal notices > preserves completed warnings and operation details through navigation and storage 4ms
+     → expected { outcome: 'completed', …(4) } to deeply equal { outcome: 'completed', …(4) }
+   × branch-pair removal notices > preserves in_progress warnings and operation details through navigation and storage 0ms
+     → expected { outcome: 'in_progress', …(4) } to deeply equal { outcome: 'in_progress', …(4) }
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 33 passed (35)
+   Start at  02:45:29
+   Duration  352ms (transform 18ms, setup 0ms, collect 16ms, tests 8ms, environment 0ms, prepare 38ms)
+
+
+STDERR
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/branchPairRemoval.test.ts > branch-pair removal notices > preserves completed warnings and operation details through navigation and storage
+AssertionError: expected { outcome: 'completed', …(4) } to deeply equal { outcome: 'completed', …(4) }
+
+- Expected
++ Received
+
+  Object {
+    "message": "Registration removed",
+    "name": "Child pair",
+    "operationId": "op-70",
+    "outcome": "completed",
+-   "warnings": Array [
+-     "Git branch cleanup failed",
+-   ],
++   "warnings": Array [],
+  }
+
+ ❯ src/branchPairRemoval.test.ts:88:73
+     86|   it.each(['completed', 'in_progress'] as const)('preserves %s warning…
+     87|     const receipt = { ...notice, outcome };
+     88|     expect(readBranchPairRemovalNotice({ branchPairRemoval: receipt })…
+       |                                                                         ^
+     89|     persistBranchPairRemovalNotice(receipt);
+     90|     expect(readPersistedBranchPairRemovalNotice()).toEqual(receipt);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  src/branchPairRemoval.test.ts > branch-pair removal notices > preserves in_progress warnings and operation details through navigation and storage
+AssertionError: expected { outcome: 'in_progress', …(4) } to deeply equal { outcome: 'in_progress', …(4) }
+
+- Expected
++ Received
+
+  Object {
+    "message": "Registration removed",
+    "name": "Child pair",
+    "operationId": "op-70",
+    "outcome": "in_progress",
+-   "warnings": Array [
+-     "Git branch cleanup failed",
+-   ],
++   "warnings": Array [],
+  }
+
+ ❯ src/branchPairRemoval.test.ts:88:73
+     86|   it.each(['completed', 'in_progress'] as const)('preserves %s warning…
+     87|     const receipt = { ...notice, outcome };
+     88|     expect(readBranchPairRemovalNotice({ branchPairRemoval: receipt })…
+       |                                                                         ^
+     89|     persistBranchPairRemovalNotice(receipt);
+     90|     expect(readPersistedBranchPairRemovalNotice()).toEqual(receipt);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+

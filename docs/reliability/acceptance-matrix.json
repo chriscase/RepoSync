@@ -42,13 +42,14 @@
         "R01_SVNSERVE_PERSONAL_ROUNDTRIP",
         "R01_SVNSERVE_FAILED_APPLY_BARRIER",
         "R01_SVNSERVE_FAILED_APPLY_RETRY",
-        "R01_SVNSERVE_POST_WRITE_RECOVERY"
+        "R01_SVNSERVE_POST_WRITE_RECOVERY",
+        "R01_SVNSERVE_LARGE_MESSAGE_RETRY"
       ],
       "open": [
         "Post-write recovery of a successful SVN/Git effect whose DB write failed remains #64/#23 when R01_SVNSERVE_POST_WRITE_RECOVERY cannot PASS",
         "Deployed-version ordinary sync is NOT ESTABLISHED"
       ],
-      "evidence": "Team-engine fixtures prove linear Git replay, directional cursor splits, lagging-P admission, failed nonempty SVN apply stop-and-retry, explicit no-target metadata revisions, and ignored-path noncollision. Intermediate tree and mapping assertions exist for those subcases. A second unchanged Git run is a no-op in R01_LINEAR. R01_SVNSERVE_MULTI_COMMIT_SVN_TO_GIT and R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN drive disposable svnserve plus bare Git through production SyncEngine with ordered multi-commit tree/mapping checks and repeat no-op oracles. R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP chains multi-commit SVN→Git and Git→SVN on one svnserve pair with distinct per-revision Git mappings, intermediate-tree absence checks, remote tree/mapping checks, and a second cycle no-op. R01_SVNSERVE_PERSONAL_ROUNDTRIP drives PersonalSyncEngine through authenticated loopback svnserve with snapshot import, SVN→Git via run_cycle, and Git→SVN via the personal replay path with commit_map and both-side file-content checks (not the team SyncEngine). R01_SVNSERVE_FAILED_APPLY_BARRIER and R01_SVNSERVE_FAILED_APPLY_RETRY exercise F06 on real svnserve with a per-bridge/per-revision invalid-patch apply fault (real git apply subprocess, debug hook scoped to the fixture bridge): ApplyFailed stops before failed and queued SVN revisions with frontier watermark, bridge tree, and sync_records assertions, then clearing the fault and retrying applies both revisions with file-content checks and mapping rows before a repeat no-op. R01_SVNSERVE_POST_WRITE_RECOVERY simulates checkpoint/mapping loss after a successful svnserve SVN→Git effect and records PASS only when a reopened engine completes exactly once without duplicate bare publication. Live upgrade remains open.",
+      "evidence": "Team-engine fixtures prove linear Git replay, directional cursor splits, lagging-P admission, failed nonempty SVN apply stop-and-retry, explicit no-target metadata revisions, and ignored-path noncollision. Intermediate tree and mapping assertions exist for those subcases. A second unchanged Git run is a no-op in R01_LINEAR. R01_SVNSERVE_MULTI_COMMIT_SVN_TO_GIT and R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN drive disposable svnserve plus bare Git through production SyncEngine with ordered multi-commit tree/mapping checks and repeat no-op oracles. R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP chains multi-commit SVN→Git and Git→SVN on one svnserve pair with distinct per-revision Git mappings, intermediate-tree absence checks, remote tree/mapping checks, and a second cycle no-op. R01_SVNSERVE_PERSONAL_ROUNDTRIP drives PersonalSyncEngine through authenticated loopback svnserve with snapshot import, SVN→Git via run_cycle, and Git→SVN via the personal replay path with commit_map and both-side file-content checks (not the team SyncEngine). R01_SVNSERVE_FAILED_APPLY_BARRIER and R01_SVNSERVE_FAILED_APPLY_RETRY exercise F06 on real svnserve with a per-bridge/per-revision invalid-patch apply fault (real git apply subprocess, debug hook scoped to the fixture bridge): ApplyFailed stops before failed and queued SVN revisions with frontier watermark, bridge tree, and sync_records assertions, then clearing the fault and retrying applies both revisions with file-content checks and mapping rows before a repeat no-op. R01_SVNSERVE_POST_WRITE_RECOVERY simulates checkpoint/mapping loss after a successful svnserve SVN→Git effect and records PASS only when a reopened engine completes exactly once without duplicate bare publication. Live upgrade remains open. R01_SVNSERVE_LARGE_MESSAGE_RETRY is the #228 synthetic >=256KiB UTF-8/provenance case: real pre-commit interpreter launch refusal, unchanged checkpoint/no applied mapping, explicit absent-unchanged reconciliation, one retry, exact SVN log/content and repeat no-op. Its current result must come from the exact-version scenario receipt; source registration alone is not PASS.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -297,6 +298,9 @@
         "RS05_TEAM_EQUAL_REVISION_SCOPED",
         "RS05_TEAM_GLOBAL_NOT_ADOPTED",
         "RS05_LATE_PAIR_BC_PENDING",
+        "RS63_SCOPE_UUID_REREGISTER",
+        "RS63_SCOPE_UUID_MIGRATION_IDEMPOTENT",
+        "RS63_LEGACY_RECEIPT_NOT_AUTHORITATIVE",
         "ECHO_GENERATION_STALE_RECEIPT",
         "ECHO_GENERATION_STALE_RECEIPT_SAME_SHA",
         "ECHO_SPLIT_CURSOR_UNPROVED_COLUMN",
@@ -400,7 +404,7 @@
       "id": "R11",
       "title": "Snapshot at a pinned SVN revision",
       "baseline": "NOT RUN",
-      "candidate": "PARTIAL",
+      "candidate": "PASS",
       "tier": "actual_engine",
       "required_case_ids": [
         "R11_SNAPSHOT_FIXED_R",
@@ -412,21 +416,15 @@
         "R11_SNAPSHOT_LFS",
         "R11_SNAPSHOT_RECONCILE"
       ],
-      "open": [
-        "Rich onboarding UI / wizard polish is later",
-        "Late-pair replay of a snapshot-derived branch remains #67 (admission/preview is R06_SNAPSHOT_BASELINE)",
-        "Optional reuse of a previously imported baseline is not implemented",
-        "Bidirectional incremental sync after snapshot is covered only by existing R01 cases on full-import baselines",
-        "Issue #68 remains open"
-      ],
-      "evidence": "Team snapshot init pins UUID/path/operative+peg revision once, materializes the selected SVN tree under file policy, verifies projected bytes, publishes through the #64 import journal, and records the verified baseline. R11_SNAPSHOT_FIXED_R imports r2 only (one Git commit, history.txt=first). R11_PIN_HOLDS_AFTER_ADVANCE keeps r3 after SVN advances. Mismatched non-empty Git targets and invalid revisions are refused without watermark advance. R11_SNAPSHOT_LFS publishes one snapshot commit whose threshold file is an LFS pointer (size 1100000). A unit check rejects a fat blob or a pointer whose oid or size does not match the projected bytes. R11_SNAPSHOT_RECONCILE finishes a held snapshot only when the remote SHA is that baseline. Status reports starting_revision/history_boundary and earlier_history_imported=false.",
+      "open": [],
+      "evidence": "Scoped mandatory snapshot criteria demonstrated on a887e048662c9b4804649be10feff13b0c7b22c7, tree 960d1536df6bcd0bad7ba5e893bb6c65eecc7a15, CI42023789883 (original API job log 7f8f6bad518c13ceb4043e9c80000e1eb135fba321aef7fc025366805b3f4789). All existing R11 fixed-revision/pin-after-advance/mismatched-target/invalid-revision and LFS/reconcile controls passed. Separate catalog profiles RS68_SNAPSHOT_CONTINUATION_LFS and RS68_SNAPSHOT_LOST_REPLY_HTTP add genuine snapshot-to-SVN-to-Git-to-SVN continuation, checkpoint rollback/reopen/reconcile, actual accepted-lost-reply authenticated HTTP, cancellation before effects and real Git LFS3.8.1 publication/fresh-fetch/object/missing-object checks. Earlier full/default/boundary/invalid mounted-browser and225UI evidence retains byte-identical frontend/harness inputs; it is local evidence, not hosted browser execution. Starting revision/history boundary/omitted earlier history remain explicit. The original PARTIAL continuation gap is closed by these actual tests. Optional baseline reuse is not implemented and is not required; wizard polish is outside the existing explicit mode onboarding. Snapshot-derived late-pair admission is retained; #67 replay remains unimplemented/open. This records the tested source above, not execution of a later records-only successor. Issue68 stays open until its final-head and own postmerge gates pass; no whole-epic, native collection or production qualification is implied.",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R12",
       "title": "Default full-history import remains supported",
       "baseline": "NOT RUN",
-      "candidate": "PARTIAL",
+      "candidate": "PASS",
       "tier": "actual_engine",
       "required_case_ids": [
         "64A_ORDINARY",
@@ -435,11 +433,8 @@
         "R12_FULL_DEFAULT"
       ],
       "supporting_case_ids": [],
-      "open": [
-        "Installer/update-path full import of a deployed installation is NOT ESTABLISHED",
-        "Personal full import is not in this catalog"
-      ],
-      "evidence": "A real disposable full import completes with confirmed Git ref, cursors, and LFS pointer publication through supervised commands. reset=true remains refused. R12_FULL_DEFAULT proves omitted import_mode still replays every SVN revision (three Git commits on the history fixture). This does not qualify an unknown deployed binary.",
+      "open": [],
+      "evidence": "Scoped default/import and pinned synthetic installer-update criteria demonstrated on a887e048662c9b4804649be10feff13b0c7b22c7, tree 960d1536df6bcd0bad7ba5e893bb6c65eecc7a15, CI42023789883 (original API job log 7f8f6bad518c13ceb4043e9c80000e1eb135fba321aef7fc025366805b3f4789). 64A_ORDINARY,74_APPLY_POSITIVE,74_LFS_POSITIVE and R12_FULL_DEFAULT all passed; reset remains refused. Separate catalog profile R12_PERSONAL_FULL_IMPORT records the actual existing CLI two-revision full import/no-op repeat and startup/joined-restart tests, correcting the former catalog omission. R12_PINNED_INSTALLER_UPDATE builds canonical8737974 old source/tree with reviewed lock plus actual candidate binaries, verifies two-binary package/source/installed digests, executes the real offline installer on genuine synthetic old state and preserves config/data/refs/WAL/key bytes/modes. Installed candidate omitted-mode Personal import/repeat and all retained same-state in-process engine continuity assertions pass; schema12-to12; daemon --version only. This satisfies the initial pinned synthetic tier of #62 requirement3/GOAL126-128 without a work-server input prerequisite. It does not qualify the unknown actively deployed version, privileged/default installer, physical service restart, fresh release templates or #118/platform release. deployed_version remains NOT ESTABLISHED. This records the tested source above; final records-head and own postmerge qualification remain required before issue68 closure.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -645,15 +640,14 @@
       "id": "R20",
       "title": "Deletion UI navigation",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
+      "candidate": "PASS",
       "tier": "browser",
-      "required_case_ids": [],
-      "supporting_case_ids": [],
-      "open": [
-        "Issue #70 browser reproduction is not in the isolated catalog",
-        "Mounted import-card browser cases are #64 UI, not deletion navigation"
+      "required_case_ids": [
+        "R70_DELETE_NAVIGATION"
       ],
-      "evidence": "No required exact case for deleting the currently viewed pair. Existing mounted Chrome fixtures exercise ImportProgressCard cancel/reconcile only and run in ordinary E2E, not the sealed runtime.",
+      "supporting_case_ids": [],
+      "open": [],
+      "evidence": "Reviewed deletion-navigation code PASS (Refs #70): E2E https://github.com/chriscase/RepoSync/actions/runs/38865124037 executed R70_DELETE_NAVIGATION, 35 helper cases and 14 browser scenarios, including real local API removal and deterministic error/warning variants. Reviewed head 3f96f8b1a50a456ceceb5e09257bb9a09c022712 and actual PR merge checkout 0007b5ac22faf3229e84d6be88c0d9e4a813baef share immutable tree 4d76b31c3af84e49c31135860750c5478cce529b; commits and compiled revision metadata remain distinct. Independent direct review accepted the source and labeled identical-tree qualification (SHIP-WITH-NITS). Capture/destination, confirmed removal, Back/history, stopped detail polling, child-on-parent list/warnings, cancel/error/permission/busy, queued/delayed completion, parent fallback, stale links and explicit remote options are covered. Detailed workflow/dependency provenance, acceptance mapping, six mutation receipts and first-failure/retry disclosure are in docs/reliability/evidence/r70/README.md and acceptance.json. Browser execution remains separate from the sealed runtime. The original-base receipt is not relabeled as a later checkout; current-main closeout checks are recorded separately. No binary identity, whole-epic, enterprise or live PASS is claimed.",
       "diagnostic_expected_baseline_failure": false
     },
     {

@@ -31,6 +31,14 @@ pub fn history_block_key(repo_id: Option<&str>) -> String {
     }
 }
 
+/// Durable history block key scoped by repository `scope_uuid` when available.
+pub fn history_block_key_for_repo(db: &Database, repo_id: &str) -> Result<String, DatabaseError> {
+    let scope = crate::db::repo_scope_identity::repository_scope_token(&db.conn(), repo_id)?;
+    Ok(crate::db::repo_scope_identity::team_history_block_kv_key(
+        &scope,
+    ))
+}
+
 pub fn is_full_git_oid(value: &str) -> bool {
     (value.len() == 40 || value.len() == 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -57,6 +65,17 @@ pub struct HistoryInspectReject {
     pub o: Option<String>,
     pub r: Option<String>,
     pub l: Option<String>,
+}
+
+pub fn load_history_block_for_repo(
+    db: &Database,
+    repo_id: &str,
+) -> Result<Option<Value>, DatabaseError> {
+    let scoped = history_block_key_for_repo(db, repo_id)?;
+    if let Some(block) = load_history_block(db, &scoped)? {
+        return Ok(Some(block));
+    }
+    load_history_block(db, &history_block_key(Some(repo_id)))
 }
 
 pub fn load_history_block(db: &Database, key: &str) -> Result<Option<Value>, DatabaseError> {
@@ -139,7 +158,19 @@ pub fn persist_history_block(
         "first_blocked_at": now,
         "durable": durable,
     });
-    db.set_state(key, &record.to_string())
+    let serialized = record.to_string();
+    db.set_state(key, &serialized)?;
+    if let Some(rid) = repo_id {
+        if let Ok(scoped) = history_block_key_for_repo(db, rid) {
+            if key == scoped
+                && crate::db::repo_scope_identity::legacy_repo_id_kv_authoritative(&db.conn())?
+            {
+                let legacy = history_block_key(Some(rid));
+                db.set_state(&legacy, &serialized)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn clear_transient_history_block(db: &Database, key: &str) -> Result<(), DatabaseError> {
@@ -158,6 +189,16 @@ pub fn inspect_fetched_history(
     branch: &str,
     p: Option<String>,
     http_auth_token: Option<&str>,
+) -> Result<HistoryInspectAdmission, HistoryInspectReject> {
+    inspect_fetched_history_with_refresh_baseline(path, branch, p, http_auth_token, None)
+}
+
+pub(crate) fn inspect_fetched_history_with_refresh_baseline(
+    path: &Path,
+    branch: &str,
+    p: Option<String>,
+    http_auth_token: Option<&str>,
+    refresh: Option<&crate::pair_refresh::engine_checkout::CompletedRefreshCheckout>,
 ) -> Result<HistoryInspectAdmission, HistoryInspectReject> {
     let run = |args: &[&str]| -> std::io::Result<Output> {
         #[cfg(debug_assertions)]
@@ -420,8 +461,19 @@ pub fn inspect_fetched_history(
             }
         }
     }
+    let completed_refresh_checkout = refresh
+        .is_some_and(|proof| proof.permits(branch, checkpoint, &local))
+        && run(&["merge-base", "--is-ancestor", &local, checkpoint])
+            .is_ok_and(|output| output.status.code() == Some(0));
     for (ancestor, descendant) in [
-        (checkpoint, local.as_str()),
+        (
+            if completed_refresh_checkout {
+                local.as_str()
+            } else {
+                checkpoint
+            },
+            local.as_str(),
+        ),
         (local.as_str(), fetched.as_str()),
     ] {
         match run(&["merge-base", "--is-ancestor", ancestor, descendant]) {

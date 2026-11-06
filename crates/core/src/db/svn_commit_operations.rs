@@ -229,10 +229,11 @@ fn finalize_tx(
                 "git-to-svn commit lost its repository registration".into(),
             ));
         }
-        write_value(
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
             tx,
-            &format!("last_git_sha_{}", op.repo_id),
+            &op.repo_id,
             &op.source_git_sha,
+            &now,
         )?;
         if Database::repo_writes_global_git_watermark(tx, &op.repo_id)? {
             write_value(tx, "last_git_hash", &op.source_git_sha)?;
@@ -414,6 +415,10 @@ impl Database {
         intent: SvnCommitIntent<'_>,
     ) -> Result<SvnCommitOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+                tx,
+                intent.repo_id,
+            )?;
             crate::writer_fence::require_current(tx)?;
             let active = key("active", intent.repo_id);
             let active_existing = read_value(tx, &active)?;
@@ -573,6 +578,7 @@ impl Database {
         fingerprint: &str,
     ) -> Result<ReconciledSvnCommit, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
@@ -627,6 +633,7 @@ impl Database {
         svn_tree: &str,
     ) -> Result<SvnCommitOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
@@ -656,6 +663,7 @@ impl Database {
         git_author: &str,
     ) -> Result<SvnCommitOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
@@ -687,6 +695,7 @@ impl Database {
         git_author: &str,
     ) -> Result<SvnCommitOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
@@ -715,6 +724,7 @@ impl Database {
         F: FnOnce(&mut SvnCommitOperation) -> Result<(), DatabaseError>,
     {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             let active = key("active", repo_id);
             if read_value(tx, &active)?.as_deref() != Some(op_id) {

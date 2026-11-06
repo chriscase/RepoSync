@@ -153,73 +153,20 @@ pub async fn verify_projected_snapshot(
     svn.export("", pin.operative_rev, export_dir.path())
         .await
         .context("failed to re-export pinned revision for verification")?;
-    let projected = tempfile::tempdir().context("failed to create snapshot projection")?;
-    copy_tree_with_policy(export_dir.path(), projected.path(), policy, db)
-        .context("failed to project pinned tree for verification")?;
-
-    let expected = content_index(projected.path())?;
-    let actual = content_index(git_workdir)?;
-    let mut result = VerificationResult {
-        files_checked: expected.len() as u64,
-        ..VerificationResult::default()
-    };
-    for (path, hash) in &expected {
-        match actual.get(path) {
-            Some(other) if other == hash => result.files_matched += 1,
-            Some(_) => result.mismatches.push(path.clone()),
-            None => result.svn_only.push(path.clone()),
-        }
-    }
-    for path in actual.keys() {
-        if !expected.contains_key(path) {
-            result.git_only.push(path.clone());
-        }
-    }
-    result.sample_hashed = result.files_checked;
-    result.verified = result.mismatches.is_empty()
-        && result.svn_only.is_empty()
-        && result.git_only.is_empty()
-        && result.files_matched == result.files_checked;
-    if !result.verified {
-        bail!(
-            "snapshot projection mismatch at r{}: mismatches={:?} svn_only={:?} git_only={:?}",
-            pin.operative_rev,
-            result.mismatches,
-            result.svn_only,
-            result.git_only
-        );
-    }
-    Ok(result)
+    let _ = db; // Verification performs no copy or database mutation.
+    crate::import::verify_export_projection(export_dir.path(), git_workdir, policy)
 }
 
 fn content_index(root: &Path) -> Result<BTreeMap<String, String>> {
-    let mut files = BTreeMap::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in
-            std::fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            let name = entry.file_name();
-            if name == ".git" || name == ".svn" {
-                continue;
-            }
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("failed to read snapshot file {rel}"))?;
-            files.insert(rel, hex::encode(Sha256::digest(&bytes)));
-        }
-    }
-    Ok(files)
+    let manifest = crate::import::require_supported_export(root)?;
+    Ok(manifest
+        .entries
+        .into_iter()
+        .filter_map(|(path, entry)| match entry {
+            crate::import::ManifestEntry::File { sha256, .. } => Some((path, sha256)),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Baseline commit message used by personal and team snapshot imports.
@@ -243,26 +190,16 @@ pub fn snapshot_workdir_is_born(git_workdir: &Path) -> Result<bool> {
 /// Walk a Git commit tree (not the dirty workdir) for content verification
 /// after the baseline commit exists.
 pub fn git_commit_content_index(git_workdir: &Path, sha: &str) -> Result<BTreeMap<String, String>> {
-    let repo = git2::Repository::open(git_workdir).context("failed to open Git workdir")?;
-    let oid = git2::Oid::from_str(sha).context("snapshot Git SHA is malformed")?;
-    let commit = repo
-        .find_commit(oid)
-        .context("snapshot Git commit is missing")?;
-    let tree = commit.tree().context("snapshot Git tree is missing")?;
-    let mut files = BTreeMap::new();
-    tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
-        if entry.kind() == Some(git2::ObjectType::Blob) {
-            if let Some(name) = entry.name() {
-                if let Ok(blob) = repo.find_blob(entry.id()) {
-                    let path = format!("{dir}{name}");
-                    files.insert(path, hex::encode(Sha256::digest(blob.content())));
-                }
-            }
-        }
-        git2::TreeWalkResult::Ok
-    })
-    .context("failed to walk snapshot Git tree")?;
-    Ok(files)
+    Ok(git_commit_blobs(git_workdir, sha)?
+        .into_iter()
+        .map(|(path, entry)| {
+            let digest = match entry.blob {
+                CommittedBlob::Inline(bytes) => hex::encode(Sha256::digest(bytes)),
+                CommittedBlob::Digest(hash) => hash,
+            };
+            (path, digest)
+        })
+        .collect())
 }
 
 enum CommittedBlob {
@@ -272,7 +209,12 @@ enum CommittedBlob {
     Digest(String),
 }
 
-fn git_commit_blobs(git_workdir: &Path, sha: &str) -> Result<BTreeMap<String, CommittedBlob>> {
+struct CommittedEntry {
+    mode: u32,
+    blob: CommittedBlob,
+}
+
+fn git_commit_blobs(git_workdir: &Path, sha: &str) -> Result<BTreeMap<String, CommittedEntry>> {
     let repo = git2::Repository::open(git_workdir).context("failed to open Git workdir")?;
     let oid = git2::Oid::from_str(sha).context("snapshot Git SHA is malformed")?;
     let commit = repo
@@ -280,24 +222,46 @@ fn git_commit_blobs(git_workdir: &Path, sha: &str) -> Result<BTreeMap<String, Co
         .context("snapshot Git commit is missing")?;
     let tree = commit.tree().context("snapshot Git tree is missing")?;
     let mut files = BTreeMap::new();
-    tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
-        if entry.kind() == Some(git2::ObjectType::Blob) {
-            if let Some(name) = entry.name() {
-                if let Ok(blob) = repo.find_blob(entry.id()) {
-                    let path = format!("{dir}{name}");
+    fn walk(
+        repo: &git2::Repository,
+        tree: &git2::Tree<'_>,
+        prefix: &str,
+        files: &mut BTreeMap<String, CommittedEntry>,
+    ) -> Result<()> {
+        for entry in tree {
+            let name = entry
+                .name()
+                .context("snapshot Git tree has a non-UTF8 path")?;
+            let path = format!("{prefix}{name}");
+            match entry.filemode() {
+                0o040000 => walk(
+                    repo,
+                    &repo.find_tree(entry.id())?,
+                    &format!("{path}/"),
+                    files,
+                )?,
+                0o100644 | 0o100755 => {
+                    let blob = repo.find_blob(entry.id())?;
                     let content = blob.content();
                     let record = if content.len() <= 512 {
                         CommittedBlob::Inline(content.to_vec())
                     } else {
                         CommittedBlob::Digest(hex::encode(Sha256::digest(content)))
                     };
-                    files.insert(path, record);
+                    files.insert(
+                        path,
+                        CommittedEntry {
+                            mode: entry.filemode() as u32,
+                            blob: record,
+                        },
+                    );
                 }
+                mode => bail!("unsupported committed snapshot entry '{path}' mode {mode:o}"),
             }
         }
-        git2::TreeWalkResult::Ok
-    })
-    .context("failed to walk snapshot Git tree")?;
+        Ok(())
+    }
+    walk(&repo, &tree, "", &mut files)?;
     Ok(files)
 }
 
@@ -308,7 +272,11 @@ fn committed_blob_matches(
     expected_size: u64,
     blob: &CommittedBlob,
 ) -> bool {
-    match policy.evaluate(path, expected_size) {
+    match if path == ".gitattributes" {
+        FilePolicyDecision::Allow
+    } else {
+        policy.evaluate(path, expected_size)
+    } {
         FilePolicyDecision::LfsTrack { .. } => {
             let CommittedBlob::Inline(bytes) = blob else {
                 return false;
@@ -334,22 +302,29 @@ pub fn verify_commit_matches_projection(
     sha: &str,
     policy: &FilePolicy,
 ) -> Result<VerificationResult> {
-    let expected = content_index(projected_root)?;
+    let projected =
+        crate::import::independent_export_projection(projected_root, git_workdir, policy)?;
+    let expected: BTreeMap<_, _> = projected
+        .entries
+        .into_iter()
+        .filter_map(|(path, entry)| match entry {
+            crate::import::ManifestEntry::File { sha256, size, mode } => {
+                Some((path, (sha256, size, mode)))
+            }
+            _ => None,
+        })
+        .collect();
     let actual = git_commit_blobs(git_workdir, sha)?;
     let mut result = VerificationResult {
         files_checked: expected.len() as u64,
         ..VerificationResult::default()
     };
-    for (path, hash) in &expected {
-        let size = match std::fs::metadata(projected_root.join(path)) {
-            Ok(meta) => meta.len(),
-            Err(_) => {
-                result.mismatches.push(path.clone());
-                continue;
-            }
-        };
+    for (path, (hash, size, mode)) in &expected {
         match actual.get(path) {
-            Some(blob) if committed_blob_matches(policy, path, hash, size, blob) => {
+            Some(entry)
+                if (entry.mode & 0o100 != 0) == (mode & 0o100 != 0)
+                    && committed_blob_matches(policy, path, hash, *size, &entry.blob) =>
+            {
                 result.files_matched += 1;
             }
             Some(_) => result.mismatches.push(path.clone()),
@@ -377,22 +352,20 @@ pub fn verify_commit_matches_projection(
     Ok(result)
 }
 
-/// Project the pin into a temp directory for post-commit tree comparison.
+/// Re-export the raw pin for independent post-commit verification. Expected
+/// bytes are never produced by a second run of the materialization copier.
 pub async fn project_snapshot_tree(
     svn: &SvnClient,
-    policy: &FilePolicy,
-    db: &Database,
+    _policy: &FilePolicy,
+    _db: &Database,
     pin: &SnapshotPin,
 ) -> Result<tempfile::TempDir> {
     let export_dir = tempfile::tempdir().context("failed to export snapshot for commit verify")?;
     svn.export("", pin.operative_rev, export_dir.path())
         .await
         .context("failed to export pinned revision for commit verify")?;
-    let projected = tempfile::tempdir().context("failed to create commit-verify projection")?;
-    copy_tree_with_policy(export_dir.path(), projected.path(), policy, db)
-        .context("failed to project pinned tree for commit verify")?;
-    let _ = export_dir;
-    Ok(projected)
+    crate::import::require_supported_export(export_dir.path())?;
+    Ok(export_dir)
 }
 
 pub fn relative_paths(root: &Path) -> Result<Vec<PathBuf>> {
@@ -434,6 +407,89 @@ mod tests {
         let left = content_index(a.path()).unwrap();
         let right = content_index(b.path()).unwrap();
         assert_ne!(left.get("keep.txt"), right.get("keep.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rs88_production_verifier_refuses_double_copy_canary_and_unsafe_actual_tree() {
+        use std::os::unix::fs::symlink;
+        let source = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let policy = FilePolicy::new(0, vec![]);
+        std::fs::write(outside.path().join("secret"), b"outside-root-canary").unwrap();
+        symlink(outside.path().join("secret"), source.path().join("escape")).unwrap();
+        // Model the historic double-copy bug using independently specified
+        // canary bytes. Production expectations must reject the raw source.
+        std::fs::write(dest.path().join("escape"), b"outside-root-canary").unwrap();
+        assert!(
+            crate::import::verify_export_projection(source.path(), dest.path(), &policy).is_err()
+        );
+        std::fs::remove_file(source.path().join("escape")).unwrap();
+        std::fs::write(source.path().join("escape"), b"inside").unwrap();
+        std::fs::remove_file(dest.path().join("escape")).unwrap();
+        symlink(outside.path().join("secret"), dest.path().join("escape")).unwrap();
+        assert!(
+            crate::import::verify_export_projection(source.path(), dest.path(), &policy).is_err()
+        );
+        assert!(content_index(dest.path()).is_err());
+        assert_eq!(
+            std::fs::read(outside.path().join("secret")).unwrap(),
+            b"outside-root-canary"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rs88_committed_verifier_checks_modes_and_rejects_symlink_blobs() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let plain = FilePolicy::new(0, vec![]);
+        std::fs::write(source.path().join("run"), b"same").unwrap();
+        std::fs::set_permissions(
+            source.path().join("run"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let sha = commit_files(dest.path(), &[("run", b"same")]);
+        assert!(
+            verify_commit_matches_projection(source.path(), dest.path(), &sha, &plain).is_err()
+        );
+        std::fs::set_permissions(
+            source.path().join("run"),
+            std::fs::Permissions::from_mode(0o654),
+        )
+        .unwrap();
+        assert!(verify_commit_matches_projection(source.path(), dest.path(), &sha, &plain).is_ok());
+        let repo = git2::Repository::open(dest.path()).unwrap();
+        std::fs::remove_file(dest.path().join("run")).unwrap();
+        symlink("same", dest.path().join("run")).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("run")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo
+            .find_commit(git2::Oid::from_str(&sha).unwrap())
+            .unwrap();
+        let sig = git2::Signature::now("Snapshot", "snapshot@example.com").unwrap();
+        let next = repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "unsupported symlink",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        assert!(verify_commit_matches_projection(
+            source.path(),
+            dest.path(),
+            &next.to_string(),
+            &plain
+        )
+        .is_err());
     }
 
     #[test]
@@ -480,9 +536,17 @@ mod tests {
         std::fs::write(projected.path().join("note.txt"), b"ok\n").unwrap();
 
         let good = tempfile::tempdir().unwrap();
+        git2::Repository::init(good.path()).unwrap();
+        crate::lfs::ensure_lfs_tracked(good.path(), &crate::lfs::pattern_for_path("large.bin"))
+            .unwrap();
+        let attributes = std::fs::read(good.path().join(".gitattributes")).unwrap();
         let sha = commit_files(
             good.path(),
-            &[("large.bin", pointer.as_bytes()), ("note.txt", b"ok\n")],
+            &[
+                ("large.bin", pointer.as_bytes()),
+                ("note.txt", b"ok\n"),
+                (".gitattributes", &attributes),
+            ],
         );
         assert!(
             verify_commit_matches_projection(projected.path(), good.path(), &sha, &policy).is_ok()
@@ -501,9 +565,16 @@ mod tests {
 
         let wrong = pointer.replace("size 19", "size 18");
         let bad = tempfile::tempdir().unwrap();
+        git2::Repository::init(bad.path()).unwrap();
+        crate::lfs::ensure_lfs_tracked(bad.path(), &crate::lfs::pattern_for_path("large.bin"))
+            .unwrap();
         let bad_sha = commit_files(
             bad.path(),
-            &[("large.bin", wrong.as_bytes()), ("note.txt", b"ok\n")],
+            &[
+                ("large.bin", wrong.as_bytes()),
+                ("note.txt", b"ok\n"),
+                (".gitattributes", &attributes),
+            ],
         );
         assert!(
             verify_commit_matches_projection(projected.path(), bad.path(), &bad_sha, &policy)

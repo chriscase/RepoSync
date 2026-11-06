@@ -1,3 +1,8 @@
+import { ApiError, clientSession, sessionFetch } from './session';
+export { ApiError } from './session';
+import { decodeAuditPage, decodeConflictPage, type ConflictFilters } from './listPagination';
+import { decodeSyncStatus, type StatusObservation } from './statusObservation';
+import type { ErrorObservation, ErrorScope } from './errorAcknowledgement';
 import { buildBranchPairDeleteQuery } from './branchPairDeletion';
 import type { BranchPairRemovalResult } from './branchPairRemoval';
 import type { ManagedRemovalStatus } from './managedRemoval';
@@ -5,7 +10,18 @@ import type { RepoImportMode, SnapshotPin, StartRepoImportRequest } from './impo
 
 const API_BASE = '/api';
 
+export interface RepositorySaveReceipt {
+  version: number;
+  request_id: string;
+  kind: 'create' | 'configuration' | 'credentials';
+  repo_id: string;
+  configuration_updated_at: string;
+  credential_fields: Array<'svn_password' | 'git_token'>;
+  propagated_repositories: number;
+}
+
 export interface SyncStatus {
+  observation?: StatusObservation;
   state: string;
   last_sync_at: string | null;
   last_svn_revision: number | null;
@@ -15,6 +31,7 @@ export interface SyncStatus {
   active_conflicts: number;
   total_errors: number;
   last_error_at: string | null;
+  error_observation: ErrorObservation;
   uptime_secs: number;
 }
 
@@ -32,12 +49,12 @@ export interface Conflict {
   resolved_by: string | null;
   created_at: string;
   resolved_at: string | null;
-  repo_id?: string;
+  repo_id?: string | null;
 }
 
 export interface AuditEntry {
   id: number;
-  repo_id?: string;
+  repo_id?: string | null;
   action: string;
   direction: string | null;
   svn_rev: number | null;
@@ -48,9 +65,15 @@ export interface AuditEntry {
   success: boolean;
 }
 
+export type ConflictListItem = Pick<Conflict,'id'|'file_path'|'conflict_type'|'status'|'svn_revision'|'git_hash'|'created_at'|'resolved_at'|'repo_id'>;
+export interface ConflictPage {
+  items: ConflictListItem[];
+  total:number;page:number;per_page:number;total_pages:number;
+}
+
 export interface AuditListResponse {
   entries: AuditEntry[];
-  total: number;
+  total:number;page:number;per_page:number;total_pages:number;offset:number;
 }
 
 export interface AuthorMapping {
@@ -95,6 +118,16 @@ export interface SyncRecordResponse {
 }
 
 export interface LatePairPlan {
+  review_pin?: string;
+  include_parent?: boolean;
+  result_git_sha?: string | null;
+  result_tree_digest?: string;
+  operation_id?: string | null;
+  observation?: string;
+  updated_at?: string | null;
+  handled_steps?: number;
+  total_steps?: number;
+  action_error?: string;
   mode: string;
   published: boolean;
   admitted: boolean;
@@ -288,33 +321,18 @@ export interface LoginResponse {
 }
 
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const token = localStorage.getItem('session_token');
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-  };
-
-  const res = await fetch(`${API_BASE}${url}`, { ...options, headers });
-  if (res.status === 401) {
-    // Clear credentials and redirect to login
-    localStorage.removeItem('session_token');
-    localStorage.removeItem('user');
-    if (window.location.pathname !== '/login') {
-      window.location.href = '/login';
-    }
-    throw new Error('Session expired — please log in again');
-  }
+  const res = await sessionFetch(`${API_BASE}${url}`, { ...options, headers: { 'Content-Type': 'application/json', ...options?.headers } });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`API error ${res.status}: ${text}`);
+    throw new ApiError(res.status, `API error ${res.status}: ${text}`);
   }
   return res.json();
 }
 
 export const api = {
   getStatus: (repoId?: string) => {
-    const params = repoId ? `?repo_id=${repoId}` : '';
-    return fetchJson<SyncStatus>(`/status${params}`);
+    const params = repoId ? `?repo_id=${encodeURIComponent(repoId)}` : '';
+    return fetchJson<unknown>(`/status${params}`).then(value=>decodeSyncStatus(value,repoId));
   },
 
   getHealth: () => fetchJson<{ ok: boolean }>('/status/health'),
@@ -329,6 +347,13 @@ export const api = {
     return fetchJson<Conflict[]>(`/conflicts${qs ? `?${qs}` : ''}`);
   },
 
+  getConflictsPage: (filters:ConflictFilters) => {
+    const params=new URLSearchParams({page:String(filters.page),per_page:String(filters.perPage)});
+    if(filters.status)params.set('status',filters.status);
+    if(filters.repoId)params.set('repo_id',filters.repoId);
+    return fetchJson<unknown>(`/conflicts?${params}`).then(value=>decodeConflictPage(value,filters));
+  },
+
   getConflict: (id: string) => fetchJson<Conflict>(`/conflicts/${id}`),
 
   resolveConflict: (id: string, resolution: string, mergedContent?: string) =>
@@ -340,29 +365,20 @@ export const api = {
   deferConflict: (id: string) =>
     fetchJson<{ ok: boolean }>(`/conflicts/${id}/defer`, { method: 'POST' }),
 
-  getAuditLog: (limit = 50, page?: number, success?: boolean, repoId?: string) => {
+  getAuditLog: (limit = 50, page?: number, success?: boolean, repoId?: string, action?: string) => {
     const params = new URLSearchParams({ limit: String(limit) });
     if (page !== undefined) params.append('page', String(page));
     if (success !== undefined) params.append('success', String(success));
     if (repoId) params.append('repo_id', repoId);
-    return fetchJson<AuditListResponse>(`/audit?${params.toString()}`);
+    if(action)params.append('action',action);
+    return fetchJson<unknown>(`/audit?${params.toString()}`).then(value=>decodeAuditPage(value,{page:page ?? 1,perPage:limit,success,repoId,action}));
   },
 
-  resetErrors: async (repoId?: string): Promise<{ok: boolean, cleared: number}> => {
-    const token = localStorage.getItem('session_token');
-    const url = repoId
-      ? `${API_BASE}/status/reset-errors?repo_id=${encodeURIComponent(repoId)}`
-      : `${API_BASE}/status/reset-errors`;
-    const res = await fetch(url, {
+  acknowledgeErrors: (scope: ErrorScope, observation: ErrorObservation) =>
+    fetchJson<{ ok: boolean; acknowledged: number }>('/status/acknowledge-errors', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
-    });
-    if (!res.ok) throw new Error('Failed to reset errors');
-    return res.json();
-  },
+      body: JSON.stringify({ scope, observation }),
+    }),
 
   getIdentityMappings: () => fetchJson<AuthorMapping[]>('/config/identity'),
 
@@ -439,8 +455,8 @@ export const api = {
 
   // Repositories (multi-repo)
   getRepos: () => fetchJson<Repository[]>('/repos'),
-  createRepo: (data: Partial<Repository>) =>
-    fetchJson<Repository>('/repos', { method: 'POST', body: JSON.stringify(data) }),
+  createRepo: (data: Partial<Repository>, requestId?: string, signal?: AbortSignal) =>
+    fetchJson<Repository>('/repos', { method: 'POST', signal, body: JSON.stringify({ ...data, save_request_id: requestId }) }),
   startRepoImport: (id: string, body: StartRepoImportRequest = {}) =>
     fetchJson<{
       ok: boolean;
@@ -454,8 +470,8 @@ export const api = {
       body: JSON.stringify(body),
     }),
   getRepo: (id: string) => fetchJson<Repository>(`/repos/${id}`),
-  updateRepo: (id: string, data: Partial<Repository>) =>
-    fetchJson<Repository>(`/repos/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  updateRepo: (id: string, data: Partial<Repository>, options?: { requestId?: string; expectedUpdatedAt?: string; signal?: AbortSignal }) =>
+    fetchJson<Repository>(`/repos/${id}`, { method: 'PUT', signal: options?.signal, body: JSON.stringify({ ...data, save_request_id: options?.requestId, expected_updated_at: options?.expectedUpdatedAt }) }),
   /** Legacy root DELETE — disable only (non-destructive). Prefer `disableRepo`. */
   deleteRepo: (id: string) =>
     fetchJson<{
@@ -477,6 +493,57 @@ export const api = {
       managed_removal: boolean;
     }>(`/repos/${id}/disable`, { method: 'POST' }),
 
+  reviewManagedRemoval: (id: string, options: { delete_git: boolean; delete_svn: boolean }, signal?: AbortSignal) =>
+    fetchJson<import('./managedRemoval').ReviewedRemovalPreview>(`/repos/${id}/removal/review`, { method: 'POST', signal, body: JSON.stringify(options) }),
+
+  approveManagedRemoval: async (id: string, review: import('./managedRemoval').ReviewedRemovalPreview, owner?: { assertCurrent(): void }): Promise<ManagedRemovalStatus> => {
+    const session = clientSession(); const origin = session.snapshot();
+    const journal = await import('./managedRemoval');
+    session.assertCurrent(origin); owner?.assertCurrent();
+    journal.retainPendingRemovalReview(id, review);
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/removal/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${localStorage.getItem('session_token') || ''}` },
+      body: JSON.stringify({ delete_git: review.delete_git, delete_svn: review.delete_svn, review_pin: review.review_pin, request_id: `ui-remove-v2-${review.review_pin}` }),
+    });
+    const body = await res.json() as ManagedRemovalStatus & { error?: string; request_rejected?: boolean };
+    session.assertCurrent(origin);
+    if ((!res.ok && res.status !== 202 && res.status !== 409) || !body.operation_id) {
+      if (res.status === 409 && body.request_rejected === true) journal.clearPendingRemovalReview(id, review.review_pin);
+      throw new Error(body.error || body.message || `API error ${res.status}`);
+    }
+    journal.persistManagedRemovalReceipt(journal.managedRemovalReceiptFromStatus(id, body), true);
+    journal.clearPendingRemovalReview(id, review.review_pin);
+    return body;
+  },
+
+  continueManagedRemoval: async (id: string, operationId: string): Promise<ManagedRemovalStatus> => {
+    const session = clientSession(); const origin = session.snapshot();
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/removal/continue`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${localStorage.getItem('session_token') || ''}` },
+      body: JSON.stringify({ operation_id: operationId }),
+    });
+    const body = await res.json() as ManagedRemovalStatus & { error?: string };
+    if ((!res.ok && res.status !== 202 && res.status !== 409) || !body.operation_id) throw new Error(body.error || body.message || `API error ${res.status}`);
+    if (body.operation_id !== operationId || body.protocol !== 2) throw new Error('Continuation returned a different removal identity');
+    const journal = await import('./managedRemoval'); session.assertCurrent(origin);
+    journal.persistManagedRemovalReceipt(journal.managedRemovalReceiptFromStatus(id, body), true);
+    return body;
+  },
+
+  lookupRemovalRequest: async (id: string, reviewPin: string): Promise<ManagedRemovalStatus | null> => {
+    const params = new URLSearchParams({ request_id: `ui-remove-v2-${reviewPin}`, review_pin: reviewPin });
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/removal/request?${params}`, {
+      headers: { Authorization: `Bearer ${localStorage.getItem('session_token') || ''}` },
+    });
+    if (res.status === 404) return null;
+    const body = await res.json() as ManagedRemovalStatus & { error?: string };
+    if ((!res.ok && res.status !== 202 && res.status !== 409) || !body.operation_id) throw new Error(body.error || body.message || `API error ${res.status}`);
+    if (body.protocol !== 2 || body.request_id !== `ui-remove-v2-${reviewPin}` || body.review_pin !== reviewPin) throw new Error('Removal lookup returned a different request identity');
+    return body;
+  },
+
   removeManagedRepo: async (
     id: string,
     remoteOpts?: { delete_git?: boolean; delete_svn?: boolean },
@@ -487,7 +554,7 @@ export const api = {
       delete_git: String(remoteOpts?.delete_git ?? false),
       delete_svn: String(remoteOpts?.delete_svn ?? false),
     });
-    const res = await fetch(`${API_BASE}/repos/${id}/remove?${params}`, {
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/remove?${params}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -526,7 +593,7 @@ export const api = {
     message: string;
   }> => {
     const token = localStorage.getItem('session_token');
-    const res = await fetch(`${API_BASE}/repos/${id}/restore`, {
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/restore`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -562,7 +629,7 @@ export const api = {
 
   getRemovalDependencyPreview: async (id: string): Promise<import('./managedRemoval').RemovalPreviewResponse> => {
     const token = localStorage.getItem('session_token');
-    const res = await fetch(`${API_BASE}/repos/${id}/removal/preview`, {
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/removal/preview`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     const text = await res.text();
@@ -588,7 +655,7 @@ export const api = {
     const params = operationId
       ? `?operation_id=${encodeURIComponent(operationId)}`
       : '';
-    const res = await fetch(`${API_BASE}/repos/${id}/removal${params}`, {
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/removal${params}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (res.status === 404) {
@@ -606,6 +673,11 @@ export const api = {
     return body;
   },
   createBranchPair: (repoId: string, data: {
+    reconciliation?: boolean;
+    include_parent?: boolean;
+    review_pin?: string;
+    operation_id?: string;
+    action?: 'preview' | 'publish' | 'status' | 'resume' | 'cancel';
     svn_branch: string;
     git_branch: string;
     skip_import?: boolean;
@@ -636,7 +708,7 @@ export const api = {
   ): Promise<BranchPairRemovalResult> => {
     const params = buildBranchPairDeleteQuery(opts);
     const token = localStorage.getItem('session_token');
-    const res = await fetch(`${API_BASE}/repos/${repoId}/branch-pair?${params.toString()}`, {
+    const res = await sessionFetch(`${API_BASE}/repos/${repoId}/branch-pair?${params.toString()}`, {
       method: 'DELETE',
       headers: {
         'Content-Type': 'application/json',
@@ -653,14 +725,6 @@ export const api = {
       }
     }
     const message = body.error || body.message || text || `API error ${res.status}`;
-    if (res.status === 401 && !/admin access required/i.test(message)) {
-      localStorage.removeItem('session_token');
-      localStorage.removeItem('user');
-      if (window.location.pathname !== '/login') {
-        window.location.href = '/login';
-      }
-      throw new Error(message || 'Session expired — please log in again');
-    }
     if (!res.ok) {
       throw new Error(message);
     }
@@ -694,38 +758,47 @@ export const api = {
     ),
   getRepoCredentials: (id: string) =>
     fetchJson<{ svn_password_set: boolean; git_token_set: boolean }>(`/repos/${id}/credentials`),
-  saveRepoCredentials: (id: string, data: { svn_password?: string; git_token?: string }) =>
-    fetchJson<{ ok: boolean }>(`/repos/${id}/credentials`, {
-      method: 'POST',
-      body: JSON.stringify(data),
+  getRepoSaveRequest: (requestId: string, repoId?: string, signal?: AbortSignal) =>
+    fetchJson<RepositorySaveReceipt>(repoId
+      ? `/repos/${encodeURIComponent(repoId)}/save-requests/${encodeURIComponent(requestId)}`
+      : `/repository-save-requests/${encodeURIComponent(requestId)}`, { signal }),
+
+  saveRepoCredentials: (id: string, data: { svn_password?: string; git_token?: string }, requestId?: string, expectedUpdatedAt?: string, signal?: AbortSignal) =>
+    fetchJson<{ ok: boolean; save_receipt: RepositorySaveReceipt }>(`/repos/${id}/credentials`, {
+      method: 'POST', signal,
+      body: JSON.stringify({ ...data, save_request_id: requestId, expected_updated_at: expectedUpdatedAt }),
     }),
 
   // Auth - public info (no auth required) for login page LDAP hints
   getAuthInfo: async (): Promise<{ ldap_enabled: boolean; ldap_domain: string | null }> => {
-    const res = await fetch(`${API_BASE}/auth/info`);
+    const res = await sessionFetch(`${API_BASE}/auth/info`, {}, false);
     return res.json();
   },
 
   // Auth - multi-user login with real error messages
   login: async (username: string, password: string): Promise<LoginResponse> => {
-    const res = await fetch(`${API_BASE}/auth/login`, {
+    const session = clientSession(); const origin = session.snapshot();
+    const res = await sessionFetch(`${API_BASE}/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
-    });
+    }, false);
     if (!res.ok) {
       const data = await res.json().catch(() => ({ error: 'Login failed' }));
       throw new Error(data.error || `Login failed (${res.status})`);
     }
-    return res.json();
+    const result: LoginResponse = await res.json();
+    session.signIn(result, origin);
+    return result;
   },
 
   logout: () => {
-    const token = localStorage.getItem('session_token');
-    return fetchJson<{ ok: boolean }>('/auth/logout', {
-      method: 'POST',
+    // Local retirement is immediate. A late revocation response cannot clear a new login.
+    const token = clientSession().end();
+    return sessionFetch(`${API_BASE}/auth/logout`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: JSON.stringify({ token: token ?? '' }),
-    });
+    }, false).then(async response => { if (!response.ok) throw new ApiError(response.status, 'Server logout could not be confirmed'); return response.json(); });
   },
 
   getMe: () => fetchJson<User>('/auth/me'),
@@ -849,6 +922,7 @@ export interface WizardSetupConfig {
 }
 
 export interface Repository {
+  save_receipt?: RepositorySaveReceipt;
   id: string;
   name: string;
   parent_id: string | null;

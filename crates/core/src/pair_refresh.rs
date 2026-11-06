@@ -13,6 +13,26 @@ use sha2::{Digest, Sha256};
 use crate::history_inspect::is_full_git_oid;
 use crate::late_pair::VerifiedMapping;
 
+pub mod actor_policy;
+pub(crate) mod engine_checkout;
+pub mod execution;
+pub mod execution_configuration;
+pub mod git_sources;
+mod http_transport;
+pub mod lineage;
+pub mod live_preparation;
+pub mod native_owner;
+pub mod noop;
+pub mod preparation;
+pub mod publication;
+pub mod recovery;
+pub mod service;
+pub mod svn_observation;
+pub mod svn_preparation;
+pub mod svn_sources;
+pub mod svn_visibility;
+pub mod workspace;
+
 /// Policy identity pinned into every preview from this slice.
 pub const POLICY_VERSION: &str = "pair_refresh_preview_v1";
 /// Single existing registration until #63 generation tables exist.
@@ -73,16 +93,8 @@ pub fn svn_path_missing(error: &str) -> bool {
         || error.contains("(not found)")
 }
 
-pub fn branch_svn_url(root: &str, branch: &str) -> String {
-    if branch.is_empty() {
-        root.trim_end_matches('/').to_string()
-    } else {
-        format!(
-            "{}/{}",
-            root.trim_end_matches('/'),
-            branch.trim_start_matches('/')
-        )
-    }
+pub fn branch_svn_url(root: &str, branch: &str) -> Result<String, crate::errors::SvnError> {
+    crate::svn::operand::configured_branch_url(root, branch)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

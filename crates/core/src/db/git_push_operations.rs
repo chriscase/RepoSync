@@ -407,6 +407,10 @@ impl Database {
         intent: GitPushIntent<'_>,
     ) -> Result<GitPushOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+                tx,
+                intent.repo_id,
+            )?;
             crate::writer_fence::require_current(tx)?;
             let active = key("active", intent.repo_id);
             let active_existing = read_value(tx, &active)?;
@@ -560,6 +564,7 @@ impl Database {
         fingerprint: &str,
     ) -> Result<ReconciledGitPush, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
@@ -613,6 +618,7 @@ impl Database {
         observed_git_tree: &str,
     ) -> Result<GitPushOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
@@ -662,6 +668,7 @@ impl Database {
         git_author: &str,
     ) -> Result<GitPushOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
@@ -698,6 +705,7 @@ impl Database {
         F: FnOnce(&mut GitPushOperation) -> Result<(), DatabaseError>,
     {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             let active = key("active", repo_id);
             if read_value(tx, &active)?.as_deref() != Some(op_id) {
@@ -845,7 +853,14 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.set_state("last_git_sha_pair", inbound_cursor).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+            &db.conn(),
+            "pair",
+            inbound_cursor,
+            &now,
+        )
+        .unwrap();
         let op = db.begin_svn_to_git_push(sample_intent()).unwrap();
         assert_eq!(op.state, GitPushOperationState::Running);
         let held = db
@@ -891,7 +906,9 @@ mod tests {
             (3, emitted_tip.into())
         );
         assert_eq!(
-            db.get_state("last_git_sha_pair").unwrap().as_deref(),
+            crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, "pair")
+                .unwrap()
+                .as_deref(),
             Some(inbound_cursor),
             "svn-to-git finalize must preserve scoped inbound git cursor kv"
         );

@@ -79,6 +79,21 @@ impl GitClient {
         })
     }
 
+    /// Open the existing recovery engine cache without credential-sidecar
+    /// migration or any other repair. The sidecar is never loaded as authority.
+    pub fn open_existing_for_pair_refresh_recovery(
+        path: impl AsRef<Path>,
+    ) -> Result<Self, GitError> {
+        let path = path.as_ref();
+        let repo = Repository::open(path)
+            .map_err(|_| GitError::RepositoryNotFound(path.display().to_string()))?;
+        Ok(Self {
+            repo,
+            repo_path: path.to_path_buf(),
+            http_auth_token: RefCell::new(None),
+        })
+    }
+
     /// Initialize a new empty Git repository at `repo_path`.
     pub fn init<P: AsRef<Path>>(repo_path: P) -> Result<Self, GitError> {
         let path = repo_path.as_ref();
@@ -501,7 +516,17 @@ impl GitClient {
         // Build the commit via git CLI with explicit author/committer.
         let author_str = format!("{} <{}>", author_name, author_email);
         let commit_output = std::process::Command::new("git")
-            .args(["commit", "-m", message, "--author", &author_str])
+            .args([
+                "commit",
+                "--file",
+                "-",
+                "--cleanup=verbatim",
+                "--author",
+                &author_str,
+            ])
+            .stdin(std::process::Stdio::from(crate::commit_message::input(
+                message,
+            )?))
             .current_dir(repo_path)
             .env("GIT_COMMITTER_NAME", committer_name)
             .env("GIT_COMMITTER_EMAIL", committer_email)
@@ -1381,5 +1406,44 @@ mod tests {
             .get_file_content_at_commit(&oid1.to_string(), "nonexistent.txt")
             .unwrap();
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn candidate_228_cli_commit_preserves_oversized_verbatim_utf8() {
+        let root = tempfile::tempdir().unwrap();
+        let client = GitClient::init(root.path()).unwrap();
+        client
+            .repo
+            .config()
+            .unwrap()
+            .set_bool("commit.gpgsign", false)
+            .unwrap();
+        std::fs::write(root.path().join("message.txt"), "synthetic content\n").unwrap();
+        let message = format!(
+            "{}\n\n[reposync]\nquotes: '\"\\\n\n",
+            "é中文😀 multiline\n".repeat(16_384)
+        );
+        assert!(message.len() >= 256 * 1024);
+        let oid = client
+            .commit_via_cli(
+                &message,
+                "Fixture User",
+                "fixture@example.invalid",
+                "Fixture User",
+                "fixture@example.invalid",
+            )
+            .unwrap();
+        let commit = client.repo.find_commit(oid).unwrap();
+        assert_eq!(commit.message_bytes(), message.as_bytes());
+        assert!(client
+            .commit_via_cli(
+                "quiet repeat",
+                "Fixture User",
+                "fixture@example.invalid",
+                "Fixture User",
+                "fixture@example.invalid"
+            )
+            .is_err());
+        assert_eq!(client.repo.head().unwrap().target(), Some(oid));
     }
 }

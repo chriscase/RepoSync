@@ -1,0 +1,40 @@
+STDOUT
+
+> reposync-web-ui@0.1.0 test
+> vitest run src/branchPairRemoval.test.ts
+
+
+ RUN  v2.1.9 <fixture>/web-ui
+
+ ❯ src/branchPairRemoval.test.ts (35 tests | 1 failed) 5ms
+   × removalDestination > keeps a surviving parent in place when deleting one of its children 2ms
+     → expected '/repos' to be null
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 34 passed (35)
+   Start at  02:45:28
+   Duration  312ms (transform 20ms, setup 0ms, collect 17ms, tests 5ms, environment 0ms, prepare 31ms)
+
+
+STDERR
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/branchPairRemoval.test.ts > removalDestination > keeps a surviving parent in place when deleting one of its children
+AssertionError: expected '/repos' to be null
+
+- Expected: 
+null
+
++ Received: 
+"/repos"
+
+ ❯ src/branchPairRemoval.test.ts:38:67
+     36| 
+     37|   it('keeps a surviving parent in place when deleting one of its child…
+     38|     expect(removalDestination({ ...viewed, viewedId: 'parent' })).toBe…
+       |                                                                   ^
+     39|     expect(removalDestination({ ...viewed, viewedId: 'parent', parentE…
+     40|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+

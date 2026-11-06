@@ -6,6 +6,7 @@
 
 pub mod auto_reconcile;
 pub mod busy;
+mod commit_message;
 pub mod config;
 pub mod conflict;
 pub mod crypto;

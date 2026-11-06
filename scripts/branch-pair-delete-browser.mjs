@@ -140,6 +140,7 @@ function startMock() {
     ['child-queued', repo('child-queued', 'Queued Child', 'parent-1', 'queued-branch')],
     ['child-delayed', repo('child-delayed', 'Delayed Child', 'parent-1', 'delayed-branch')],
     ['child-warn', repo('child-warn', 'Warn Child', 'parent-1', 'warn-branch')],
+    ['child-stay-warn', repo('child-stay-warn', 'Stay Warn Child', 'parent-1', 'stay-warn-branch')],
     ['child-queued-gone', repo('child-queued-gone', 'Queued Gone Child', 'parent-1', 'queued-gone-branch')],
   ]);
 
@@ -235,8 +236,8 @@ function startMock() {
         return;
       }
       deleted.add(id);
-      const warnings = id === 'child-warn' && deleteGit
-        ? ["failed to delete Git branch 'warn-branch'"]
+      const warnings = ['child-warn', 'child-stay-warn'].includes(id) && deleteGit
+        ? [`failed to delete Git branch '${records.get(id).git_branch}'`]
         : [];
       send(200, { ok: true, message: `Branch pair '${id}' deleted`, warnings });
       return;
@@ -594,6 +595,38 @@ async function runScenarios(uiOrigin, session, mode) {
   await until(async () => !(await evaluate(`!!document.querySelector('[data-testid="branch-pair-row-child-stay"]')`)), 'mock child row removed');
   if ((await pathOf()) !== '/repos/parent-1') throw new Error(`Mock child delete left the parent: ${await pathOf()}`);
   results.push('mock-delete-child-stays-on-parent');
+
+  // Combine the two requirements: list refresh must keep the parent mounted
+  // while the remote-cleanup warning remains visible on that same page.
+  await until(async () => Boolean(await evaluate(`!!document.querySelector('[data-testid="branch-pair-row-child-stay-warn"]')`)), 'warning child listed');
+  const parentHistoryBefore = await send('Page.getNavigationHistory');
+  const parentListReads = () => evaluate(`window.__pairFetches.filter(entry => entry.method === 'GET' && entry.path === '/api/repos/parent-1/branches').length`);
+  const readsBeforeWarning = await parentListReads();
+  await click('delete-child-pair-child-stay-warn');
+  const childWarningDeletesBefore = await confirmDelete('stay-warn-branch', { remote: true });
+  const childWarningDelete = await latestDeleteFor('child-stay-warn', childWarningDeletesBefore);
+  assertDeleteQuery(childWarningDelete.path, { deleteGit: true, deleteSvn: true });
+  const childWarningText = "failed to delete Git branch 'stay-warn-branch'";
+  await until(async () => (await notice()).includes(childWarningText), 'child cleanup warning visible on parent');
+  await until(async () => !(await evaluate(`!!document.querySelector('[data-testid="branch-pair-row-child-stay-warn"]')`)), 'warning child row removed');
+  if ((await parentListReads()) <= readsBeforeWarning) throw new Error('Warning child removal did not refresh the parent list');
+  if ((await pathOf()) !== '/repos/parent-1' || !(await heading()).includes('Parent trunk')) {
+    throw new Error(`Warning child removal left the parent: ${await pathOf()}`);
+  }
+  if (!(await evaluate(`!!document.querySelector('[data-testid="branch-pair-row-child-cancel"]')`))) {
+    throw new Error('Warning child removal lost the surviving sibling');
+  }
+  const parentHistoryAfter = await send('Page.getNavigationHistory');
+  if (JSON.stringify(parentHistoryAfter) !== JSON.stringify(parentHistoryBefore)) {
+    throw new Error('Warning child removal changed parent navigation history');
+  }
+  await pause(5500);
+  const retainedWarning = await notice();
+  if (!retainedWarning.includes('cleanup warnings') || !retainedWarning.includes(childWarningText)) {
+    throw new Error(`Child warning did not survive parent refresh: ${retainedWarning}`);
+  }
+  if ((await pathOf()) !== '/repos/parent-1') throw new Error('Parent polling navigated after warning child removal');
+  results.push('delete-child-with-warnings-stays-on-parent');
 
   await goto('/repos/already-removed');
   await until(async () => Boolean(await evaluate(`!!document.querySelector('[data-testid="repo-not-found"]')`)), 'friendly not-found');

@@ -9,6 +9,71 @@ use super::Database;
 use crate::errors::DatabaseError;
 use crate::models;
 
+/// Explicit acknowledgement scope; absence never means “all”.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ErrorScope {
+    All {},
+    Repository { repo_id: String },
+}
+
+impl ErrorScope {
+    fn repo_id(&self) -> Option<&str> {
+        match self {
+            Self::All {} => None,
+            Self::Repository { repo_id } => Some(repo_id),
+        }
+    }
+}
+
+/// Finite observation boundary, with IDs encoded as strings for JavaScript safety.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorObservation {
+    pub through_id: String,
+    pub observed_at: String,
+}
+
+#[derive(Debug)]
+pub struct ErrorSnapshot {
+    pub count: i64,
+    pub last_error_at: Option<String>,
+    pub observation: ErrorObservation,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ErrorAcknowledgementError {
+    #[error("invalid error observation")]
+    InvalidObservation,
+    #[error("repository not found")]
+    UnknownRepository,
+    #[error(transparent)]
+    Database(#[from] DatabaseError),
+}
+
+// Only versioned, well-formed success events dismiss failures. Unknown or malformed
+// metadata leaves the original failure visible. Original rows are never changed.
+const UNACKNOWLEDGED_ERROR: &str = r#"
+    e.success = 0 AND NOT EXISTS (
+        SELECT 1 FROM audit_log a,
+        json_each(CASE WHEN json_valid(a.details) THEN CASE WHEN json_type(a.details) = 'object' THEN json_array(json(a.details)) ELSE '[]' END ELSE '[]' END) j
+        WHERE a.action = 'errors_acknowledged' AND a.success = 1 AND a.id > e.id
+          AND a.author IS NOT NULL AND length(a.author) > 0
+          AND json_extract(j.value, '$.schema') = 'reposync.error-ack.v1'
+          AND typeof(json_extract(j.value, '$.through_id')) = 'integer'
+          AND json_extract(j.value, '$.through_id') >= 0
+          AND json_extract(j.value, '$.through_id') < a.id
+          AND json_type(j.value, '$.observed_at') = 'text'
+          AND typeof(json_extract(j.value, '$.acknowledged')) = 'integer'
+          AND json_extract(j.value, '$.acknowledged') > 0
+          AND json_extract(j.value, '$.through_id') >= e.id
+          AND julianday(e.created_at) > julianday(json_extract(j.value, '$.observed_at'), '-1 day')
+          AND julianday(e.created_at) <= julianday(json_extract(j.value, '$.observed_at'))
+          AND julianday(a.created_at) >= julianday(json_extract(j.value, '$.observed_at'))
+          AND ((json_extract(j.value, '$.scope') = 'all' AND a.repo_id IS NULL)
+            OR (json_extract(j.value, '$.scope') = 'repository' AND a.repo_id = e.repo_id))
+    )"#;
+
 // ---------------------------------------------------------------------------
 // Domain structs returned by queries
 // ---------------------------------------------------------------------------
@@ -315,51 +380,55 @@ impl Database {
     ) -> Result<String, DatabaseError> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
+        self.transaction(|conn| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold(conn, None)?;
+            conn.execute(
+                "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
              base_content, svn_rev, git_sha, status, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'detected', ?9)",
-            params![
-                id,
-                file_path,
-                conflict_type,
-                svn_content,
-                git_content,
-                base_content,
-                svn_rev,
-                git_sha,
-                now
-            ],
-        )?;
-        debug!(id = %id, file_path, conflict_type, "inserted conflict");
-        Ok(id)
+                params![
+                    id,
+                    file_path,
+                    conflict_type,
+                    svn_content,
+                    git_content,
+                    base_content,
+                    svn_rev,
+                    git_sha,
+                    now
+                ],
+            )?;
+            debug!(id = %id, file_path, conflict_type, "inserted conflict");
+            Ok(id)
+        })
     }
 
     /// Insert a conflict from a model struct.
     pub fn insert_conflict(&self, conflict: &models::Conflict) -> Result<String, DatabaseError> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
+        self.transaction(|conn| {
+            Self::require_conflict_scope_refresh_quiet(conn, conflict.repo_id.as_deref())?;
+            conn.execute(
+                "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
              base_content, svn_rev, git_sha, status, created_at, repo_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                conflict.id,
-                conflict.file_path,
-                conflict.conflict_type,
-                conflict.svn_content,
-                conflict.git_content,
-                conflict.base_content,
-                conflict.svn_revision,
-                conflict.git_hash,
-                conflict.status,
-                now,
-                conflict.repo_id
-            ],
-        )?;
-        debug!(id = %conflict.id, file_path = %conflict.file_path, "inserted conflict");
-        Ok(conflict.id.clone())
+                params![
+                    conflict.id,
+                    conflict.file_path,
+                    conflict.conflict_type,
+                    conflict.svn_content,
+                    conflict.git_content,
+                    conflict.base_content,
+                    conflict.svn_revision,
+                    conflict.git_hash,
+                    conflict.status,
+                    now,
+                    conflict.repo_id
+                ],
+            )?;
+            debug!(id = %conflict.id, file_path = %conflict.file_path, "inserted conflict");
+            Ok(conflict.id.clone())
+        })
     }
 
     /// Conflict statuses that must block SVN/Git apply in team mode.
@@ -464,6 +533,7 @@ impl Database {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            Self::require_conflict_scope_refresh_quiet(&conn, conflict.repo_id.as_deref())?;
             let existing: Option<(String, String)> = conn
                 .query_row(
                     "SELECT id, status FROM conflicts
@@ -631,6 +701,65 @@ impl Database {
         Ok(entries)
     }
 
+    /// Raw conflict list page: filters precede pagination; count and rows share a read snapshot.
+    pub fn list_conflict_page(
+        &self,
+        status: Option<&str>,
+        repo_id: Option<&str>,
+        pagination: &models::Pagination,
+    ) -> Result<models::PaginatedResult<ConflictEntry>, DatabaseError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let predicates = "(?1 IS NULL OR status = ?1) AND (?2 IS NULL OR repo_id = ?2)";
+        let total: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM conflicts WHERE {predicates}"),
+            params![status, repo_id],
+            |row| row.get(0),
+        )?;
+        let page = pagination.page.max(1);
+        let per_page = pagination.per_page.max(1);
+        let offset = i64::from(page - 1)
+            .checked_mul(i64::from(per_page))
+            .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, i64::MAX))?;
+        let items = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id, file_path, conflict_type, svn_content, git_content, base_content,
+                 svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at, repo_id
+                 FROM conflicts WHERE {predicates} ORDER BY created_at DESC, id DESC LIMIT ?3 OFFSET ?4"
+            ))?;
+            let rows = stmt.query_map(params![status, repo_id, per_page, offset], |row| {
+                Ok(ConflictEntry {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    conflict_type: row.get(2)?,
+                    svn_content: row.get(3)?,
+                    git_content: row.get(4)?,
+                    base_content: row.get(5)?,
+                    svn_rev: row.get(6)?,
+                    git_sha: row.get(7)?,
+                    status: row.get(8)?,
+                    resolution: row.get(9)?,
+                    resolved_by: row.get(10)?,
+                    created_at: row.get(11)?,
+                    resolved_at: row.get(12)?,
+                    repo_id: row.get(13)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.commit()?;
+        let total = total as u64;
+        let total_pages = u32::try_from(total.div_ceil(u64::from(per_page)))
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, total as i64))?;
+        Ok(models::PaginatedResult {
+            items,
+            total,
+            page,
+            per_page,
+            total_pages,
+        })
+    }
+
     /// List conflicts with pagination support for the web layer.
     pub fn list_conflicts_paginated(
         &self,
@@ -647,92 +776,35 @@ impl Database {
         repo_id: Option<&str>,
         pagination: &models::Pagination,
     ) -> Result<models::PaginatedResult<models::WebConflict>, DatabaseError> {
-        let conn = self.conn();
-
-        // Build WHERE clause dynamically
-        let mut where_clauses: Vec<String> = Vec::new();
-        let mut count_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(s) = status {
-            where_clauses.push(format!("status = ?{}", count_params.len() + 1));
-            count_params.push(Box::new(s.to_string()));
-        }
-        if let Some(r) = repo_id {
-            where_clauses.push(format!("repo_id = ?{}", count_params.len() + 1));
-            count_params.push(Box::new(r.to_string()));
-        }
-        let where_sql = if where_clauses.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", where_clauses.join(" AND "))
-        };
-
-        // Count total
-        let count_param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            count_params.iter().map(|p| p.as_ref()).collect();
-        let total: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM conflicts{}", where_sql),
-            count_param_refs.as_slice(),
-            |row| row.get(0),
-        )?;
-
-        let per_page = pagination.per_page.max(1);
-        let total_pages = ((total as u64).saturating_add(per_page as u64 - 1)) / per_page as u64;
-        let offset = ((pagination.page.max(1) - 1) as i64) * per_page as i64;
-
-        // Build the SELECT with the same WHERE plus LIMIT/OFFSET
-        let mut bound_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(s) = status {
-            bound_params.push(Box::new(s.to_string()));
-        }
-        if let Some(r) = repo_id {
-            bound_params.push(Box::new(r.to_string()));
-        }
-        bound_params.push(Box::new(per_page as i64));
-        bound_params.push(Box::new(offset));
-
-        let sql = format!(
-            "SELECT id, file_path, conflict_type, svn_content, git_content, base_content,
-             svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at, repo_id
-             FROM conflicts{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
-            where_sql,
-            bound_params.len() - 1,
-            bound_params.len()
-        );
-
-        let mut stmt = conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            bound_params.iter().map(|p| p.as_ref()).collect();
-        let items = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                let created_at_str: String = row.get(11)?;
-                let resolved_at_str: Option<String> = row.get(12)?;
-                Ok(models::WebConflict {
-                    id: row.get(0)?,
-                    file_path: row.get(1)?,
-                    conflict_type: row.get(2)?,
-                    svn_content: row.get(3)?,
-                    git_content: row.get(4)?,
-                    base_content: row.get(5)?,
-                    diff: None,
-                    svn_revision: row.get(6)?,
-                    git_hash: row.get(7)?,
-                    status: row.get(8)?,
-                    resolution: row.get(9)?,
-                    resolved_content: None,
-                    resolved_by: row.get(10)?,
-                    detected_at: parse_datetime(&created_at_str),
-                    resolved_at: resolved_at_str.as_deref().map(parse_datetime),
-                    repo_id: row.get(13)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
+        let page = self.list_conflict_page(status, repo_id, pagination)?;
+        let items = page
+            .items
+            .into_iter()
+            .map(|c| models::WebConflict {
+                id: c.id,
+                file_path: c.file_path,
+                conflict_type: c.conflict_type,
+                svn_content: c.svn_content,
+                git_content: c.git_content,
+                base_content: c.base_content,
+                diff: None,
+                svn_revision: c.svn_rev,
+                git_hash: c.git_sha,
+                status: c.status,
+                resolution: c.resolution,
+                resolved_content: None,
+                resolved_by: c.resolved_by,
+                detected_at: parse_datetime(&c.created_at),
+                resolved_at: c.resolved_at.as_deref().map(parse_datetime),
+                repo_id: c.repo_id,
+            })
+            .collect();
         Ok(models::PaginatedResult {
             items,
-            total: total as u64,
-            page: pagination.page.max(1),
-            per_page,
-            total_pages: total_pages as u32,
+            total: page.total,
+            page: page.page,
+            per_page: page.per_page,
+            total_pages: page.total_pages,
         })
     }
 
@@ -782,21 +854,42 @@ impl Database {
         resolution: &str,
         resolved_by: &str,
     ) -> Result<(), DatabaseError> {
+        self.resolve_conflict_with_content(id, status, resolution, resolved_by, None)
+    }
+
+    /// Resolve and optionally store merged content atomically. A refresh cannot
+    /// be admitted between the status and content writes.
+    pub fn resolve_conflict_with_content(
+        &self,
+        id: &str,
+        status: &str,
+        resolution: &str,
+        resolved_by: &str,
+        content: Option<&str>,
+    ) -> Result<(), DatabaseError> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        let changed = conn.execute(
+        self.transaction(|conn| {
+            Self::require_conflict_refresh_quiet(conn, id)?;
+            let changed = conn.execute(
             "UPDATE conflicts SET status = ?1, resolution = ?2, resolved_by = ?3, resolved_at = ?4
              WHERE id = ?5",
             params![status, resolution, resolved_by, now, id],
         )?;
-        if changed == 0 {
-            return Err(DatabaseError::NotFound {
-                entity: "conflict".into(),
-                id: id.to_string(),
-            });
-        }
-        debug!(id, status, resolution, "resolved conflict");
-        Ok(())
+            if changed == 0 {
+                return Err(DatabaseError::NotFound {
+                    entity: "conflict".into(),
+                    id: id.to_string(),
+                });
+            }
+            if let Some(content) = content {
+                conn.execute(
+                    "UPDATE conflicts SET resolved_content=?1 WHERE id=?2",
+                    params![content, id],
+                )?;
+            }
+            debug!(id, status, resolution, "resolved conflict");
+            Ok(())
+        })
     }
 
     /// Resolve a conflict using a ConflictResolution enum.
@@ -807,11 +900,43 @@ impl Database {
         content: Option<&str>,
         resolved_by: &str,
     ) -> Result<(), DatabaseError> {
-        self.resolve_conflict(id, "resolved", &resolution.to_string(), resolved_by)?;
-        if let Some(c) = content {
-            self.store_resolved_content(id, c)?;
+        self.resolve_conflict_with_content(
+            id,
+            "resolved",
+            &resolution.to_string(),
+            resolved_by,
+            content,
+        )
+    }
+
+    fn require_conflict_refresh_quiet(
+        conn: &rusqlite::Connection,
+        id: &str,
+    ) -> Result<(), DatabaseError> {
+        // Unknown/legacy attribution is a global writer scope. Do not guess
+        // ownership from a pathname while another job holds either identity.
+        let repo: Option<String> = conn
+            .query_row("SELECT repo_id FROM conflicts WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten();
+        Self::require_conflict_scope_refresh_quiet(conn, repo.as_deref())
+    }
+
+    fn require_conflict_scope_refresh_quiet(
+        conn: &rusqlite::Connection,
+        repo_id: Option<&str>,
+    ) -> Result<(), DatabaseError> {
+        // Historical Personal conflict rows used the literal "personal". They
+        // lack a managed registration identity, so conservatively exclude every
+        // held scope rather than treating that label as an unrelated repository.
+        match repo_id.filter(|id| !id.is_empty() && *id != "personal") {
+            Some(id) => {
+                super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(conn, id)
+            }
+            None => super::pair_refresh_operations::require_no_pair_refresh_hold(conn, None),
         }
-        Ok(())
     }
 
     /// Store merged/resolved content for a conflict.
@@ -820,29 +945,33 @@ impl Database {
         conflict_id: &str,
         content: &str,
     ) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        conn.execute(
-            "UPDATE conflicts SET resolved_content = ?1 WHERE id = ?2",
-            params![content, conflict_id],
-        )?;
-        Ok(())
+        self.transaction(|conn| {
+            Self::require_conflict_refresh_quiet(conn, conflict_id)?;
+            conn.execute(
+                "UPDATE conflicts SET resolved_content = ?1 WHERE id = ?2",
+                params![content, conflict_id],
+            )?;
+            Ok(())
+        })
     }
 
     /// Defer a conflict.
     pub fn defer_conflict(&self, id: &str) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        let changed = conn.execute(
-            "UPDATE conflicts SET status = 'deferred' WHERE id = ?1",
-            params![id],
-        )?;
-        if changed == 0 {
-            return Err(DatabaseError::NotFound {
-                entity: "conflict".into(),
-                id: id.to_string(),
-            });
-        }
-        debug!(id, "deferred conflict");
-        Ok(())
+        self.transaction(|conn| {
+            Self::require_conflict_refresh_quiet(conn, id)?;
+            let changed = conn.execute(
+                "UPDATE conflicts SET status = 'deferred' WHERE id = ?1",
+                params![id],
+            )?;
+            if changed == 0 {
+                return Err(DatabaseError::NotFound {
+                    entity: "conflict".into(),
+                    id: id.to_string(),
+                });
+            }
+            debug!(id, "deferred conflict");
+            Ok(())
+        })
     }
 
     /// Count conflicts by status.
@@ -903,11 +1032,14 @@ impl Database {
     pub fn set_watermark(&self, source: &str, value: &str) -> Result<(), DatabaseError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold(&tx, None)?;
+        tx.execute(
             "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![source, value, now],
         )?;
+        tx.commit()?;
         debug!(source, value, "set watermark");
         Ok(())
     }
@@ -931,13 +1063,8 @@ impl Database {
         tx: &rusqlite::Connection,
         sha: &str,
     ) -> Result<(), DatabaseError> {
-        let repo_count: i64 =
-            tx.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
-        if repo_count > 0 {
-            return Err(DatabaseError::Other(
-                "refusing global git_sha watermark while repositories table is non-empty".into(),
-            ));
-        }
+        super::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
+        Self::require_legacy_import_watermarks_available_tx(tx)?;
         let now = Utc::now().to_rfc3339();
         tx.execute(
             "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
@@ -949,6 +1076,26 @@ impl Database {
             value = sha,
             "set watermark in transaction"
         );
+        Ok(())
+    }
+
+    /// Refuse a known checkpoint incompatibility before a legacy import can
+    /// publish. Recheck inside checkpoint storage to account for later drift.
+    pub fn require_legacy_import_watermarks_available(&self) -> Result<(), DatabaseError> {
+        self.transaction(Self::require_legacy_import_watermarks_available_tx)
+    }
+
+    pub(crate) fn require_legacy_import_watermarks_available_tx(
+        tx: &rusqlite::Connection,
+    ) -> Result<(), DatabaseError> {
+        super::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
+        let repo_count: i64 =
+            tx.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+        if repo_count > 0 {
+            return Err(DatabaseError::Other(
+                "refusing global git_sha watermark while repositories table is non-empty".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1080,6 +1227,50 @@ impl Database {
         Ok(entries)
     }
 
+    /// Filtered audit rows and matching total from one read transaction; no evidence is changed.
+    pub fn list_audit_log_filtered(
+        &self,
+        repo_id: Option<&str>,
+        success: Option<bool>,
+        action: Option<&str>,
+        limit: u32,
+        offset: u64,
+    ) -> Result<(Vec<AuditLogEntry>, u64), DatabaseError> {
+        let offset = i64::try_from(offset)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, i64::MAX))?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let predicates = "(?1 IS NULL OR repo_id = ?1) AND (?2 IS NULL OR (success != 0) = ?2) AND (?3 IS NULL OR action = ?3)";
+        let total: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM audit_log WHERE {predicates}"),
+            params![repo_id, success, action],
+            |row| row.get(0),
+        )?;
+        let entries = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id, action, direction, svn_rev, git_sha, author, details, created_at, success, repo_id
+                 FROM audit_log WHERE {predicates} ORDER BY id DESC LIMIT ?4 OFFSET ?5"
+            ))?;
+            let rows = stmt.query_map(params![repo_id, success, action, limit, offset], |row| {
+                Ok(AuditLogEntry {
+                    id: row.get(0)?,
+                    action: row.get(1)?,
+                    direction: row.get(2)?,
+                    svn_rev: row.get(3)?,
+                    git_sha: row.get(4)?,
+                    author: row.get(5)?,
+                    details: row.get(6)?,
+                    created_at: row.get(7)?,
+                    success: row.get::<_, i32>(8)? != 0,
+                    repo_id: row.get(9)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.commit()?;
+        Ok((entries, total as u64))
+    }
+
     /// List audit entries with web-layer types (for the web API).
     pub fn list_audit_entries(
         &self,
@@ -1189,14 +1380,128 @@ impl Database {
         Ok(entries)
     }
 
-    /// Count audit entries that represent failures in the last 24 hours.
+    /// Count unacknowledged failures in the rolling 24-hour window (also used by CLI).
     pub fn count_errors(&self) -> Result<i64, DatabaseError> {
-        let conn = self.conn();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM audit_log WHERE success = 0 AND created_at > datetime('now', '-24 hours')",
-            [],
+        Ok(self.error_snapshot(&ErrorScope::All {})?.count)
+    }
+
+    /// Read count, active timestamp and acknowledgement boundary under one connection lock.
+    pub fn error_snapshot(&self, scope: &ErrorScope) -> Result<ErrorSnapshot, DatabaseError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let observed_at = Utc::now().to_rfc3339();
+        let sql = format!(
+            "SELECT COUNT(*), strftime('%Y-%m-%dT%H:%M:%fZ', MAX(julianday(e.created_at))) FROM audit_log e WHERE {UNACKNOWLEDGED_ERROR}
+             AND (?1 IS NULL OR e.repo_id = ?1)
+             AND julianday(e.created_at) > julianday(?2, '-1 day')
+             AND julianday(e.created_at) <= julianday(?2)"
+        );
+        let (count, last_error_at) =
+            tx.query_row(&sql, params![scope.repo_id(), observed_at], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        let through_id: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM audit_log WHERE ?1 IS NULL OR repo_id = ?1",
+            params![scope.repo_id()],
             |row| row.get(0),
         )?;
+        tx.commit()?;
+        Ok(ErrorSnapshot {
+            count,
+            last_error_at,
+            observation: ErrorObservation {
+                through_id: through_id.to_string(),
+                observed_at,
+            },
+        })
+    }
+
+    /// Append acknowledgement metadata atomically. No failure, cumulative repository
+    /// counter, sync checkpoint or hold is updated. A retry with the same observation
+    /// cannot dismiss later arrivals and does not append another event.
+    pub fn acknowledge_errors(
+        &self,
+        scope: &ErrorScope,
+        observation: &ErrorObservation,
+        actor: &str,
+    ) -> Result<i64, ErrorAcknowledgementError> {
+        use ErrorAcknowledgementError as AckError;
+        let through_id: i64 = observation
+            .through_id
+            .parse()
+            .map_err(|_| AckError::InvalidObservation)?;
+        let observed = DateTime::parse_from_rfc3339(&observation.observed_at)
+            .map_err(|_| AckError::InvalidObservation)?;
+        let now = Utc::now();
+        if through_id < 0
+            || through_id.to_string() != observation.through_id
+            || observed > now
+            || actor.is_empty()
+            || scope.repo_id().is_some_and(str::is_empty)
+        {
+            return Err(AckError::InvalidObservation);
+        }
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(DatabaseError::from)?;
+        if let Some(repo_id) = scope.repo_id() {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM repositories WHERE id = ?1)",
+                    [repo_id],
+                    |row| row.get(0),
+                )
+                .map_err(DatabaseError::from)?;
+            if !exists {
+                return Err(AckError::UnknownRepository);
+            }
+        }
+        let maximum: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM audit_log WHERE ?1 IS NULL OR repo_id = ?1",
+                params![scope.repo_id()],
+                |row| row.get(0),
+            )
+            .map_err(DatabaseError::from)?;
+        if through_id > maximum {
+            return Err(AckError::InvalidObservation);
+        }
+        let sql = format!(
+            "SELECT COUNT(*) FROM audit_log e WHERE {UNACKNOWLEDGED_ERROR}
+            AND (?1 IS NULL OR e.repo_id = ?1) AND e.id <= ?2
+            AND julianday(e.created_at) > julianday(?3, '-1 day')
+            AND julianday(e.created_at) <= julianday(?3)
+            AND julianday(e.created_at) > julianday(?4, '-1 day')"
+        );
+        let count: i64 = tx
+            .query_row(
+                &sql,
+                params![
+                    scope.repo_id(),
+                    through_id,
+                    observation.observed_at,
+                    now.to_rfc3339()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(DatabaseError::from)?;
+        if count > 0 {
+            let details = serde_json::json!({
+                "schema": "reposync.error-ack.v1",
+                "scope": if scope.repo_id().is_some() { "repository" } else { "all" },
+                "through_id": through_id, "observed_at": observation.observed_at,
+                "acknowledged": count,
+            })
+            .to_string();
+            tx.execute(
+                "INSERT INTO audit_log (action, author, details, created_at, success, repo_id)
+                VALUES ('errors_acknowledged', ?1, ?2, ?3, 1, ?4)",
+                params![actor, details, now.to_rfc3339(), scope.repo_id()],
+            )
+            .map_err(DatabaseError::from)?;
+        }
+        tx.commit().map_err(DatabaseError::from)?;
         Ok(count)
     }
 
@@ -1206,14 +1511,6 @@ impl Database {
         let mut stmt = conn.prepare("SELECT MAX(created_at) FROM audit_log WHERE success = 0")?;
         let result: Option<String> = stmt.query_row([], |row| row.get(0))?;
         Ok(result)
-    }
-
-    /// Delete all error entries from the audit log.
-    /// Returns the number of rows deleted.
-    pub fn clear_errors(&self) -> Result<usize, DatabaseError> {
-        let conn = self.conn();
-        let deleted = conn.execute("DELETE FROM audit_log WHERE success = 0", [])?;
-        Ok(deleted)
     }
 
     // -- kv_state -----------------------------------------------------------
@@ -1234,13 +1531,37 @@ impl Database {
     pub fn set_state(&self, key: &str, value: &str) -> Result<(), DatabaseError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_state_mutation(&tx, key)?;
+        tx.execute(
             "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![key, value, now],
         )?;
+        tx.commit()?;
         debug!(key, value, "set kv_state");
         Ok(())
+    }
+
+    /// Remove a `kv_state` row. Prefer this over holding a raw `conn()` guard while
+    /// computing scoped keys (the connection mutex is not re-entrant).
+    pub fn delete_kv_state(&self, key: &str) -> Result<(), DatabaseError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_state_mutation(&tx, key)?;
+        tx.execute("DELETE FROM kv_state WHERE key = ?1", params![key])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// UUID-scoped inbound Git checkpoint KV key for a managed repository row.
+    pub fn scoped_last_git_sha_kv_key_for_repo(
+        &self,
+        repo_id: &str,
+    ) -> Result<String, DatabaseError> {
+        let conn = self.conn();
+        let scope = crate::db::repo_scope_identity::repository_scope_token(&conn, repo_id)?;
+        Ok(crate::db::repo_scope_identity::last_git_sha_kv_key(&scope))
     }
 
     // -- sync_records -------------------------------------------------------
@@ -1315,10 +1636,13 @@ impl Database {
     /// Delete all sync records for a specific repository (used during reset/reimport).
     pub fn delete_sync_records_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
         let conn = self.conn();
-        let count = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        let count = tx.execute(
             "DELETE FROM sync_records WHERE repo_id = ?1",
             params![repo_id],
         )?;
+        tx.commit()?;
         info!(repo_id, count, "deleted sync_records for repo");
         Ok(count)
     }
@@ -1326,10 +1650,13 @@ impl Database {
     /// Delete all commit_map entries for a specific repository (used during reset/reimport).
     pub fn delete_commit_map_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
         let conn = self.conn();
-        let count = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        let count = tx.execute(
             "DELETE FROM commit_map WHERE repo_id = ?1",
             params![repo_id],
         )?;
+        tx.commit()?;
         info!(repo_id, count, "deleted commit_map entries for repo");
         Ok(count)
     }
@@ -1343,6 +1670,9 @@ impl Database {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+                &conn, repo_id,
+            )?;
             conn.execute(
                 "DELETE FROM sync_records WHERE repo_id = ?1",
                 params![repo_id],
@@ -1351,7 +1681,7 @@ impl Database {
                 "DELETE FROM commit_map WHERE repo_id = ?1",
                 params![repo_id],
             )?;
-            crate::echo_receipt_scope::bump_repo_echo_generation_tx(&conn, repo_id)?;
+            crate::echo_receipt_scope::bump_repo_echo_generation_tx(None, &conn, repo_id)?;
             Ok(())
         })();
         match result {
@@ -1370,15 +1700,13 @@ impl Database {
         }
     }
 
-    /// Count errors in the last 24 hours for a specific repository.
+    /// Count unacknowledged errors in the last 24 hours for one repository.
     pub fn count_errors_for_repo(&self, repo_id: &str) -> Result<i64, DatabaseError> {
-        let conn = self.conn();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM audit_log WHERE success = 0 AND repo_id = ?1 AND created_at > datetime('now', '-24 hours')",
-            params![repo_id],
-            |row| row.get(0),
-        )?;
-        Ok(count)
+        Ok(self
+            .error_snapshot(&ErrorScope::Repository {
+                repo_id: repo_id.into(),
+            })?
+            .count)
     }
 
     /// Get the most recent error timestamp for a specific repository.
@@ -1390,50 +1718,28 @@ impl Database {
         Ok(result)
     }
 
-    /// Delete error entries from audit_log for a specific repository.
-    pub fn clear_errors_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
-        let conn = self.conn();
-        let count = conn.execute(
-            "DELETE FROM audit_log WHERE success = 0 AND repo_id = ?1",
-            params![repo_id],
-        )?;
-        // Also reset the cumulative total_errors column
-        let _ = conn.execute(
-            "UPDATE repositories SET total_errors = 0 WHERE id = ?1",
-            params![repo_id],
-        );
-        info!(repo_id, count, "cleared error entries for repo");
-        Ok(count)
-    }
-
     /// Hard-delete a repository and all associated data from all tables.
     /// Used for branch pair cleanup. Wraps all deletes in a transaction.
     pub fn hard_delete_repository(&self, repo_id: &str) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        conn.execute_batch("BEGIN TRANSACTION")?;
-
-        let tables_with_repo_id = ["sync_records", "commit_map", "conflicts", "audit_log"];
-        for table in &tables_with_repo_id {
-            let sql = format!("DELETE FROM {} WHERE repo_id = ?1", table);
-            match conn.execute(&sql, params![repo_id]) {
-                Ok(n) => debug!(table, repo_id, count = n, "deleted records"),
-                Err(e) => {
-                    debug!(table, repo_id, error = %e, "table may not have repo_id column, skipping")
-                }
+        self.transaction(|conn| {
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                conn, repo_id,
+            )?;
+            crate::db::repo_scope_identity::ensure_repository_removal_ready(conn)?;
+            let tables_with_repo_id = ["sync_records", "commit_map", "conflicts", "audit_log"];
+            for table in &tables_with_repo_id {
+                let sql = format!("DELETE FROM {} WHERE repo_id = ?1", table);
+                let n = conn.execute(&sql, params![repo_id])?;
+                debug!(table, repo_id, count = n, "deleted records");
             }
-        }
 
-        // Clean up kv_state credential entries for this repo
-        let cred_pattern = format!("%_{}", repo_id);
-        let _ = conn.execute(
-            "DELETE FROM kv_state WHERE key LIKE ?1",
-            params![cred_pattern],
-        );
+            for cred_key in super::managed_remove::owned_secret_keys(repo_id) {
+                conn.execute("DELETE FROM kv_state WHERE key = ?1", params![cred_key])?;
+            }
 
-        // Delete the repository row itself
-        conn.execute("DELETE FROM repositories WHERE id = ?1", params![repo_id])?;
-
-        conn.execute_batch("COMMIT")?;
+            crate::db::repo_scope_identity::delete_repository_registration_row(conn, repo_id)?;
+            Ok(())
+        })?;
         info!(repo_id, "hard-deleted repository and all associated data");
         Ok(())
     }
@@ -1471,6 +1777,7 @@ impl Database {
             "outcome": outcome, "projection": projection,
         });
         crate::echo_receipt_scope::attach_generation_to_receipt(&mut receipt, generation);
+        crate::echo_receipt_scope::attach_scope_to_new_receipt(self, repo_id, &mut receipt)?;
         self.advance_git_watermarks(repo_id, git_sha, Some(receipt))
     }
 
@@ -1488,6 +1795,7 @@ impl Database {
             "target": target,
         });
         crate::echo_receipt_scope::attach_generation_to_receipt(&mut receipt, generation);
+        crate::echo_receipt_scope::attach_scope_to_new_receipt(self, repo_id, &mut receipt)?;
         self.advance_git_watermarks(repo_id, git_sha, Some(receipt))
     }
 
@@ -1517,6 +1825,7 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
         let now = chrono::Utc::now().to_rfc3339();
 
         tx.execute(
@@ -1524,13 +1833,13 @@ impl Database {
             params![frontier_sha, repo_id],
         )?;
 
-        let kv_key = format!("last_git_sha_{}", repo_id);
-        tx.execute(
-            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-            params![kv_key, frontier_sha, now],
-        )?;
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(&tx, repo_id, frontier_sha, &now)?;
 
         if Self::repo_writes_global_git_watermark(&tx, repo_id)? {
+            super::pair_refresh_operations::require_no_pair_refresh_state_mutation(
+                &tx,
+                "last_git_hash",
+            )?;
             tx.execute(
                 "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('last_git_hash', ?1, ?2)",
                 params![frontier_sha, now],
@@ -1577,6 +1886,7 @@ impl Database {
         };
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
 
         // 1. Update repositories table
         tx.execute(
@@ -1584,15 +1894,14 @@ impl Database {
             params![git_sha, repo_id],
         )?;
 
-        // 2. Update per-repo kv_state key
-        let kv_key = format!("last_git_sha_{}", repo_id);
         let now = chrono::Utc::now().to_rfc3339();
-        tx.execute(
-            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-            params![kv_key, git_sha, now],
-        )?;
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(&tx, repo_id, git_sha, &now)?;
 
         if Self::repo_writes_global_git_watermark(&tx, repo_id)? {
+            super::pair_refresh_operations::require_no_pair_refresh_state_mutation(
+                &tx,
+                "last_git_hash",
+            )?;
             tx.execute(
                 "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('last_git_hash', ?1, ?2)",
                 params![git_sha, now],
@@ -1601,12 +1910,13 @@ impl Database {
 
         if let Some(receipt) = no_target {
             let generation = receipt_generation.expect("receipt generation");
-            let key = crate::echo_receipt_scope::handled_git_no_target_state_key(
-                repo_id, generation, git_sha,
-            );
-            tx.execute(
-                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                params![key, receipt.to_string(), now],
+            crate::echo_receipt_scope::write_git_no_target_receipt_kv(
+                &tx,
+                repo_id,
+                generation,
+                git_sha,
+                &receipt.to_string(),
+                &now,
             )?;
         }
         tx.commit()?;
@@ -2447,22 +2757,38 @@ impl Database {
 
     /// Insert a new repository.
     pub fn insert_repository(&self, repo: &models::Repository) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        if super::managed_remove::new_work_blocked(&conn, &repo.id)? {
+        let held_conn = self.conn();
+        let conn = rusqlite::Transaction::new_unchecked(
+            &held_conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        Self::insert_repository_tx(&conn, repo)?;
+        conn.commit()?;
+        debug!(id = %repo.id, name = %repo.name, "inserted repository");
+        Ok(())
+    }
+
+    fn insert_repository_tx(
+        conn: &rusqlite::Connection,
+        repo: &models::Repository,
+    ) -> Result<(), DatabaseError> {
+        super::pair_refresh_operations::require_no_pair_refresh_hold(conn, None)?;
+        if super::managed_remove::new_work_blocked(conn, &repo.id)? {
             return Err(DatabaseError::Other(
                 "stale job cannot recreate a removed repository".into(),
             ));
         }
         if let Some(parent_id) = &repo.parent_id {
-            if super::managed_remove::new_work_blocked(&conn, parent_id)? {
+            if super::managed_remove::new_work_blocked(conn, parent_id)? {
                 return Err(DatabaseError::Other(
                     "parent removal blocks a new child registration".into(),
                 ));
             }
         }
+        let scope_uuid = crate::db::repo_scope_identity::new_scope_uuid();
         conn.execute(
-            "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+            "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url, scope_uuid)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
             params![
                 repo.id,
                 repo.name,
@@ -2492,15 +2818,26 @@ impl Database {
                 repo.blocked_patterns,
                 repo.consecutive_errors,
                 repo.teams_webhook_url,
+                scope_uuid,
             ],
         )?;
-        debug!(id = %repo.id, name = %repo.name, "inserted repository");
+        let repo_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+        if repo_count > 1 {
+            crate::db::repo_scope_identity::revoke_legacy_repo_id_kv_reads(conn)?;
+        }
         Ok(())
     }
 
     /// Get a repository by ID.
     pub fn get_repository(&self, id: &str) -> Result<Option<models::Repository>, DatabaseError> {
-        let conn = self.conn();
+        Self::get_repository_tx(&self.conn(), id)
+    }
+
+    fn get_repository_tx(
+        conn: &rusqlite::Connection,
+        id: &str,
+    ) -> Result<Option<models::Repository>, DatabaseError> {
         let mut stmt = conn.prepare(
             "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url
              FROM repositories WHERE id = ?1",
@@ -2638,13 +2975,27 @@ impl Database {
     /// Update a repository's configuration.
     pub fn update_repository(&self, repo: &models::Repository) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        if super::managed_remove::new_work_blocked(&conn, &repo.id)? {
+        let tx = conn.unchecked_transaction()?;
+        Self::update_repository_tx(&tx, repo)?;
+        tx.commit()?;
+        debug!(id = %repo.id, name = %repo.name, "updated repository");
+        Ok(())
+    }
+
+    fn update_repository_tx(
+        tx: &rusqlite::Connection,
+        repo: &models::Repository,
+    ) -> Result<(), DatabaseError> {
+        super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+            tx, &repo.id,
+        )?;
+        if super::managed_remove::new_work_blocked(tx, &repo.id)? {
             return Err(DatabaseError::Other(
                 "repository removal is in progress or completed; refusing to rewrite the registration"
                     .into(),
             ));
         }
-        let changed = conn.execute(
+        let changed = tx.execute(
             "UPDATE repositories SET name = ?1, svn_url = ?2, svn_branch = ?3, svn_username = ?4, git_provider = ?5, git_api_url = ?6, git_repo = ?7, git_branch = ?8, sync_mode = ?9, poll_interval_secs = ?10, lfs_threshold_mb = ?11, auto_merge = ?12, enabled = ?13, updated_at = ?14, last_svn_rev = ?15, last_git_sha = ?16, last_sync_at = ?17, sync_status = ?18, total_syncs = ?19, total_errors = ?20, parent_id = ?21, allowed_paths = ?22, blocked_patterns = ?23, consecutive_errors = ?24, teams_webhook_url = ?25
              WHERE id = ?26",
             params![
@@ -2682,7 +3033,6 @@ impl Database {
                 id: repo.id.clone(),
             });
         }
-        debug!(id = %repo.id, name = %repo.name, "updated repository");
         Ok(())
     }
 
@@ -2712,10 +3062,13 @@ impl Database {
         git_sha: &str,
     ) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        tx.execute(
             "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
             params![svn_rev, git_sha, repo_id],
         )?;
+        tx.commit()?;
         debug!(
             repo_id,
             svn_rev, git_sha, "updated repo watermark (columns only)"
@@ -2732,6 +3085,7 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
         tx.execute(
             "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
             params![svn_rev, git_sha, repo_id],
@@ -2755,10 +3109,13 @@ impl Database {
     /// Used when skipping metadata-only SVN revisions that produce no git commit.
     pub fn advance_svn_watermark(&self, repo_id: &str, svn_rev: i64) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        tx.execute(
             "UPDATE repositories SET last_svn_rev = MAX(last_svn_rev, ?1) WHERE id = ?2",
             params![svn_rev, repo_id],
         )?;
+        tx.commit()?;
         debug!(
             repo_id,
             svn_rev, "advanced SVN watermark (metadata-only skip)"
@@ -2903,14 +3260,14 @@ impl Database {
     }
 
     pub fn delete_repository(&self, id: &str) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        let changed = conn.execute("DELETE FROM repositories WHERE id = ?1", params![id])?;
-        if changed == 0 {
-            return Err(DatabaseError::NotFound {
-                entity: "repository".into(),
-                id: id.into(),
-            });
-        }
+        self.transaction(|conn| {
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                conn, id,
+            )?;
+            crate::db::repo_scope_identity::ensure_repository_removal_ready(conn)?;
+            crate::db::repo_scope_identity::delete_repository_registration_row(conn, id)?;
+            Ok(())
+        })?;
         debug!(id, "deleted repository");
         Ok(())
     }
@@ -2927,6 +3284,7 @@ impl Database {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold(&conn, None)?;
             conn.execute_batch(
                 "DELETE FROM commit_map;
              DELETE FROM sync_records;
@@ -2939,9 +3297,10 @@ impl Database {
              DELETE FROM kv_state WHERE key LIKE 'last_%' OR key LIKE 'sync_%';",
             )?;
             for repo_id in &repo_ids {
-                crate::echo_receipt_scope::bump_repo_echo_generation_tx(&conn, repo_id)?;
+                crate::echo_receipt_scope::bump_repo_echo_generation_tx(None, &conn, repo_id)?;
             }
             crate::echo_receipt_scope::bump_repo_echo_generation_tx(
+                None,
                 &conn,
                 crate::db::personal_scope::PERSONAL_SCOPE_KEY,
             )?;
@@ -3002,10 +3361,13 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_state_mutation(&tx, key)?;
+        tx.execute(
             "INSERT OR REPLACE INTO encrypted_secrets (key, ciphertext, nonce, updated_at) VALUES (?1, ?2, ?3, ?4)",
             params![key, ciphertext, nonce, now],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3029,7 +3391,10 @@ impl Database {
     /// Delete an encrypted secret by key.
     pub fn delete_secret(&self, key: &str) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        conn.execute("DELETE FROM encrypted_secrets WHERE key = ?1", params![key])?;
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_state_mutation(&tx, key)?;
+        tx.execute("DELETE FROM encrypted_secrets WHERE key = ?1", params![key])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3087,6 +3452,487 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+// #115: request receipts belong to the same SQLite transaction as their effects.
+// They are not execution permits and never contain credential plaintext.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositorySaveKind {
+    Create,
+    Configuration,
+    Credentials,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySaveReceipt {
+    pub version: u8,
+    pub request_id: String,
+    pub kind: RepositorySaveKind,
+    pub repo_id: String,
+    pub configuration_updated_at: String,
+    pub credential_fields: Vec<String>,
+    pub propagated_repositories: usize,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositorySaveRecord {
+    actor: String,
+    receipt: RepositorySaveReceipt,
+    scope_uuid: String,
+    payload_mac: String,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum RepositorySaveError {
+    #[error("invalid save request identity")]
+    InvalidRequest,
+    #[error("save request conflicts with a previous request or changed registration; no write was replayed")]
+    Conflict,
+    #[error("repository or save request not found")]
+    NotFound,
+    #[error(transparent)]
+    Database(#[from] DatabaseError),
+}
+
+const REPOSITORY_SAVE_KEY: &str = "repository-save:v1:mac-key";
+const REPOSITORY_SAVE_PREFIX: &str = "repository-save:v1:request:";
+
+fn repository_save_key(actor: &str, request_id: &str) -> Result<String, RepositorySaveError> {
+    use sha2::{Digest, Sha256};
+    if actor.is_empty()
+        || uuid::Uuid::parse_str(request_id)
+            .ok()
+            .is_none_or(|id| id.to_string() != request_id)
+    {
+        return Err(RepositorySaveError::InvalidRequest);
+    }
+    let encoded = serde_json::to_vec(&(actor, request_id))
+        .map_err(|e| DatabaseError::Other(e.to_string()))?;
+    Ok(format!(
+        "{REPOSITORY_SAVE_PREFIX}{}",
+        hex::encode(Sha256::digest(encoded))
+    ))
+}
+
+fn repository_save_record(
+    tx: &rusqlite::Connection,
+    actor: &str,
+    request_id: &str,
+) -> Result<Option<RepositorySaveRecord>, RepositorySaveError> {
+    let key = repository_save_key(actor, request_id)?;
+    let raw: Option<String> = tx
+        .query_row("SELECT value FROM kv_state WHERE key=?1", [key], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(DatabaseError::from)?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let record: RepositorySaveRecord = serde_json::from_str(&raw)
+        .map_err(|_| DatabaseError::Other("invalid repository save receipt".into()))?;
+    if record.actor != actor
+        || record.receipt.version != 1
+        || record.receipt.request_id != request_id
+        || hex::decode(&record.payload_mac)
+            .ok()
+            .is_none_or(|mac| mac.len() != 32)
+    {
+        return Err(DatabaseError::Other("invalid repository save receipt".into()).into());
+    }
+    let key: Option<String> = tx
+        .query_row(
+            "SELECT value FROM kv_state WHERE key=?1",
+            [REPOSITORY_SAVE_KEY],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(DatabaseError::from)?;
+    if key
+        .as_ref()
+        .and_then(|v| hex::decode(v).ok())
+        .is_none_or(|v| v.len() != 32)
+    {
+        return Err(DatabaseError::Other(
+            "repository save key is missing or invalid; receipts were preserved".into(),
+        )
+        .into());
+    }
+    let scope: Option<String> = tx
+        .query_row(
+            "SELECT scope_uuid FROM repositories WHERE id=?1",
+            [&record.receipt.repo_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(DatabaseError::from)?;
+    if scope.as_deref() != Some(&record.scope_uuid) {
+        return Err(RepositorySaveError::Conflict);
+    }
+    Ok(Some(record))
+}
+
+fn repository_save_mac_key(tx: &rusqlite::Connection) -> Result<[u8; 32], DatabaseError> {
+    use rand::RngCore;
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT value FROM kv_state WHERE key=?1",
+            [REPOSITORY_SAVE_KEY],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        return hex::decode(existing)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| DatabaseError::Other("invalid repository save key".into()));
+    }
+    let receipts: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key LIKE 'repository-save:v1:request:%')",
+        [],
+        |r| r.get(0),
+    )?;
+    if receipts {
+        return Err(DatabaseError::Other(
+            "repository save key is missing; receipts were preserved".into(),
+        ));
+    }
+    let mut key = [0u8; 32];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut key)
+        .map_err(|e| DatabaseError::Other(format!("save key generation failed: {e}")))?;
+    // Dedicated internal receipt key. Do not read/rotate the existing encryption key.
+    tx.execute(
+        "INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)",
+        params![
+            REPOSITORY_SAVE_KEY,
+            hex::encode(key),
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(key)
+}
+
+fn repository_payload_mac(
+    key: &[u8],
+    actor: &str,
+    request_id: &str,
+    kind: RepositorySaveKind,
+    repo_id: Option<&str>,
+    payload: &[u8],
+) -> Result<hmac::Hmac<sha2::Sha256>, DatabaseError> {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key)
+        .map_err(|_| DatabaseError::Other("invalid save MAC key".into()))?;
+    mac.update(b"reposync/repository-save/payload/v1\0");
+    let context = serde_json::to_vec(&(actor, request_id, kind, repo_id))
+        .map_err(|e| DatabaseError::Other(e.to_string()))?;
+    mac.update(&(context.len() as u64).to_be_bytes());
+    mac.update(&context);
+    mac.update(payload);
+    Ok(mac)
+}
+
+impl Database {
+    fn repository_save_once<F>(
+        &self,
+        actor: &str,
+        request_id: &str,
+        kind: RepositorySaveKind,
+        repo_id: Option<&str>,
+        payload: &[u8],
+        effect: F,
+    ) -> Result<RepositorySaveReceipt, RepositorySaveError>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<RepositorySaveReceipt, RepositorySaveError>,
+    {
+        use hmac::Mac;
+        let storage_key = repository_save_key(actor, request_id)?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(DatabaseError::from)?;
+        let prior = repository_save_record(&tx, actor, request_id)?;
+        let key = repository_save_mac_key(&tx)?;
+        let mac = repository_payload_mac(&key, actor, request_id, kind, repo_id, payload)?;
+        if let Some(prior) = prior {
+            if prior.receipt.kind != kind || repo_id.is_some_and(|id| id != prior.receipt.repo_id) {
+                return Err(RepositorySaveError::Conflict);
+            }
+            let expected =
+                hex::decode(&prior.payload_mac).map_err(|_| RepositorySaveError::Conflict)?;
+            mac.verify_slice(&expected)
+                .map_err(|_| RepositorySaveError::Conflict)?;
+            // Known commit, not another write. Later settings/credentials stay untouched.
+            tx.commit().map_err(DatabaseError::from)?;
+            return Ok(prior.receipt);
+        }
+        let payload_mac = hex::encode(mac.finalize().into_bytes());
+        let receipt = effect(&tx)?;
+        let scope_uuid: String = tx
+            .query_row(
+                "SELECT scope_uuid FROM repositories WHERE id=?1",
+                [&receipt.repo_id],
+                |r| r.get(0),
+            )
+            .map_err(DatabaseError::from)?;
+        let record = RepositorySaveRecord {
+            actor: actor.into(),
+            receipt: receipt.clone(),
+            scope_uuid,
+            payload_mac,
+        };
+        let value =
+            serde_json::to_string(&record).map_err(|e| DatabaseError::Other(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)",
+            params![storage_key, value, Utc::now().to_rfc3339()],
+        )
+        .map_err(DatabaseError::from)?;
+        tx.commit().map_err(DatabaseError::from)?;
+        Ok(receipt)
+    }
+
+    /// Read-only historical confirmation before optional mutation preflights. No key,
+    /// registration or receipt is created, and matching never replays a prior effect.
+    pub fn verified_repository_save_receipt(
+        &self,
+        actor: &str,
+        request_id: &str,
+        kind: RepositorySaveKind,
+        repo_id: Option<&str>,
+        payload: &[u8],
+    ) -> Result<Option<RepositorySaveReceipt>, RepositorySaveError> {
+        use hmac::Mac;
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(DatabaseError::from)?;
+        let Some(record) = repository_save_record(&tx, actor, request_id)? else {
+            return Ok(None);
+        };
+        if record.receipt.kind != kind || repo_id.is_some_and(|id| id != record.receipt.repo_id) {
+            return Err(RepositorySaveError::Conflict);
+        }
+        // An existing receipt makes a missing key an error; the helper cannot rotate it.
+        let key = repository_save_mac_key(&tx)?;
+        let mac = repository_payload_mac(&key, actor, request_id, kind, repo_id, payload)?;
+        mac.verify_slice(
+            &hex::decode(&record.payload_mac).map_err(|_| RepositorySaveError::Conflict)?,
+        )
+        .map_err(|_| RepositorySaveError::Conflict)?;
+        tx.commit().map_err(DatabaseError::from)?;
+        Ok(Some(record.receipt))
+    }
+
+    pub fn repository_save_receipt(
+        &self,
+        actor: &str,
+        request_id: &str,
+    ) -> Result<Option<RepositorySaveReceipt>, RepositorySaveError> {
+        Ok(repository_save_record(&self.conn(), actor, request_id)?.map(|r| r.receipt))
+    }
+
+    pub fn create_repository_once(
+        &self,
+        repo: &models::Repository,
+        actor: &str,
+        request_id: &str,
+        payload: &[u8],
+    ) -> Result<RepositorySaveReceipt, RepositorySaveError> {
+        self.repository_save_once(
+            actor,
+            request_id,
+            RepositorySaveKind::Create,
+            None,
+            payload,
+            |tx| {
+                Self::insert_repository_tx(tx, repo)?;
+                Ok(RepositorySaveReceipt {
+                    version: 1,
+                    request_id: request_id.into(),
+                    kind: RepositorySaveKind::Create,
+                    repo_id: repo.id.clone(),
+                    configuration_updated_at: repo.updated_at.clone(),
+                    credential_fields: vec![],
+                    propagated_repositories: 0,
+                })
+            },
+        )
+    }
+
+    pub fn update_repository_once(
+        &self,
+        repo: &models::Repository,
+        actor: &str,
+        request_id: &str,
+        expected_updated_at: Option<&str>,
+        payload: &[u8],
+    ) -> Result<RepositorySaveReceipt, RepositorySaveError> {
+        self.repository_save_once(
+            actor,
+            request_id,
+            RepositorySaveKind::Configuration,
+            Some(&repo.id),
+            payload,
+            |tx| {
+                let current =
+                    Self::get_repository_tx(tx, &repo.id)?.ok_or(RepositorySaveError::NotFound)?;
+                if expected_updated_at.is_some_and(|expected| expected != current.updated_at) {
+                    return Err(RepositorySaveError::Conflict);
+                }
+                let mut updated = repo.clone();
+                // A settings save never restores a stale runtime snapshot over a live cursor.
+                updated.created_by = current.created_by;
+                updated.created_at = current.created_at;
+                updated.parent_id = current.parent_id;
+                updated.last_svn_rev = current.last_svn_rev;
+                updated.last_git_sha = current.last_git_sha;
+                updated.last_sync_at = current.last_sync_at;
+                updated.sync_status = current.sync_status;
+                updated.total_syncs = current.total_syncs;
+                updated.total_errors = current.total_errors;
+                updated.consecutive_errors = current.consecutive_errors;
+                updated.teams_webhook_url = current.teams_webhook_url;
+                Self::update_repository_tx(tx, &updated)?;
+                Ok(RepositorySaveReceipt {
+                    version: 1,
+                    request_id: request_id.into(),
+                    kind: RepositorySaveKind::Configuration,
+                    repo_id: repo.id.clone(),
+                    configuration_updated_at: updated.updated_at,
+                    credential_fields: vec![],
+                    propagated_repositories: 0,
+                })
+            },
+        )
+    }
+
+    /// Preserve the existing explicit-empty revocation and nonempty descendant propagation
+    /// policy, but commit both credential fields and every descendant write atomically.
+    fn save_repository_credentials_tx(
+        tx: &rusqlite::Connection,
+        repo_id: &str,
+        password: Option<&str>,
+        token: Option<&str>,
+        expected_updated_at: Option<&str>,
+    ) -> Result<(Vec<String>, usize, String), RepositorySaveError> {
+        let updated_at: String = tx
+            .query_row(
+                "SELECT updated_at FROM repositories WHERE id=?1",
+                [repo_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(DatabaseError::from)?
+            .ok_or(RepositorySaveError::NotFound)?;
+        if expected_updated_at.is_some_and(|expected| expected != updated_at) {
+            return Err(RepositorySaveError::Conflict);
+        }
+        let mut descendants = vec![];
+        let mut pending =
+            if password.is_some_and(|v| !v.is_empty()) || token.is_some_and(|v| !v.is_empty()) {
+                vec![repo_id.to_owned()]
+            } else {
+                vec![]
+            };
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) {
+                return Err(DatabaseError::Other("credential lineage is cyclic".into()).into());
+            }
+            let mut stmt = tx
+                .prepare("SELECT id FROM repositories WHERE parent_id=?1 ORDER BY id")
+                .map_err(DatabaseError::from)?;
+            for child in stmt
+                .query_map([id], |r| r.get::<_, String>(0))
+                .map_err(DatabaseError::from)?
+            {
+                let child = child.map_err(DatabaseError::from)?;
+                pending.push(child.clone());
+                descendants.push(child);
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut fields = vec![];
+        let mut propagated = std::collections::HashSet::new();
+        for (field, prefix, value) in [
+            ("svn_password", "secret_svn_password", password),
+            ("git_token", "secret_git_token", token),
+        ] {
+            if let Some(value) = value {
+                fields.push(field.into());
+                let targets = std::iter::once(repo_id).chain(
+                    descendants
+                        .iter()
+                        .filter(|_| !value.is_empty())
+                        .map(String::as_str),
+                );
+                for target in targets {
+                    tx.execute("INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![format!("{prefix}_{target}"),value,now]).map_err(DatabaseError::from)?;
+                    if target != repo_id {
+                        propagated.insert(target.to_owned());
+                    }
+                }
+            }
+        }
+        Ok((fields, propagated.len(), updated_at))
+    }
+
+    pub fn save_repository_credentials(
+        &self,
+        repo_id: &str,
+        password: Option<&str>,
+        token: Option<&str>,
+        actor: &str,
+        request_id: Option<&str>,
+        expected_updated_at: Option<&str>,
+    ) -> Result<RepositorySaveReceipt, RepositorySaveError> {
+        if request_id.is_some() && password.is_none() && token.is_none() {
+            return Err(RepositorySaveError::InvalidRequest);
+        }
+        let effect = |tx: &rusqlite::Connection| {
+            let (fields, propagated, updated_at) = Self::save_repository_credentials_tx(
+                tx,
+                repo_id,
+                password,
+                token,
+                expected_updated_at,
+            )?;
+            Ok(RepositorySaveReceipt {
+                version: 1,
+                request_id: request_id.unwrap_or("").into(),
+                kind: RepositorySaveKind::Credentials,
+                repo_id: repo_id.into(),
+                configuration_updated_at: updated_at,
+                credential_fields: fields,
+                propagated_repositories: propagated,
+            })
+        };
+        if let Some(request_id) = request_id {
+            // The request MAC covers credential bytes, but neither plaintext nor an
+            // offline-guessable unkeyed credential digest is stored in a receipt.
+            let payload = serde_json::to_vec(&(password, token, expected_updated_at))
+                .map_err(|e| DatabaseError::Other(e.to_string()))?;
+            self.repository_save_once(
+                actor,
+                request_id,
+                RepositorySaveKind::Credentials,
+                Some(repo_id),
+                &payload,
+                effect,
+            )
+        } else {
+            let mut conn = self.conn();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(DatabaseError::from)?;
+            let receipt = effect(&tx)?;
+            tx.commit().map_err(DatabaseError::from)?;
+            Ok(receipt)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3731,7 +4577,7 @@ mod tests {
 
         db.advance_all_watermarks("repo1", "sha456").unwrap();
 
-        let kv_val = db.get_state("last_git_sha_repo1").unwrap();
+        let kv_val = crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, "repo1").unwrap();
         assert_eq!(kv_val.as_deref(), Some("sha456"));
     }
 
@@ -3763,7 +4609,9 @@ mod tests {
             "team-mode managed repo must not clobber global last_git_hash"
         );
         assert_eq!(
-            db.get_state("last_git_sha_pair").unwrap().as_deref(),
+            crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, "pair")
+                .unwrap()
+                .as_deref(),
             Some("sha7890123456789012345678901234567890")
         );
     }
@@ -3977,5 +4825,574 @@ mod tests {
 
         let state = db.resolve_credential_chain_state("repo_a", "secret_git_token");
         assert_eq!(state, CredentialChainState::not_found());
+    }
+    fn ack_failure(db: &Database, repo: Option<&str>, created: &str) -> i64 {
+        let conn = db.conn();
+        conn.execute("INSERT INTO audit_log (action,direction,svn_rev,git_sha,author,details,created_at,success,repo_id)
+            VALUES ('sync_failed','svn_to_git',42,'original-hash','original-author','operation-id=original; raw failure',?1,0,?2)", params![created,repo]).unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn rs114_scoped_ack_preserves_originals_counters_history_and_later_errors() {
+        let db = setup_db();
+        create_test_repo(&db, "a", "A");
+        create_test_repo(&db, "b", "B");
+        db.conn()
+            .execute("UPDATE repositories SET total_errors=7", [])
+            .unwrap();
+        let now = Utc::now().to_rfc3339();
+        let a = ack_failure(&db, Some("a"), &now);
+        ack_failure(&db, Some("b"), &now);
+        ack_failure(&db, None, &now);
+        let before = db
+            .list_audit_log(100, 0)
+            .unwrap()
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>();
+        let historical_last = db.last_error_at().unwrap();
+        let scope = ErrorScope::Repository {
+            repo_id: "a".into(),
+        };
+        let observed = db.error_snapshot(&scope).unwrap();
+        assert_eq!(observed.count, 1);
+        assert_eq!(
+            db.acknowledge_errors(&scope, &observed.observation, "admin-a")
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.count_errors_for_repo("a").unwrap(), 0);
+        assert_eq!(db.count_errors_for_repo("b").unwrap(), 1);
+        assert_eq!(db.count_errors().unwrap(), 2, "CLI reports active failures");
+        assert_eq!(
+            db.last_error_at().unwrap(),
+            historical_last,
+            "engine retains history"
+        );
+        assert_eq!(db.last_error_at_for_repo("a").unwrap(), Some(now.clone()));
+        assert_eq!(db.get_repository("a").unwrap().unwrap().total_errors, 7);
+        let original = db
+            .list_audit_log(100, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|e| !e.success)
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>();
+        assert_eq!(original, before);
+        let later = ack_failure(&db, Some("a"), &Utc::now().to_rfc3339());
+        assert!(later > a);
+        assert_eq!(
+            db.acknowledge_errors(&scope, &observed.observation, "admin-a")
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.count_errors_for_repo("a").unwrap(), 1);
+        assert_eq!(
+            db.list_audit_log_by_action("errors_acknowledged", 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        let all = db.error_snapshot(&ErrorScope::All {}).unwrap();
+        assert_eq!(
+            db.acknowledge_errors(&ErrorScope::All {}, &all.observation, "admin-b")
+                .unwrap(),
+            3
+        );
+        assert_eq!(db.count_errors().unwrap(), 0);
+        assert!(db
+            .error_snapshot(&ErrorScope::All {})
+            .unwrap()
+            .last_error_at
+            .is_none());
+        assert_eq!(
+            db.list_audit_log(100, 0)
+                .unwrap()
+                .iter()
+                .filter(|e| !e.success)
+                .count(),
+            4
+        );
+        assert_eq!(
+            db.conn()
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            13
+        );
+    }
+
+    #[test]
+    fn rs114_ack_rolling_window_uses_dates_and_ignores_malformed_events() {
+        let db = setup_db();
+        ack_failure(
+            &db,
+            None,
+            &(Utc::now() - chrono::Duration::hours(25)).to_rfc3339(),
+        );
+        ack_failure(
+            &db,
+            None,
+            &(Utc::now() - chrono::Duration::hours(23))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        );
+        ack_failure(&db, None, &Utc::now().to_rfc3339());
+        for details in [
+            "invalid-json",
+            "null",
+            "42",
+            "\"string\"",
+            "[]",
+            "{}",
+            r#"{"schema":"unknown"}"#,
+        ] {
+            db.insert_audit_log(
+                "errors_acknowledged",
+                None,
+                None,
+                None,
+                Some("admin"),
+                Some(details),
+                true,
+            )
+            .unwrap();
+        }
+        let invalid = serde_json::json!({"schema":"reposync.error-ack.v1", "scope":"all",
+            "through_id":9223372036854775808_u64, "observed_at":Utc::now().to_rfc3339(), "acknowledged":2}).to_string();
+        db.insert_audit_log(
+            "errors_acknowledged",
+            None,
+            None,
+            None,
+            Some("admin"),
+            Some(&invalid),
+            true,
+        )
+        .unwrap();
+        assert_eq!(db.count_errors().unwrap(), 2);
+        let observed = db.error_snapshot(&ErrorScope::All {}).unwrap();
+        assert_eq!(
+            db.acknowledge_errors(&ErrorScope::All {}, &observed.observation, "admin")
+                .unwrap(),
+            2
+        );
+        assert_eq!(db.count_errors().unwrap(), 0);
+        assert_eq!(
+            db.list_audit_log(100, 0)
+                .unwrap()
+                .iter()
+                .filter(|e| !e.success)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn rs114_ack_refuses_invalid_boundaries_and_rolls_back_failed_receipt() {
+        let db = setup_db();
+        ack_failure(&db, None, &Utc::now().to_rfc3339());
+        let observation = db.error_snapshot(&ErrorScope::All {}).unwrap().observation;
+        for through_id in ["-1", "01", "+1", "9223372036854775808", "999", ""] {
+            let invalid = ErrorObservation {
+                through_id: through_id.into(),
+                ..observation.clone()
+            };
+            assert!(matches!(
+                db.acknowledge_errors(&ErrorScope::All {}, &invalid, "admin"),
+                Err(ErrorAcknowledgementError::InvalidObservation)
+            ));
+        }
+        let future = ErrorObservation {
+            observed_at: (Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            ..observation.clone()
+        };
+        assert!(db
+            .acknowledge_errors(&ErrorScope::All {}, &future, "admin")
+            .is_err());
+        assert!(matches!(
+            db.acknowledge_errors(
+                &ErrorScope::Repository {
+                    repo_id: "missing".into()
+                },
+                &observation,
+                "admin"
+            ),
+            Err(ErrorAcknowledgementError::UnknownRepository)
+        ));
+        db.conn().execute_batch("CREATE TRIGGER reject_ack BEFORE INSERT ON audit_log WHEN NEW.action='errors_acknowledged' BEGIN SELECT RAISE(ABORT,'injected write failure'); END;").unwrap();
+        assert!(matches!(
+            db.acknowledge_errors(&ErrorScope::All {}, &observation, "admin"),
+            Err(ErrorAcknowledgementError::Database(_))
+        ));
+        assert_eq!(db.count_errors().unwrap(), 1);
+        assert!(db
+            .list_audit_log_by_action("errors_acknowledged", 100)
+            .unwrap()
+            .is_empty());
+    }
+    fn save_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    #[test]
+    fn rs115_create_lost_response_reuses_id_and_never_recreates_or_overwrites() {
+        let db = setup_db();
+        let repo = create_test_repo(&db, "seed", "Seed");
+        let mut desired = repo.clone();
+        desired.id = "repo-first".into();
+        desired.name = "First".into();
+        let request = save_id();
+        let first = db
+            .create_repository_once(&desired, "actor-a", &request, b"same-public-create")
+            .unwrap();
+        desired.id = "repo-retry-unused".into();
+        let replay = db
+            .create_repository_once(&desired, "actor-a", &request, b"same-public-create")
+            .unwrap();
+        assert_eq!(first.repo_id, replay.repo_id);
+        assert!(db.get_repository("repo-retry-unused").unwrap().is_none());
+        assert!(db
+            .create_repository_once(&desired, "actor-a", &request, b"changed-public-create")
+            .is_err());
+        let mut newer = db.get_repository(&first.repo_id).unwrap().unwrap();
+        newer.name = "Later administrator edit".into();
+        db.update_repository(&newer).unwrap();
+        db.create_repository_once(&desired, "actor-a", &request, b"same-public-create")
+            .unwrap();
+        assert_eq!(
+            db.get_repository(&first.repo_id).unwrap().unwrap().name,
+            "Later administrator edit"
+        );
+        assert!(db
+            .repository_save_receipt("actor-b", &request)
+            .unwrap()
+            .is_none());
+        assert_eq!(db.list_repositories().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rs115_configuration_receipt_and_stale_version_preserve_live_cursors() {
+        let db = setup_db();
+        let original = create_test_repo(&db, "a", "A");
+        let mut desired = original.clone();
+        desired.name = "Edited".into();
+        desired.updated_at = "2026-11-03T12:00:00Z".into();
+        db.conn().execute("UPDATE repositories SET last_svn_rev=105,last_git_sha='live',total_syncs=8,total_errors=9 WHERE id='a'",[]).unwrap();
+        let request = save_id();
+        let receipt = db
+            .update_repository_once(
+                &desired,
+                "admin",
+                &request,
+                Some(&original.updated_at),
+                b"edit-a",
+            )
+            .unwrap();
+        let actual = db.get_repository("a").unwrap().unwrap();
+        assert_eq!(actual.name, "Edited");
+        assert_eq!(actual.last_svn_rev, 105);
+        assert_eq!(actual.last_git_sha, "live");
+        assert_eq!(actual.total_syncs, 8);
+        assert_eq!(actual.total_errors, 9);
+        assert!(db
+            .update_repository_once(
+                &desired,
+                "admin",
+                &save_id(),
+                Some(&original.updated_at),
+                b"stale"
+            )
+            .is_err());
+        assert_eq!(
+            db.verified_repository_save_receipt(
+                "admin",
+                &request,
+                RepositorySaveKind::Configuration,
+                Some("a"),
+                b"edit-a"
+            )
+            .unwrap()
+            .unwrap()
+            .configuration_updated_at,
+            receipt.configuration_updated_at
+        );
+        assert!(db
+            .verified_repository_save_receipt(
+                "admin",
+                &request,
+                RepositorySaveKind::Configuration,
+                Some("a"),
+                b"different"
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn rs115_credential_batch_failure_rolls_back_both_fields_and_every_descendant() {
+        let db = setup_db();
+        create_test_repo(&db, "parent", "Parent");
+        let mut child = create_test_repo(&db, "child", "Child");
+        child.parent_id = Some("parent".into());
+        db.update_repository(&child).unwrap();
+        db.set_state("secret_svn_password_parent", "old-svn")
+            .unwrap();
+        db.set_state("secret_git_token_parent", "old-git").unwrap();
+        db.set_state("secret_svn_password_child", "child-svn")
+            .unwrap();
+        db.set_state("secret_git_token_child", "child-git").unwrap();
+        db.set_state("encryption_key", "unchanged-existing-key")
+            .unwrap();
+        db.conn().execute_batch("CREATE TRIGGER reject_child_git BEFORE INSERT ON kv_state WHEN NEW.key='secret_git_token_child' BEGIN SELECT RAISE(ABORT,'injected credential write failure'); END;").unwrap();
+        let request = save_id();
+        assert!(db
+            .save_repository_credentials(
+                "parent",
+                Some("new-svn"),
+                Some("new-git"),
+                "admin",
+                Some(&request),
+                None
+            )
+            .is_err());
+        for (key, value) in [
+            ("secret_svn_password_parent", "old-svn"),
+            ("secret_git_token_parent", "old-git"),
+            ("secret_svn_password_child", "child-svn"),
+            ("secret_git_token_child", "child-git"),
+        ] {
+            assert_eq!(db.get_state(key).unwrap().as_deref(), Some(value));
+        }
+        assert!(db
+            .repository_save_receipt("admin", &request)
+            .unwrap()
+            .is_none());
+        assert!(db.get_state(REPOSITORY_SAVE_KEY).unwrap().is_none());
+        assert_eq!(
+            db.get_state("encryption_key").unwrap().as_deref(),
+            Some("unchanged-existing-key")
+        );
+        db.conn()
+            .execute_batch("DROP TRIGGER reject_child_git")
+            .unwrap();
+        let receipt = db
+            .save_repository_credentials(
+                "parent",
+                Some("new-svn"),
+                Some("new-git"),
+                "admin",
+                Some(&request),
+                None,
+            )
+            .unwrap();
+        assert_eq!(receipt.propagated_repositories, 1);
+        assert_eq!(
+            db.get_state("secret_svn_password_child")
+                .unwrap()
+                .as_deref(),
+            Some("new-svn")
+        );
+        assert_eq!(
+            db.get_state("secret_git_token_parent").unwrap().as_deref(),
+            Some("new-git")
+        );
+    }
+
+    #[test]
+    fn rs115_credential_replay_cannot_overwrite_a_newer_save_or_change_payload() {
+        let db = setup_db();
+        create_test_repo(&db, "a", "A");
+        create_test_repo(&db, "b", "B");
+        let request = save_id();
+        db.save_repository_credentials(
+            "a",
+            Some("synthetic-secret-old"),
+            None,
+            "admin",
+            Some(&request),
+            None,
+        )
+        .unwrap();
+        db.save_repository_credentials(
+            "a",
+            Some("synthetic-secret-new"),
+            None,
+            "admin",
+            Some(&save_id()),
+            None,
+        )
+        .unwrap();
+        db.save_repository_credentials(
+            "a",
+            Some("synthetic-secret-old"),
+            None,
+            "admin",
+            Some(&request),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_state("secret_svn_password_a").unwrap().as_deref(),
+            Some("synthetic-secret-new")
+        );
+        assert!(db
+            .save_repository_credentials(
+                "a",
+                Some("different"),
+                None,
+                "admin",
+                Some(&request),
+                None
+            )
+            .is_err());
+        assert!(db
+            .save_repository_credentials(
+                "b",
+                Some("synthetic-secret-old"),
+                None,
+                "admin",
+                Some(&request),
+                None
+            )
+            .is_err());
+        assert!(db.get_state("secret_svn_password_b").unwrap().is_none());
+        let key = repository_save_key("admin", &request).unwrap();
+        let stored = db.get_state(&key).unwrap().unwrap();
+        assert!(!stored.contains("synthetic-secret-old"));
+        let exposed = serde_json::to_string(
+            &db.repository_save_receipt("admin", &request)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!exposed.contains("secret-old"));
+        assert!(!exposed.contains("payload_mac"));
+    }
+
+    #[test]
+    fn rs115_revocation_and_absence_keep_existing_credential_semantics() {
+        let db = setup_db();
+        create_test_repo(&db, "a", "A");
+        let mut child = create_test_repo(&db, "c", "C");
+        child.parent_id = Some("a".into());
+        db.update_repository(&child).unwrap();
+        db.set_state("secret_svn_password_a", "parent").unwrap();
+        db.set_state("secret_git_token_a", "keep-token").unwrap();
+        db.set_state("secret_svn_password_c", "child").unwrap();
+        db.save_repository_credentials("a", Some(""), None, "admin", Some(&save_id()), None)
+            .unwrap();
+        assert_eq!(
+            db.get_state("secret_svn_password_a").unwrap().as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            db.get_state("secret_svn_password_c").unwrap().as_deref(),
+            Some("child")
+        );
+        assert_eq!(
+            db.get_state("secret_git_token_a").unwrap().as_deref(),
+            Some("keep-token")
+        );
+    }
+
+    #[test]
+    fn rs115_receipt_scope_and_key_loss_refuse_without_recreation_or_rotation() {
+        let db = setup_db();
+        let repo = create_test_repo(&db, "a", "A");
+        let request = save_id();
+        db.update_repository_once(&repo, "admin", &request, None, b"original")
+            .unwrap();
+        let storage = repository_save_key("admin", &request).unwrap();
+        let original = db.get_state(&storage).unwrap().unwrap();
+        db.conn()
+            .execute(
+                "UPDATE repositories SET scope_uuid=?1 WHERE id='a'",
+                [uuid::Uuid::new_v4().to_string()],
+            )
+            .unwrap();
+        assert!(db.repository_save_receipt("admin", &request).is_err());
+        assert_eq!(db.get_state(&storage).unwrap().unwrap(), original);
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key=?1", [REPOSITORY_SAVE_KEY])
+            .unwrap();
+        assert!(db
+            .create_repository_once(&repo, "admin", &save_id(), b"cannot-rotate")
+            .is_err());
+        assert!(db.get_state(REPOSITORY_SAVE_KEY).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod rs119_filtered_read_tests {
+    use super::*;
+    #[test]
+    fn rs119_shared_conflict_reader_preserves_tie_order_scope_and_refuses_offset_overflow() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        for i in 0..30 {
+            db.conn().execute("INSERT INTO conflicts(id,file_path,conflict_type,status,created_at,repo_id) VALUES(?1,'file','content','detected','2026-11-04T00:00:00Z',?2)",params![format!("id{i:03}"),if i%2==0 {"A"}else{"B"}]).unwrap();
+        }
+        let pagination = models::Pagination {
+            page: 2,
+            per_page: 7,
+        };
+        let raw = db
+            .list_conflict_page(Some("detected"), Some("A"), &pagination)
+            .unwrap();
+        let web = db
+            .list_conflicts_paginated_filtered(Some("detected"), Some("A"), &pagination)
+            .unwrap();
+        assert_eq!(raw.total, 15);
+        assert_eq!(raw.total_pages, 3);
+        assert_eq!(raw.items.len(), 7);
+        assert_eq!(
+            raw.items.iter().map(|x| &x.id).collect::<Vec<_>>(),
+            web.items.iter().map(|x| &x.id).collect::<Vec<_>>()
+        );
+        assert_eq!(raw.items[0].id, "id014");
+        assert_eq!(raw.items[6].id, "id002");
+        assert!(db
+            .list_conflict_page(
+                None,
+                None,
+                &models::Pagination {
+                    page: u32::MAX,
+                    per_page: u32::MAX
+                }
+            )
+            .is_err());
+        assert_eq!(db.list_conflicts(None, 100).unwrap().len(), 30);
+    }
+    #[test]
+    fn rs119_audit_filtered_count_preserves_legacy_nonzero_success_and_never_drops_bad_rows() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.conn().execute("INSERT INTO audit_log(action,created_at,success,repo_id) VALUES('legacy','2026-11-04T00:00:00Z',2,'A')",[]).unwrap();
+        db.conn().execute("INSERT INTO audit_log(action,created_at,success,repo_id) VALUES('failed','2026-11-04T00:00:00Z',0,'B')",[]).unwrap();
+        let (rows, total) = db
+            .list_audit_log_filtered(Some("A"), Some(true), Some("legacy"), 50, 0)
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].success);
+        let (rows, total) = db
+            .list_audit_log_filtered(Some("A"), Some(false), None, 50, 0)
+            .unwrap();
+        assert_eq!(total, 0);
+        assert!(rows.is_empty());
+        db.conn()
+            .execute("UPDATE audit_log SET details=X'FF' WHERE repo_id='B'", [])
+            .unwrap();
+        assert!(db.list_audit_log_filtered(None, None, None, 50, 0).is_err());
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(db
+            .list_audit_log_filtered(None, None, None, 50, u64::MAX)
+            .is_err());
     }
 }

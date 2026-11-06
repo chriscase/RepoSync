@@ -39,6 +39,11 @@ use reposync_web::AppState;
 // Test helpers
 // ---------------------------------------------------------------------------
 
+fn inbound_git_sha_kv(db: &Database, repo_id: &str) -> Option<String> {
+    reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)
+        .expect("read inbound git sha kv")
+}
+
 /// A fixed test token pre-seeded into every test server's session map.
 const TEST_TOKEN: &str = "test-session-token-for-freeze-tests";
 
@@ -123,6 +128,7 @@ async fn build_test_server() -> (
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
         import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(reposync_web::SchedulerServiceState::running()),
     });
 
     let app = Router::new()
@@ -294,6 +300,7 @@ async fn build_test_server_full() -> (
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
         import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(reposync_web::SchedulerServiceState::running()),
     });
 
     let app = Router::new()
@@ -417,6 +424,7 @@ async fn build_test_server_with_ldap(
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
         import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(reposync_web::SchedulerServiceState::running()),
     });
 
     let app = Router::new()
@@ -1722,6 +1730,7 @@ async fn import_fixture() -> (
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
         import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(reposync_web::SchedulerServiceState::running()),
     });
     state.sessions.write().await.insert(
         TEST_TOKEN.into(),
@@ -4298,12 +4307,7 @@ mod import_reconciliation_tests {
             Some("3")
         );
         assert_eq!(
-            fixture
-                .state
-                .db
-                .get_state(&format!("last_git_sha_{}", fixture.id))
-                .unwrap()
-                .as_deref(),
+            inbound_git_sha_kv(&fixture.state.db, &fixture.id).as_deref(),
             Some(before.0.as_str())
         );
         assert!(fixture
@@ -5884,17 +5888,21 @@ async fn candidate_r68_import_card_full_default_ui() {
     let barrier = tmp.path().join(&id);
     std::fs::create_dir(&barrier).unwrap();
     let (browser, mut vite) = run_import_card_browser(addr, &id, &barrier, "full-default").await;
-    let output = tokio::time::timeout(Duration::from_secs(60), browser.wait_with_output())
-        .await
-        .unwrap()
+    let output = tokio::time::timeout(Duration::from_secs(60), browser.wait_with_output()).await;
+    // Retain and collect this owned server handle before any browser failure
+    // assertion can unwind the test. Never discover or signal by process name.
+    if vite.try_wait().expect("observe owned Vite child").is_none() {
+        vite.kill().expect("stop owned Vite child");
+    }
+    vite.wait().expect("join owned Vite child");
+    let output = output
+        .expect("browser deadline; Node/Chrome collection remains unverified")
         .unwrap();
     assert!(
         output.status.success(),
         "browser: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    vite.kill().unwrap();
-    vite.wait().unwrap();
     server.abort();
 }
 
@@ -5907,17 +5915,21 @@ async fn candidate_r68_import_card_snapshot_boundary_ui() {
     std::fs::create_dir(&barrier).unwrap();
     let (browser, mut vite) =
         run_import_card_browser(addr, &id, &barrier, "snapshot-boundary").await;
-    let output = tokio::time::timeout(Duration::from_secs(180), browser.wait_with_output())
-        .await
-        .unwrap()
+    let output = tokio::time::timeout(Duration::from_secs(180), browser.wait_with_output()).await;
+    // Retain and collect this owned server handle before any browser failure
+    // assertion can unwind the test. Never discover or signal by process name.
+    if vite.try_wait().expect("observe owned Vite child").is_none() {
+        vite.kill().expect("stop owned Vite child");
+    }
+    vite.wait().expect("join owned Vite child");
+    let output = output
+        .expect("browser deadline; Node/Chrome collection remains unverified")
         .unwrap();
     assert!(
         output.status.success(),
         "browser: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    vite.kill().unwrap();
-    vite.wait().unwrap();
     assert_eq!(git_rev_list_count(&bare), 1);
     assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 2);
     server.abort();
@@ -5932,17 +5944,21 @@ async fn candidate_r68_import_card_invalid_revision_refusal_ui() {
     std::fs::create_dir(&barrier).unwrap();
     let (browser, mut vite) =
         run_import_card_browser(addr, &id, &barrier, "snapshot-invalid-rev").await;
-    let output = tokio::time::timeout(Duration::from_secs(90), browser.wait_with_output())
-        .await
-        .unwrap()
+    let output = tokio::time::timeout(Duration::from_secs(90), browser.wait_with_output()).await;
+    // Retain and collect this owned server handle before any browser failure
+    // assertion can unwind the test. Never discover or signal by process name.
+    if vite.try_wait().expect("observe owned Vite child").is_none() {
+        vite.kill().expect("stop owned Vite child");
+    }
+    vite.wait().expect("join owned Vite child");
+    let output = output
+        .expect("browser deadline; Node/Chrome collection remains unverified")
         .unwrap();
     assert!(
         output.status.success(),
         "browser: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    vite.kill().unwrap();
-    vite.wait().unwrap();
     server.abort();
 }
 
@@ -7802,6 +7818,19 @@ async fn candidate_70_delete_viewed_pair_redirects_without_detail_polling() {
         .unwrap();
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // The existing E2E browser step installs web-ui dependencies. Run the
+    // helper suite here as well so CI cannot silently omit the new unit tests.
+    let helpers = Command::new("npm")
+        .args(["test", "--", "src/branchPairRemoval.test.ts"])
+        .current_dir(root.join("web-ui"))
+        .output()
+        .expect("spawn branch-pair removal helper tests");
+    eprintln!("{}", String::from_utf8_lossy(&helpers.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&helpers.stderr));
+    assert!(
+        helpers.status.success(),
+        "branch-pair removal helpers failed"
+    );
     let output = Command::new("node")
         .arg(root.join("scripts/branch-pair-delete-browser.mjs"))
         .env("REPOSYNC_REAL_API", format!("http://{addr}"))
@@ -7819,6 +7848,16 @@ async fn candidate_70_delete_viewed_pair_redirects_without_detail_polling() {
     assert!(state.db.get_repository(viewed_id).unwrap().is_none());
     assert!(state.db.get_repository(listed_id).unwrap().is_none());
     assert!(state.db.get_repository(parent_id).unwrap().is_some());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case": "R70_DELETE_NAVIGATION",
+            "real_api_removal_confirmed": true,
+            "parent_preserved": true,
+            "helper_tests_passed": true,
+            "browser_scenarios_passed": true
+        })
+    );
     server.abort();
     drop(tmp);
 }
@@ -7984,7 +8023,7 @@ async fn candidate_r65_managed_remove_reconciliation_required_is_409() {
     server.abort();
 }
 
-/// RS-16: explicit branch-pair remote deletion opts default false; legacy omitted params stay destructive.
+/// RS-16: omitted remote flags require review; explicit false retains local-only removal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r65_branch_pair_remote_deletion_explicit_false_defaults() {
     let (addr, state, server, _tmp) = build_test_server_full().await;
@@ -8009,28 +8048,44 @@ async fn candidate_r65_branch_pair_remote_deletion_explicit_false_defaults() {
         ))
         .unwrap();
 
+    let owned = state.config.daemon.data_dir.join("repos").join(pair_id);
+    std::fs::create_dir_all(&owned).unwrap();
+    std::fs::write(
+        owned.join("custody.txt"),
+        "retained until local-only approval\n",
+    )
+    .unwrap();
+    state.db.conn().execute("INSERT INTO commit_map(svn_rev,git_sha,direction,synced_at,svn_author,git_author,repo_id) VALUES(1,'synthetic-retained-mapping','svn_to_git','t','a','b',?1)",[pair_id]).unwrap();
     let legacy = client
         .delete(format!("{base}/api/repos/{pair_id}/branch-pair"))
         .send()
         .await
         .unwrap();
-    assert_eq!(legacy.status(), reqwest::StatusCode::OK);
+    assert_eq!(legacy.status(), reqwest::StatusCode::CONFLICT);
     let legacy_body: serde_json::Value = legacy.json().await.unwrap();
     assert_eq!(legacy_body["remote_deletion"]["delete_git_requested"], true);
+    assert_eq!(legacy_body["remote_git"], "untouched");
+    assert_eq!(legacy_body["remote_svn"], "untouched");
     assert_eq!(legacy_body["remote_deletion"]["delete_svn_requested"], true);
     assert_eq!(legacy_body["remote_deletion"]["explicit_opts"], false);
-    assert!(state.db.get_repository(pair_id).unwrap().is_none());
+    assert!(state.db.get_repository(pair_id).unwrap().is_some());
+    assert_eq!(legacy_body["review_required"], true);
+    assert!(legacy_body["operation_id"].is_null());
+    assert!(state.db.managed_removal(pair_id).unwrap().is_none());
+    assert!(owned.join("custody.txt").is_file());
+    assert_eq!(
+        state
+            .db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM commit_map WHERE repo_id=?1",
+                [pair_id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
 
-    state
-        .db
-        .insert_repository(&fixture_branch_repo(
-            pair_id,
-            "Pair",
-            Some(parent_id),
-            "feature",
-            "branches/feature",
-        ))
-        .unwrap();
     let explicit = client
         .delete(format!(
             "{base}/api/repos/{pair_id}/branch-pair?explicit_remote_deletion_opts=true&delete_git=false&delete_svn=false"
@@ -8057,7 +8112,7 @@ async fn candidate_r65_branch_pair_remote_deletion_explicit_false_defaults() {
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
             "case": "R65_BRANCH_REMOTE_OPTS",
-            "legacy_defaults_destructive": true,
+            "legacy_unreviewed_refused": true,
             "explicit_ui_defaults_safe": true
         })
     );
@@ -8553,13 +8608,15 @@ async fn candidate_r65_restore_managed_registration() {
             [repo_id],
         )
         .unwrap();
-    state
-        .db
-        .set_state(
-            &format!("last_git_sha_{repo_id}"),
-            "inboundcheckpoint0123456789abcdef0123456789",
-        )
-        .unwrap();
+    let inbound_checkpoint = "inboundcheckpoint0123456789abcdef0123456789";
+    let now = chrono::Utc::now().to_rfc3339();
+    reposync_core::echo_receipt_scope::write_scoped_last_git_sha_kv(
+        &state.db.conn(),
+        repo_id,
+        inbound_checkpoint,
+        &now,
+    )
+    .unwrap();
     let data = state.config.daemon.data_dir.clone();
     std::fs::create_dir_all(data.join("repos").join(repo_id)).unwrap();
 
@@ -8591,12 +8648,8 @@ async fn candidate_r65_restore_managed_registration() {
         Some("restore-token")
     );
     assert_eq!(
-        state
-            .db
-            .get_state(&format!("last_git_sha_{repo_id}"))
-            .unwrap()
-            .as_deref(),
-        Some("inboundcheckpoint0123456789abcdef0123456789")
+        inbound_git_sha_kv(&state.db, repo_id).as_deref(),
+        Some(inbound_checkpoint)
     );
     assert_eq!(
         state
@@ -8929,19 +8982,19 @@ async fn candidate_r65_managed_remove_remote_deletion_outcomes() {
         .send()
         .await
         .unwrap();
-    assert_eq!(remove.status(), reqwest::StatusCode::OK);
+    assert_eq!(remove.status(), reqwest::StatusCode::CONFLICT);
     let body: serde_json::Value = remove.json().await.unwrap();
-    assert_eq!(body["ok"], true);
-    assert_eq!(body["state"], "completed");
-    assert_eq!(body["remote_git"], "deleted");
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["state"], "blocked");
+    assert_eq!(body["remote_git"], "untouched");
     assert_eq!(body["remote_svn"], "untouched");
-    assert!(state.db.get_repository(child_id).unwrap().is_none());
-    assert_eq!(auth_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
+    assert!(state.db.get_repository(child_id).unwrap().is_some());
+    assert_eq!(auth_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(delete_hits.load(Ordering::SeqCst), 0);
     assert_eq!(
         auth_seen.lock().await.as_str(),
-        "Bearer child-only-token",
-        "remote deletion must use the child repo id credential chain, not the parent token"
+        "",
+        "legacy refusal must not send any child or parent credential"
     );
 
     let mut revoked_parent = parent.clone();
@@ -8951,6 +9004,7 @@ async fn candidate_r65_managed_remove_remote_deletion_outcomes() {
     state.db.insert_repository(&revoked_parent).unwrap();
     let mut revoked = child.clone();
     revoked.id = revoked_child.into();
+    revoked.name = "Remote revoked child".into();
     revoked.parent_id = Some(revoked_parent.id.clone());
     revoked.git_repo = revoked_parent.git_repo.clone();
     state.db.insert_repository(&revoked).unwrap();
@@ -8977,8 +9031,8 @@ async fn candidate_r65_managed_remove_remote_deletion_outcomes() {
     assert_eq!(revoked_remove.status(), reqwest::StatusCode::CONFLICT);
     let revoked_body: serde_json::Value = revoked_remove.json().await.unwrap();
     assert_eq!(revoked_body["ok"], false);
-    assert_eq!(revoked_body["state"], "failed");
-    assert_eq!(revoked_body["remote_git"], "failed");
+    assert_eq!(revoked_body["state"], "blocked");
+    assert_eq!(revoked_body["remote_git"], "untouched");
     assert_eq!(
         revoked_delete_hits.load(Ordering::SeqCst),
         0,
@@ -9065,9 +9119,9 @@ async fn candidate_r65_managed_remove_retry_skips_recorded_remote_delete() {
     let first_status = first.status();
     let first_body: serde_json::Value = first.json().await.unwrap();
     assert_eq!(first_status, reqwest::StatusCode::CONFLICT, "{first_body}");
-    assert_eq!(first_body["state"], "failed");
-    assert_eq!(first_body["remote_git"], "deleted");
-    assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(first_body["state"], "blocked");
+    assert_eq!(first_body["remote_git"], "untouched");
+    assert_eq!(delete_hits.load(Ordering::SeqCst), 0);
     assert!(state.db.get_repository(child_id).unwrap().is_some());
 
     std::fs::remove_file(&owned).unwrap();
@@ -9083,15 +9137,15 @@ async fn candidate_r65_managed_remove_retry_skips_recorded_remote_delete() {
         .unwrap();
     assert_eq!(
         retry.status(),
-        reqwest::StatusCode::OK,
+        reqwest::StatusCode::CONFLICT,
         "{}",
         retry.text().await.unwrap()
     );
     let retry_body: serde_json::Value = retry.json().await.unwrap();
-    assert_eq!(retry_body["state"], "completed");
-    assert_eq!(retry_body["remote_git"], "deleted");
-    assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
-    assert!(state.db.get_repository(child_id).unwrap().is_none());
+    assert_eq!(retry_body["state"], "blocked");
+    assert_eq!(retry_body["remote_git"], "untouched");
+    assert_eq!(delete_hits.load(Ordering::SeqCst), 0);
+    assert!(state.db.get_repository(child_id).unwrap().is_some());
 
     server.abort();
     mock_handle.abort();
@@ -9174,10 +9228,10 @@ async fn candidate_r65_managed_remove_retry_ignores_unrequested_remote_failure()
         .unwrap();
     assert_eq!(first.status(), reqwest::StatusCode::CONFLICT);
     let first_body: serde_json::Value = first.json().await.unwrap();
-    assert_eq!(first_body["state"], "failed");
-    assert_eq!(first_body["remote_git"], "failed");
+    assert_eq!(first_body["state"], "blocked");
+    assert_eq!(first_body["remote_git"], "untouched");
     assert_eq!(first_body["remote_svn"], "untouched");
-    assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(delete_hits.load(Ordering::SeqCst), 0);
 
     std::fs::remove_file(&owned).unwrap();
     std::fs::create_dir_all(owned.join("git-repo")).unwrap();
@@ -9198,9 +9252,9 @@ async fn candidate_r65_managed_remove_retry_ignores_unrequested_remote_failure()
     );
     let retry_body: serde_json::Value = retry.json().await.unwrap();
     assert_eq!(retry_body["state"], "completed");
-    assert_eq!(retry_body["remote_git"], "failed");
+    assert_eq!(retry_body["remote_git"], "untouched");
     assert_eq!(retry_body["remote_svn"], "untouched");
-    assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(delete_hits.load(Ordering::SeqCst), 0);
     assert!(state.db.get_repository(child_id).unwrap().is_none());
 
     server.abort();
@@ -9331,11 +9385,1247 @@ async fn candidate_r65_managed_remove_missing_parent_fails_operation() {
     assert_eq!(remove.status(), reqwest::StatusCode::CONFLICT);
     let body: serde_json::Value = remove.json().await.unwrap();
     assert_eq!(body["ok"], false);
-    assert_eq!(body["state"], "failed");
-    use reposync_core::db::managed_remove::ManagedRemoveState;
-    let op = state.db.managed_removal(child_id).unwrap().unwrap();
-    assert_eq!(op.state, ManagedRemoveState::Failed);
+    assert_eq!(body["state"], "blocked");
+    assert!(
+        state.db.managed_removal(child_id).unwrap().is_none(),
+        "refusal cannot fabricate an accepted operation"
+    );
     assert!(state.db.get_repository(child_id).unwrap().is_some());
 
+    server.abort();
+}
+
+/// #68 / RS-29: a snapshot push accepted by Git with a lost reply remains held
+/// across a server/database reconstruction and finishes through the real API.
+/// Run this fixture-qualified selector alone with --test-threads=1, as its
+/// existing fault injector uses process environment variables.
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs68_snapshot_lost_push_reply_reopens_and_reconciles_through_http_once() {
+    struct FaultEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for FaultEnvironment {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let environment = FaultEnvironment(vec![
+        (
+            "REPOSYNC_FIXTURE_ROOT",
+            std::env::var_os("REPOSYNC_FIXTURE_ROOT"),
+        ),
+        (
+            "REPOSYNC_IMPORT_LOST_PUSH_REPLY",
+            std::env::var_os("REPOSYNC_IMPORT_LOST_PUSH_REPLY"),
+        ),
+        ("GIT_TRACE2_EVENT", std::env::var_os("GIT_TRACE2_EVENT")),
+    ]);
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_LOST_PUSH_REPLY", &id);
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client
+        .post(&base)
+        .json(&serde_json::json!({"import_mode":"snapshot","svn_revision":"2"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(start.status().is_success());
+    let start: serde_json::Value = start.json().await.unwrap();
+    let operation_id = start["operation_id"].as_str().unwrap().to_owned();
+    let held = wait_import_terminal(&client, &base).await;
+    assert_eq!(held["lifecycle"], "reconciliation_required", "{held}");
+    let operation = state
+        .db
+        .get_import_operation(&id, &operation_id)
+        .unwrap()
+        .unwrap();
+    let intended = operation
+        .intended_git_sha
+        .clone()
+        .expect("durable publication intent");
+    assert!(operation.last_confirmed_git_sha.is_none());
+    assert_eq!(
+        state.db.get_repo_watermark(&id).unwrap(),
+        (0, String::new())
+    );
+    assert_eq!(git_rev_list_count(&bare), 1);
+    assert_eq!(git_show(&bare, "main:history.txt"), b"first\n");
+    assert_eq!(
+        state
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND status='applied'",
+                [&id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    std::env::remove_var("REPOSYNC_IMPORT_LOST_PUSH_REPLY");
+    let trace = tmp.path().join("snapshot-reconcile-git-events.jsonl");
+    std::env::set_var("GIT_TRACE2_EVENT", &trace);
+
+    // Reuse the production WebServer initialization and the same isolated
+    // fixture data/engine, replacing only the stopped HTTP server and DB handle.
+    let config = state.config.clone();
+    let engine = state.sync_engine.clone();
+    let trigger = state.sync_trigger.clone();
+    server.abort();
+    drop(state);
+    let db = Database::new(tmp.path().join("reposync.db")).unwrap();
+    db.initialize().unwrap();
+    db.hold_interrupted_imports().unwrap();
+    let state = reposync_web::WebServer::new(
+        config,
+        db,
+        engine,
+        trigger,
+        tmp.path().join("config.toml"),
+        Arc::new(tokio::sync::RwLock::new(ImportProgress::default())),
+    )
+    .app_state();
+    state.sessions.write().await.insert(
+        TEST_TOKEN.into(),
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    );
+    let app = Router::new()
+        .merge(api::repos::routes())
+        .with_state(state.clone());
+    let (addr, server) = spawn_isolated_test_server(app);
+    let reconcile = format!("http://{addr}/api/repos/{id}/import/{operation_id}/reconcile");
+    // A disappeared ref is uncertainty, never permission to publish or advance
+    // a checkpoint. Restore only this fixture's exact previously observed ref
+    // before exercising the positive authenticated reconciliation.
+    git_cmd(
+        tmp.path(),
+        &[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "update-ref",
+            "-d",
+            "refs/heads/main",
+            &intended,
+        ],
+    );
+    let absent = client.post(&reconcile).send().await.unwrap();
+    assert_eq!(absent.status(), reqwest::StatusCode::OK);
+    let absent: serde_json::Value = absent.json().await.unwrap();
+    assert_eq!(absent["lifecycle"], "reconciliation_required", "{absent}");
+    assert_eq!(absent["checkpoint_completed"], false);
+    assert_eq!(
+        state.db.get_repo_watermark(&id).unwrap(),
+        (0, String::new())
+    );
+    assert_eq!(
+        state
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND status='applied'",
+                [&id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    git_cmd(
+        tmp.path(),
+        &[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "update-ref",
+            "refs/heads/main",
+            &intended,
+            &"0".repeat(40),
+        ],
+    );
+    for attempt in 0..2 {
+        let response = client.post(&reconcile).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let result: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            result["lifecycle"], "completed",
+            "attempt {attempt}: {result}"
+        );
+        assert_eq!(result["checkpoint_completed"], true);
+        assert_eq!(
+            state.db.get_repo_watermark(&id).unwrap(),
+            (2, intended.clone())
+        );
+        assert_eq!(git_rev_list_count(&bare), 1);
+        assert_eq!(git_show(&bare, "main:history.txt"), b"first\n");
+        assert_eq!(state.db.conn().query_row("SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND status='applied' AND svn_rev=2 AND git_sha=?2", rusqlite::params![id, intended], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            state
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+                    [&id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert!(state.db.active_import_operation(&id).unwrap().is_none());
+    }
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "start")
+        .filter_map(|event| event["argv"].as_array())
+        .collect();
+    assert!(
+        starts
+            .iter()
+            .any(|args| args.iter().any(|arg| arg == "ls-remote")),
+        "fresh Git observation must actually execute"
+    );
+    assert!(
+        !starts.iter().any(|args| args
+            .iter()
+            .filter_map(|arg| arg.as_str())
+            .any(|arg| matches!(arg, "push" | "send-pack" | "receive-pack")
+                || arg.ends_with("git-receive-pack"))),
+        "reconcile and repeated receipts must not issue Git publication commands"
+    );
+    drop(environment);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"RS68_SNAPSHOT_LOST_REPLY_HTTP", "operation_id":operation_id,"snapshot_revision":2,"remote_commits":1,"applied_baseline_records":1,"database_and_server_reopened":true,"receipt_repeated":true})
+    );
+    server.abort();
+}
+
+fn rs67_command(program: &str, args: &[&str]) -> Vec<u8> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{program}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn rs67_pairing_storage(db: &reposync_core::db::Database) -> Vec<Vec<String>> {
+    let conn = db.conn();
+    ["repositories", "sync_records", "commit_map", "kv_state"]
+        .iter()
+        .map(|table| {
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    Ok((0..columns)
+                        .map(|i| format!("{:?}", row.get_ref(i).unwrap()))
+                        .collect::<Vec<_>>()
+                        .join(" | "))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        })
+        .collect()
+}
+
+fn rs67_svn_history(url: &str) -> serde_json::Value {
+    let xml = rs67_command("svn", &["log", "--xml", "-v", url, "--non-interactive"]);
+    let entries = reposync_core::svn::parse_svn_log(std::str::from_utf8(&xml).unwrap()).unwrap();
+    assert!(!entries.is_empty());
+    serde_json::to_value(entries).unwrap()
+}
+
+/// The old unpinned publisher safely refuses even a genuinely related target.
+/// This records the positive whole-story gap without weakening that refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_existing_target_nonoverlap_legacy_refusal_preserves_all_work() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let tip = push_feature_commits(tmp.path(), &bare, 2);
+    let svn_repo = tmp.path().join("svn-repo");
+    let root_url = format!("file://{}", svn_repo.display());
+    let target = format!("{root_url}/branches/feature");
+    rs67_command(
+        "svn",
+        &[
+            "mkdir",
+            &format!("{root_url}/branches"),
+            "-m",
+            "fixture branches",
+            "--non-interactive",
+        ],
+    );
+    rs67_command(
+        "svn",
+        &[
+            "copy",
+            "-r",
+            "2",
+            &format!("{root_url}/trunk@2"),
+            &target,
+            "-m",
+            "copy actual baseline B",
+            "--non-interactive",
+        ],
+    );
+    svn_commit_on(
+        tmp.path(),
+        &target,
+        "independent-target",
+        "svn-only.txt",
+        "independent SVN work\n",
+        "independent target change C",
+    );
+
+    let svn_before = svn_youngest(&svn_repo);
+    let svn_history = rs67_svn_history(&root_url);
+    let git_refs = rs67_command("git", &["--git-dir", bare.to_str().unwrap(), "show-ref"]);
+    let stored = rs67_pairing_storage(&state.db);
+    let response = authed_client().post(format!("http://{addr}/api/repos/{id}/branches"))
+        .json(&serde_json::json!({"svn_branch":"branches/feature", "git_branch":"feature", "dry_run":false, "preview":false}))
+        .send().await.unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains("existing_svn_target_blocks_publish"),
+        "{body}"
+    );
+    assert_eq!(svn_youngest(&svn_repo), svn_before);
+    assert_eq!(rs67_svn_history(&root_url), svn_history);
+    assert_eq!(
+        rs67_command("git", &["--git-dir", bare.to_str().unwrap(), "show-ref"]),
+        git_refs
+    );
+    assert_eq!(
+        rs67_pairing_storage(&state.db),
+        stored,
+        "no checkpoints, mapping, journal or registration change on refusal"
+    );
+    assert_eq!(
+        rs67_command(
+            "svn",
+            &[
+                "cat",
+                &format!("{target}/svn-only.txt"),
+                "--non-interactive"
+            ]
+        ),
+        b"independent SVN work\n"
+    );
+    assert_eq!(git_show(&bare, "feature:feature.txt"), b"step 2\n");
+    assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS67_EXISTING_NONOVERLAP_LEGACY_REFUSAL", "git_tip":tip,
+            "svn_revision":svn_before, "svn_history_and_git_refs_unchanged":true,
+            "all_pairing_storage_unchanged":true, "both_sides_work_preserved":true,
+            "positive_reconciliation_implemented":false
+        })
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_reviewed_http_recaptures_stale_pins_and_publishes_existing_target() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let _tip = push_feature_commits(tmp.path(), &bare, 2);
+    let root = format!("file://{}", tmp.path().join("svn-repo").display());
+    let target = format!("{root}/branches/feature");
+    rs67_command(
+        "svn",
+        &["mkdir", &format!("{root}/branches"), "-m", "branches"],
+    );
+    rs67_command(
+        "svn",
+        &[
+            "copy",
+            "-r",
+            "2",
+            &format!("{root}/trunk@2"),
+            &target,
+            "-m",
+            "copy B",
+        ],
+    );
+    svn_commit_on(
+        tmp.path(),
+        &target,
+        "target-first",
+        "svn-only.txt",
+        "independent C\n",
+        "target C",
+    );
+    let client = authed_client();
+    let url = format!("http://{addr}/api/repos/{id}/branches");
+    let preview = serde_json::json!({"reconciliation":true,"action":"preview","git_branch":"feature","svn_branch":"branches/feature","dry_run":true});
+    let response = client.post(&url).json(&preview).send().await.unwrap();
+    let status = response.status();
+    let first: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{first}");
+    assert_eq!(first["mode"], "review");
+    assert_eq!(first["pending_git"]["count"], 2);
+    assert_eq!(first["published"], false);
+    assert!(first["operation_id"].is_null());
+    assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
+    let refs = rs67_command("git", &["--git-dir", bare.to_str().unwrap(), "show-ref"]);
+    svn_commit_on(
+        tmp.path(),
+        &target,
+        "target-second",
+        "second.txt",
+        "new C2\n",
+        "target C2 after review",
+    );
+    let revision = svn_youngest(&tmp.path().join("svn-repo"));
+    let storage = rs67_pairing_storage(&state.db);
+    let mut publish = preview.clone();
+    publish["action"] = serde_json::json!("publish");
+    publish["dry_run"] = serde_json::json!(false);
+    publish["preview"] = serde_json::json!(false);
+    publish["review_pin"] = first["review_pin"].clone();
+    let response = client.post(&url).json(&publish).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("stale late-pair review"));
+    assert_eq!(
+        rs67_pairing_storage(&state.db),
+        storage,
+        "stale review must not reserve or acknowledge work"
+    );
+    assert_eq!(svn_youngest(&tmp.path().join("svn-repo")), revision);
+    assert_eq!(
+        rs67_command("git", &["--git-dir", bare.to_str().unwrap(), "show-ref"]),
+        refs
+    );
+    let response = client.post(&url).json(&preview).send().await.unwrap();
+    assert!(response.status().is_success());
+    let fresh: serde_json::Value = response.json().await.unwrap();
+    assert_ne!(fresh["review_pin"], first["review_pin"]);
+    publish["review_pin"] = fresh["review_pin"].clone();
+    let response = client.post(&url).json(&publish).send().await.unwrap();
+    let status = response.status();
+    let done: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{done}");
+    assert_eq!(done["published"], true, "{done}");
+    assert_eq!(done["scheduler_active"], true);
+    assert_eq!(done["handled_steps"], 2);
+    assert!(done["action_error"].is_null());
+    assert!(done["operation_id"].is_string());
+    let child = state
+        .db
+        .list_child_repositories(&id)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(child.enabled);
+    assert_eq!(git_show(&bare, "feature:svn-only.txt"), b"independent C\n");
+    assert_eq!(git_show(&bare, "feature:second.txt"), b"new C2\n");
+    assert_eq!(git_show(&bare, "feature:feature.txt"), b"step 2\n");
+    let after = rs67_pairing_storage(&state.db);
+    let revision = svn_youngest(&tmp.path().join("svn-repo"));
+    let mut status_request = publish;
+    status_request["action"] = serde_json::json!("status");
+    status_request["operation_id"] = done["operation_id"].clone();
+    for action in ["status", "resume", "status"] {
+        status_request["action"] = serde_json::json!(action);
+        let response = client
+            .post(&url)
+            .json(&status_request)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let view: serde_json::Value = response.json().await.unwrap();
+        assert!(status.is_success(), "{view}");
+        assert_eq!(view["operation_id"], done["operation_id"]);
+        assert_eq!(view["published"], true);
+    }
+    assert_eq!(rs67_pairing_storage(&state.db), after);
+    assert_eq!(svn_youngest(&tmp.path().join("svn-repo")), revision);
+    status_request["git_branch"] = serde_json::json!("different");
+    assert_eq!(
+        client
+            .post(&url)
+            .json(&status_request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        reqwest::Client::new()
+            .post(&url)
+            .json(&preview)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_held_status_and_real_skip_refusal_preserve_work_in_both_busy_orders() {
+    use reposync_core::late_pair_publish::reviewed::{self, Fault};
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let tip = push_feature_commits(tmp.path(), &bare, 2);
+    let client = authed_client();
+    let url = format!("http://{addr}/api/repos/{id}/branches");
+    let preview = serde_json::json!({"reconciliation":true,"action":"preview","git_branch":"feature","svn_branch":"branches/feature","dry_run":true});
+    let response = client.post(&url).json(&preview).send().await.unwrap();
+    let status = response.status();
+    let plan: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{plan}");
+    let mut publish = preview;
+    publish["action"] = serde_json::json!("publish");
+    publish["dry_run"] = serde_json::json!(false);
+    publish["preview"] = serde_json::json!(false);
+    publish["review_pin"] = plan["review_pin"].clone();
+    // The real Skip entry acquires this exact same existing scope guard. If
+    // it owns the slot first, late-pair admission must not create a journal.
+    let busy = reposync_core::busy::try_acquire(&id).unwrap();
+    let before = rs67_pairing_storage(&state.db);
+    let response = client.post(&url).json(&publish).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("parent repository is busy"));
+    assert_eq!(rs67_pairing_storage(&state.db), before);
+    drop(busy);
+    // Conversely, an admitted operation outlives the runtime busy guard. Its
+    // genuine uncertain copy outcome must still block the native Skip route.
+    reviewed::set_fault(&id, Fault::AfterCopy);
+    let response = client.post(&url).json(&publish).send().await.unwrap();
+    let status = response.status();
+    let held: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{held}");
+    assert_eq!(held["pair_state"], "reconciliation_held");
+    assert_eq!(held["scheduler_active"], false);
+    assert!(!reposync_core::busy::is_busy(&id));
+    // The retained import fixture intentionally mounts only repository routes.
+    // Mount the real status router on the same state without changing it.
+    let (status_addr, status_server) = spawn_isolated_test_server(
+        Router::new()
+            .merge(api::status::routes())
+            .with_state(state.clone()),
+    );
+    let response = client
+        .get(format!("http://{status_addr}/api/status?repo_id={id}"))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert!(status.is_success(), "{status}: {text}");
+    let observation: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        observation["observation"]["health"], "held",
+        "{observation}"
+    );
+    assert!(observation["observation"]["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|op| op["kind"] == "late_pair"
+            && op["held"] == true
+            && op["state"] == "reconciliation_held"));
+    let stored = rs67_pairing_storage(&state.db);
+    let refs = rs67_command("git", &["--git-dir", bare.to_str().unwrap(), "show-ref"]);
+    let history = rs67_svn_history(&format!("file://{}", tmp.path().join("svn-repo").display()));
+    let parent = state.db.get_repository(&id).unwrap().unwrap();
+    let response=client.post(format!("http://{addr}/api/repos/{id}/skip-commit")).json(&serde_json::json!({
+        "pinned_cursor":parent.last_git_sha,"selected_commits":[tip],"expected_remote_tip":parent.last_git_sha,
+        "expected_bridge_tip":parent.last_git_sha,"reason":"synthetic held-scope refusal"})).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("ordinary mutation is held"));
+    assert_eq!(
+        rs67_pairing_storage(&state.db),
+        stored,
+        "Skip cannot change cursors, mapping, journal or registration"
+    );
+    assert_eq!(
+        rs67_command("git", &["--git-dir", bare.to_str().unwrap(), "show-ref"]),
+        refs
+    );
+    assert_eq!(
+        rs67_svn_history(&format!("file://{}", tmp.path().join("svn-repo").display())),
+        history
+    );
+    let mut resume = publish;
+    resume["action"] = serde_json::json!("resume");
+    resume["operation_id"] = held["operation_id"].clone();
+    let response = client.post(&url).json(&resume).send().await.unwrap();
+    let status = response.status();
+    let completed: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{completed}");
+    assert_eq!(completed["published"], true, "{completed}");
+    let work = clone_work(tmp.path(), &bare, "ordinary-skip-main");
+    git_cmd(&work, &["checkout", "main"]);
+    std::fs::write(
+        work.join("explicit-skip.txt"),
+        b"explicitly selected synthetic work\n",
+    )
+    .unwrap();
+    git_cmd(&work, &["add", "explicit-skip.txt"]);
+    git_cmd(&work, &["commit", "-m", "ordinary selected skip"]);
+    git_cmd(&work, &["push", "origin", "main"]);
+    let new_tip = String::from_utf8(rs67_command(
+        "git",
+        &["--git-dir", bare.to_str().unwrap(), "rev-parse", "main"],
+    ))
+    .unwrap()
+    .trim()
+    .to_string();
+    let bridge = state
+        .config
+        .daemon
+        .data_dir
+        .join("repos")
+        .join(&id)
+        .join("git-repo");
+    git_cmd(&bridge, &["fetch", "origin"]);
+    git_cmd(&bridge, &["checkout", "main"]);
+    git_cmd(&bridge, &["merge", "--ff-only", "origin/main"]);
+    let response=client.post(format!("http://{addr}/api/repos/{id}/skip-commit")).json(&serde_json::json!({
+        "pinned_cursor":parent.last_git_sha,"selected_commits":[new_tip],"expected_remote_tip":new_tip,
+        "expected_bridge_tip":new_tip,"reason":"explicit selection after genuine pair completion"})).send().await.unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert!(status.is_success(), "{status}: {text}");
+    assert_eq!(
+        state.db.get_repository(&id).unwrap().unwrap().last_git_sha,
+        new_tip
+    );
+    status_server.abort();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_full_import_ancestry_replays_only_new_development_commits() {
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let client = authed_client();
+    let import = format!("http://{addr}/api/repos/{id}/import");
+    let response = client
+        .post(&import)
+        .json(&serde_json::json!({"import_mode":"full"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let imported = wait_import_terminal(&client, &import).await;
+    assert_eq!(imported["lifecycle"], "completed", "{imported}");
+    rs67_command(
+        "git",
+        &[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
+    );
+    let tip = push_feature_commits(tmp.path(), &bare, 2);
+    let parent = state.db.get_repository(&id).unwrap().unwrap();
+    assert_eq!(parent.last_svn_rev, 3);
+    let parent_records: i64 = state
+        .db
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM sync_records WHERE repo_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let url = format!("http://{addr}/api/repos/{id}/branches");
+    let mut body = serde_json::json!({"reconciliation":true,"action":"preview","git_branch":"feature","svn_branch":"branches/feature","dry_run":true});
+    let response = client.post(&url).json(&body).send().await.unwrap();
+    let status = response.status();
+    let plan: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{plan}");
+    assert_eq!(plan["verified_baseline"]["svn_revision"], 3);
+    assert_eq!(plan["pending_git"]["count"], 2);
+    assert_eq!(
+        plan["result_git_sha"], tip,
+        "plain new target preserves the existing exact Git objects"
+    );
+    body["action"] = serde_json::json!("publish");
+    body["dry_run"] = serde_json::json!(false);
+    body["preview"] = serde_json::json!(false);
+    body["review_pin"] = plan["review_pin"].clone();
+    let response = client.post(&url).json(&body).send().await.unwrap();
+    let status = response.status();
+    let done: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{done}");
+    assert_eq!(done["published"], true, "{done}");
+    assert_eq!(done["result_git_sha"], tip);
+    let target = format!(
+        "file://{}/branches/feature",
+        tmp.path().join("svn-repo").display()
+    );
+    let svn = SvnClient::new(&target, "", "");
+    let revision = svn.info().await.unwrap().latest_rev;
+    let history = svn.copy_history_at_rev(revision).await.unwrap();
+    assert_eq!(
+        history.len(),
+        3,
+        "one copy plus only A1/A2; imported history is not replayed"
+    );
+    assert_eq!(
+        history
+            .last()
+            .unwrap()
+            .changed_paths
+            .iter()
+            .find(|path| path.path.ends_with("/branches/feature"))
+            .unwrap()
+            .copy_from_rev,
+        Some(3)
+    );
+    assert_eq!(
+        state
+            .db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sync_records WHERE repo_id=?1",
+                [&id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        parent_records
+    );
+    assert_eq!(
+        rs67_command(
+            "git",
+            &["--git-dir", bare.to_str().unwrap(), "rev-parse", "feature"]
+        )
+        .strip_suffix(b"\n")
+        .unwrap(),
+        tip.as_bytes()
+    );
+    server.abort();
+}
+
+/// Whole #65: a failed remote action must not discard local recovery evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs65_legacy_unreviewed_remote_deletion_refuses_and_retains_provenance() {
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mock = axum::Router::new().route(
+        "/repos/org/parent/git/refs/heads/feature",
+        axum::routing::delete({
+            let hits = hits.clone();
+            move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let svn_repo = tmp.path().join("svn-removal");
+    rs67_command("svnadmin", &["create", svn_repo.to_str().unwrap()]);
+    let root = format!("file://{}", svn_repo.display());
+    let seed = tmp.path().join("seed");
+    std::fs::create_dir(&seed).unwrap();
+    std::fs::write(seed.join("shared.txt"), b"historic SVN bytes\n").unwrap();
+    rs67_command(
+        "svn",
+        &[
+            "import",
+            seed.to_str().unwrap(),
+            &format!("{root}/trunk"),
+            "-m",
+            "synthetic baseline",
+            "--non-interactive",
+        ],
+    );
+    rs67_command(
+        "svn",
+        &[
+            "mkdir",
+            &format!("{root}/branches"),
+            "-m",
+            "branches",
+            "--non-interactive",
+        ],
+    );
+    let target = format!("{root}/branches/feature");
+    rs67_command(
+        "svn",
+        &[
+            "copy",
+            &format!("{root}/trunk"),
+            &target,
+            "-m",
+            "synthetic branch",
+            "--non-interactive",
+        ],
+    );
+    let before_revision = svn_youngest(&svn_repo);
+    let bare = tmp.path().join("real-history.git");
+    let git = git2::Repository::init_bare(&bare).unwrap();
+    let blob = git.blob(b"published Git bytes\n").unwrap();
+    let mut builder = git.treebuilder(None).unwrap();
+    builder.insert("shared.txt", blob, 0o100644).unwrap();
+    let tree = git.find_tree(builder.write().unwrap()).unwrap();
+    let signature = git2::Signature::now("synthetic", "fixture@invalid").unwrap();
+    let tip = git
+        .commit(
+            Some("refs/heads/feature"),
+            &signature,
+            &signature,
+            "synthetic published history",
+            &tree,
+            &[],
+        )
+        .unwrap()
+        .to_string();
+    let refs_before = rs67_command("git", &["--git-dir", bare.to_str().unwrap(), "show-ref"]);
+    let parent_id = "rs65-partial-parent";
+    let child_id = "rs65-partial-child";
+    let mut parent = fixture_branch_repo(parent_id, "Synthetic parent", None, "main", "trunk");
+    parent.svn_url = root.clone();
+    parent.git_api_url = format!("http://{mock_addr}");
+    parent.git_repo = "org/parent".into();
+    state.db.insert_repository(&parent).unwrap();
+    let mut child = parent.clone();
+    child.id = child_id.into();
+    child.name = "Synthetic child".into();
+    child.parent_id = Some(parent_id.into());
+    child.git_branch = "feature".into();
+    child.svn_branch = "branches/feature".into();
+    child.last_svn_rev = before_revision;
+    child.last_git_sha = tip.clone();
+    state.db.insert_repository(&child).unwrap();
+    let mapping = state
+        .db
+        .insert_commit_map_with_repo(
+            before_revision,
+            &tip,
+            "svn_to_git",
+            "fixture",
+            "fixture@invalid",
+            Some(child_id),
+        )
+        .unwrap();
+    let owned = state.config.daemon.data_dir.join("repos").join(child_id);
+    std::fs::create_dir_all(&owned).unwrap();
+    std::fs::write(
+        owned.join("recovery-evidence.txt"),
+        b"preserve until outcomes are resolved\n",
+    )
+    .unwrap();
+    let response=authed_client().delete(format!("http://{addr}/api/repos/{child_id}/branch-pair?explicit_remote_deletion_opts=true&delete_git=true&delete_svn=true")).send().await.unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    let listed = state.db.get_repository(child_id).unwrap().is_some();
+    let mapping_retained: i64 = state
+        .db
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM commit_map WHERE id=?1",
+            [mapping],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let after_revision = svn_youngest(&svn_repo);
+    let target_present = SvnClient::new(&target, "", "").info().await.is_ok();
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"RS65_LEGACY_UNREVIEWED_REMOTE_REFUSAL","http":status.as_u16(),"body":body,"git_failure_requests":hits.load(std::sync::atomic::Ordering::SeqCst),"svn_before":before_revision,"svn_after":after_revision,"svn_target_present":target_present,"registration_retained":listed,"mapping_retained":mapping_retained,"local_evidence_retained":owned.join("recovery-evidence.txt").exists()})
+    );
+    assert_eq!(
+        rs67_command("git", &["--git-dir", bare.to_str().unwrap(), "show-ref"]),
+        refs_before
+    );
+    assert_eq!(
+        rs67_command(
+            "svn",
+            &[
+                "cat",
+                "-r",
+                &before_revision.to_string(),
+                &format!("{target}/shared.txt@{before_revision}")
+            ]
+        ),
+        b"historic SVN bytes\n"
+    );
+    assert!(
+        listed,
+        "partial remote failure must retain registration and recovery custody"
+    );
+    assert_eq!(
+        mapping_retained, 1,
+        "partial failure must retain scoped provenance"
+    );
+    assert!(owned.join("recovery-evidence.txt").exists());
+    assert_eq!(status, reqwest::StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["ok"], false);
+    assert!(body["operation_id"].is_null());
+    assert_eq!(body["review_required"], true);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(before_revision, after_revision);
+    assert!(target_present);
+    server.abort();
+    mock_task.abort();
+}
+
+async fn rs65_native_command(dir: &Path, program: &str, args: &[&str]) -> String {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Synthetic removal fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Synthetic removal fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid");
+    let out = reposync_core::process::run(command, Duration::from_secs(15), None)
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{program} {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+async fn rs65_native_api_fixture() -> (
+    SocketAddr,
+    Arc<AppState>,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+    String,
+) {
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let p = tmp.path();
+    let svn = p.join("removal-svn");
+    rs65_native_command(p, "svnadmin", &["create", svn.to_str().unwrap()]).await;
+    let url = reqwest::Url::from_directory_path(&svn)
+        .unwrap()
+        .to_string()
+        .trim_end_matches('/')
+        .to_string();
+    rs65_native_command(
+        p,
+        "svn",
+        &[
+            "mkdir",
+            &format!("{url}/trunk"),
+            &format!("{url}/branches"),
+            "-m",
+            "fixture directories",
+        ],
+    )
+    .await;
+    rs65_native_command(
+        p,
+        "svn",
+        &[
+            "copy",
+            &format!("{url}/trunk"),
+            &format!("{url}/branches/dev"),
+            "-m",
+            "fixture branch",
+        ],
+    )
+    .await;
+    let bare = p.join("upstream.git");
+    rs65_native_command(p, "git", &["init", "--bare", bare.to_str().unwrap()]).await;
+    let seed = p.join("seed");
+    std::fs::create_dir(&seed).unwrap();
+    rs65_native_command(&seed, "git", &["init", "-b", "main"]).await;
+    std::fs::write(seed.join("keep.txt"), "synthetic bytes\n").unwrap();
+    rs65_native_command(&seed, "git", &["add", "keep.txt"]).await;
+    rs65_native_command(&seed, "git", &["commit", "-m", "fixture root"]).await;
+    rs65_native_command(
+        &seed,
+        "git",
+        &[
+            "push",
+            bare.to_str().unwrap(),
+            "HEAD:refs/heads/main",
+            "HEAD:refs/heads/dev",
+        ],
+    )
+    .await;
+    let parent_id = format!("parent-{}", uuid::Uuid::new_v4());
+    let id = format!("child-{}", uuid::Uuid::new_v4());
+    let mut parent = fixture_branch_repo(&parent_id, "Native API parent", None, "main", "trunk");
+    parent.svn_url = url;
+    parent.svn_username = String::new();
+    parent.git_api_url = reqwest::Url::from_directory_path(p).unwrap().to_string();
+    parent.git_repo = "upstream".into();
+    state.db.insert_repository(&parent).unwrap();
+    let mut child = parent;
+    child.id = id.clone();
+    child.name = "Native API child".into();
+    child.parent_id = Some(parent_id);
+    child.git_branch = "dev".into();
+    child.svn_branch = "branches/dev".into();
+    state.db.insert_repository(&child).unwrap();
+    let owned = p.join("repos").join(&id);
+    std::fs::create_dir_all(&owned).unwrap();
+    std::fs::write(owned.join("custody.txt"), "retained until completion\n").unwrap();
+    (addr, state, server, tmp, id)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs65_reviewed_api_lost_reply_lookup_repeat_and_disabled_restore() {
+    tokio::time::timeout(Duration::from_secs(90),async {
+        let (addr,state,server,tmp,id)=rs65_native_api_fixture().await;let client=authed_client();let base=format!("http://{addr}/api/repos/{id}");
+        let review=client.post(format!("{base}/removal/review")).json(&serde_json::json!({"delete_git":true,"delete_svn":true})).send().await.unwrap();
+        assert_eq!(review.status(),reqwest::StatusCode::OK);let plan:serde_json::Value=review.json().await.unwrap();
+        assert_eq!(plan["git"]["reference"],"refs/heads/dev");assert!(plan["git"]["expected_sha"].as_str().unwrap().len()==40);assert!(!plan["svn"]["uuid"].as_str().unwrap().is_empty());
+        assert!(state.db.managed_removal(&id).unwrap().is_none(),"review is read-only");
+        let approval=serde_json::json!({"delete_git":true,"delete_svn":true,"review_pin":plan["review_pin"],"request_id":"api-lost-reply"});
+        // The caller deliberately discards the completed HTTP response and
+        // reconstructs its state by operation lookup and the same request.
+        let ignored=client.post(format!("{base}/removal/approve")).json(&approval).send().await.unwrap();assert_eq!(ignored.status(),reqwest::StatusCode::OK);drop(ignored);
+        let found=client.get(format!("{base}/removal")).send().await.unwrap();assert_eq!(found.status(),reqwest::StatusCode::OK);let found:serde_json::Value=found.json().await.unwrap();
+        assert_eq!(found["protocol"],2);assert_eq!(found["state"],"completed");assert_eq!(found["registration_listed"],false);assert_eq!(found["remote_git"],"deleted");assert_eq!(found["remote_svn"],"deleted");
+        let lookup=client.get(format!("{base}/removal/request")).query(&[("request_id","api-lost-reply"),("review_pin",plan["review_pin"].as_str().unwrap())]).send().await.unwrap();assert_eq!(lookup.status(),reqwest::StatusCode::OK);let lookup:serde_json::Value=lookup.json().await.unwrap();assert_eq!(lookup["operation_id"],found["operation_id"]);assert_eq!(lookup["request_id"],"api-lost-reply");
+        let before=rs65_native_command(tmp.path(),"svnlook",&["youngest",tmp.path().join("removal-svn").to_str().unwrap()]).await;
+        let repeat=client.post(format!("{base}/removal/approve")).json(&approval).send().await.unwrap();assert_eq!(repeat.status(),reqwest::StatusCode::OK);let repeat:serde_json::Value=repeat.json().await.unwrap();assert_eq!(repeat["operation_id"],found["operation_id"]);
+        assert_eq!(rs65_native_command(tmp.path(),"svnlook",&["youngest",tmp.path().join("removal-svn").to_str().unwrap()]).await,before);
+        let restore=client.post(format!("{base}/restore")).send().await.unwrap();assert_eq!(restore.status(),reqwest::StatusCode::OK);assert!(!state.db.get_repository(&id).unwrap().unwrap().enabled);
+        let historical=client.get(format!("{base}/removal/request")).query(&[("request_id","api-lost-reply"),("review_pin",plan["review_pin"].as_str().unwrap())]).send().await.unwrap();assert_eq!(historical.status(),reqwest::StatusCode::OK);let historical:serde_json::Value=historical.json().await.unwrap();assert_eq!(historical["operation_id"],found["operation_id"]);assert_eq!(historical["registration_listed"],true,"historical completion is not a fresh removal of the restored incarnation");
+        let old_request=client.post(format!("{base}/removal/approve")).json(&approval).send().await.unwrap();assert_eq!(old_request.status(),reqwest::StatusCode::CONFLICT,"restored incarnation must not reuse old approval as a new removal");assert!(state.db.get_repository(&id).unwrap().is_some());server.abort();
+    }).await.expect("bounded actual reviewed-removal HTTP fixture");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs65_reviewed_api_401_403_foreign_actor_and_untrusted_payload_refuse() {
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let base = format!("http://{addr}/api/repos/auth-removal");
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            "auth-removal",
+            "Auth removal",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    let no_auth = reqwest::Client::new()
+        .post(format!("{base}/removal/review"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_auth.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, role, token) in [
+        ("fixture-reader", "viewer", "reader-token"),
+        ("fixture-admin", "admin", TEST_TOKEN),
+        ("other-admin", "admin", "other-token"),
+    ] {
+        state
+            .db
+            .insert_user(&reposync_core::models::User {
+                id: id.into(),
+                username: id.into(),
+                display_name: id.into(),
+                email: "synthetic@example.invalid".into(),
+                password_hash: String::new(),
+                role: role.into(),
+                enabled: true,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_session(&reposync_core::models::Session {
+                token: token.into(),
+                user_id: id.into(),
+                expires_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                created_at: now.clone(),
+            })
+            .unwrap();
+    }
+    let reader = reqwest::Client::new();
+    for path in [
+        "removal/review",
+        "removal/approve",
+        "removal/continue",
+        "disable",
+        "restore",
+        "remove",
+    ] {
+        let body = match path {
+            "removal/approve" => {
+                serde_json::json!({"delete_git":false,"delete_svn":false,"review_pin":"not-a-pin","request_id":"not-approved"})
+            }
+            "removal/continue" => serde_json::json!({"operation_id":"not-owned"}),
+            _ => serde_json::json!({}),
+        };
+        let response = reader
+            .post(format!("{base}/{path}"))
+            .bearer_auth("reader-token")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN, "{path}");
+    }
+    let extra = authed_client()
+        .post(format!("{base}/removal/review"))
+        .json(&serde_json::json!({"actor":"other-admin","cleanup_completed":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(extra.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(state.db.managed_removal("auth-removal").unwrap().is_none());
+    assert!(
+        state
+            .db
+            .get_repository("auth-removal")
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
+    let review = authed_client()
+        .post(format!("{base}/removal/review"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(review.status(), reqwest::StatusCode::OK);
+    let review: serde_json::Value = review.json().await.unwrap();
+    let approved=authed_client().post(format!("{base}/removal/approve")).json(&serde_json::json!({"delete_git":false,"delete_svn":false,"review_pin":review["review_pin"],"request_id":"owned-by-admin"})).send().await.unwrap();
+    assert_eq!(approved.status(), reqwest::StatusCode::OK);
+    let approved: serde_json::Value = approved.json().await.unwrap();
+    let original = state.db.managed_removal("auth-removal").unwrap().unwrap();
+    let foreign = reader
+        .post(format!("{base}/removal/continue"))
+        .bearer_auth("other-token")
+        .json(&serde_json::json!({"operation_id":approved["operation_id"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), reqwest::StatusCode::FORBIDDEN);
+    let foreign_lookup = reader
+        .get(format!("{base}/removal/request"))
+        .bearer_auth("other-token")
+        .query(&[
+            ("request_id", "owned-by-admin"),
+            ("review_pin", review["review_pin"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign_lookup.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        state.db.managed_removal("auth-removal").unwrap().unwrap(),
+        original,
+        "another administrator cannot adopt the retained actor's operation"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs65_reviewed_api_missing_parent_and_stale_pin_preserve_custody() {
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let id = "api-orphan";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            id,
+            "API orphan",
+            Some("missing-parent"),
+            "feature",
+            "branches/feature",
+        ))
+        .unwrap();
+    let owned = tmp.path().join("repos").join(id);
+    std::fs::create_dir_all(&owned).unwrap();
+    std::fs::write(owned.join("keep.txt"), "custody\n").unwrap();
+    let response = authed_client()
+        .post(format!("http://{addr}/api/repos/{id}/removal/review"))
+        .json(&serde_json::json!({"delete_git":true,"delete_svn":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    assert!(state.db.managed_removal(id).unwrap().is_none());
+    assert_eq!(std::fs::read(owned.join("keep.txt")).unwrap(), b"custody\n");
+    assert!(state.db.get_repository(id).unwrap().is_some());
+    // Remove the synthetic orphan only from this fixture so its intentionally
+    // invalid dependency cannot conceal the separate stale-review case.
+    state
+        .db
+        .conn()
+        .execute("DELETE FROM repositories WHERE id=?1", [id])
+        .unwrap();
+    let stale_id = "api-stale-root";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            stale_id,
+            "Stale root",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    let root_base = format!("http://{addr}/api/repos/{stale_id}");
+    let reviewed = authed_client()
+        .post(format!("{root_base}/removal/review"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reviewed.status(), reqwest::StatusCode::OK);
+    let reviewed: serde_json::Value = reviewed.json().await.unwrap();
+    let mut changed = state.db.get_repository(stale_id).unwrap().unwrap();
+    changed.git_branch = "different-configuration".into();
+    state.db.update_repository(&changed).unwrap();
+    let stale=authed_client().post(format!("{root_base}/removal/approve")).json(&serde_json::json!({"delete_git":false,"delete_svn":false,"review_pin":reviewed["review_pin"],"request_id":"stale-request"})).send().await.unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::CONFLICT);
+    let stale: serde_json::Value = stale.json().await.unwrap();
+    assert_eq!(
+        stale["request_rejected"], true,
+        "only an authoritative non-admission retires a pending browser request"
+    );
+    assert!(state.db.managed_removal(stale_id).unwrap().is_none());
+    assert!(state.db.get_repository(stale_id).unwrap().unwrap().enabled);
     server.abort();
 }

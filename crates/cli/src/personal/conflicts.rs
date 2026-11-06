@@ -12,7 +12,7 @@ use super::style;
 pub fn run_list(config: &PersonalConfig) -> Result<()> {
     let data_dir = &config.personal.data_dir;
     let db_path = data_dir.join("personal.db");
-    let db = Database::new(&db_path).context("failed to open database")?;
+    let db = Database::open_existing_read_only(&db_path).context("failed to open database")?;
 
     let conflicts = db
         .list_conflicts(Some("detected"), 50)
@@ -63,8 +63,8 @@ pub fn run_list(config: &PersonalConfig) -> Result<()> {
 /// Resolve a conflict.
 pub fn run_resolve(config: &PersonalConfig, id: &str, accept: &str) -> Result<()> {
     let data_dir = &config.personal.data_dir;
-    let db_path = data_dir.join("personal.db");
-    let db = Database::new(&db_path).context("failed to open database")?;
+    let db = Database::open_personal_writer(data_dir)
+        .context("Personal conflict startup writer admission refused")?;
 
     let resolution = match accept {
         "svn" => "accept_svn",

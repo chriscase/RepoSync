@@ -1,9 +1,11 @@
+import { useId } from 'react';
 import { LoadingSpinner } from '../components/LoadingSpinner';
 import { useState, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, type SaveLdapConfigRequest } from '../api';
 
 export default function AdminLdap() {
+  const fieldId = useId();
   const queryClient = useQueryClient();
 
   // Check admin role
@@ -129,6 +131,8 @@ export default function AdminLdap() {
 
       {message && (
         <div
+          id={`${fieldId}-feedback`}
+          role={message.type === 'error' ? 'alert' : 'status'}
           className={`px-4 py-3 rounded text-sm ${
             message.type === 'success'
               ? 'bg-green-900/40 border border-green-700 text-green-300'
@@ -139,7 +143,7 @@ export default function AdminLdap() {
         </div>
       )}
 
-      <div className="bg-gray-800 rounded-lg border border-gray-700 p-6 space-y-6">
+      <div role="group" aria-label="LDAP configuration settings" aria-describedby={message ? `${fieldId}-feedback` : undefined} className="bg-gray-800 rounded-lg border border-gray-700 p-6 space-y-6">
         {/* Enable/Disable */}
         <div className="flex items-center gap-3">
           <input
@@ -156,42 +160,42 @@ export default function AdminLdap() {
 
         {/* Server URL */}
         <div>
-          <label className="block text-sm font-medium text-gray-400 mb-1">Server URL</label>
+          <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-1`}>Server URL</label>
           <input
             type="text"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             className={inputClass}
-            placeholder="ldaps://ldap.example.com:3269"
+            placeholder="ldaps://ldap.example.com:3269" id={`${fieldId}-1`}
           />
-          <p className="mt-1 text-xs text-gray-500">
+          <p className="mt-1 text-xs text-gray-300">
             Use ldaps:// for TLS connections or ldap:// for plain connections.
           </p>
         </div>
 
         {/* Base DN */}
         <div>
-          <label className="block text-sm font-medium text-gray-400 mb-1">Base DN</label>
+          <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-2`}>Base DN</label>
           <input
             type="text"
             value={baseDn}
             onChange={(e) => setBaseDn(e.target.value)}
             className={inputClass}
-            placeholder="dc=corp,dc=example,dc=com"
+            placeholder="dc=corp,dc=example,dc=com" id={`${fieldId}-2`}
           />
         </div>
 
         {/* Search Filter */}
         <div>
-          <label className="block text-sm font-medium text-gray-400 mb-1">User Search Filter</label>
+          <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-3`}>User Search Filter</label>
           <input
             type="text"
             value={searchFilter}
             onChange={(e) => setSearchFilter(e.target.value)}
             className={inputClass}
-            placeholder="(&(objectClass=user)(name={0}))"
+            placeholder="(&(objectClass=user)(name={0}))" id={`${fieldId}-3`}
           />
-          <p className="mt-1 text-xs text-gray-500">
+          <p className="mt-1 text-xs text-gray-300">
             Use {'{0}'} as a placeholder for the username.
           </p>
         </div>
@@ -199,33 +203,33 @@ export default function AdminLdap() {
         {/* Attribute Mappings */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">Display Name Attribute</label>
+            <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-4`}>Display Name Attribute</label>
             <input
               type="text"
               value={displayNameAttr}
               onChange={(e) => setDisplayNameAttr(e.target.value)}
               className={inputClass}
-              placeholder="displayname"
+              placeholder="displayname" id={`${fieldId}-4`}
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">Email Attribute</label>
+            <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-5`}>Email Attribute</label>
             <input
               type="text"
               value={emailAttr}
               onChange={(e) => setEmailAttr(e.target.value)}
               className={inputClass}
-              placeholder="mail"
+              placeholder="mail" id={`${fieldId}-5`}
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">Group Membership Attribute</label>
+            <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-6`}>Group Membership Attribute</label>
             <input
               type="text"
               value={groupAttr}
               onChange={(e) => setGroupAttr(e.target.value)}
               className={inputClass}
-              placeholder="memberOf"
+              placeholder="memberOf" id={`${fieldId}-6`}
             />
           </div>
         </div>
@@ -235,23 +239,23 @@ export default function AdminLdap() {
           <h3 className="text-sm font-semibold text-gray-300 mb-3">
             Service Account (Optional)
           </h3>
-          <p className="text-xs text-gray-500 mb-4">
+          <p className="text-xs text-gray-300 mb-4">
             A service account is used to search for user DNs before binding. If not provided,
             a direct bind with the constructed DN will be attempted.
           </p>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-gray-400 mb-1">Bind DN</label>
+              <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-7`}>Bind DN</label>
               <input
                 type="text"
                 value={bindDn}
                 onChange={(e) => setBindDn(e.target.value)}
                 className={inputClass}
-                placeholder="cn=svc-reposync,ou=service,dc=corp,dc=example,dc=com"
+                placeholder="cn=svc-reposync,ou=service,dc=corp,dc=example,dc=com" id={`${fieldId}-7`}
               />
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-400 mb-1">
+              <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-8`}>
                 Bind Password
                 {bindPasswordSet && !bindPassword && (
                   <span className="ml-2 text-xs text-green-400">(saved)</span>
@@ -262,7 +266,7 @@ export default function AdminLdap() {
                 value={bindPassword}
                 onChange={(e) => setBindPassword(e.target.value)}
                 className={inputClass}
-                placeholder={bindPasswordSet ? 'Leave blank to keep current' : 'Service account password'}
+                placeholder={bindPasswordSet ? 'Leave blank to keep current' : 'Service account password'} id={`${fieldId}-8`}
               />
             </div>
           </div>
@@ -272,6 +276,7 @@ export default function AdminLdap() {
         <div className="flex items-center gap-3 pt-4 border-t border-gray-700">
           <button
             onClick={handleSave}
+            aria-describedby={message ? `${fieldId}-feedback` : undefined}
             disabled={saving}
             className="px-4 py-2 text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500"
           >
@@ -279,6 +284,7 @@ export default function AdminLdap() {
           </button>
           <button
             onClick={handleTest}
+            aria-describedby={message ? `${fieldId}-feedback` : undefined}
             disabled={testing || !url}
             className="px-4 py-2 text-sm font-medium rounded-md text-gray-200 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-gray-500"
           >

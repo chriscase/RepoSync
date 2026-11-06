@@ -1,5 +1,6 @@
+import { auditFilters, auditPageKey, changeListFilter, changeListPage } from '../listPagination';
 import { LoadingSpinner } from '../components/LoadingSpinner';
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
 import { UIForgeActivityStream } from '@appforgeapps/uiforge';
@@ -21,56 +22,26 @@ const ACTION_TYPES = [
 ];
 
 export default function AuditLog() {
-  const [searchParams] = useSearchParams();
-  const PAGE_SIZE = 50;
-  const [page, setPage] = useState(1);
-  const [actionFilter, setActionFilter] = useState('');
-  const [successFilter, setSuccessFilter] = useState<string>('');
+  const [searchParams,setSearchParams]=useSearchParams();
+  const filters=auditFilters(searchParams);
+  const page=filters.page,PAGE_SIZE=filters.perPage;
+  const actionFilter=filters.action ?? '';
+  const successFilter=filters.success===false ? 'failure':filters.success===true ? 'success':'';
+  const setActionFilter=(value:string)=>setSearchParams(changeListFilter(searchParams,'action',value));
+  const setSuccessFilter=(value:string)=>setSearchParams(changeListFilter(searchParams,'success',value==='failure' ? 'false':value==='success' ? 'true':''));
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [viewMode, setViewMode] = useState<'table' | 'stream'>('stream');
 
-  // Read success=false from URL params (from clickable card integration)
-  useEffect(() => {
-    const successParam = searchParams.get('success');
-    if (successParam === 'false') {
-      setSuccessFilter('failure');
-    } else if (successParam === 'true') {
-      setSuccessFilter('success');
-    }
-  }, [searchParams]);
-
-  const successParam = successFilter === 'failure' ? false : successFilter === 'success' ? true : undefined;
-
-  const { data: response, isLoading, isError, error } = useQuery({
-    queryKey: ['audit', PAGE_SIZE, page, successFilter, actionFilter],
-    queryFn: () => api.getAuditLog(PAGE_SIZE, page, successParam),
-    refetchInterval: 15000,
+  const {data:response,isPending,isError,error,refetch}=useQuery({
+    queryKey:auditPageKey(filters),
+    queryFn:()=>api.getAuditLog(PAGE_SIZE,page,filters.success,filters.repoId,filters.action),
+    refetchInterval:15000,enabled:!filters.error,
   });
-
-  if (isLoading) {
-    return <LoadingSpinner />;
-  }
-
-  if (isError) {
-    return (
-      <div className="text-center py-8 text-red-400">
-        Error loading audit log: {error?.message ?? 'Unknown error'}
-      </div>
-    );
-  }
-
-  const allEntries = response?.entries ?? [];
-  const totalCount = response?.total ?? 0;
-  const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
-
-  // Client-side filtering
-  const entries = allEntries.filter((e) => {
-    if (actionFilter && e.action !== actionFilter) return false;
-    if (successFilter === 'success' && !e.success) return false;
-    if (successFilter === 'failure' && e.success) return false;
-    return true;
-  });
-
+  const {data:repos}=useQuery({queryKey:['repos'],queryFn:api.getRepos});
+  const entries=response?.entries ?? [];
+  const totalCount=response?.total;
+  const totalPages=response?.total_pages ?? 0;
+  const allEntries=entries;
   const successCount = allEntries.filter((e) => e.success).length;
   const failureCount = allEntries.filter((e) => !e.success).length;
 
@@ -86,22 +57,29 @@ export default function AuditLog() {
         <div className="flex items-center space-x-3">
           <span className="flex items-center space-x-1 text-sm">
             <span className="w-2 h-2 rounded-full bg-green-400 inline-block" />
-            <span className="text-gray-400">{successCount}</span>
+            <span className="text-gray-400">{response && !isError ? `${successCount} successes on this page`:'Success count unknown'}</span>
           </span>
           <span className="flex items-center space-x-1 text-sm">
             <span className="w-2 h-2 rounded-full bg-red-400 inline-block" />
-            <span className="text-gray-400">{failureCount}</span>
+            <span className="text-gray-400">{response && !isError ? `${failureCount} failures on this page`:'Failure count unknown'}</span>
           </span>
         </div>
       </div>
 
       {/* Filters */}
       <div className="flex items-center space-x-3">
+        <select aria-label="Repository filter" value={filters.repoId ?? 'all'} onChange={e=>setSearchParams(changeListFilter(searchParams,'repo_id',e.target.value==='all' ? '':e.target.value))} className="rounded-md border border-gray-600 bg-gray-700 text-gray-200 px-3 py-2 text-sm">
+          <option value="all">All Repositories</option>
+          {filters.repoId && !repos?.some(r=>r.id===filters.repoId) && <option value={filters.repoId}>Repository {filters.repoId}</option>}
+          {repos?.map(r=><option key={r.id} value={r.id}>{r.name}</option>)}
+        </select>
         <select
           value={actionFilter}
+          aria-label="Action filter"
           onChange={(e) => setActionFilter(e.target.value)}
           className="rounded-md border border-gray-600 bg-gray-700 text-gray-200 px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
         >
+          {actionFilter && !ACTION_TYPES.some(a=>a.value===actionFilter) && <option value={actionFilter}>{actionFilter}</option>}
           {ACTION_TYPES.map((at) => (
             <option key={at.value} value={at.value}>{at.label}</option>
           ))}
@@ -114,6 +92,7 @@ export default function AuditLog() {
           ].map((f) => (
             <button
               key={f.value}
+              aria-pressed={successFilter===f.value}
               onClick={() => setSuccessFilter(f.value)}
               className={`px-3 py-2 text-sm ${
                 successFilter === f.value
@@ -148,11 +127,15 @@ export default function AuditLog() {
           </button>
         </div>
         <span className="text-sm text-gray-500">
-          Showing {entries.length} of {allEntries.length} entries
+          {response && !isError ? `Showing ${entries.length} of ${totalCount} matching entries`:'Matching total unknown'}
         </span>
       </div>
 
-      {viewMode === 'stream' ? (
+      {filters.error ? <div role="alert">{filters.error} <button onClick={()=>setSearchParams(new URLSearchParams())}>Clear filters</button></div>
+      : isError ? <div role="alert" className="text-red-300">Error loading audit log: {error.message}. Results are unknown. <button onClick={()=>void refetch()}>Retry</button></div>
+      : isPending || !response ? <LoadingSpinner/>
+      : !entries.length ? <div role="status">{response.total===0 ? 'No matching audit entries':'No audit entries on this page; matching records exist on other pages.'}</div>
+      : viewMode === 'stream' ? (
         <AuditStreamView entries={entries} />
       ) : (
         <AuditTableView
@@ -163,10 +146,10 @@ export default function AuditLog() {
       )}
 
       {/* Pagination */}
-      {totalPages > 1 && (
+      {response && !isError && !filters.error && (
         <div className="flex items-center justify-center space-x-4 py-4">
           <button
-            onClick={() => setPage((p) => Math.max(1, p - 1))}
+            onClick={() => setSearchParams(changeListPage(searchParams,page-1))}
             disabled={page <= 1}
             className={`px-3 py-2 text-sm rounded-md border ${
               page <= 1
@@ -176,11 +159,11 @@ export default function AuditLog() {
           >
             &larr; Previous
           </button>
-          <span className="text-sm text-gray-400">
-            Page {page} of {totalPages}
+          <span aria-live="polite" aria-atomic="true" className="text-sm text-gray-400">
+            {totalPages ? `Page ${page} of ${totalPages}`:'No matching pages'}
           </span>
           <button
-            onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+            onClick={() => setSearchParams(changeListPage(searchParams,page+1))}
             disabled={page >= totalPages}
             className={`px-3 py-2 text-sm rounded-md border ${
               page >= totalPages
@@ -190,6 +173,7 @@ export default function AuditLog() {
           >
             Next &rarr;
           </button>
+          {page>1 && !entries.length && <button onClick={()=>setSearchParams(changeListPage(searchParams,1))}>Return to first page</button>}
         </div>
       )}
     </div>
@@ -305,7 +289,6 @@ function AuditRow({
   return (
     <>
       <tr
-        onClick={onToggle}
         className={`cursor-pointer transition-colors ${
           expanded ? 'bg-gray-700/50' : 'hover:bg-gray-700/30'
         }`}
@@ -338,7 +321,9 @@ function AuditRow({
           )}
         </td>
         <td className="px-4 py-3 text-sm text-gray-300 max-w-sm truncate">
-          {entry.details ?? '-'}
+          <button type="button" onClick={onToggle} aria-expanded={expanded} className="text-left text-blue-300 underline">
+            {expanded ? 'Hide audit details: ' : 'Show audit details: '}{entry.details ?? entry.action}
+          </button>
         </td>
         <td className="px-4 py-3 text-sm text-gray-300">
           {entry.author ?? '-'}

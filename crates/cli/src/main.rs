@@ -172,16 +172,26 @@ async fn run(cli: Cli) -> Result<()> {
             personal_config,
             action,
         } => personal::run_personal(action, &personal_config).await,
+        Commands::Identity { action } => {
+            let config = load_config(&cli.config)?;
+            cmd_identity(&config, action)
+        }
         _ => {
             // All other commands need the team-mode config and database
             let config = load_config(&cli.config)?;
-            let db = open_database(&config)?;
+            let writer = matches!(
+                &cli.command,
+                Commands::Sync { .. }
+                    | Commands::Conflicts {
+                        action: ConflictsAction::Resolve { .. }
+                    }
+            );
+            let db = open_database(&config, writer)?;
 
             match cli.command {
                 Commands::Status => cmd_status(&db),
                 Commands::Conflicts { action } => cmd_conflicts(&db, action),
-                Commands::Sync { action } => cmd_sync(&db, &config, action).await,
-                Commands::Identity { action } => cmd_identity(&config, action),
+                Commands::Sync { action } => cmd_sync(db, &config, action).await,
                 Commands::Audit { limit } => cmd_audit(&db, limit),
                 _ => unreachable!(),
             }
@@ -202,11 +212,14 @@ fn load_config(path: &PathBuf) -> Result<AppConfig> {
     Ok(config)
 }
 
-fn open_database(config: &AppConfig) -> Result<Database> {
-    let db_path = config.daemon.data_dir.join("reposync.db");
-    let db = Database::new(&db_path).context("failed to open database")?;
-    db.initialize().context("failed to initialize database")?;
-    Ok(db)
+fn open_database(config: &AppConfig, writer: bool) -> Result<Database> {
+    if writer {
+        Database::open_cli_writer(&config.daemon.data_dir)
+            .context("CLI startup writer admission refused")
+    } else {
+        Database::open_existing_read_only(config.daemon.data_dir.join("reposync.db"))
+            .context("failed to open existing database for inspection")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -483,7 +496,7 @@ fn cmd_conflicts(db: &Database, action: ConflictsAction) -> Result<()> {
     }
 }
 
-async fn cmd_sync(_db: &Database, config: &AppConfig, action: SyncAction) -> Result<()> {
+async fn cmd_sync(db: Database, config: &AppConfig, action: SyncAction) -> Result<()> {
     match action {
         SyncAction::Now => {
             println!("Triggering immediate sync cycle...");
@@ -502,15 +515,9 @@ async fn cmd_sync(_db: &Database, config: &AppConfig, action: SyncAction) -> Res
             let identity = IdentityMapper::new(&config.identity)
                 .context("failed to initialize identity mapper")?;
 
-            // Open a dedicated database connection for the sync engine
-            let engine_db = {
-                let db_path = config.daemon.data_dir.join("reposync.db");
-                Database::new(&db_path).context("failed to open engine database")?
-            };
-
             let engine = reposync_core::sync_engine::SyncEngine::new(
                 config.clone(),
-                engine_db,
+                db,
                 svn_client,
                 git_client,
                 Arc::new(identity),

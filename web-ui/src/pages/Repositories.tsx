@@ -1,7 +1,14 @@
-import { useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useId } from 'react';
+import Dialog from '../components/Dialog';
+import { clientSession } from '../session';
+import RepositoryStatusSummary from '../components/StatusObservation';
+import { useRepositorySave } from '../useRepositorySave';
+import { samePublicConfiguration, retainUnsavedCredentials, sameImportPreferences, canContinueWithPreferences, repositoryEditorKey, publicConfiguration } from '../repositorySave';
+import RepositorySaveNotice from '../components/RepositorySaveNotice';
+import { useEffect, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { api, type Repository, type SyncStatus } from '../api';
+import { api, type Repository } from '../api';
 import {
   DEFAULT_REPO_IMPORT_MODE,
   type RepoImportMode,
@@ -11,10 +18,8 @@ import { readBranchPairRemovalNotice, readPersistedBranchPairRemovalNotice } fro
 import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
 import ManagedRemovalReceiptNotice from '../components/ManagedRemovalReceiptNotice';
 import { readAllManagedRemovalReceipts, shouldDisplayManagedRemovalReceipt } from '../managedRemoval';
-import { GitBranch, Plus, Database, Clock, X, ArrowRight, AlertTriangle, RefreshCw } from 'lucide-react';
+import { GitBranch, Plus, Database, Clock, X, ArrowRight } from 'lucide-react';
 import { getStoredUser } from '../utils/auth';
-import { formatTimeAgo } from '../utils/time';
-import { syncStateVisual } from '../utils/syncStateColor';
 
 /** Custom SVG icon: two circular sync arrows, one blue (SVN) and one purple (Git) */
 function SyncArrowsIcon({ className = 'w-8 h-8' }: { className?: string }) {
@@ -39,27 +44,6 @@ function SyncArrowsIcon({ className = 'w-8 h-8' }: { className?: string }) {
       />
       <path d="M10 22 L8 18 L12 18" fill="#a855f7" />
     </svg>
-  );
-}
-
-/** Status dot with optional pulsing animation for active state */
-function StatusDot({ state, enabled }: { state?: string; enabled: boolean }) {
-  const visual = syncStateVisual(state, enabled);
-  if (visual === 'disabled') {
-    return <span className="w-2.5 h-2.5 rounded-full bg-gray-500 flex-shrink-0" />;
-  }
-  if (visual === 'error') {
-    return <span className="w-2.5 h-2.5 rounded-full bg-red-400 flex-shrink-0" />;
-  }
-  if (visual === 'attention') {
-    return <span className="w-2.5 h-2.5 rounded-full bg-yellow-400 flex-shrink-0" />;
-  }
-  const color = visual === 'healthy' ? 'bg-green-400' : 'bg-blue-400';
-  return (
-    <span className="relative flex-shrink-0 w-2.5 h-2.5">
-      <span className={`absolute inset-0 rounded-full ${color} animate-ping opacity-40`} />
-      <span className={`relative block w-2.5 h-2.5 rounded-full ${color}`} />
-    </span>
   );
 }
 
@@ -110,6 +94,12 @@ const defaultForm: AddRepoForm = {
 };
 
 export default function Repositories() {
+  const key=repositoryEditorKey({owner:getStoredUser()?.id ?? 'legacy',session:clientSession().snapshot().token,epoch:clientSession().snapshot().epoch});
+  return <RepositoriesEditor key={key} />;
+}
+
+function RepositoriesEditor() {
+  const fieldId = useId();
   const navigate = useNavigate();
   const location = useLocation();
   const removalNotice = readBranchPairRemovalNotice(location.state) ?? readPersistedBranchPairRemovalNotice();
@@ -126,75 +116,78 @@ export default function Repositories() {
   const [gitTestResult, setGitTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [svnTesting, setSvnTesting] = useState(false);
   const [gitTesting, setGitTesting] = useState(false);
+  const saveFlow=useRepositorySave(undefined,showAddModal);
+  const [saveMessage,setSaveMessage]=useState<string | null>(null);
+  const [saveError,setSaveError]=useState<string | null>(null);
+  const currentForm=useRef(form);currentForm.current=form;
+  const dialogVersion=useRef(0);
+  useEffect(()=>{
+    if(showAddModal && saveFlow.initial) {
+      const previous=saveFlow.initial;
+      setForm({...defaultForm,...(previous.draftConfiguration ?? previous.configuration),svn_password:'',git_token:'',
+        initial_import_mode:((previous.draftPreferences ?? previous.preferences)?.importMode ?? DEFAULT_REPO_IMPORT_MODE) as RepoImportMode,
+        initial_svn_revision:(previous.draftPreferences ?? previous.preferences)?.svnRevision ?? 'HEAD'});
+    }
+  },[showAddModal,saveFlow.initial]);
+  useEffect(()=>{
+    if(saveFlow.attempt?.repoId) void queryClient.invalidateQueries({queryKey:['repos']});
+  },[saveFlow.attempt?.repoId,queryClient]);
+
 
   const { data: repos, isLoading, isError, error } = useQuery({
     queryKey: ['repos'],
     queryFn: api.getRepos,
   });
 
-  // Fetch per-repo statuses for all parent repos
-  const repoList = repos ?? [];
-  const parents = repoList.filter((r) => !r.parent_id);
-  const parentIds = parents.map((r) => r.id);
-
-  const statusQueries = useQuery({
-    queryKey: ['repo-statuses', parentIds],
-    queryFn: async () => {
-      const results = new Map<string, SyncStatus>();
-      await Promise.all(
-        parentIds.map(async (id) => {
-          try {
-            const s = await api.getStatus(id);
-            results.set(id, s);
-          } catch {
-            // ignore - status may not be available
-          }
-        }),
-      );
-      return results;
-    },
-    enabled: parentIds.length > 0,
-    refetchInterval: 15000,
-  });
-
-  const statusMap = statusQueries.data ?? new Map<string, SyncStatus>();
-
-  const createMutation = useMutation({
-    mutationFn: async (data: AddRepoForm) => {
-      const { svn_password, git_token, initial_import_mode, initial_svn_revision, ...repoData } =
-        data;
-      void initial_import_mode;
-      void initial_svn_revision;
-      const created = await api.createRepo(repoData);
-      // Save credentials for the newly created repo
-      if (svn_password || git_token) {
-        const credData: { svn_password?: string; git_token?: string } = {};
-        if (svn_password) credData.svn_password = svn_password;
-        if (git_token) credData.git_token = git_token;
-        await api.saveRepoCredentials(created.id, credData);
-      }
-      return created;
-    },
-    onSuccess: (created) => {
-      queryClient.invalidateQueries({ queryKey: ['repos'] });
-      setShowAddModal(false);
-      const prefs = {
-        importMode: form.initial_import_mode,
-        svnRevision: form.initial_svn_revision,
-      };
-      setForm({ ...defaultForm });
-      setSvnTestResult(null);
-      setGitTestResult(null);
-      navigate(`/repos/${created.id}`, { state: { importPrefs: prefs } });
-    },
-  });
+  const repoList=repos ?? [];
+  const parents=repoList.filter(repo=>!repo.parent_id);
 
   function setField<K extends keyof AddRepoForm>(key: K, value: AddRepoForm[K]) {
-    setForm((prev) => ({ ...prev, [key]: value }));
+    const next={...currentForm.current,[key]:value};currentForm.current=next;setForm(next);
+    saveFlow.rememberDraft(next,{importMode:next.initial_import_mode,svnRevision:next.initial_svn_revision});
   }
-
-  function handleCreate() {
-    createMutation.mutate(form);
+  async function loadCurrentSettingsForReview() {
+    const generation=dialogVersion.current;
+    try {
+      const current=await saveFlow.loadCurrentForReview();
+      if(!saveFlow.viewActive() || generation!==dialogVersion.current)return;
+      setForm(previous=>({...previous,...publicConfiguration(current),svn_password:'',git_token:''}));setSaveError(null);setSaveMessage('Review these current settings on the existing ID. Required credentials were cleared.');
+    } catch(cause) {if(saveFlow.viewActive() && generation===dialogVersion.current)setSaveError(cause instanceof Error ? cause.message : 'Current settings could not be read.');}
+  }
+  function useReviewedSettings() {
+    const live=currentForm.current;
+    try {saveFlow.useReviewedSettings(live,{svn_password:live.svn_password || undefined,git_token:live.git_token || undefined},{importMode:live.initial_import_mode,svnRevision:live.initial_svn_revision});setSaveError(null);setSaveMessage('New save prepared on the existing repository; earlier outcomes are retained.');}
+    catch(cause) {setSaveError(cause instanceof Error ? cause.message : 'Reviewed recovery could not be prepared.');}
+  }
+  function openAdd() {dialogVersion.current++;setSaveMessage(null);setSaveError(null);setShowAddModal(true);}
+  function closeAdd() {
+    saveFlow.rememberDraft(currentForm.current,{importMode:currentForm.current.initial_import_mode,svnRevision:currentForm.current.initial_svn_revision});dialogVersion.current++;setShowAddModal(false);
+    setForm({...defaultForm});setSaveError(null);setSaveMessage(null);
+  }
+  async function handleCreate() {
+    const generation=dialogVersion.current;
+    const submitted={...currentForm.current};setSaveError(null);setSaveMessage(null);
+    try {
+      if(canContinueWithPreferences(saveFlow.attempt,submitted,{svn_password:submitted.svn_password,git_token:submitted.git_token})) {
+        const previous=saveFlow.attempt;saveFlow.finish(previous.configRequestId);setShowAddModal(false);setForm({...defaultForm});
+        navigate(`/repos/${previous.repoId}`,{state:{importPrefs:{importMode:submitted.initial_import_mode,svnRevision:submitted.initial_svn_revision}}});return;
+      }
+      const result=await saveFlow.save(submitted,{svn_password:submitted.svn_password || undefined,git_token:submitted.git_token || undefined},undefined,
+        {importMode:submitted.initial_import_mode,svnRevision:submitted.initial_svn_revision});
+      if(!result.viewActive || dialogVersion.current!==generation)return;
+      void queryClient.invalidateQueries({queryKey:['repos']});
+      const live=currentForm.current;
+      const same= samePublicConfiguration(live,result.configuration)
+        && (live.svn_password || '')===(result.credentials.svn_password || '')
+        && (live.git_token || '')===(result.credentials.git_token || '')
+        && sameImportPreferences({importMode:live.initial_import_mode,svnRevision:live.initial_svn_revision},result.preferences);
+      if(!same) {setForm(previous=>({...previous,...retainUnsavedCredentials(previous,result.credentials)}));setSaveMessage('The earlier save completed on the existing ID. Newer entered changes remain unsaved; save again to update that registration.');return;}
+      saveFlow.finish(result.attempt.configRequestId);
+      setShowAddModal(false);setForm({...defaultForm});setSvnTestResult(null);setGitTestResult(null);
+      navigate(`/repos/${result.attempt.repoId}`,{state:{importPrefs:{importMode:submitted.initial_import_mode,svnRevision:submitted.initial_svn_revision}}});
+    } catch(cause) {
+      if(saveFlow.viewActive() && dialogVersion.current===generation)setSaveError(cause instanceof Error ? cause.message : 'Save is not confirmed; the recovery record was retained.');
+    }
   }
 
   async function handleTestSvn() {
@@ -283,7 +276,7 @@ export default function Repositories() {
         </div>
         {isAdmin && (
           <button
-            onClick={() => setShowAddModal(true)}
+            onClick={openAdd}
             className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition-colors"
           >
             <Plus className="w-4 h-4" />
@@ -303,7 +296,7 @@ export default function Repositories() {
           </p>
           {isAdmin && (
             <button
-              onClick={() => setShowAddModal(true)}
+              onClick={openAdd}
               className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition-colors"
             >
               <Plus className="w-4 h-4" />
@@ -314,11 +307,6 @@ export default function Repositories() {
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
           {parents.map((repo: Repository) => {
-            const status = statusMap.get(repo.id);
-            const lastSync = status?.last_sync_at ?? repo.updated_at;
-            const totalSyncs = status?.total_syncs ?? 0;
-            const activeConflicts = status?.active_conflicts ?? 0;
-
             return (
               <div key={repo.id} className="group/card bg-gray-800/60 border border-gray-700 rounded-lg overflow-hidden hover:border-blue-500/50 transition-colors">
                 {/* Parent Repo Card */}
@@ -342,11 +330,11 @@ export default function Repositories() {
                         <span
                           className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium flex-shrink-0 ${
                             repo.enabled
-                              ? 'bg-green-900/50 text-green-300'
+                              ? 'bg-blue-900/50 text-blue-300'
                               : 'bg-gray-700 text-gray-400'
                           }`}
                         >
-                          {repo.enabled ? 'Enabled' : 'Disabled'}
+                          {repo.enabled ? 'Configured enabled' : 'Configured disabled'}
                         </span>
                       </div>
 
@@ -362,36 +350,10 @@ export default function Repositories() {
                         </div>
                       </div>
 
-                      {/* Stats Row */}
-                      <div className="flex items-center gap-5 text-xs text-gray-500">
-                        <div className="flex items-center gap-1.5">
-                          <StatusDot state={status?.state} enabled={repo.enabled} />
-                          <span className="text-gray-400">
-                            {status?.state === 'error' || status?.state === 'failed'
-                              ? 'Error'
-                              : repo.enabled
-                                ? 'Active'
-                                : 'Disabled'}
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-1.5">
-                          <Clock className="w-3 h-3" />
-                          <span>{formatTimeAgo(lastSync)}</span>
-                        </div>
-                        <div className="flex items-center gap-1.5">
-                          <RefreshCw className="w-3 h-3" />
-                          <span>{totalSyncs} syncs</span>
-                        </div>
-                        {activeConflicts > 0 && (
-                          <div className="flex items-center gap-1.5 text-red-400">
-                            <AlertTriangle className="w-3 h-3" />
-                            <span>{activeConflicts} conflict{activeConflicts !== 1 ? 's' : ''}</span>
-                          </div>
-                        )}
-                      </div>
                     </div>
                   </div>
                 </button>
+                <div className="px-5 pb-4"><RepositoryStatusSummary repoId={repo.id}/></div>
 
                 {/* Branch Pairs inside parent card (recursive) */}
                 <BranchTree repoId={repo.id} childMap={childrenByParent} navigate={navigate} depth={0} />
@@ -403,13 +365,14 @@ export default function Repositories() {
 
       {/* Add Repository Modal */}
       {showAddModal && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+        <Dialog title="Add Repository" description="Configure the registered SVN and Git endpoints and import policy. Review saved and pending stages before retrying." onClose={closeAdd} busy={saveFlow.pending}>
           <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
             {/* Modal header */}
             <div className="flex items-center justify-between p-6 border-b border-gray-700">
-              <h2 className="text-lg font-semibold text-gray-100">Add Repository</h2>
+
               <button
-                onClick={() => { setShowAddModal(false); setForm({ ...defaultForm }); createMutation.reset(); }}
+                onClick={closeAdd}
+                aria-label="Close dialog" data-dialog-cancel disabled={saveFlow.pending}
                 className="text-gray-400 hover:text-gray-200 transition-colors"
               >
                 <X className="w-5 h-5" />
@@ -417,21 +380,18 @@ export default function Repositories() {
             </div>
 
             <div className="p-6 space-y-6">
-              {createMutation.isError && (
-                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm">
-                  Failed to create repository: {createMutation.error?.message}
-                </div>
-              )}
+              <RepositorySaveNotice attempt={saveFlow.attempt} error={saveError ?? saveFlow.error} pending={saveFlow.pending} onLoadCurrent={loadCurrentSettingsForReview} onUseReviewed={useReviewedSettings} reviewed={!!saveFlow.reviewedCurrent} />
+              {saveMessage && <p role="status" className="text-yellow-300">{saveMessage}</p>}
 
               {/* Name */}
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1">Repository Name</label>
+                <label className="block text-sm font-medium text-gray-300 mb-1" htmlFor={`${fieldId}-1`}>Repository Name</label>
                 <input
                   type="text"
                   className={inputClass}
                   value={form.name}
                   onChange={(e) => setField('name', e.target.value)}
-                  placeholder="My Project"
+                  placeholder="My Project" id={`${fieldId}-1`}
                 />
               </div>
 
@@ -443,43 +403,43 @@ export default function Repositories() {
                 </h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">SVN URL</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-2`}>SVN URL</label>
                     <input
                       type="text"
                       className={inputClass}
                       value={form.svn_url}
                       onChange={(e) => setField('svn_url', e.target.value)}
-                      placeholder="https://svn.example.com/repo"
+                      placeholder="https://svn.example.com/repo" id={`${fieldId}-2`}
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Branch</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-3`}>Branch</label>
                     <input
                       type="text"
                       className={inputClass}
                       value={form.svn_branch}
                       onChange={(e) => setField('svn_branch', e.target.value)}
-                      placeholder="trunk"
+                      placeholder="trunk" id={`${fieldId}-3`}
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Username</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-4`}>Username</label>
                     <input
                       type="text"
                       className={inputClass}
                       value={form.svn_username}
                       onChange={(e) => setField('svn_username', e.target.value)}
-                      placeholder="svn-user"
+                      placeholder="svn-user" id={`${fieldId}-4`}
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Password</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-5`}>Password</label>
                     <input
                       type="password"
                       className={inputClass}
                       value={form.svn_password}
                       onChange={(e) => setField('svn_password', e.target.value)}
-                      placeholder="Enter SVN password"
+                      placeholder="Enter SVN password" id={`${fieldId}-5`}
                     />
                   </div>
                   <div className="md:col-span-2">
@@ -508,54 +468,54 @@ export default function Repositories() {
                 </h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Provider</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-6`}>Provider</label>
                     <select
                       className={selectClass}
                       value={form.git_provider}
-                      onChange={(e) => setField('git_provider', e.target.value)}
+                      onChange={(e) => setField('git_provider', e.target.value)} id={`${fieldId}-6`}
                     >
                       <option value="github">GitHub</option>
                       <option value="gitea">Gitea</option>
                     </select>
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">API URL</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-7`}>API URL</label>
                     <input
                       type="text"
                       className={inputClass}
                       value={form.git_api_url}
                       onChange={(e) => setField('git_api_url', e.target.value)}
-                      placeholder="https://api.github.com"
+                      placeholder="https://api.github.com" id={`${fieldId}-7`}
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Repository</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-8`}>Repository</label>
                     <input
                       type="text"
                       className={inputClass}
                       value={form.git_repo}
                       onChange={(e) => setField('git_repo', e.target.value)}
-                      placeholder="owner/repo"
+                      placeholder="owner/repo" id={`${fieldId}-8`}
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Default Branch</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-9`}>Default Branch</label>
                     <input
                       type="text"
                       className={inputClass}
                       value={form.git_branch}
                       onChange={(e) => setField('git_branch', e.target.value)}
-                      placeholder="main"
+                      placeholder="main" id={`${fieldId}-9`}
                     />
                   </div>
                   <div className="md:col-span-2">
-                    <label className="block text-sm text-gray-400 mb-1">Git Token</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-10`}>Git Token</label>
                     <input
                       type="password"
                       className={inputClass}
                       value={form.git_token}
                       onChange={(e) => setField('git_token', e.target.value)}
-                      placeholder="Enter Git API token"
+                      placeholder="Enter Git API token" id={`${fieldId}-10`}
                     />
                   </div>
                   <div className="md:col-span-2">
@@ -595,39 +555,39 @@ export default function Repositories() {
                 </h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Sync Mode</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-11`}>Sync Mode</label>
                     <select
                       className={selectClass}
                       value={form.sync_mode}
-                      onChange={(e) => setField('sync_mode', e.target.value)}
+                      onChange={(e) => setField('sync_mode', e.target.value)} id={`${fieldId}-11`}
                     >
                       <option value="direct">Direct</option>
                       <option value="pr">Pull Request</option>
                     </select>
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Poll Interval (seconds)</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-12`}>Poll Interval (seconds)</label>
                     <input
                       type="number"
                       className={inputClass}
                       value={form.poll_interval_secs}
                       onChange={(e) => setField('poll_interval_secs', Number(e.target.value))}
-                      min={10}
+                      min={10} id={`${fieldId}-12`}
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">LFS Threshold (MB, 0 = disabled)</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-13`}>LFS Threshold (MB, 0 = disabled)</label>
                     <input
                       type="number"
                       className={inputClass}
                       value={form.lfs_threshold_mb}
                       onChange={(e) => setField('lfs_threshold_mb', Number(e.target.value))}
-                      min={0}
+                      min={0} id={`${fieldId}-13`}
                     />
                   </div>
                   <div className="flex items-end gap-3">
                     <div>
-                      <label className="block text-sm text-gray-400 mb-1">Auto Merge</label>
+                      <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-14`}>Auto Merge</label>
                       <button
                         type="button"
                         role="switch"
@@ -636,7 +596,7 @@ export default function Repositories() {
                         onClick={() => setField('auto_merge', !form.auto_merge)}
                         className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
                           form.auto_merge ? 'bg-blue-600' : 'bg-gray-600'
-                        }`}
+                        }`} id={`${fieldId}-14`}
                       >
                         <span
                           className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
@@ -646,7 +606,7 @@ export default function Repositories() {
                       </button>
                     </div>
                     <div>
-                      <label className="block text-sm text-gray-400 mb-1">Enabled</label>
+                      <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-15`}>Enabled</label>
                       <button
                         type="button"
                         role="switch"
@@ -655,7 +615,7 @@ export default function Repositories() {
                         onClick={() => setField('enabled', !form.enabled)}
                         className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
                           form.enabled ? 'bg-green-600' : 'bg-gray-600'
-                        }`}
+                        }`} id={`${fieldId}-15`}
                       >
                         <span
                           className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
@@ -672,22 +632,22 @@ export default function Repositories() {
             {/* Modal footer */}
             <div className="flex items-center justify-end gap-3 p-6 border-t border-gray-700">
               <button
-                onClick={() => { setShowAddModal(false); setForm({ ...defaultForm }); createMutation.reset(); }}
+                onClick={closeAdd}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
-              >
+               data-dialog-cancel disabled={saveFlow.pending}>
                 Cancel
               </button>
               <button
                 onClick={handleCreate}
-                disabled={createMutation.isPending || !form.name.trim()}
+                disabled={saveFlow.pending || !form.name.trim()}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
                 <Plus className="w-4 h-4" />
-                {createMutation.isPending ? 'Creating...' : 'Create Repository'}
+                {saveFlow.pending ? 'Saving...' : saveFlow.attempt?.repoId ? 'Resume / Save on Existing ID' : saveFlow.attempt ? 'Resume Same Save Request' : 'Create Repository'}
               </button>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
     </div>
   );
@@ -732,10 +692,10 @@ function BranchTree({
             <ArrowRight className="w-2.5 h-2.5 text-gray-600 flex-shrink-0" />
             <span className="text-[10px] text-purple-400/60">{child.git_branch}</span>
             <span className="ml-auto flex items-center gap-1.5 flex-shrink-0">
-              <span className="text-[10px] text-gray-600">{formatTimeAgo(child.updated_at)}</span>
-              <StatusDot state={undefined} enabled={child.enabled} />
+              <span className="text-[10px] text-gray-400">Configuration: {child.enabled ? 'enabled':'disabled'}</span>
             </span>
           </button>
+          <RepositoryStatusSummary repoId={child.id}/>
           {/* Recurse into this child's children */}
           <BranchTree repoId={child.id} childMap={childMap} navigate={navigate} depth={depth + 1} />
         </div>

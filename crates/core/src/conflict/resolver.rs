@@ -59,11 +59,13 @@ impl ConflictResolver {
             conflict_id,
             resolved_by, "resolving conflict: accept merged content"
         );
-        Self::apply_resolution(conflict_id, "accept_merged", resolved_by, db)?;
-        // Store the merged content in the resolved_content column
-        db.store_resolved_content(conflict_id, merged_content)
-            .map_err(ConflictError::DatabaseError)?;
-        Ok(())
+        Self::apply_resolution_with_content(
+            conflict_id,
+            "accept_merged",
+            resolved_by,
+            db,
+            Some(merged_content),
+        )
     }
 
     /// Defer resolution of a conflict.
@@ -85,6 +87,16 @@ impl ConflictResolver {
         resolved_by: &str,
         db: &Database,
     ) -> Result<(), ConflictError> {
+        Self::apply_resolution_with_content(conflict_id, resolution, resolved_by, db, None)
+    }
+
+    fn apply_resolution_with_content(
+        conflict_id: &str,
+        resolution: &str,
+        resolved_by: &str,
+        db: &Database,
+        content: Option<&str>,
+    ) -> Result<(), ConflictError> {
         // Verify the conflict exists and is not already resolved.
         let conflict = db
             .get_conflict(conflict_id)
@@ -96,7 +108,7 @@ impl ConflictResolver {
         }
 
         // Update the conflict record.
-        db.resolve_conflict(conflict_id, "resolved", resolution, resolved_by)
+        db.resolve_conflict_with_content(conflict_id, "resolved", resolution, resolved_by, content)
             .map_err(ConflictError::DatabaseError)?;
 
         // Write an audit log entry.

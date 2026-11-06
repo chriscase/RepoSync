@@ -28,7 +28,7 @@ jobs:
         run: git lfs install
 
       - name: Verify tools
-        run: svn --version && svnadmin --version && git --version && git lfs version
+        run: svn --version && svnadmin --version && svnserve --version && svnlook --version && git --version && git lfs version
 
       - name: Reliability #62 acceptance matrix
         run: |
@@ -52,7 +52,526 @@ jobs:
         run: cargo build --locked -p reposync-core --release
 
       - name: Test
-        run: cargo test --workspace
+        run: |
+          # This case samples /proc/self/fd for its whole test process. Give
+          # only this case a separate process; retain normal workspace parallelism.
+          fd_case=test_no_resource_leak_after_many_requests
+          inventory_status=0
+          inventory="$(cargo test --workspace -- --list --format pretty --color never)" || inventory_status=$?
+          if [[ "$inventory_status" -ne 0 ]]; then
+            printf '%s\n' "$inventory"
+            exit "$inventory_status"
+          fi
+          matches="$(awk -v wanted="$fd_case: test" '$0 == wanted { count++ } END { print count + 0 }' <<< "$inventory")"
+          if [[ "$matches" -ne 1 ]]; then
+            echo "::error::Expected exactly one workspace FD case; found $matches"
+            exit 1
+          fi
+
+          workspace_status=0
+          cargo test --workspace -- --exact --skip "$fd_case" || workspace_status=$?
+
+          # Run the mandatory case even if another workspace case failed.
+          fd_status=0
+          fd_stdout="$RUNNER_TEMP/reposync-fd-case.stdout.log"
+          cargo test -p reposync-web --test server_freeze "$fd_case" -- --exact --format pretty --color never \
+            > "$fd_stdout" || fd_status=$?
+          cat "$fd_stdout"
+          # Cargo/libtest can exit successfully with zero selected or ignored
+          # tests. Require the exact case's passing result as well as exit zero.
+          if ! awk -v wanted="test $fd_case ... ok" '$0 == wanted { count++ } END { exit(count != 1) }' "$fd_stdout"; then
+            echo "::error::Mandatory FD case did not report exactly one passing result"
+            if [[ "$fd_status" -eq 0 ]]; then fd_status=1; fi
+          fi
+          printf 'Workspace exit: %s; isolated FD case exit: %s\n' "$workspace_status" "$fd_status"
+          if [[ "$workspace_status" -ne 0 ]]; then exit "$workspace_status"; fi
+          exit "$fd_status"
+        env:
+          RUST_BACKTRACE: 1
+          GIT_AUTHOR_NAME: "Test User"
+          GIT_AUTHOR_EMAIL: "test@example.com"
+          GIT_COMMITTER_NAME: "Test User"
+          GIT_COMMITTER_EMAIL: "test@example.com"
+
+      - name: Snapshot and full-import feature qualification (#68)
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          receipt_dir="$(mktemp -d "$RUNNER_TEMP/reposync-snapshot-http.XXXXXX")"
+          trap 'rm -rf -- "$receipt_dir"' EXIT
+          printf 'Qualified snapshot source: %s\n' "$GITHUB_SHA"
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          git lfs version
+          sha256sum Cargo.lock
+          cases=(
+            candidate_74_incremental_apply_completes_through_supervised_command
+            candidate_74_lfs_enabled_import_completes_with_pointer_publication
+            rs68_snapshot_lost_push_reply_reopens_and_reconciles_through_http_once
+          )
+          cargo test --locked -p reposync-web --features reliability-fixture --test server_freeze --no-run
+          cargo test --locked -p reposync-web --features reliability-fixture --test server_freeze \
+            -- --list --format pretty --color never > "$receipt_dir/normal.list"
+          cargo test --locked -p reposync-web --features reliability-fixture --test server_freeze \
+            -- --ignored --list --format pretty --color never > "$receipt_dir/ignored.list"
+          cat "$receipt_dir/normal.list" "$receipt_dir/ignored.list"
+          for case_id in "${cases[@]}"; do
+            matches="$(awk -v wanted="$case_id: test" '$0 == wanted { n++ } END { print n + 0 }' "$receipt_dir/normal.list")"
+            ignored="$(awk -v wanted="$case_id: test" '$0 == wanted { n++ } END { print n + 0 }' "$receipt_dir/ignored.list")"
+            if [[ "$matches" -ne 1 || "$ignored" -ne 0 ]]; then
+              echo "::error::Expected one nonignored $case_id; found $matches normal and $ignored ignored"
+              exit 1
+            fi
+          done
+          failed=0
+          for case_id in "${cases[@]}"; do
+            case_status=0
+            cargo test --locked -p reposync-web --features reliability-fixture --test server_freeze "$case_id" \
+              -- --exact --nocapture --test-threads=1 --format pretty --color never \
+              > "$receipt_dir/$case_id.stdout.log" 2> "$receipt_dir/$case_id.stderr.log" || case_status=$?
+            cat "$receipt_dir/$case_id.stdout.log" "$receipt_dir/$case_id.stderr.log"
+            if ! python3 - "$case_id" "$case_status" "$receipt_dir/$case_id.stdout.log" \
+              "$receipt_dir/normal.list" "$receipt_dir/ignored.list" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          case_id, status, stdout_path, normal_path, ignored_path = sys.argv[1:]
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(f"{case_id}: {message}")
+
+          require(int(status) == 0, "test process exited nonzero")
+          expected = f"{case_id}: test"
+          normal = pathlib.Path(normal_path).read_text().splitlines()
+          ignored = pathlib.Path(ignored_path).read_text().splitlines()
+          require(normal.count(expected) == 1 and ignored.count(expected) == 0,
+                  "expected exactly one nonignored selector")
+          lines = [line.strip() for line in pathlib.Path(stdout_path).read_text().splitlines()
+                   if line.strip()]
+          runs = [line for line in lines if re.fullmatch(r"running \d+ tests?", line)]
+          require(runs == ["running 1 test"], "expected exactly one executed test")
+          starts = [(i, match.group(1)) for i, line in enumerate(lines)
+                    if (match := re.match(r"test (\S+) \.\.\.(?: |$)", line))]
+          require(len(starts) == 1 and starts[0][1] == case_id,
+                  "missing, wrong or duplicate executed identity")
+          summaries = [(i, line) for i, line in enumerate(lines) if line.startswith("test result:")]
+          require(len(summaries) == 1, "missing or contradictory test summaries")
+          summary_index, summary = summaries[0]
+          require(re.fullmatch(r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; "
+                               r"\d+ filtered out; finished in \S+", summary),
+                  "expected one pass, zero failures and zero ignored tests")
+          require(summary_index == len(lines) - 1, "unexpected output after terminal summary")
+          # Inherited child stdout can split libtest's named prefix from its final ok.
+          terminals = [(i, line) for i, line in enumerate(lines)
+                       if line in {"ok", "FAILED", "ignored"}
+                       or re.fullmatch(r"test \S+ \.\.\. (?:ok|FAILED|ignored(?:,.*)?)", line)]
+          require(len(terminals) == 1 and terminals[0][1] in {"ok", f"test {case_id} ... ok"},
+                  "missing or contradictory terminal result")
+          require(lines.index("running 1 test") < starts[0][0] <= terminals[0][0] == summary_index - 1,
+                  "terminal result is outside the selected test")
+          PY
+            then
+              echo "::error::Required snapshot case $case_id failed result qualification"
+              if [[ "$case_status" -eq 0 ]]; then case_status=1; fi
+            fi
+            printf 'Snapshot feature case %s exit: %s\n' "$case_id" "$case_status"
+            if [[ "$case_status" -ne 0 ]]; then failed=1; fi
+          done
+          exit "$failed"
+        env:
+          RUST_BACKTRACE: 1
+          GIT_AUTHOR_NAME: "Test User"
+          GIT_AUTHOR_EMAIL: "test@example.com"
+          GIT_COMMITTER_NAME: "Test User"
+          GIT_COMMITTER_EMAIL: "test@example.com"
+
+      - name: Pinned synthetic installer/update qualification (#68)
+        timeout-minutes: 10
+        run: |
+          python3 - <<'PY'
+          import ast
+          import hashlib
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import stat
+          import subprocess
+          import sys
+          import tarfile
+          import tempfile
+
+          OLD = "87379741779a6259f7eeb52a68cc6f061174e5ef"
+          OLD_TREE = "f383bb9b123f3f75b2dde7f17f7311a264946abd"
+          CASE = "candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade"
+          BINS = ("reposync", "reposync-daemon")
+
+
+          def require(ok, message):
+              if not ok:
+                  raise ValueError(message)
+
+
+          def digest(path):
+              h = hashlib.sha256()
+              with Path(path).open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      h.update(block)
+              return h.hexdigest()
+
+
+          def selected_result(text, case, status):
+              require(status == 0, "qualification process failed")
+              lines = [line.strip() for line in text.splitlines() if line.strip()]
+              runs = [(i, line) for i, line in enumerate(lines) if line.startswith("running ")]
+              require(len(runs) == 1 and runs[0][1] == "running 1 test",
+                      "expected exactly one admitted test")
+              starts = [(i, match.group(1)) for i, line in enumerate(lines)
+                        if (match := re.match(r"test (\S+) \.\.\.(?: |$)", line))]
+              require(len(starts) == 1 and starts[0][1] == case, "wrong or duplicate selected test")
+              summaries = [(i, line) for i, line in enumerate(lines) if line.startswith("test result:")]
+              require(len(summaries) == 1, "missing, duplicate or contradictory test summary")
+              summary_index, summary = summaries[0]
+              require(re.fullmatch(r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; "
+                                   r"\d+ filtered out; finished in \d+(?:\.\d+)?s", summary),
+                      "expected one complete passing summary")
+              require(summary_index == len(lines) - 1, "unexpected output after final summary")
+              # Child stdout can split libtest's prefix from its result. Count malformed
+              # result-like lines too, then require the sole result to be exactly supported.
+              terminals = [(i, line) for i, line in enumerate(lines)
+                           if re.match(r"(?:ok|FAILED|ignored)(?:\b|$)", line)
+                           or re.match(r"test \S+ \.\.\. (?:ok|FAILED|ignored)(?:\b|$)", line)]
+              require(len(terminals) == 1 and terminals[0][1] in ("ok", f"test {case} ... ok"),
+                      "missing, malformed or contradictory passing terminal")
+              require(runs[0][0] < starts[0][0] <= terminals[0][0] == summary_index - 1,
+                      "selected test, terminal and final summary are out of order")
+
+
+          def receipts(text):
+              result = {}
+              for match in re.finditer(r"RELIABILITY_EVIDENCE\s+(?=\{)", text):
+                  line = text[match.end():].splitlines()[0]
+                  value, end = json.JSONDecoder().raw_decode(line)
+                  require(not line[end:].strip(), "trailing receipt text")
+                  key = value.get("case")
+                  require(key in ("R01_OLD_INSTALL_UPGRADE", "R12_PINNED_INSTALLER_UPDATE")
+                          and key not in result, "wrong or duplicate installer receipt")
+                  result[key] = value
+              require(set(result) == {"R01_OLD_INSTALL_UPGRADE", "R12_PINNED_INSTALLER_UPDATE"},
+                      "missing installer-tier receipt")
+              return result
+
+
+          def validate_receipts(values, old, candidate, generator_hash):
+              r = values["R01_OLD_INSTALL_UPGRADE"]
+              require(r["old_code"] == OLD and r["old_generation"]["generator_code"] == OLD
+                      and r["old_generator_sha256"] == generator_hash, "old generator/source mismatch")
+              for flag in ("prewrite_restore_verified", "restore_noop", "restart_noop",
+                           "configuration_and_synthetic_credentials_preserved",
+                           "changed_projection_rejected_without_remote_write"):
+                  require(r.get(flag) is True, "missing retained engine observation: " + flag)
+              require(r["schema_before"] == r["schema_after"] == 12
+                      and r["outgoing_mapping"] == 1
+                      and r["svn_only_rev"] == r["old_svn_rev"] + 1
+                      and r["final_svn_rev"] == r["svn_only_rev"] + 1
+                      and r["final_svn_tree"] == r["final_git_tree"]
+                      and bool(r["final_git_tree"]), "retained continuity receipt differs")
+              r = values["R12_PINNED_INSTALLER_UPDATE"]
+              require(r["old_source"] == OLD and r["candidate_source"] == candidate["source_head"]
+                      and r["old_package"] == old["sha256"]
+                      and r["candidate_package"] == candidate["sha256"], "installer artifact/source mismatch")
+              for flag in ("installer_preserved_state_bytes_and_modes", "installed_cli_executed",
+                           "installed_daemon_version_only", "full_import_repeat_noop"):
+                  require(r.get(flag) is True, "missing installed observation: " + flag)
+              require(r["schema_before"] == r["schema_after"] == 12
+                      and r["omitted_mode_full_import_revisions"] == 2, "default import/schema differs")
+              receipt = r["installer_receipt"]
+              require(receipt["mode"] == "offline-owned-root-update"
+                      and receipt["package_sha256"] == candidate["sha256"]
+                      and receipt["binary_sha256"] == candidate["binaries"]
+                      and sorted(receipt["changed"]) == sorted(BINS)
+                      and receipt["activation_performed"] is False
+                      and receipt["configuration_or_database_opened"] is False,
+                      "incomplete or mismatched actual installer receipt")
+              require(len(r["executions"]) == 17 and all(type(v["exit_code"]) is int
+                      and v["exit_code"] == 0 for v in r["executions"]), "foreground command failure")
+
+
+          def main():
+              repo = Path.cwd().resolve()
+              head = os.environ["GITHUB_SHA"]
+              require(re.fullmatch(r"[0-9a-f]{40}", head), "missing exact source")
+              require(subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == head,
+                      "checkout is not GITHUB_SHA")
+              require(not subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"]),
+                      "tracked candidate source is dirty")
+              runner = Path(os.environ["RUNNER_TEMP"]).resolve()
+              require(shutil.disk_usage(runner).free >= 8 * 1024 ** 3, "less than 8 GiB free")
+              stage = Path(tempfile.mkdtemp(prefix="reposync-installer-update-", dir=runner))
+              stage.chmod(0o700)
+              logs = stage / "logs"
+              logs.mkdir()
+              runtime = stage / "runtime"
+              runtime.mkdir(mode=0o700)
+              target = stage / "target"
+              env = dict(os.environ, CARGO_BUILD_JOBS="2", CARGO_INCREMENTAL="0",
+                         CARGO_PROFILE_DEV_DEBUG="0", CARGO_PROFILE_TEST_DEBUG="0",
+                         CARGO_TARGET_DIR=str(target), TMPDIR=str(runtime),
+                         GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
+              print("Installer qualification stage:", stage, flush=True)
+
+              def run(label, argv, cwd=repo, extra=None, show=False, allow_failure=False):
+                  argv = [str(a) for a in argv]
+                  out, err = logs / (label + ".stdout"), logs / (label + ".stderr")
+                  with out.open("wb") as stdout, err.open("wb") as stderr:
+                      result = subprocess.run(argv, cwd=cwd, env=dict(env, **(extra or {})),
+                                              stdout=stdout, stderr=stderr)
+                  record = {"command": argv, "cwd": str(cwd), "exit_code": result.returncode,
+                            "stdout_sha256": digest(out), "stderr_sha256": digest(err),
+                            "stdout_bytes": out.stat().st_size, "stderr_bytes": err.stat().st_size}
+                  (logs / (label + ".command.json")).write_text(json.dumps(record, sort_keys=True) + "\n")
+                  print(json.dumps(record, sort_keys=True), flush=True)
+                  if show or result.returncode:
+                      print(out.read_text(errors="replace"), end="", flush=True)
+                      print(err.read_text(errors="replace"), end="", flush=True)
+                  require(allow_failure or result.returncode == 0, label + " failed; stage retained")
+                  return out.read_text(), result.returncode
+
+              unit, _ = run("mechanism", [sys.executable, "scripts/test_install.py", "-v"], show=True)
+              unit += (logs / "mechanism.stderr").read_text()
+              module = ast.parse((repo / "scripts/test_install.py").read_text())
+              names = [n.name for c in module.body if isinstance(c, ast.ClassDef)
+                       and c.name == "OfflineInstaller" for n in c.body
+                       if isinstance(n, ast.FunctionDef) and n.name.startswith("test_")]
+              require(len(names) == len(set(names)) == 12, "mechanism inventory is not twelve")
+              require(re.findall(r"(?m)^Ran (\d+) tests? in .*", unit) == ["12"]
+                      and re.findall(r"(?m)^OK$", unit) == ["OK"], "mechanism summary failed")
+              for name in names:
+                  require(len(re.findall(r"(?m)^" + re.escape(name) + r" \([^\n]+\) \.\.\. ok$", unit)) == 1,
+                          "mechanism result missing or duplicated: " + name)
+
+              if subprocess.run(["git", "cat-file", "-e", OLD + "^{commit}"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+                  run("old-fetch", ["git", "fetch", "--no-tags", "origin", OLD])
+              old_tree, _ = run("old-tree", ["git", "rev-parse", OLD + "^{tree}"])
+              require(old_tree.strip() == OLD_TREE, "historical tree differs")
+              old_root = stage / "old-source"
+              old_root.mkdir()
+              archive = stage / "old-source.tar"
+              run("old-archive", ["git", "archive", "--format=tar", "--output", archive, OLD])
+              with tarfile.open(archive) as tar:
+                  tar.extractall(old_root, filter="data")
+              tracked = subprocess.check_output(["git", "ls-tree", "-rz", OLD])
+
+              def verify_old():
+                  records = {}
+                  for row in tracked.split(b"\0"):
+                      if not row:
+                          continue
+                      info, path = row.split(b"\t")
+                      mode, kind, blob = info.decode().split()
+                      require(kind == "blob" and mode in ("100644", "100755"), "unsupported old tree member")
+                      path = path.decode()
+                      expected = subprocess.check_output(["git", "cat-file", "blob", blob])
+                      actual = old_root / path
+                      require(actual.is_file() and not actual.is_symlink() and actual.read_bytes() == expected,
+                              "historical body changed: " + path)
+                      require(bool(actual.stat().st_mode & 0o111) == (mode == "100755"), "historical mode changed")
+                      records[path] = {"mode": mode, "blob": blob, "sha256": digest(actual)}
+                  require(len(records) == 200, "historical inventory differs")
+                  (logs / "old-unchanged-bodies.json").write_text(json.dumps(records, sort_keys=True) + "\n")
+              verify_old()
+              run("old-lock", [sys.executable, "scripts/reliability-lock-overlay.py", "stage", old_root,
+                               "--source", OLD, "--receipt", logs / "old-lock.json"])
+              require(digest(old_root / "Cargo.lock") ==
+                      "9feb01d8964bc93d67ff94014fcd1c7ff0f86111dc5e0efceaf288ec12cc2d05", "old lock differs")
+              adapter = repo / "scripts/legacy_import_generator.rs"
+              adapter_dest = old_root / "crates/web/tests/legacy_import_generator.rs"
+              require(not adapter_dest.exists(), "adapter would replace historical source")
+              shutil.copyfile(adapter, adapter_dest)
+              rustc, _ = run("rustc", ["rustc", "-vV"], show=True)
+              platform = re.search(r"(?m)^host: (\S+)$", rustc).group(1)
+
+              def build(label, root, argv, expected):
+                  text, _ = run(label, ["cargo", *argv, "--message-format=json"], cwd=root)
+                  rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+                  require([v.get("success") for v in rows if v.get("reason") == "build-finished"] == [True],
+                          "missing successful compiler completion")
+                  selected = {}
+                  for name, relative in expected.items():
+                      found = [v for v in rows if v.get("reason") == "compiler-artifact"
+                               and v["target"]["name"] == name and v.get("executable")
+                               and Path(v["target"]["src_path"]).resolve() == (root / relative).resolve()]
+                      require(len(found) == 1, "wrong or duplicate actual compiler artifact: " + name)
+                      value = found[0]
+                      require(value["profile"]["debuginfo"] == 0, "unexpected debug-info resource profile")
+                      selected[name] = value
+                      print("INSTALLER_COMPILER_ARTIFACT " + json.dumps(value, sort_keys=True), flush=True)
+                  (logs / (label + ".artifacts.json")).write_text(json.dumps(selected, sort_keys=True) + "\n")
+                  return selected
+
+              args = ["build", "--locked", "-p", "reposync-cli", "-p", "reposync-daemon",
+                      "--bin", "reposync", "--bin", "reposync-daemon"]
+              expected = {"reposync": "crates/cli/src/main.rs", "reposync-daemon": "crates/daemon/src/main.rs"}
+
+              def package(label, source, tree, root, artifacts):
+                  path = stage / (label + ".tar.gz")
+                  binaries = {}
+                  with tarfile.open(path, "w:gz") as tar:
+                      for name in BINS:
+                          artifact = artifacts[name]
+                          require(artifact["target"]["kind"] == ["bin"] and artifact["profile"]["test"] is False,
+                                  "non-binary package artifact")
+                          binary = Path(artifact["executable"]).resolve()
+                          require(binary.is_relative_to(target.resolve()) and binary.is_file(), "artifact escaped target")
+                          binaries[name] = digest(binary)
+                          tar.add(binary, arcname=name, recursive=False)
+                  value = {"source_head": source, "source_tree": tree, "archive": str(path),
+                           "sha256": digest(path), "bytes": path.stat().st_size, "binaries": binaries,
+                           "platform": platform, "profile": "dev no debuginfo; locked; synthetic build, not distributed release"}
+                  print("INSTALLER_PACKAGE " + json.dumps(value, sort_keys=True), flush=True)
+                  return value
+
+              old_artifacts = build("old-binaries", old_root, args, expected)
+              old = package("old-package", OLD, OLD_TREE, old_root, old_artifacts)
+              generator = build("old-generator", old_root,
+                                ["test", "--locked", "--no-run", "-p", "reposync-web", "--test", "legacy_import_generator"],
+                                {"legacy_import_generator": "crates/web/tests/legacy_import_generator.rs"})
+              generator_bin = stage / "old-generator"
+              require(generator["legacy_import_generator"]["target"]["kind"] == ["test"]
+                      and generator["legacy_import_generator"]["profile"]["test"] is True,
+                      "old generator is not the compiled test target")
+              shutil.copy2(generator["legacy_import_generator"]["executable"], generator_bin)
+              generator_hash = digest(generator_bin)
+              inventory, _ = run("old-generator-list", [generator_bin, "--list", "--format", "pretty", "--color", "never"])
+              require(inventory.splitlines().count("generate_legacy_import: test") == 1, "missing genuine generator case")
+              verify_old()
+              candidate_lock = digest(repo / "Cargo.lock")
+              candidate_tree, _ = run("candidate-tree", ["git", "rev-parse", "HEAD^{tree}"])
+              candidate_artifacts = build("candidate-binaries", repo, [args[0], "--offline", *args[1:]], expected)
+              candidate = package("candidate-package", head, candidate_tree.strip(), repo, candidate_artifacts)
+              require(digest(generator_bin) == generator_hash and digest(repo / "Cargo.lock") == candidate_lock,
+                      "generator or candidate lock changed")
+              spec = {"kind": "reposync.synthetic-installer-update.v1", "old": old, "candidate": candidate}
+              spec_path = stage / "install-update-spec.json"
+              spec_path.write_text(json.dumps(spec, sort_keys=True) + "\n")
+              prefix = ["cargo", "test", "--locked", "--offline", "-p", "reposync-core", "--features",
+                        "reliability-fixture", "--test", "team_mode_e2e"]
+              run("candidate-test-build", prefix + ["--no-run"])
+              normal, _ = run("candidate-test-list", prefix + ["--", "--list", "--format", "pretty", "--color", "never"])
+              ignored, _ = run("candidate-test-ignored", prefix + ["--", "--ignored", "--list", "--format", "pretty", "--color", "never"])
+              require(normal.splitlines().count(CASE + ": test") == 1
+                      and ignored.splitlines().count(CASE + ": test") == 0, "missing or ignored exact upgrade case")
+              text, status = run("native-update", prefix + [CASE, "--", "--exact", "--nocapture", "--test-threads=1",
+                                                              "--format", "pretty", "--color", "never"],
+                                 extra={"REPOSYNC_OLD_GENERATOR": str(generator_bin),
+                                        "REPOSYNC_INSTALL_UPDATE_SPEC": str(spec_path),
+                                        "REPOSYNC_INSTALL_UPDATE_HEAD": head}, show=True, allow_failure=True)
+              selected_result(text, CASE, status)
+              values = receipts(text + "\n" + (logs / "native-update.stderr").read_text())
+              validate_receipts(values, old, candidate, generator_hash)
+              require(digest(repo / "Cargo.lock") == candidate_lock and digest(generator_bin) == generator_hash,
+                      "qualification changed pinned inputs")
+              result = {"outcome": "PASS", "head": head, "tree": candidate_tree.strip(),
+                        "old": old, "candidate": candidate, "old_generator_sha256": generator_hash,
+                        "old_source_archive_sha256": digest(archive),
+                        "old_unchanged_bodies_sha256": digest(logs / "old-unchanged-bodies.json"),
+                        "old_lock_sha256": digest(old_root / "Cargo.lock"),
+                        "adapter_sha256": digest(adapter), "candidate_lock_sha256": candidate_lock,
+                        "mechanism_tests": 12, "selected_case": CASE, "receipts": values,
+                        "limits": "Synthetic owned-root update; installed CLI/import plus in-process engine observations. No service, privileged installer, deployed-version or platform-release qualification."}
+              (logs / "QUALIFIED.json").write_text(json.dumps(result, sort_keys=True) + "\n")
+              print("PINNED_INSTALLER_QUALIFIED " + json.dumps(result, sort_keys=True), flush=True)
+              # Keep command/original-output/receipt records. Remove only this step's own
+              # heavy build/fixture/package data after success; failure leaves it intact.
+              for path in (target, old_root, runtime):
+                  shutil.rmtree(path)
+              for path in (archive, generator_bin, stage / "old-package.tar.gz", stage / "candidate-package.tar.gz"):
+                  path.unlink()
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+        env:
+          RUST_BACKTRACE: 1
+          GIT_AUTHOR_NAME: "Test User"
+          GIT_AUTHOR_EMAIL: "test@example.com"
+          GIT_COMMITTER_NAME: "Test User"
+          GIT_COMMITTER_EMAIL: "test@example.com"
+
+      - name: Authenticated read-only review HTTP qualification
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          case_id=authenticated_review_http_journey::authenticated_http_review_real_sources_choices_staleness_and_no_approval
+          receipt_dir="$(mktemp -d "$RUNNER_TEMP/reposync-review-http.XXXXXX")"
+          trap 'rm -rf -- "$receipt_dir"' EXIT
+          printf 'Qualified source: %s\n' "$GITHUB_SHA"
+          printf 'Runner image: %s / %s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+          rustc --version --verbose
+          cargo --version
+          sha256sum Cargo.lock
+          cargo clippy --locked -p reposync-web --features reliability-fixture --test pair_refresh_v2 -- -D warnings
+          cargo test --locked -p reposync-web --features reliability-fixture --test pair_refresh_v2 --no-run --message-format=json \
+            > "$receipt_dir/compiler-artifacts.jsonl"
+          python3 - "$receipt_dir/compiler-artifacts.jsonl" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          selected = []
+          for line in pathlib.Path(sys.argv[1]).read_text().splitlines(keepends=True):
+              record = json.loads(line)
+              target = record.get("target", {})
+              if (record.get("reason") == "compiler-artifact"
+                      and target.get("name") == "pair_refresh_v2"
+                      and target.get("kind") == ["test"]
+                      and target.get("src_path", "").endswith("/crates/web/tests/pair_refresh_v2.rs")
+                      and "reliability-fixture" in record.get("features", [])
+                      and record.get("executable")):
+                  selected.append((record, line))
+          if len(selected) != 1:
+              raise SystemExit("Expected one feature-qualified pair_refresh_v2 test artifact")
+          record, original_line = selected[0]
+          sys.stdout.write(original_line)
+          executable = pathlib.Path(record["executable"])
+          digest = hashlib.sha256()
+          with executable.open("rb") as stream:
+              for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          print("Qualified test binary SHA256:", digest.hexdigest())
+          PY
+          cargo test --locked -p reposync-web --features reliability-fixture --test pair_refresh_v2 \
+            -- --list --format pretty --color never > "$receipt_dir/normal.list"
+          cargo test --locked -p reposync-web --features reliability-fixture --test pair_refresh_v2 \
+            -- --ignored --list --format pretty --color never > "$receipt_dir/ignored.list"
+          cat "$receipt_dir/normal.list" "$receipt_dir/ignored.list"
+          matches="$(awk -v wanted="$case_id: test" '$0 == wanted { n++ } END { print n + 0 }' "$receipt_dir/normal.list")"
+          ignored="$(awk -v wanted="$case_id: test" '$0 == wanted { n++ } END { print n + 0 }' "$receipt_dir/ignored.list")"
+          if [[ "$matches" -ne 1 || "$ignored" -ne 0 ]]; then
+            echo "::error::Expected one nonignored positive HTTP case; found $matches normal and $ignored ignored"
+            exit 1
+          fi
+          case_status=0
+          cargo test --locked -p reposync-web --features reliability-fixture --test pair_refresh_v2 "$case_id" \
+            -- --exact --test-threads=1 --format pretty --color never \
+            > "$receipt_dir/test.stdout.log" 2> "$receipt_dir/test.stderr.log" || case_status=$?
+          cat "$receipt_dir/test.stdout.log" "$receipt_dir/test.stderr.log"
+          if ! awk -v wanted="test $case_id ... ok" '$0 == wanted { n++ } END { exit(n != 1) }' "$receipt_dir/test.stdout.log"; then
+            echo "::error::Positive HTTP case did not report exactly one passing result"
+            if [[ "$case_status" -eq 0 ]]; then case_status=1; fi
+          fi
+          if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$receipt_dir/test.stdout.log"; then
+            echo "::error::Positive HTTP case lacks a one-pass, zero-failed, zero-ignored summary"
+            if [[ "$case_status" -eq 0 ]]; then case_status=1; fi
+          fi
+          printf 'Positive HTTP case exit: %s\n' "$case_status"
+          exit "$case_status"
         env:
           RUST_BACKTRACE: 1
           GIT_AUTHOR_NAME: "Test User"

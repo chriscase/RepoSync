@@ -4,6 +4,13 @@ set -euo pipefail
 # RepoSync installer
 # Usage: curl -fsSL https://github.com/chriscase/RepoSync/releases/latest/download/install.sh | bash
 
+# Explicit offline update of an already-configured, private user-owned root.
+# The existing privileged/default installer flow below remains unchanged.
+if [[ "${1:-}" == "--offline-update" ]]; then
+    shift
+    exec python3 "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/install_offline.py" "$@"
+fi
+
 VERSION="${REPOSYNC_VERSION:-latest}"
 INSTALL_DIR="${REPOSYNC_INSTALL_DIR:-/usr/local/bin}"
 CONFIG_DIR="/etc/reposync"

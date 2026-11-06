@@ -1,7 +1,7 @@
-//! Durable v12 journal for explicit managed removal (#65).
+//! Durable KV journal for explicit managed removal (#65).
 //!
 //! Documents live in `kv_state` under `managed_remove_v1:`. Ordinary schema
-//! stays v12. Legacy root DELETE does not write this journal.
+//! stays at its existing operational version 13. Legacy root DELETE does not write this journal.
 //!
 //! Removal disables the registration, waits until #64 import / Git→SVN /
 //! SVN→Git ownership is quiet, then deletes only exact per-repo secret keys and the
@@ -46,6 +46,7 @@ impl ManagedRemoveState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedRemoveOperation {
     pub version: u8,
     pub id: String,
@@ -60,9 +61,216 @@ pub struct ManagedRemoveOperation {
     pub outcome_detail: Option<String>,
     pub last_svn_rev: i64,
     pub last_git_sha: String,
+    #[serde(default = "untouched_remote")]
     pub remote_git: String,
+    #[serde(default = "untouched_remote")]
     pub remote_svn: String,
+    #[serde(default)]
     pub restore_supported: bool,
+    /// Version 2 is an explicit reviewed protocol; legacy v1 bytes stay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed: Option<Box<ReviewedRemoval>>,
+}
+
+fn untouched_remote() -> String {
+    "untouched".into()
+}
+
+// Pure decoding must not initialize libgit2 or execute a ref-format subprocess.
+fn reviewed_ref_name(reference: &str) -> bool {
+    reference.starts_with("refs/heads/")
+        && reference.len() > "refs/heads/".len()
+        && !reference.ends_with('.')
+        && !reference.ends_with('/')
+        && !reference.contains("..")
+        && !reference.contains("@{")
+        && !reference
+            .bytes()
+            .any(|b| b <= b' ' || b == 127 || b"~^:?*[\\".contains(&b))
+        && reference
+            .split('/')
+            .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
+pub const REVIEWED_REMOVAL_POLICY: &str = "reviewed_managed_removal_v2";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemovalChoices {
+    pub delete_git: bool,
+    pub delete_svn: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedGitDeletion {
+    pub remote_url: String,
+    pub reference: String,
+    /// None is a positively observed missing ref, never an unavailable lookup.
+    pub expected_sha: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedSvnDeletion {
+    pub root_url: String,
+    pub uuid: String,
+    pub url: String,
+    pub branch_path: String,
+    pub base_revision: i64,
+    pub expected_present: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedRemovalPlan {
+    pub version: u8,
+    pub policy: String,
+    pub actor: String,
+    pub repo_id: String,
+    pub scope_uuid: String,
+    pub parent_id: Option<String>,
+    pub parent_scope_uuid: Option<String>,
+    pub configuration_digest: String,
+    pub managed_root: String,
+    pub choices: RemovalChoices,
+    pub git: Option<ReviewedGitDeletion>,
+    pub svn: Option<ReviewedSvnDeletion>,
+    pub approval_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionPhase {
+    NotRequested,
+    Prepared,
+    IntentRecorded,
+    VerifiedDeleted,
+    VerifiedAlreadyAbsent,
+    FailedBeforeEffect,
+    ReconciliationRequired,
+}
+
+impl DeletionPhase {
+    pub fn is_verified(&self) -> bool {
+        matches!(
+            self,
+            Self::NotRequested | Self::VerifiedDeleted | Self::VerifiedAlreadyAbsent
+        )
+    }
+}
+
+pub(crate) fn deletion_evidence_digest(
+    operation: &str,
+    pin: &str,
+    side: &str,
+    receipt: &DeletionReceipt,
+) -> Result<String, DatabaseError> {
+    let bytes = serde_json::to_vec(&(
+        REVIEWED_REMOVAL_POLICY,
+        operation,
+        pin,
+        side,
+        &receipt.operation_marker,
+        &receipt.phase,
+        receipt.confirmed_svn_revision,
+    ))
+    .map_err(|_| DatabaseError::Other("deletion evidence encoding failed".into()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeletionReceipt {
+    pub phase: DeletionPhase,
+    pub operation_marker: String,
+    pub confirmed_svn_revision: Option<i64>,
+    pub observed_git_sha: Option<String>,
+    pub evidence_digest: Option<String>,
+    /// Ordered bounded causes are retained across retry/inspection.
+    pub errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedRemoval {
+    pub plan: ReviewedRemovalPlan,
+    pub git: DeletionReceipt,
+    pub svn: DeletionReceipt,
+    pub cleanup_started: bool,
+    pub cleanup_completed: bool,
+    #[serde(default)]
+    pub cleanup_errors: Vec<String>,
+}
+
+impl ReviewedRemovalPlan {
+    pub fn digest(&self) -> Result<String, DatabaseError> {
+        let mut canonical = self.clone();
+        canonical.approval_digest.clear();
+        let bytes = serde_json::to_vec(&canonical)
+            .map_err(|_| DatabaseError::Other("removal plan encoding failed".into()))?;
+        if bytes.len() > 65536 {
+            return Err(DatabaseError::Other(
+                "removal plan exceeds retained evidence bound".into(),
+            ));
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"reposync:reviewed-managed-removal:v2\0");
+        hash.update(bytes);
+        Ok(hex::encode(hash.finalize()))
+    }
+
+    pub fn validate(&self) -> Result<(), DatabaseError> {
+        let invalid = || DatabaseError::Other("invalid reviewed removal plan".into());
+        if self.version != 2
+            || self.policy != REVIEWED_REMOVAL_POLICY
+            || self.actor.is_empty()
+            || self.actor.len() > 256
+            || crate::managed_remove::validate_repo_id(&self.repo_id).is_err()
+            || uuid::Uuid::parse_str(&self.scope_uuid).is_err()
+            || self.parent_id.is_some() != self.parent_scope_uuid.is_some()
+            || self
+                .parent_scope_uuid
+                .as_ref()
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
+            || self.configuration_digest.len() != 64
+            || !self
+                .configuration_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+            || !std::path::Path::new(&self.managed_root).is_absolute()
+            || self.choices.delete_git != self.git.is_some()
+            || self.choices.delete_svn != self.svn.is_some()
+            || ((self.choices.delete_git || self.choices.delete_svn) && self.parent_id.is_none())
+            || self.approval_digest != self.digest()?
+        {
+            return Err(invalid());
+        }
+        if let Some(git) = &self.git {
+            if !reviewed_ref_name(&git.reference)
+                || git
+                    .expected_sha
+                    .as_ref()
+                    .is_some_and(|s| s.len() != 40 || !s.bytes().all(|b| b.is_ascii_hexdigit()))
+                || git.remote_url.is_empty()
+            {
+                return Err(invalid());
+            }
+        }
+        if let Some(svn) = &self.svn {
+            if svn.uuid.is_empty()
+                || svn.base_revision < 0
+                || svn.branch_path.is_empty()
+                || crate::svn::operand::configured_branch_url(&svn.root_url, &svn.branch_path)
+                    .ok()
+                    .as_deref()
+                    != Some(svn.url.as_str())
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +390,7 @@ pub enum RemovalBlocker {
     SvnCommitReconciliationRequired,
     GitPushRunning,
     GitPushReconciliationRequired,
+    LatePairOwnedOrUncertain,
     ChildRegistrations { count: i64 },
 }
 
@@ -211,6 +420,7 @@ impl RemovalBlocker {
                 "SVN-to-Git push has an unresolved external effect; registration and local data were kept"
                     .into()
             }
+            Self::LatePairOwnedOrUncertain => "late pairing still owns or holds this scope; registration and local data were kept".into(),
             Self::ChildRegistrations { count } => format!(
                 "parent removal is blocked while {count} child registration(s) exist; remove child branch pairs first — children are not removed automatically"
             ),
@@ -222,6 +432,7 @@ impl RemovalBlocker {
             Self::ImportReconciliationRequired
             | Self::SvnCommitReconciliationRequired
             | Self::GitPushReconciliationRequired => ManagedRemoveState::ReconciliationRequired,
+            Self::LatePairOwnedOrUncertain => ManagedRemoveState::ReconciliationRequired,
             Self::ChildRegistrations { .. } => ManagedRemoveState::Failed,
             Self::ImportRunning | Self::SvnCommitRunning | Self::GitPushRunning => {
                 ManagedRemoveState::Cancelling
@@ -276,14 +487,163 @@ fn write_value(conn: &Connection, name: &str, value: &str) -> Result<(), Databas
 }
 
 fn parse_op(raw: &str) -> Result<ManagedRemoveOperation, DatabaseError> {
+    if raw.len() > 1_048_576 {
+        return Err(DatabaseError::Other(
+            "managed removal exceeds evidence bound".into(),
+        ));
+    }
     let op: ManagedRemoveOperation = serde_json::from_str(raw)
         .map_err(|error| DatabaseError::Other(format!("invalid managed removal: {error}")))?;
-    if op.version != 1 || op.operation_type != "managed_remove" {
+    if op.operation_type != "managed_remove" {
         return Err(DatabaseError::Other(
             "unsupported managed removal document".into(),
         ));
     }
+    match (op.version, op.reviewed.as_deref()) {
+        (1, None) => {}
+        (2, Some(progress)) => {
+            progress.plan.validate()?;
+            if op.id.is_empty()
+                || Uuid::parse_str(&op.id).is_err()
+                || op.request_id.is_empty()
+                || op.request_id.len() > 256
+                || op.repo_id != progress.plan.repo_id
+                || op.initiator_id != progress.plan.actor
+                || op.target_fingerprint != progress.plan.approval_digest
+                || (progress.cleanup_completed
+                    && (!progress.cleanup_started || op.state != ManagedRemoveState::Completed))
+                || (progress.cleanup_started
+                    && (!progress.git.phase.is_verified() || !progress.svn.phase.is_verified()))
+                || (op.state == ManagedRemoveState::Completed && !progress.cleanup_completed)
+                || progress.cleanup_errors.len() > 8
+                || progress.cleanup_errors.iter().any(|e| e.len() > 8192)
+            {
+                return Err(DatabaseError::Other(
+                    "contradictory reviewed removal identity or completion".into(),
+                ));
+            }
+            for (side, requested, receipt) in [
+                ("git", progress.plan.choices.delete_git, &progress.git),
+                ("svn", progress.plan.choices.delete_svn, &progress.svn),
+            ] {
+                let valid_digest =
+                    |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit());
+                if requested == matches!(receipt.phase, DeletionPhase::NotRequested)
+                    || receipt.operation_marker != format!("{}:{side}", op.id)
+                    || receipt.errors.len() > 8
+                    || receipt.errors.iter().any(|e| e.len() > 8192)
+                    || receipt
+                        .evidence_digest
+                        .as_deref()
+                        .is_some_and(|value| !valid_digest(value))
+                    || (requested
+                        && receipt.phase.is_verified()
+                        && receipt.evidence_digest.is_none())
+                    || (requested
+                        && receipt.phase.is_verified()
+                        && receipt.evidence_digest.as_deref()
+                            != Some(
+                                deletion_evidence_digest(
+                                    &op.id,
+                                    &op.target_fingerprint,
+                                    side,
+                                    receipt,
+                                )?
+                                .as_str(),
+                            ))
+                    || (!receipt.phase.is_verified()
+                        && (receipt.evidence_digest.is_some()
+                            || receipt.confirmed_svn_revision.is_some()))
+                    || (!requested
+                        && (!receipt.errors.is_empty() || receipt.evidence_digest.is_some()))
+                    || (side == "git" && receipt.confirmed_svn_revision.is_some())
+                    || (side == "svn" && receipt.observed_git_sha.is_some())
+                    || (side == "svn"
+                        && receipt.phase == DeletionPhase::VerifiedDeleted
+                        && receipt.confirmed_svn_revision.is_none())
+                    || (side == "git"
+                        && receipt.phase.is_verified()
+                        && receipt.observed_git_sha.is_some())
+                {
+                    return Err(DatabaseError::Other(
+                        "invalid or incomplete reviewed deletion receipt".into(),
+                    ));
+                }
+                if op.remote_git != reviewed_remote_label(&progress.git.phase)
+                    || op.remote_svn != reviewed_remote_label(&progress.svn.phase)
+                {
+                    return Err(DatabaseError::Other(
+                        "reviewed remote summary differs from its typed receipt".into(),
+                    ));
+                }
+                if receipt.phase == DeletionPhase::VerifiedAlreadyAbsent {
+                    let absent = if side == "git" {
+                        progress
+                            .plan
+                            .git
+                            .as_ref()
+                            .is_some_and(|t| t.expected_sha.is_none())
+                    } else {
+                        progress
+                            .plan
+                            .svn
+                            .as_ref()
+                            .is_some_and(|t| !t.expected_present)
+                    };
+                    if !absent {
+                        return Err(DatabaseError::Other(
+                            "unexpected absent-target receipt".into(),
+                        ));
+                    }
+                }
+                if side == "svn"
+                    && receipt.confirmed_svn_revision.is_some_and(|r| {
+                        progress
+                            .plan
+                            .svn
+                            .as_ref()
+                            .is_none_or(|t| r <= t.base_revision)
+                    })
+                {
+                    return Err(DatabaseError::Other("invalid deletion revision".into()));
+                }
+            }
+            if serde_json::to_string(&op)
+                .map_err(|_| DatabaseError::Other("removal encoding failed".into()))?
+                != raw
+            {
+                return Err(DatabaseError::Other(
+                    "noncanonical reviewed removal document".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(DatabaseError::Other(
+                "unsupported or blended managed-removal version".into(),
+            ))
+        }
+    }
     Ok(op)
+}
+
+/// Strict read-only decoder for foreign journal consumers. Serde's concrete
+/// structs reject duplicate and unknown fields at every nested object level.
+pub fn validated_foreign_document(raw: &str) -> Result<serde_json::Value, DatabaseError> {
+    serde_json::to_value(parse_op(raw)?)
+        .map_err(|_| DatabaseError::Other("managed removal encoding failed".into()))
+}
+
+pub fn completed_for_foreign_journal(
+    raw: &str,
+    id: &str,
+    owner: &str,
+) -> Result<bool, DatabaseError> {
+    let op = parse_op(raw)?;
+    Ok(!id.is_empty()
+        && !owner.is_empty()
+        && op.id == id
+        && op.repo_id == owner
+        && op.state == ManagedRemoveState::Completed)
 }
 
 pub fn new_work_blocked(conn: &Connection, repo_id: &str) -> Result<bool, DatabaseError> {
@@ -382,7 +742,7 @@ fn git_remote_identity_nonempty(repo: &Repository) -> bool {
     !repo.git_api_url.trim().is_empty() && !repo.git_repo.trim().is_empty()
 }
 
-fn owned_secret_keys(repo_id: &str) -> [String; 2] {
+pub(crate) fn owned_secret_keys(repo_id: &str) -> [String; 2] {
     [
         format!("secret_svn_password_{repo_id}"),
         format!("secret_git_token_{repo_id}"),
@@ -839,22 +1199,456 @@ fn fingerprint(repo: &Repository) -> String {
     hex::encode(Sha256::digest(source.as_bytes()))
 }
 
+/// Stable configuration/credential generations, excluding operational counters
+/// and the disable timestamp written by this removal itself. No secret values
+/// are retained in the plan or returned to a client.
+pub(crate) fn reviewed_configuration_digest(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<String, DatabaseError> {
+    let mut lineage = Vec::new();
+    let mut credentials = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut next = Some(repo_id.to_string());
+    while let Some(id) = next {
+        if !seen.insert(id.clone()) {
+            return Err(DatabaseError::Other("repository ancestry is cyclic".into()));
+        }
+        let repo = load_repo(conn, &id)?
+            .ok_or_else(|| DatabaseError::Other("repository ancestry is missing".into()))?;
+        let scope = super::repo_scope_identity::repository_scope_uuid(conn, &id)?;
+        lineage.push(serde_json::json!({"id":id,"scope_uuid":scope,"parent_id":repo.parent_id,"svn_url":repo.svn_url,"svn_branch":repo.svn_branch,"svn_username":repo.svn_username,"git_provider":repo.git_provider,"git_api_url":repo.git_api_url,"git_repo":repo.git_repo,"git_branch":repo.git_branch,"sync_mode":repo.sync_mode,"allowed_paths":repo.allowed_paths,"blocked_patterns":repo.blocked_patterns}));
+        for prefix in ["secret_git_token", "secret_svn_password"] {
+            let key = format!("{prefix}_{id}");
+            let kv: Option<(String, bool)> = conn
+                .query_row(
+                    "SELECT updated_at,value='' FROM kv_state WHERE key=?1",
+                    [&key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let encrypted: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT updated_at,nonce FROM encrypted_secrets WHERE key=?1",
+                    [&key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            credentials.push((key, kv, encrypted));
+        }
+        next = repo.parent_id;
+    }
+    for key in ["secret_git_token", "secret_svn_password"] {
+        let kv: Option<(String, bool)> = conn
+            .query_row(
+                "SELECT updated_at,value='' FROM kv_state WHERE key=?1",
+                [key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let encrypted: Option<(String, String)> = conn
+            .query_row(
+                "SELECT updated_at,nonce FROM encrypted_secrets WHERE key=?1",
+                [key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        credentials.push((key.to_string(), kv, encrypted));
+    }
+    // A new registration sharing a target is also drift, even if the selected
+    // row and its ancestors did not change. Operational counters are excluded.
+    let ids = {
+        let mut statement = conn.prepare("SELECT id FROM repositories ORDER BY id")?;
+        let values = statement
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        values
+    };
+    let mut registrations = Vec::new();
+    for id in ids {
+        let repo = load_repo(conn, &id)?.ok_or_else(|| {
+            DatabaseError::Other("registration disappeared during dependency capture".into())
+        })?;
+        registrations.push((
+            id.clone(),
+            super::repo_scope_identity::repository_scope_uuid(conn, &id)?,
+            repo.parent_id,
+            repo.svn_url,
+            repo.svn_branch,
+            repo.git_api_url,
+            repo.git_repo,
+            repo.git_branch,
+        ));
+    }
+    let bytes = serde_json::to_vec(&(REVIEWED_REMOVAL_POLICY, lineage, credentials, registrations))
+        .map_err(|_| DatabaseError::Other("removal configuration encoding failed".into()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn reviewed_remote_label(phase: &DeletionPhase) -> &'static str {
+    match phase {
+        DeletionPhase::NotRequested => "untouched",
+        DeletionPhase::Prepared => "pending",
+        DeletionPhase::IntentRecorded | DeletionPhase::ReconciliationRequired => {
+            "reconciliation_required"
+        }
+        DeletionPhase::VerifiedDeleted => "deleted",
+        DeletionPhase::VerifiedAlreadyAbsent => "already_absent",
+        DeletionPhase::FailedBeforeEffect => "failed",
+    }
+}
+
+fn check_reviewed_registration(
+    conn: &Connection,
+    op: &ManagedRemoveOperation,
+) -> Result<(), DatabaseError> {
+    let p = op
+        .reviewed
+        .as_deref()
+        .ok_or_else(|| DatabaseError::Other("reviewed removal payload missing".into()))?;
+    if super::repo_scope_identity::repository_scope_uuid(conn, &op.repo_id)? != p.plan.scope_uuid
+        || reviewed_configuration_digest(conn, &op.repo_id)? != p.plan.configuration_digest
+    {
+        return Err(DatabaseError::Other("removal registration, incarnation or credential generation changed; new effects remain held".into()));
+    }
+    Ok(())
+}
+
+impl Database {
+    pub fn reviewed_removal_configuration(&self, repo_id: &str) -> Result<String, DatabaseError> {
+        reviewed_configuration_digest(&self.conn(), repo_id)
+    }
+
+    pub(crate) fn claim_reviewed_removal(
+        &self,
+        plan: ReviewedRemovalPlan,
+        request_id: &str,
+    ) -> Result<ManagedRemoveOperation, DatabaseError> {
+        plan.validate()?;
+        if request_id.is_empty() || request_id.len() > 256 {
+            return Err(DatabaseError::Other(
+                "invalid removal request identity".into(),
+            ));
+        }
+        self.immediate_transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+                tx,
+                &plan.repo_id,
+            )?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx,
+                &plan.repo_id,
+            )?;
+            super::late_pair_publish_operations::require_no_reconciliation_hold(tx, &plan.repo_id)
+                .map_err(DatabaseError::Other)?;
+            if let Some(op) = read_op(tx, &plan.repo_id)? {
+                if op.version == 2
+                    && op.initiator_id == plan.actor
+                    && op.request_id == request_id
+                    && op.target_fingerprint == plan.approval_digest
+                {
+                    return Ok(op);
+                }
+                if !op.state.is_terminal_success() {
+                    return Err(DatabaseError::Other(
+                        "another removal owns the repository; inspect its operation".into(),
+                    ));
+                }
+                if load_repo(tx, &plan.repo_id)?.is_none() {
+                    return Err(DatabaseError::Other(
+                        "repository is already removed; retained receipt remains available".into(),
+                    ));
+                }
+                retire_managed_remove_completion_pointer(tx, &plan.repo_id)?;
+            }
+            let repo = load_repo(tx, &plan.repo_id)?
+                .ok_or_else(|| DatabaseError::Other("repository not found".into()))?;
+            if child_count(tx, &repo.id)? > 0 {
+                return Err(DatabaseError::Other(
+                    "parent removal requires child registrations to be handled first".into(),
+                ));
+            }
+            let scope = super::repo_scope_identity::repository_scope_uuid(tx, &repo.id)?;
+            if scope != plan.scope_uuid
+                || reviewed_configuration_digest(tx, &repo.id)? != plan.configuration_digest
+            {
+                return Err(DatabaseError::Other(
+                    "stale removal review; review the current target again".into(),
+                ));
+            }
+            let mut op = fresh_op(&repo, &plan.actor, request_id);
+            op.version = 2;
+            op.target_fingerprint = plan.approval_digest.clone();
+            let receipt = |side: &str, requested: bool| DeletionReceipt {
+                phase: if requested {
+                    DeletionPhase::Prepared
+                } else {
+                    DeletionPhase::NotRequested
+                },
+                operation_marker: format!("{}:{side}", op.id),
+                confirmed_svn_revision: None,
+                observed_git_sha: None,
+                evidence_digest: None,
+                errors: Vec::new(),
+            };
+            let git = receipt("git", plan.choices.delete_git);
+            let svn = receipt("svn", plan.choices.delete_svn);
+            op.remote_git = reviewed_remote_label(&git.phase).into();
+            op.remote_svn = reviewed_remote_label(&svn.phase).into();
+            op.reviewed = Some(Box::new(ReviewedRemoval {
+                plan,
+                git,
+                svn,
+                cleanup_started: false,
+                cleanup_completed: false,
+                cleanup_errors: Vec::new(),
+            }));
+            tx.execute(
+                "UPDATE repositories SET enabled=0,updated_at=?1 WHERE id=?2",
+                params![Utc::now().to_rfc3339(), repo.id],
+            )?;
+            if let Some(blocker) = writer_blocker(tx, &repo.id)? {
+                op.state = blocker.waiting_state();
+                op.outcome_detail = Some(blocker.detail());
+            } else {
+                super::ordinary_writer_windows::require_quiet_for_refresh(tx, &repo.id, &scope)?;
+                op.state = ManagedRemoveState::Running;
+            }
+            store_op(tx, &op)?;
+            audit(
+                tx,
+                &repo.id,
+                "reviewed_managed_remove_accepted",
+                "explicit reviewed removal recorded; no effect or cleanup acknowledged",
+                true,
+            )?;
+            Ok(op)
+        })
+    }
+
+    pub(crate) fn transition_reviewed_removal(
+        &self,
+        expected: &ManagedRemoveOperation,
+        mut next: ManagedRemoveOperation,
+    ) -> Result<ManagedRemoveOperation, DatabaseError> {
+        self.transition_reviewed_removal_inner(expected, &mut next, false)
+    }
+
+    pub(crate) fn record_reviewed_deletion(
+        &self,
+        expected: &ManagedRemoveOperation,
+        proof: crate::managed_remove::reviewed::VerifiedDeletion,
+    ) -> Result<ManagedRemoveOperation, DatabaseError> {
+        let (operation, pin, side, receipt) = proof.into_parts();
+        if operation != expected.id || pin != expected.target_fingerprint {
+            return Err(DatabaseError::Other(
+                "native deletion proof belongs to another operation".into(),
+            ));
+        }
+        let mut next = expected.clone();
+        let progress = next
+            .reviewed
+            .as_mut()
+            .ok_or_else(|| DatabaseError::Other("reviewed removal missing".into()))?;
+        match side {
+            "git" => {
+                progress.git = receipt;
+                next.remote_git = reviewed_remote_label(&progress.git.phase).into();
+            }
+            "svn" => {
+                progress.svn = receipt;
+                next.remote_svn = reviewed_remote_label(&progress.svn.phase).into();
+            }
+            _ => return Err(DatabaseError::Other("unknown native deletion side".into())),
+        }
+        self.transition_reviewed_removal_inner(expected, &mut next, true)
+    }
+
+    fn transition_reviewed_removal_inner(
+        &self,
+        expected: &ManagedRemoveOperation,
+        next: &mut ManagedRemoveOperation,
+        native_proof: bool,
+    ) -> Result<ManagedRemoveOperation, DatabaseError> {
+        if expected.version != 2
+            || next.version != 2
+            || expected.id != next.id
+            || expected.repo_id != next.repo_id
+            || expected.initiator_id != next.initiator_id
+            || expected.request_id != next.request_id
+            || expected.target_fingerprint != next.target_fingerprint
+            || expected.created_at != next.created_at
+            || expected.reviewed.as_ref().map(|p| &p.plan)
+                != next.reviewed.as_ref().map(|p| &p.plan)
+        {
+            return Err(DatabaseError::Other(
+                "reviewed removal immutable identity changed".into(),
+            ));
+        }
+        for (before, after) in [
+            (
+                expected.reviewed.as_ref().map(|p| &p.git),
+                next.reviewed.as_ref().map(|p| &p.git),
+            ),
+            (
+                expected.reviewed.as_ref().map(|p| &p.svn),
+                next.reviewed.as_ref().map(|p| &p.svn),
+            ),
+        ] {
+            let (before, after) = before
+                .zip(after)
+                .ok_or_else(|| DatabaseError::Other("missing reviewed removal receipt".into()))?;
+            if before.operation_marker != after.operation_marker
+                || !after.errors.starts_with(&before.errors)
+                || (before.phase.is_verified() && before != after)
+                || (before.phase == DeletionPhase::ReconciliationRequired && before != after)
+                || (before.phase == DeletionPhase::IntentRecorded
+                    && !matches!(
+                        after.phase,
+                        DeletionPhase::IntentRecorded
+                            | DeletionPhase::ReconciliationRequired
+                            | DeletionPhase::VerifiedDeleted
+                    ))
+                || (!native_proof && !before.phase.is_verified() && after.phase.is_verified())
+            {
+                return Err(DatabaseError::Other(
+                    "retained deletion receipt was changed, lost or lacks native proof".into(),
+                ));
+            }
+        }
+        if expected
+            .reviewed
+            .as_ref()
+            .map(|p| (p.cleanup_started, p.cleanup_completed))
+            != next
+                .reviewed
+                .as_ref()
+                .map(|p| (p.cleanup_started, p.cleanup_completed))
+        {
+            return Err(DatabaseError::Other(
+                "cleanup requires its separate native admission".into(),
+            ));
+        }
+        if !next
+            .reviewed
+            .as_ref()
+            .unwrap()
+            .cleanup_errors
+            .starts_with(&expected.reviewed.as_ref().unwrap().cleanup_errors)
+        {
+            return Err(DatabaseError::Other(
+                "retained cleanup errors were lost or reordered".into(),
+            ));
+        }
+        next.updated_at = Utc::now().to_rfc3339();
+        self.immediate_transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
+            let current = require_active(tx, &expected.repo_id, &expected.id)?;
+            if current != *expected {
+                return Err(DatabaseError::Other(
+                    "removal operation changed during work".into(),
+                ));
+            }
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+                tx,
+                &expected.repo_id,
+            )?;
+            if !matches!(
+                next.state,
+                ManagedRemoveState::Failed | ManagedRemoveState::ReconciliationRequired
+            ) {
+                check_reviewed_registration(tx, next)?;
+            }
+            store_op(tx, next)?;
+            Ok(next.clone())
+        })
+    }
+
+    pub(crate) fn admit_reviewed_removal_work(
+        &self,
+        expected: &ManagedRemoveOperation,
+        cleanup: bool,
+    ) -> Result<ManagedRemoveOperation, DatabaseError> {
+        self.immediate_transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
+            let mut current = require_active(tx, &expected.repo_id, &expected.id)?;
+            if current != *expected {
+                return Err(DatabaseError::Other(
+                    "removal operation changed before admission".into(),
+                ));
+            }
+            check_reviewed_registration(tx, &current)?;
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+                tx,
+                &current.repo_id,
+            )?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx,
+                &current.repo_id,
+            )?;
+            super::late_pair_publish_operations::require_no_reconciliation_hold(
+                tx,
+                &current.repo_id,
+            )
+            .map_err(DatabaseError::Other)?;
+            if let Some(blocker) = writer_blocker(tx, &current.repo_id)? {
+                current.state = blocker.waiting_state();
+                current.outcome_detail = Some(blocker.detail());
+                current.updated_at = Utc::now().to_rfc3339();
+                store_op(tx, &current)?;
+                return Ok(current);
+            }
+            let p = current
+                .reviewed
+                .as_mut()
+                .ok_or_else(|| DatabaseError::Other("reviewed removal missing".into()))?;
+            super::ordinary_writer_windows::require_quiet_for_refresh(
+                tx,
+                &current.repo_id,
+                &p.plan.scope_uuid,
+            )?;
+            if child_count(tx, &current.repo_id)? > 0 {
+                return Err(DatabaseError::Other(
+                    "child registrations block removal".into(),
+                ));
+            }
+            if cleanup {
+                if !p.git.phase.is_verified() || !p.svn.phase.is_verified() {
+                    return Err(DatabaseError::Other(
+                        "remote effects are not verified; cleanup remains held".into(),
+                    ));
+                }
+                p.cleanup_started = true;
+            }
+            current.state = ManagedRemoveState::Running;
+            current.updated_at = Utc::now().to_rfc3339();
+            store_op(tx, &current)?;
+            Ok(current)
+        })
+    }
+}
+
 fn read_op(
     conn: &Connection,
     repo_id: &str,
 ) -> Result<Option<ManagedRemoveOperation>, DatabaseError> {
-    let Some(op_id) =
-        read_value(conn, &key("active", repo_id))?.or(read_value(conn, &key("latest", repo_id))?)
+    let active = read_value(conn, &key("active", repo_id))?;
+    let Some(op_id) = active
+        .clone()
+        .or(read_value(conn, &key("latest", repo_id))?)
     else {
         return Ok(None);
     };
-    let Some(raw) = read_value(conn, &key("document", &op_id))? else {
-        return Ok(None);
-    };
+    let raw = read_value(conn, &key("document", &op_id))?
+        .ok_or_else(|| DatabaseError::Other("managed removal pointer has no document".into()))?;
     let op = parse_op(&raw)?;
-    if op.repo_id != repo_id {
+    if op.repo_id != repo_id
+        || op.id != op_id
+        || (active.is_some() && op.state.is_terminal_success())
+    {
         return Err(DatabaseError::Other(
-            "managed removal repository mismatch".into(),
+            "managed removal pointer identity or state is contradictory".into(),
         ));
     }
     Ok(Some(op))
@@ -970,13 +1764,11 @@ fn merge_remote_branch_outcome(existing: &str, incoming: &str) -> String {
 }
 
 fn store_op(conn: &Connection, op: &ManagedRemoveOperation) -> Result<(), DatabaseError> {
-    write_value(
-        conn,
-        &key("document", &op.id),
-        &serde_json::to_string(op).map_err(|error| {
-            DatabaseError::Other(format!("managed removal serialization failed: {error}"))
-        })?,
-    )?;
+    let encoded = serde_json::to_string(op).map_err(|error| {
+        DatabaseError::Other(format!("managed removal serialization failed: {error}"))
+    })?;
+    parse_op(&encoded)?;
+    write_value(conn, &key("document", &op.id), &encoded)?;
     write_value(conn, &key("latest", &op.repo_id), &op.id)?;
     if op.state.is_terminal_success() {
         conn.execute(
@@ -1072,6 +1864,15 @@ fn writer_blocker(
     conn: &Connection,
     repo_id: &str,
 ) -> Result<Option<RemovalBlocker>, DatabaseError> {
+    let parent = load_repo(conn, repo_id)?.and_then(|r| r.parent_id);
+    for owner in std::iter::once(repo_id).chain(parent.as_deref()) {
+        if read_value(conn, &format!("late_pair_publish_v1:active:{owner}"))?.is_some() {
+            return Ok(Some(RemovalBlocker::LatePairOwnedOrUncertain));
+        }
+    }
+    if super::late_pair_publish_operations::require_no_reconciliation_hold(conn, repo_id).is_err() {
+        return Ok(Some(RemovalBlocker::LatePairOwnedOrUncertain));
+    }
     if let Some(blocker) = import_blocker(conn, repo_id)? {
         return Ok(Some(blocker));
     }
@@ -1100,6 +1901,7 @@ fn fresh_op(repo: &Repository, initiator_id: &str, request_id: &str) -> ManagedR
         remote_git: "untouched".into(),
         remote_svn: "untouched".into(),
         restore_supported: false,
+        reviewed: None,
     }
 }
 
@@ -1129,10 +1931,65 @@ impl Database {
             return Ok(None);
         };
         let op = parse_op(&raw)?;
+        if op.id != operation_id {
+            return Err(DatabaseError::Other(
+                "managed removal document key differs from its identity".into(),
+            ));
+        }
         if op.repo_id != repo_id {
             return Ok(None);
         }
         Ok(Some(op))
+    }
+
+    /// Read-only recovery of one authenticated browser's stable request. Scan
+    /// retained documents, not only latest: a restored incarnation must not
+    /// hide an older completed receipt or cause a new action to be fabricated.
+    pub fn reviewed_removal_request(
+        &self,
+        repo_id: &str,
+        actor: &str,
+        request: &str,
+        pin: &str,
+    ) -> Result<Option<ManagedRemoveOperation>, DatabaseError> {
+        if request.is_empty()
+            || request.len() > 256
+            || pin.len() != 64
+            || !pin.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(DatabaseError::Other(
+                "invalid removal request lookup identity".into(),
+            ));
+        }
+        let conn = self.conn();
+        read_op(&conn, repo_id)?;
+        let mut stmt=conn.prepare("SELECT key,value FROM kv_state WHERE substr(key,1,27)='managed_remove_v1:document:' ORDER BY key")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut found = None;
+        for (document_key, raw) in rows {
+            let op = parse_op(&raw)?;
+            if document_key != key("document", &op.id) {
+                return Err(DatabaseError::Other(
+                    "retained removal document identity mismatch".into(),
+                ));
+            }
+            if op.version == 2
+                && op.repo_id == repo_id
+                && op.initiator_id == actor
+                && op.request_id == request
+                && op.target_fingerprint == pin
+            {
+                if found.is_some() {
+                    return Err(DatabaseError::Other(
+                        "duplicate removal request identity".into(),
+                    ));
+                }
+                found = Some(op);
+            }
+        }
+        Ok(found)
     }
 
     pub fn removal_dependency_preview(
@@ -1160,10 +2017,16 @@ impl Database {
     /// journal and does not delete mappings, secrets, files, or remotes.
     pub fn legacy_disable_repository(&self, repo_id: &str) -> Result<bool, DatabaseError> {
         let conn = self.conn();
-        let changed = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+            &tx, repo_id,
+        )?;
+        let changed = tx.execute(
             "UPDATE repositories SET enabled=0, updated_at=?1 WHERE id=?2",
             params![Utc::now().to_rfc3339(), repo_id],
         )?;
+        tx.commit()?;
         Ok(changed == 1)
     }
 
@@ -1174,6 +2037,8 @@ impl Database {
         request_id: &str,
     ) -> Result<RemovalAdvance, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(tx, repo_id)?;
             if let Some(op) = read_op(tx, repo_id)? {
                 if op.state.is_terminal_success() {
                     if load_repo(tx, repo_id)?.is_none() {
@@ -1211,6 +2076,9 @@ impl Database {
                     op
                 }
             };
+            if op.version == 2 {
+                return Err(DatabaseError::Other("reviewed removal must continue through its pinned operation endpoint".into()));
+            }
             tx.execute(
                 "UPDATE repositories SET enabled=0, updated_at=?1 WHERE id=?2",
                 params![Utc::now().to_rfc3339(), repo_id],
@@ -1243,6 +2111,10 @@ impl Database {
         remote: &ManagedRemoveRemoteOutcome,
     ) -> Result<(), DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx, repo_id,
+            )?;
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Ok(());
@@ -1262,6 +2134,10 @@ impl Database {
         detail: &str,
     ) -> Result<ManagedRemoveOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx, repo_id,
+            )?;
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Ok(op);
@@ -1291,6 +2167,10 @@ impl Database {
         remote: Option<&ManagedRemoveRemoteOutcome>,
     ) -> Result<ManagedRemoveOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx, repo_id,
+            )?;
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Err(DatabaseError::Other(
@@ -1318,15 +2198,40 @@ impl Database {
         op_id: &str,
         remote: &ManagedRemoveRemoteOutcome,
     ) -> Result<ManagedRemoveOperation, DatabaseError> {
-        let enc_key = crate::crypto::get_or_create_encryption_key(self).map_err(|error| {
-            DatabaseError::Other(format!("encryption key unavailable: {error}"))
-        })?;
-        self.transaction(|tx| {
+        self.immediate_transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx, repo_id,
+            )?;
+            let enc_key = crate::crypto::get_or_create_encryption_key_tx(tx).map_err(|error| {
+                DatabaseError::Other(format!("encryption key unavailable: {error}"))
+            })?;
+            crate::db::repo_scope_identity::ensure_repository_removal_ready(tx)?;
             let scoped_secrets = capture_owned_scoped_secrets(tx, repo_id, &enc_key)?;
-            let inbound_last_git_sha = read_value(tx, &format!("last_git_sha_{repo_id}"))?;
+            let inbound_last_git_sha =
+                crate::echo_receipt_scope::read_scoped_last_git_sha_kv_tx(tx, repo_id)?
+                    .filter(|value| !value.is_empty());
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Ok(op);
+            }
+            if let Some(reviewed) = &op.reviewed {
+                crate::writer_fence::require_current(tx)?;
+                check_reviewed_registration(tx, &op)?;
+                if !reviewed.cleanup_started
+                    || !reviewed.git.phase.is_verified()
+                    || !reviewed.svn.phase.is_verified()
+                {
+                    return Err(DatabaseError::Other(
+                        "reviewed removal lacks cleanup admission or verified remote outcomes"
+                            .into(),
+                    ));
+                }
+                if remote.remote_git != op.remote_git || remote.remote_svn != op.remote_svn {
+                    return Err(DatabaseError::Other(
+                        "reviewed remote receipt cannot be replaced at completion".into(),
+                    ));
+                }
             }
             if child_count(tx, repo_id)? > 0 {
                 return Err(DatabaseError::Other(
@@ -1401,12 +2306,21 @@ impl Database {
                 tx.execute("DELETE FROM kv_state WHERE key=?1", [&secret_key])?;
                 tx.execute("DELETE FROM encrypted_secrets WHERE key=?1", [&secret_key])?;
             }
+            let scoped_svn_rev_at_removal = scoped_svn_rev(tx, repo_id)?;
+            crate::db::repo_scope_identity::purge_repository_kv_before_row_delete(tx, repo_id)?;
             if tx.execute("DELETE FROM repositories WHERE id=?1", [repo_id])? != 1 {
                 return Err(DatabaseError::Other(
                     "registration row was not removed".into(),
                 ));
             }
+            crate::db::repo_scope_identity::after_repository_row_deleted(tx)?;
+            if let Some(rev) = scoped_svn_rev_at_removal {
+                write_value(tx, &format!("last_svn_rev_{repo_id}"), &rev.to_string())?;
+            }
             op.state = ManagedRemoveState::Completed;
+            if let Some(reviewed) = op.reviewed.as_mut() {
+                reviewed.cleanup_completed = true;
+            }
             op.restore_supported = true;
             op.remote_git = merged_remote.remote_git.clone();
             op.remote_svn = merged_remote.remote_svn.clone();
@@ -1433,10 +2347,12 @@ impl Database {
         &self,
         repo_id: &str,
     ) -> Result<RestoreAdvance, DatabaseError> {
-        let enc_key = crate::crypto::get_or_create_encryption_key(self).map_err(|error| {
-            DatabaseError::Other(format!("encryption key unavailable: {error}"))
-        })?;
-        self.transaction(|tx| {
+        self.immediate_transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(tx, repo_id)?;
+            let enc_key = crate::crypto::get_or_create_encryption_key_tx(tx).map_err(|error| {
+                DatabaseError::Other(format!("encryption key unavailable: {error}"))
+            })?;
             if removal_in_progress(tx, repo_id)? {
                 return Err(DatabaseError::Other(
                     "managed removal is still in progress; restore is not available".into(),
@@ -1567,7 +2483,13 @@ impl Database {
                     .as_ref()
                     .filter(|value| !value.is_empty())
                 {
-                    write_value(tx, &format!("last_git_sha_{repo_id}"), inbound)?;
+                    let now = chrono::Utc::now().to_rfc3339();
+                    crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+                        tx,
+                        repo_id,
+                        inbound,
+                        &now,
+                    )?;
                 }
             } else if baseline_restore == TombstoneBaselineRestore::Pending {
                 for scoped_key in [
@@ -1671,7 +2593,7 @@ mod tests {
         db
     }
 
-    fn repo(id: &str, name: &str, parent: Option<&str>) -> Repository {
+    pub(super) fn repo(id: &str, name: &str, parent: Option<&str>) -> Repository {
         Repository {
             id: id.into(),
             name: name.into(),
@@ -2284,9 +3206,13 @@ mod tests {
                 params!["2026-01-02T00:00:00Z", repo_id],
             )
             .unwrap();
-        db.set_state(
-            &format!("last_git_sha_{repo_id}"),
-            "inboundcheckpoint0123456789abcdef0123456789",
+        let inbound_checkpoint = "inboundcheckpoint0123456789abcdef0123456789";
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+            &db.conn(),
+            repo_id,
+            inbound_checkpoint,
+            &now,
         )
         .unwrap();
         assert_eq!(
@@ -2342,10 +3268,10 @@ mod tests {
             Some("4")
         );
         assert_eq!(
-            db.get_state(&format!("last_git_sha_{repo_id}"))
+            crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, repo_id)
                 .unwrap()
                 .as_deref(),
-            Some("inboundcheckpoint0123456789abcdef0123456789")
+            Some(inbound_checkpoint)
         );
         assert_eq!(
             resolve_repo_import_baseline(&db, repo_id).unwrap(),
@@ -2846,4 +3772,73 @@ mod tests {
         )
         .unwrap();
     }
+}
+
+/// Shared only by the two actual-reader unit-test tails. Completion is obtained
+/// by the real producer after physical owned-path cleanup, never by setting a
+/// terminal flag in fabricated JSON.
+#[cfg(test)]
+pub(crate) async fn native_completed_reader_fixture(
+    version: u8,
+) -> (Database, ManagedRemoveOperation, tempfile::TempDir) {
+    let db = Database::in_memory().unwrap();
+    db.initialize().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let id = format!("reader-{}", Uuid::new_v4());
+    db.insert_repository(&tests::repo(&id, "Native reader fixture", None))
+        .unwrap();
+    let owned = tmp.path().join("repos").join(&id);
+    std::fs::create_dir_all(&owned).unwrap();
+    std::fs::write(owned.join("owned.txt"), "native cleanup fixture\n").unwrap();
+    let done = if version == 2 {
+        let plan = crate::managed_remove::reviewed::capture(
+            &db,
+            tmp.path(),
+            &id,
+            "reader-fixture",
+            RemovalChoices::default(),
+        )
+        .await
+        .unwrap();
+        let op = crate::managed_remove::reviewed::begin(
+            &db,
+            tmp.path(),
+            &id,
+            "reader-fixture",
+            RemovalChoices::default(),
+            &plan.approval_digest,
+            "reader-request",
+        )
+        .await
+        .unwrap();
+        crate::managed_remove::reviewed::run(&db, tmp.path(), &id, "reader-fixture", &op.id)
+            .await
+            .unwrap()
+    } else {
+        assert_eq!(version, 1);
+        let RemovalAdvance::Cleanup { operation } = db
+            .prepare_managed_remove(&id, "reader-fixture", "reader-request")
+            .unwrap()
+        else {
+            panic!("quiet native v1 fixture")
+        };
+        crate::managed_remove::remove_owned_repo_tree(tmp.path(), &id).unwrap();
+        db.complete_managed_remove(&id, &operation.id, &ManagedRemoveRemoteOutcome::untouched())
+            .unwrap()
+    };
+    assert_eq!(done.state, ManagedRemoveState::Completed);
+    assert!(!owned.exists());
+    assert!(db.get_repository(&id).unwrap().is_none());
+    (db, done, tmp)
+}
+
+#[cfg(test)]
+pub(crate) fn reader_fixture_snapshot(conn: &Connection) -> Vec<(String, String, String)> {
+    let mut stmt = conn
+        .prepare("SELECT key,value,updated_at FROM kv_state ORDER BY key")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
 }

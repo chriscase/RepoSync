@@ -13,9 +13,10 @@ export default function ManagedRemovalReceiptNotice({ receipt }: { receipt: Mana
       className={`border rounded-lg p-4 text-sm ${tone}`}
       role="status"
     >
-      <p className="font-medium">{managedRemovalStateLabel(receipt.state)}</p>
+      <p className="font-medium">{managedRemovalStateLabel(receipt.state, receipt.protocol)}</p>
       {receipt.message && <p className="mt-1">{receipt.message}</p>}
       <p className="mt-1 font-mono text-xs">Operation {receipt.operationId}</p>
+      <a className="mt-2 inline-block underline" href={`/repos/${encodeURIComponent(receipt.repoId)}`}>View removal status and recovery</a>
       {receipt.partial_cleanup && (
         <div
           data-testid="managed-removal-receipt-partial-cleanup"

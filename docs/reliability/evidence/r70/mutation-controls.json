@@ -1,0 +1,236 @@
+{
+  "source_head": "3f96f8b1a50a456ceceb5e09257bb9a09c022712",
+  "source_tree": "4d76b31c3af84e49c31135860750c5478cce529b",
+  "scope": "Local deterministic sensitivity controls only; browser positive/control use the in-process mock API, not the real API or hosted qualification.",
+  "environment": {
+    "os": "Darwin",
+    "architecture": "arm64",
+    "node": "v25.2.1",
+    "npm": "11.6.2",
+    "chrome": "Google Chrome 155.0.8059.80",
+    "ui_lock_sha256": "06c02317aefe50bbc8f2c5d66a53616b9fc03ea856025f1f973880b250b2d0bc"
+  },
+  "log_processing": "ANSI escapes removed; checkout/temporary absolute path prefixes replaced with placeholders; no other output elided. Digests cover the committed sanitized logs.",
+  "positive_controls": [
+    {
+      "id": "positive-helpers",
+      "started_at": "2026-10-16T07:45:03.846275+00:00",
+      "command": [
+        "npm",
+        "test",
+        "--",
+        "src/branchPairRemoval.test.ts"
+      ],
+      "working_directory": "web-ui",
+      "exit_code": 0,
+      "expected_failure": false,
+      "log": "positive-helpers.log",
+      "log_sha256": "a27ba1d3e7cc4cefbbdd8c93fb25889f270fb9023f9a9497975e6873f072bc63",
+      "failed_tests": 0,
+      "passed_tests": 35,
+      "failure_names": [],
+      "expectation_met": true
+    },
+    {
+      "id": "positive-browser",
+      "started_at": "2026-10-16T07:45:04.668593+00:00",
+      "command": [
+        "node",
+        "scripts/branch-pair-delete-browser.mjs"
+      ],
+      "working_directory": ".",
+      "exit_code": 0,
+      "expected_failure": false,
+      "log": "positive-browser.log",
+      "log_sha256": "d93b43b9ef56af79b6614ccc7707667270ae7eecd1179b8d0ccb6a497f67fc06",
+      "browser_results": [
+        "cancel-modal",
+        "server-error",
+        "permission-rejection",
+        "busy-rejection",
+        "missing-parent-list-fallback",
+        "warnings-remain-visible",
+        "queued-not-complete",
+        "delayed-completion",
+        "queued-gone-leaves-without-claiming-completion",
+        "mock-delete-child-stays-on-parent",
+        "delete-child-with-warnings-stays-on-parent",
+        "stale-url-not-found"
+      ],
+      "expectation_met": true
+    }
+  ],
+  "mutation_controls": [
+    {
+      "id": "queued-completion",
+      "started_at": "2026-10-16T07:45:27.388026+00:00",
+      "command": [
+        "npm",
+        "test",
+        "--",
+        "src/branchPairRemoval.test.ts"
+      ],
+      "working_directory": "web-ui",
+      "exit_code": 1,
+      "expected_failure": true,
+      "log": "queued-completion.log",
+      "log_sha256": "b0471335881bdbf33bf19abc6b0f70828757e50fcdd950df7adc546eea88cc21",
+      "failed_tests": 7,
+      "passed_tests": 28,
+      "failure_names": [
+        "src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps queued operations unfinished even with ok: true",
+        "src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps running operations unfinished even with ok: true",
+        "src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps cancelling operations unfinished even with ok: true",
+        "src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps canceling operations unfinished even with ok: true",
+        "src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps accepted operations unfinished even with ok: true",
+        "src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps pending operations unfinished even with ok: true",
+        "src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps in_progress operations unfinished even with ok: true"
+      ],
+      "expectation_met": true,
+      "mutation": {
+        "path": "web-ui/src/branchPairRemoval.ts",
+        "original": "if (IN_PROGRESS_STATES.has(state)) return 'in_progress';",
+        "replacement": "if (IN_PROGRESS_STATES.has(state)) return 'completed';",
+        "original_sha256": "3299431fa5d2fb671ce77d5d8b68ece569ba3d5c107a09220f1be4b7edad963e",
+        "mutated_sha256": "ae3b13934ee7ca71d88d8e1ab96a5ea0262b8b5df7240655876662bd02bcc748"
+      }
+    },
+    {
+      "id": "child-destination",
+      "started_at": "2026-10-16T07:45:28.239282+00:00",
+      "command": [
+        "npm",
+        "test",
+        "--",
+        "src/branchPairRemoval.test.ts"
+      ],
+      "working_directory": "web-ui",
+      "exit_code": 1,
+      "expected_failure": true,
+      "log": "child-destination.log",
+      "log_sha256": "742ffdadcd21aa121c5cc5b40f8df3b7e656400728d0a549466f98cd9fa092fe",
+      "failed_tests": 1,
+      "passed_tests": 34,
+      "failure_names": [
+        "src/branchPairRemoval.test.ts > removalDestination > keeps a surviving parent in place when deleting one of its children"
+      ],
+      "expectation_met": true,
+      "mutation": {
+        "path": "web-ui/src/branchPairRemoval.ts",
+        "original": "if (args.targetId !== args.viewedId) return null;",
+        "replacement": "if (args.targetId !== args.viewedId) return '/repos';",
+        "original_sha256": "3299431fa5d2fb671ce77d5d8b68ece569ba3d5c107a09220f1be4b7edad963e",
+        "mutated_sha256": "3615326c839e91cb95869f09f4112d3ce02077c7dd7e3f4f200819209b26a4bc"
+      }
+    },
+    {
+      "id": "missing-parent-fallback",
+      "started_at": "2026-10-16T07:45:28.964950+00:00",
+      "command": [
+        "npm",
+        "test",
+        "--",
+        "src/branchPairRemoval.test.ts"
+      ],
+      "working_directory": "web-ui",
+      "exit_code": 1,
+      "expected_failure": true,
+      "log": "missing-parent-fallback.log",
+      "log_sha256": "d8273adc03297286107fe61dff7e51c116627fbc3250e4e559643f07e22d0622",
+      "failed_tests": 1,
+      "passed_tests": 34,
+      "failure_names": [
+        "src/branchPairRemoval.test.ts > removalDestination > uses the captured parent unless its absence is confirmed"
+      ],
+      "expectation_met": true,
+      "mutation": {
+        "path": "web-ui/src/branchPairRemoval.ts",
+        "original": "!args.parentId || args.parentExists === false",
+        "replacement": "!args.parentId",
+        "original_sha256": "3299431fa5d2fb671ce77d5d8b68ece569ba3d5c107a09220f1be4b7edad963e",
+        "mutated_sha256": "a67268ab31920b9eab087887fe1db30d6722f89ac5f9f84815cca1f190318ef4"
+      }
+    },
+    {
+      "id": "persisted-warnings",
+      "started_at": "2026-10-16T07:45:29.624428+00:00",
+      "command": [
+        "npm",
+        "test",
+        "--",
+        "src/branchPairRemoval.test.ts"
+      ],
+      "working_directory": "web-ui",
+      "exit_code": 1,
+      "expected_failure": true,
+      "log": "persisted-warnings.log",
+      "log_sha256": "8705a528334b6f307e27ae899e041041c5a8439f5df3317f83572a4e17f68176",
+      "failed_tests": 2,
+      "passed_tests": 33,
+      "failure_names": [
+        "src/branchPairRemoval.test.ts > branch-pair removal notices > preserves completed warnings and operation details through navigation and storage",
+        "src/branchPairRemoval.test.ts > branch-pair removal notices > preserves in_progress warnings and operation details through navigation and storage"
+      ],
+      "expectation_met": true,
+      "mutation": {
+        "path": "web-ui/src/branchPairRemoval.ts",
+        "original": "warnings: Array.isArray(notice.warnings) ? notice.warnings : [],",
+        "replacement": "warnings: [],",
+        "original_sha256": "3299431fa5d2fb671ce77d5d8b68ece569ba3d5c107a09220f1be4b7edad963e",
+        "mutated_sha256": "81829418a36c36d2a4d7afb96cc0fd2c1ad816b5481e1fec3d5bde1684d4a84d"
+      }
+    },
+    {
+      "id": "detail-query-retirement",
+      "started_at": "2026-10-16T07:45:30.330929+00:00",
+      "command": [
+        "npm",
+        "test",
+        "--",
+        "src/branchPairRemoval.test.ts"
+      ],
+      "working_directory": "web-ui",
+      "exit_code": 1,
+      "expected_failure": true,
+      "log": "detail-query-retirement.log",
+      "log_sha256": "08b8a89298d9457c9ceb25f8cc16205abf70b94d69a876c42252a1092db444ec",
+      "failed_tests": 1,
+      "passed_tests": 34,
+      "failure_names": [
+        "src/branchPairRemoval.test.ts > detail retirement and not-found classification > includes every detail query and scopes cancellation to the removed pair"
+      ],
+      "expectation_met": true,
+      "mutation": {
+        "path": "web-ui/src/branchPairRemoval.ts",
+        "original": "    ['import-status', repoId],\n",
+        "replacement": "",
+        "original_sha256": "3299431fa5d2fb671ce77d5d8b68ece569ba3d5c107a09220f1be4b7edad963e",
+        "mutated_sha256": "a0e234ef71f19c9fc25a0f62fb45db9c6d885707d2e4319e6af2238c6365baa7"
+      }
+    },
+    {
+      "id": "parent-warning-visibility",
+      "started_at": "2026-10-16T07:45:31.034903+00:00",
+      "command": [
+        "node",
+        "scripts/branch-pair-delete-browser.mjs"
+      ],
+      "working_directory": ".",
+      "exit_code": 1,
+      "expected_failure": true,
+      "log": "parent-warning-visibility.log",
+      "log_sha256": "6d100f44868220c48dee4fac6b4ec02f12c7a16655ba8c5ae296fc327d19b444",
+      "expected_error": "Timed out: child cleanup warning visible on parent;",
+      "expectation_met": true,
+      "mutation": {
+        "path": "web-ui/src/pages/RepoDetail.tsx",
+        "original": "setLocalNotice(notice);",
+        "replacement": "setLocalNotice({ ...notice, warnings: [] });",
+        "original_sha256": "05cb3dbec13ef6e101f9c2e769a3331e49b10fb265b1cd857b2881971a58c159",
+        "mutated_sha256": "610a618df4d9a2ab737f733fdf3d3f6c9a059f6deaeb104f53d6b8d452a402ba"
+      }
+    }
+  ],
+  "independent_verification": "Receipts prepared for evidence-delta review; no claim that the prior source reviewer verified these new receipts.",
+  "all_six_mutations_rejected": true
+}

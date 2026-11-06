@@ -1,6 +1,9 @@
+import Dialog from '../components/Dialog';
+import { useId } from 'react';
+import { useViewMutation as useMutation } from '../useViewMutation';
 import { LoadingSpinner } from '../components/LoadingSpinner';
 import { useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, type User, type CreateUserRequest } from '../api';
 import { getStoredUser } from '../utils/auth';
 import { ConfirmModal } from '../components/ConfirmModal';
@@ -15,6 +18,7 @@ interface CreateUserModalProps {
 }
 
 function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
+  const fieldId = useId();
   const [username, setUsername] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [email, setEmail] = useState('');
@@ -49,63 +53,63 @@ function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+    <Dialog title="Create User" description="Review the selected user's settings. Changes are submitted only by the save action." onClose={onClose} busy={saving}>
       <div className="bg-gray-800 rounded-lg border border-gray-700 shadow-xl w-full max-w-md p-6">
-        <h2 className="text-xl font-semibold text-gray-100 mb-4">Create User</h2>
+
 
         {error && (
-          <div className="mb-4 bg-red-900/40 border border-red-700 text-red-300 px-3 py-2 rounded text-sm">
+          <div className="mb-4 bg-red-900/40 border border-red-700 text-red-300 px-3 py-2 rounded text-sm" id={`${fieldId}-error`} role="alert">
             {error}
           </div>
         )}
 
         <div className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">Username</label>
+            <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-1`}>Username</label>
             <input
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
-              placeholder="johndoe"
+              placeholder="johndoe" id={`${fieldId}-1`} aria-describedby={error ? `${fieldId}-error` : undefined}
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">Display Name</label>
+            <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-2`}>Display Name</label>
             <input
               type="text"
               value={displayName}
               onChange={(e) => setDisplayName(e.target.value)}
               className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
-              placeholder="John Doe"
+              placeholder="John Doe" id={`${fieldId}-2`} aria-describedby={error ? `${fieldId}-error` : undefined}
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">Email</label>
+            <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-3`}>Email</label>
             <input
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
-              placeholder="john@example.com"
+              placeholder="john@example.com" id={`${fieldId}-3`} aria-describedby={error ? `${fieldId}-error` : undefined}
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">Password</label>
+            <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-4`}>Password</label>
             <input
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
-              placeholder="Minimum 8 characters"
+              placeholder="Minimum 8 characters" id={`${fieldId}-4`} aria-describedby={error ? `${fieldId}-error` : undefined}
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">Role</label>
+            <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-5`}>Role</label>
             <select
               value={role}
               onChange={(e) => setRole(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-5`} aria-describedby={error ? `${fieldId}-error` : undefined}
             >
               <option value="user">User</option>
               <option value="admin">Admin</option>
@@ -117,7 +121,7 @@ function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
           <button
             onClick={onClose}
             className="px-4 py-2 text-sm font-medium rounded-md text-gray-300 bg-gray-700 hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-500"
-          >
+           data-dialog-cancel disabled={saving}>
             Cancel
           </button>
           <button
@@ -129,7 +133,7 @@ function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
           </button>
         </div>
       </div>
-    </div>
+    </Dialog>
   );
 }
 
@@ -144,6 +148,7 @@ interface EditUserModalProps {
 }
 
 function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
+  const fieldId = useId();
   const [displayName, setDisplayName] = useState(user.display_name);
   const [email, setEmail] = useState(user.email);
   const [role, setRole] = useState(user.role);
@@ -171,43 +176,41 @@ function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+    <Dialog title={`Edit User: ${user.username}`} description="Review the selected user's settings. Changes are submitted only by the save action." onClose={onClose} busy={saving}>
       <div className="bg-gray-800 rounded-lg border border-gray-700 shadow-xl w-full max-w-md p-6">
-        <h2 className="text-xl font-semibold text-gray-100 mb-4">
-          Edit User: {user.username}
-        </h2>
+
 
         {error && (
-          <div className="mb-4 bg-red-900/40 border border-red-700 text-red-300 px-3 py-2 rounded text-sm">
+          <div className="mb-4 bg-red-900/40 border border-red-700 text-red-300 px-3 py-2 rounded text-sm" id={`${fieldId}-error`} role="alert">
             {error}
           </div>
         )}
 
         <div className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">Display Name</label>
+            <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-6`}>Display Name</label>
             <input
               type="text"
               value={displayName}
               onChange={(e) => setDisplayName(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-6`} aria-describedby={error ? `${fieldId}-error` : undefined}
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">Email</label>
+            <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-7`}>Email</label>
             <input
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-7`} aria-describedby={error ? `${fieldId}-error` : undefined}
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">Role</label>
+            <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-8`}>Role</label>
             <select
               value={role}
               onChange={(e) => setRole(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-8`} aria-describedby={error ? `${fieldId}-error` : undefined}
             >
               <option value="user">User</option>
               <option value="admin">Admin</option>
@@ -219,7 +222,7 @@ function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
               id="enabled"
               checked={enabled}
               onChange={(e) => setEnabled(e.target.checked)}
-              className="h-4 w-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-blue-500"
+              className="h-4 w-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-blue-500" aria-describedby={error ? `${fieldId}-error` : undefined}
             />
             <label htmlFor="enabled" className="text-sm font-medium text-gray-300">
               Account enabled
@@ -231,7 +234,7 @@ function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
           <button
             onClick={onClose}
             className="px-4 py-2 text-sm font-medium rounded-md text-gray-300 bg-gray-700 hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-500"
-          >
+           data-dialog-cancel disabled={saving}>
             Cancel
           </button>
           <button
@@ -243,7 +246,7 @@ function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
           </button>
         </div>
       </div>
-    </div>
+    </Dialog>
   );
 }
 
@@ -268,7 +271,7 @@ export default function AdminUsers() {
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => api.deleteUser(id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['admin-users'] }),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['admin-users'] }); setConfirmDeleteUser(null); },
   });
 
   const handleRefresh = () => {
@@ -388,7 +391,7 @@ export default function AdminUsers() {
                         Edit
                       </button>
                       <button
-                        onClick={() => setConfirmDeleteUser(u)}
+                        onClick={() => { deleteMutation.reset(); setConfirmDeleteUser(u); }}
                         disabled={u.username === currentUser?.username}
                         className="text-red-400 hover:text-red-300 disabled:opacity-30 disabled:cursor-not-allowed"
                       >
@@ -421,6 +424,8 @@ export default function AdminUsers() {
         />
       )}
       <ConfirmModal
+        error={deleteMutation.error?.message}
+        busy={deleteMutation.isPending}
         isOpen={!!confirmDeleteUser}
         title="Delete User"
         message={`Delete user "${confirmDeleteUser?.username}"? This cannot be undone.`}
@@ -431,7 +436,6 @@ export default function AdminUsers() {
           if (confirmDeleteUser) {
             deleteMutation.mutate(confirmDeleteUser.id);
           }
-          setConfirmDeleteUser(null);
         }}
         onCancel={() => setConfirmDeleteUser(null)}
       />

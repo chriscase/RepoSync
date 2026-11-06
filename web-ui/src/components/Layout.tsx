@@ -1,28 +1,21 @@
-import { Outlet, NavLink, useNavigate } from 'react-router-dom';
+import { Outlet, NavLink } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api';
+import { errorStatusQuery } from '../errorStatus';
 import SyncStatus from './SyncStatus';
 import { getStoredUser } from '../utils/auth';
 import { LogoSvg } from './Logo';
 
 export default function Layout() {
-  const navigate = useNavigate();
-  const { data: status } = useQuery({
-    queryKey: ['status'],
-    queryFn: () => api.getStatus(),
-  });
+  const statusQuery = useQuery({...errorStatusQuery(),refetchInterval:15000});
+  const status=statusQuery.isError ? undefined:statusQuery.data;
 
   const user = getStoredUser();
   const isAdmin = user?.role === 'admin';
 
-  const handleLogout = async () => {
-    try {
-      await api.logout();
-    } finally {
-      localStorage.removeItem('session_token');
-      localStorage.removeItem('user');
-      navigate('/login');
-    }
+  const handleLogout = () => {
+    // ProtectedRoute reacts to synchronous retirement, even if server revocation is unavailable.
+    void api.logout().catch(() => {});
   };
 
   const navLinkClass = ({ isActive }: { isActive: boolean }) =>
@@ -84,7 +77,7 @@ export default function Layout() {
               </div>
             </div>
             <div className="flex items-center space-x-4">
-              {status && <SyncStatus status={status} />}
+              <SyncStatus query={statusQuery} />
               {user && (
                 <span className="text-sm text-gray-400">
                   {user.display_name || user.username}
@@ -101,7 +94,7 @@ export default function Layout() {
         </div>
       </nav>
 
-      <main className="py-6 px-6 sm:px-8 lg:px-12">
+      <main tabIndex={-1} className="py-6 px-6 sm:px-8 lg:px-12">
         <Outlet />
       </main>
     </div>

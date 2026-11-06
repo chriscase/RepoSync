@@ -139,7 +139,9 @@ fn rebuild(
 use rusqlite::OptionalExtension;
 fn expected_shape(v: i64) -> Result<Vec<String>> {
     let c = Connection::open_in_memory()?;
-    schema::run_migrations(&c)?;
+    // Candidate copy migrations advance from sealed production v12 via rebuild/v14 SQL,
+    // not via the operational v13 scope-uuid migration registered in normal startup.
+    schema::run_migrations_up_to(&c, 12).map_err(|e| anyhow::anyhow!("{e}"))?;
     if v >= 13 {
         rebuild(&c, &mut |_, _, _| Ok(()))?;
     }
@@ -544,7 +546,7 @@ impl CopySession {
         // competing test migration. Legacy values remain a separate exact oracle.
         let reference = Connection::open_in_memory()?;
         reference.execute_batch("PRAGMA foreign_keys=ON")?;
-        schema::run_migrations(&reference)?;
+        schema::run_migrations_up_to(&reference, 12).map_err(|e| anyhow::anyhow!("{e}"))?;
         rebuild(&reference, &mut |_, _, _| Ok(()))?;
         for (table, values) in &self.legacy.rows {
             let source = source_db(&self.source.join("reposync.db"))?;

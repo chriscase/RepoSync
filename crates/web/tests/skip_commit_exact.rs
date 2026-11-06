@@ -143,7 +143,10 @@ fn snapshot_watermarks(db: &Database, repo_id: &str) -> WatermarkSnapshot {
         last_git_sha: repo.last_git_sha,
         consecutive_errors: repo.consecutive_errors,
         sync_status: repo.sync_status,
-        kv_last_git_sha: db.get_state(&format!("last_git_sha_{repo_id}")).unwrap(),
+        kv_last_git_sha: reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(
+            db, repo_id,
+        )
+        .unwrap(),
         kv_last_svn_rev: db.get_state(&format!("last_svn_rev_{repo_id}")).unwrap(),
         kv_last_git_hash: db.get_state("last_git_hash").unwrap(),
     }
@@ -160,8 +163,14 @@ fn assert_watermarks_unchanged(before: &WatermarkSnapshot, after: &WatermarkSnap
 }
 
 fn seed_pinned_watermarks(db: &Database, repo_id: &str, git_sha: &str) {
-    db.set_state(&format!("last_git_sha_{repo_id}"), git_sha)
-        .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    reposync_core::echo_receipt_scope::write_scoped_last_git_sha_kv(
+        &db.conn(),
+        repo_id,
+        git_sha,
+        &now,
+    )
+    .unwrap();
     db.set_state(&format!("last_svn_rev_{repo_id}"), "4")
         .unwrap();
     db.set_state("last_git_hash", git_sha).unwrap();
@@ -250,6 +259,7 @@ token_env = ""
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
         import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(reposync_web::SchedulerServiceState::running()),
     });
     state.sessions.write().await.insert(
         TEST_TOKEN.into(),
@@ -552,8 +562,13 @@ fn repo_detail_ui_binds_skip_to_observed_tips_and_selected_commits() {
         "UI must bind skip to observed tips via context endpoint"
     );
     assert!(
-        src.contains("data-testid=\"skip-commit-modal\""),
+        src.contains("testId=\"skip-commit-modal\""),
         "skip modal must exist for selected-commit confirmation"
+    );
+    let dialog = include_str!("../../../web-ui/src/components/Dialog.tsx");
+    assert!(
+        dialog.contains("data-testid={testId}"),
+        "shared dialog must forward the selected-commit confirmation marker"
     );
     assert!(
         !src.contains("Skip-to-HEAD is disabled until exact per-commit skip disposition exists"),

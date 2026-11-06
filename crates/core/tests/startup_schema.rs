@@ -1,10 +1,11 @@
-//! Ordinary startup used by daemon callers: schema v12, no candidate registry.
+//! Ordinary startup used by daemon callers: schema v13, no candidate registry.
 //! `Database::new`/`initialize` stays valid without the data-dir lock; exclusive
 //! owner is `Database::open_with_exclusive_owner` (daemon ordinary startup).
 use reposync_core::db::Database;
 use reposync_core::errors::DatabaseError;
+
 #[test]
-fn ordinary_startup_stays_v12() {
+fn ordinary_startup_stays_v13() {
     let t = tempfile::tempdir().unwrap();
     let path = t.path().join("reposync.db");
     {
@@ -15,7 +16,7 @@ fn ordinary_startup_stays_v12() {
             db.conn()
                 .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            12
+            13
         );
         assert_eq!(
             db.conn()
@@ -44,11 +45,11 @@ fn ordinary_startup_stays_v12() {
         db.conn()
             .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        12
+        13
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
-        serde_json::json!({"case":"STARTUP_V12","user_version":12,"candidate_tables":0,"git_sha_notnull":1,"repeat_initialize_and_restart":true})
+        serde_json::json!({"case":"STARTUP_V13","user_version":13,"candidate_tables":0,"git_sha_notnull":1,"repeat_initialize_and_restart":true})
     );
 }
 
@@ -68,7 +69,7 @@ fn future_user_version_is_refused_on_ordinary_open() {
     match err {
         DatabaseError::UnsupportedSchema { found, supported } => {
             assert_eq!(found, 99);
-            assert_eq!(supported, 12);
+            assert_eq!(supported, 13);
         }
         other => panic!("expected UnsupportedSchema, got {other:?}"),
     }
@@ -79,7 +80,7 @@ fn future_user_version_is_refused_on_ordinary_open() {
     assert_eq!(version, 99);
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
-        serde_json::json!({"case":"STARTUP_FUTURE_REFUSED","found":99,"supported":12,"user_version_unchanged":true})
+        serde_json::json!({"case":"STARTUP_FUTURE_REFUSED","found":99,"supported":13,"user_version_unchanged":true})
     );
 }
 
@@ -91,7 +92,7 @@ fn exclusive_data_dir_owner_blocks_second_startup() {
         db.conn()
             .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        12
+        13
     );
     let err = match Database::open_with_exclusive_owner(t.path()) {
         Ok(_) => panic!("expected second exclusive owner to be refused"),
@@ -110,7 +111,7 @@ fn exclusive_data_dir_owner_blocks_second_startup() {
             .conn()
             .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        12
+        13
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",

@@ -61,7 +61,7 @@ function MetricCard({
         <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">{label}</span>
       </div>
       <div className="text-lg font-bold text-gray-100 font-mono mb-1">{value}</div>
-      {subValue && <div className="text-xs text-gray-500 mb-2">{subValue}</div>}
+      {subValue && <div className="text-xs text-gray-300 mb-2">{subValue}</div>}
       <div className="w-full h-1.5 bg-gray-700 rounded-full overflow-hidden">
         <div
           className={`h-full rounded-full transition-all duration-500 ${barColorClass}`}
@@ -96,6 +96,7 @@ export default function ServerMonitor() {
     return (
       <div className="bg-gray-900 border border-gray-700 rounded-lg">
         <button
+          aria-expanded={open}
           onClick={() => setOpen(o => !o)}
           className="w-full flex items-center justify-between px-4 py-3 text-sm font-semibold text-gray-300 hover:text-gray-100 transition-colors"
         >
@@ -103,7 +104,7 @@ export default function ServerMonitor() {
           {open ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
         </button>
         {open && (
-          <div className="px-4 pb-4 text-sm text-gray-500 italic">Loading metrics...</div>
+          <div className="px-4 pb-4 text-sm text-gray-300 italic">Loading metrics...</div>
         )}
       </div>
     );
@@ -120,7 +121,8 @@ export default function ServerMonitor() {
   return (
     <div className="bg-gray-900 border border-gray-700 rounded-lg">
       <button
-        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+          onClick={() => setOpen(o => !o)}
         className="w-full flex items-center justify-between px-4 py-3 text-sm font-semibold text-gray-300 hover:text-gray-100 transition-colors"
       >
         <div className="flex items-center space-x-2">
@@ -152,7 +154,7 @@ export default function ServerMonitor() {
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             {/* Disk */}
             <MetricCard
-              icon={<HardDrive className="w-4 h-4 text-gray-500" />}
+              icon={<HardDrive className="w-4 h-4 text-gray-300" />}
               label="Disk"
               value={`${formatBytes(metrics.disk_free_bytes)} free`}
               subValue={`${formatBytes(usedDisk)} / ${formatBytes(metrics.disk_total_bytes)}`}
@@ -162,7 +164,7 @@ export default function ServerMonitor() {
 
             {/* Network */}
             <MetricCard
-              icon={<Wifi className="w-4 h-4 text-gray-500" />}
+              icon={<Wifi className="w-4 h-4 text-gray-300" />}
               label="Network"
               value={
                 metrics.git_push_active ? (
@@ -209,7 +211,7 @@ export default function ServerMonitor() {
 
             {/* CPU */}
             <MetricCard
-              icon={<Cpu className="w-4 h-4 text-gray-500" />}
+              icon={<Cpu className="w-4 h-4 text-gray-300" />}
               label="CPU"
               value={metrics.cpu_load_1m.toFixed(2)}
               subValue={`${metrics.cpu_load_1m.toFixed(2)} / ${metrics.cpu_load_5m.toFixed(2)} / ${metrics.cpu_load_15m.toFixed(2)}`}
@@ -219,7 +221,7 @@ export default function ServerMonitor() {
 
             {/* RAM */}
             <MetricCard
-              icon={<MemoryStick className="w-4 h-4 text-gray-500" />}
+              icon={<MemoryStick className="w-4 h-4 text-gray-300" />}
               label="RAM"
               value={`${formatBytes(metrics.mem_used_bytes)} / ${formatBytes(metrics.mem_total_bytes)}`}
               subValue={`${metrics.mem_usage_percent.toFixed(1)}% used`}

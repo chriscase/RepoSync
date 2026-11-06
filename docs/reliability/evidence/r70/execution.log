@@ -1,0 +1,33 @@
+Source: https://github.com/chriscase/RepoSync/actions/runs/38865124037
+Selected execution lines; ANSI escapes removed. Full downloaded log digest is in acceptance.json.
+
+End-to-End Tests	Run actions/checkout@v4	2026-10-16T07:06:32.6376047Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +0007b5ac22faf3229e84d6be88c0d9e4a813baef:refs/remotes/pull/208/merge
+End-to-End Tests	Run actions/checkout@v4	2026-10-16T07:06:33.1768346Z [command]/usr/bin/git checkout --progress --force refs/remotes/pull/208/merge
+End-to-End Tests	Run actions/checkout@v4	2026-10-16T07:06:33.2288756Z HEAD is now at 0007b5a Merge 3f96f8b1a50a456ceceb5e09257bb9a09c022712 into 43087e8501be56b04549472ddd0dad24b980055e
+End-to-End Tests	Run dtolnay/rust-toolchain@stable	2026-10-16T07:06:41.8884903Z   stable-x86_64-unknown-linux-gnu updated - rustc 1.99.1 (58cf8f9c3 2026-10-13) (from rustc 1.99.0 (b940084d7 2026-09-28))
+End-to-End Tests	Run dtolnay/rust-toolchain@stable	2026-10-16T07:06:41.9235170Z   stable-x86_64-unknown-linux-gnu unchanged - rustc 1.99.1 (58cf8f9c3 2026-10-13)
+End-to-End Tests	Run dtolnay/rust-toolchain@stable	2026-10-16T07:06:42.0907115Z rustc 1.99.1 (58cf8f9c3 2026-10-13)
+End-to-End Tests	Run actions/setup-node@v4	2026-10-16T07:14:10.5195540Z node: v22.23.3
+End-to-End Tests	Run actions/setup-node@v4	2026-10-16T07:14:10.5196038Z npm: 10.9.9
+End-to-End Tests	Mount import card in Chrome against disposable SVN/Git API	2026-10-16T07:14:14.4474159Z Google Chrome 155.0.8059.39 
+End-to-End Tests	Mount import card in Chrome against disposable SVN/Git API	2026-10-16T07:15:01.0459735Z added 317 packages, and audited 318 packages in 46s
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:23.8075655Z > vitest run src/branchPairRemoval.test.ts
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:23.8081378Z  ✓ src/branchPairRemoval.test.ts (35 tests) 14ms
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:23.8083816Z       Tests  35 passed (35)
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6623067Z   "ok": true,
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6623938Z     "real-delete-child-stays-on-parent",
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6624592Z     "real-delete-viewed-replaces-history",
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6625125Z     "cancel-modal",
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6625503Z     "server-error",
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6625889Z     "permission-rejection",
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6626283Z     "busy-rejection",
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6626693Z     "missing-parent-list-fallback",
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6627219Z     "warnings-remain-visible",
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6627636Z     "queued-not-complete",
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6628022Z     "delayed-completion",
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6628595Z     "queued-gone-leaves-without-claiming-completion",
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6629366Z     "mock-delete-child-stays-on-parent",
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6630160Z     "delete-child-with-warnings-stays-on-parent",
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6631089Z     "stale-url-not-found"
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6633768Z RELIABILITY_EVIDENCE {"browser_scenarios_passed":true,"case":"R70_DELETE_NAVIGATION","helper_tests_passed":true,"parent_preserved":true,"real_api_removal_confirmed":true}
+End-to-End Tests	Branch-pair delete navigation	2026-10-16T07:16:56.6655668Z test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 60 filtered out; finished in 33.84s

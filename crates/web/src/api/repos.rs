@@ -18,7 +18,9 @@ use reposync_core::db::import_operations::{
     RepoImportBaseline, SnapshotPin,
 };
 use reposync_core::db::late_pair_publish_operations::late_pair_publish_fingerprint;
-use reposync_core::db::queries::AuditLogInput;
+use reposync_core::db::queries::{
+    AuditLogInput, RepositorySaveError, RepositorySaveKind, RepositorySaveReceipt,
+};
 use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
 use reposync_core::db::Database;
 use reposync_core::errors::{redact_vcs_error_detail, DatabaseError};
@@ -31,28 +33,32 @@ use reposync_core::late_pair::{
 };
 use reposync_core::late_pair_publish::{
     publish_admitted_late_pair, resolve_publish_child_id, take_pending_publish_refusal,
-    PublishCredentials,
+    LatePairPublishRefusal, PublishCredentials,
 };
 use reposync_core::pair_refresh::{
     analyze_git_preview, branch_svn_url, build_preview, execute_refusal, execution_requested,
     format_refusal, parse_operation, reanchor_refusal, svn_path_missing, GitLayout,
     RefreshObservations, RefreshOperation,
 };
-use reposync_core::skip_commit::{
-    build_skip_context, execute_exact_skip, reason as skip_reason, SkipCommitRequest,
-};
+use reposync_core::skip_commit::{build_skip_context, reason as skip_reason, SkipCommitRequest};
 use reposync_core::svn::SvnClient;
 
 use crate::api::auth::{validate_session, validate_session_with_role};
 use crate::api::status::AppError;
 use crate::AppState;
 
+#[cfg(test)]
+#[path = "import_failure_persistence.rs"]
+mod import_failure_persistence;
+
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct CreateRepoRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    save_request_id: Option<String>,
     name: String,
     svn_url: String,
     #[serde(default)]
@@ -99,8 +105,18 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Deserialize)]
+fn present_nullable_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize, Serialize)]
 struct UpdateRepoRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    save_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_updated_at: Option<String>,
     name: Option<String>,
     svn_url: Option<String>,
     svn_branch: Option<String>,
@@ -114,8 +130,18 @@ struct UpdateRepoRequest {
     lfs_threshold_mb: Option<i64>,
     auto_merge: Option<bool>,
     enabled: Option<bool>,
-    allowed_paths: Option<String>,
-    blocked_patterns: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_nullable_string"
+    )]
+    allowed_paths: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_nullable_string"
+    )]
+    blocked_patterns: Option<Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -138,6 +164,8 @@ struct RepoSummary {
 
 #[derive(Serialize)]
 struct RepoDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    save_receipt: Option<RepositorySaveReceipt>,
     id: String,
     name: String,
     parent_id: Option<String>,
@@ -173,6 +201,7 @@ struct RepoDetail {
 impl From<reposync_core::models::Repository> for RepoDetail {
     fn from(r: reposync_core::models::Repository) -> Self {
         Self {
+            save_receipt: None,
             id: r.id,
             name: r.name,
             parent_id: r.parent_id,
@@ -258,7 +287,12 @@ fn enrich_repo_detail(db: &Database, mut detail: RepoDetail) -> Result<RepoDetai
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SaveCredentialsRequest {
+    #[serde(default)]
+    save_request_id: Option<String>,
+    #[serde(default)]
+    expected_updated_at: Option<String>,
     svn_password: Option<String>,
     git_token: Option<String>,
 }
@@ -273,11 +307,22 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/repos", get(list_repos))
         .route("/api/repos", post(create_repo))
+        .route(
+            "/api/repository-save-requests/:request_id",
+            get(get_global_save_request),
+        )
         .route("/api/repos/:id", get(get_repo))
         .route("/api/repos/:id", put(update_repo))
         .route("/api/repos/:id", delete(delete_repo))
         .route("/api/repos/:id/disable", post(disable_repo))
         .route("/api/repos/:id/remove", post(remove_repo))
+        .route("/api/repos/:id/removal/review", post(review_removal_v2))
+        .route("/api/repos/:id/removal/approve", post(approve_removal_v2))
+        .route("/api/repos/:id/removal/continue", post(continue_removal_v2))
+        .route(
+            "/api/repos/:id/removal/request",
+            get(lookup_removal_request_v2),
+        )
         .route("/api/repos/:id/restore", post(restore_repo))
         .route("/api/repos/:id/removal/preview", get(get_removal_preview))
         .route("/api/repos/:id/removal", get(get_removal))
@@ -318,6 +363,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/api/repos/:id/credentials", get(get_credentials))
         .route("/api/repos/:id/credentials", post(save_credentials))
+        .route(
+            "/api/repos/:id/save-requests/:request_id",
+            get(get_save_request),
+        )
         .route("/api/repos/:id/branches", post(create_branch_pair))
         .route("/api/repos/:id/branches", get(list_branch_pairs))
         .route("/api/repos/:id/refresh", post(preview_pair_refresh))
@@ -387,7 +436,7 @@ async fn create_repo(
     .await?;
 
     if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
+        return Err(AppError::Forbidden("admin access required".into()));
     }
 
     if body.name.is_empty() {
@@ -397,9 +446,14 @@ async fn create_repo(
         return Err(AppError::BadRequest("svn_url is required".into()));
     }
 
+    let payload = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.to_string()))?;
+    let request_id = body.save_request_id.clone();
     let now = Utc::now().to_rfc3339();
+    let repo_id = reposync_core::db::repo_scope_identity::new_human_repository_id();
+    reposync_core::db::repo_scope_identity::validate_human_repository_id(&repo_id)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
     let repo = reposync_core::models::Repository {
-        id: Uuid::new_v4().to_string(),
+        id: repo_id,
         name: body.name,
         svn_url: body.svn_url,
         svn_branch: body.svn_branch,
@@ -413,7 +467,7 @@ async fn create_repo(
         lfs_threshold_mb: body.lfs_threshold_mb,
         auto_merge: body.auto_merge,
         enabled: body.enabled,
-        created_by: Some(user_id),
+        created_by: Some(user_id.clone()),
         parent_id: None,
         created_at: now.clone(),
         updated_at: now,
@@ -431,9 +485,22 @@ async fn create_repo(
 
     let db = &state.db;
 
+    if let Some(request_id) = request_id {
+        let receipt = db
+            .create_repository_once(&repo, &user_id, &request_id, &payload)
+            .map_err(save_error)?;
+        let known = db
+            .get_repository(&receipt.repo_id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .ok_or_else(|| {
+                AppError::Conflict("created registration is no longer available".into())
+            })?;
+        let mut result = RepoDetail::from(known);
+        result.save_receipt = Some(receipt);
+        return Ok(Json(result));
+    }
     db.insert_repository(&repo)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(RepoDetail::from(repo)))
 }
 
@@ -464,17 +531,40 @@ async fn update_repo(
     Path(id): Path<String>,
     Json(body): Json<UpdateRepoRequest>,
 ) -> Result<Json<RepoDetail>, AppError> {
-    let (_user_id, role) = validate_session_with_role(
+    let (user_id, role) = validate_session_with_role(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
     .await?;
 
     if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
+        return Err(AppError::Forbidden("admin access required".into()));
     }
 
+    let payload = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.to_string()))?;
+    let request_id = body.save_request_id.clone();
+    let expected_updated_at = body.expected_updated_at.clone();
     let db = &state.db;
+    if let Some(ref request_id) = request_id {
+        if let Some(receipt) = db
+            .verified_repository_save_receipt(
+                &user_id,
+                request_id,
+                RepositorySaveKind::Configuration,
+                Some(&id),
+                &payload,
+            )
+            .map_err(save_error)?
+        {
+            let current = db
+                .get_repository(&id)
+                .map_err(|e| AppError::Internal(e.to_string()))?
+                .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+            let mut result = RepoDetail::from(current);
+            result.save_receipt = Some(receipt);
+            return Ok(Json(result));
+        }
+    }
     reject_held_import(db, &id)?;
     if db
         .managed_remove_blocks_new_work(&id)
@@ -519,15 +609,32 @@ async fn update_repo(
         sync_status: existing.sync_status,
         total_syncs: existing.total_syncs,
         total_errors: existing.total_errors,
-        allowed_paths: body.allowed_paths.or(existing.allowed_paths),
-        blocked_patterns: body.blocked_patterns.or(existing.blocked_patterns),
+        allowed_paths: body.allowed_paths.unwrap_or(existing.allowed_paths),
+        blocked_patterns: body.blocked_patterns.unwrap_or(existing.blocked_patterns),
         consecutive_errors: existing.consecutive_errors,
         teams_webhook_url: existing.teams_webhook_url,
     };
 
+    if let Some(request_id) = request_id {
+        let receipt = db
+            .update_repository_once(
+                &updated,
+                &user_id,
+                &request_id,
+                expected_updated_at.as_deref(),
+                &payload,
+            )
+            .map_err(save_error)?;
+        let current = db
+            .get_repository(&id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+        let mut result = RepoDetail::from(current);
+        result.save_receipt = Some(receipt);
+        return Ok(Json(result));
+    }
     db.update_repository(&updated)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(RepoDetail::from(updated)))
 }
 
@@ -560,7 +667,7 @@ async fn disable_repo_inner(
     .await?;
 
     if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
+        return Err(AppError::Forbidden("admin access required".into()));
     }
 
     let db = &state.db;
@@ -663,7 +770,12 @@ fn removal_response(
         | ManagedRemoveState::Cancelling
         | ManagedRemoveState::Running => StatusCode::ACCEPTED,
     };
-    let retryable = !operation.state.is_terminal_success();
+    let retryable = !operation.state.is_terminal_success()
+        && operation.reviewed.as_ref().is_none_or(|p| {
+            p.git.phase != reposync_core::db::managed_remove::DeletionPhase::ReconciliationRequired
+                && p.svn.phase
+                    != reposync_core::db::managed_remove::DeletionPhase::ReconciliationRequired
+        });
     let message = operation.outcome_detail.clone().unwrap_or_else(|| {
         match operation.state {
             ManagedRemoveState::Completed => {
@@ -693,7 +805,7 @@ fn removal_response(
             "registration_listed": registration_listed,
             "remote_git": operation.remote_git,
             "remote_svn": operation.remote_svn,
-            "retry_is_local_cleanup_only": true,
+            "retry_is_local_cleanup_only": operation.reviewed.as_ref().is_none_or(|p|p.git.phase.is_verified()&&p.svn.phase.is_verified()),
         }))
     } else {
         None
@@ -714,6 +826,10 @@ fn removal_response(
             "registration_listed": registration_listed,
             "recovery": recovery,
             "partial_cleanup": partial_cleanup,
+            "protocol": operation.version,
+            "request_id": (operation.version==2).then_some(&operation.request_id),
+            "review_pin": operation.reviewed.as_ref().map(|p|&p.plan.approval_digest),
+            "reviewed": operation.reviewed.as_ref().map(|p|serde_json::json!({"git":p.git,"svn":p.svn,"cleanup_started":p.cleanup_started,"cleanup_completed":p.cleanup_completed,"cleanup_errors":p.cleanup_errors})),
         })),
     ))
 }
@@ -758,7 +874,7 @@ async fn restore_repo(
     )
     .await?;
     if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
+        return Err(AppError::Forbidden("admin access required".into()));
     }
     if reposync_core::managed_remove::validate_repo_id(&id).is_err() {
         return Err(AppError::BadRequest(
@@ -822,12 +938,21 @@ async fn remove_repo(
     )
     .await?;
     if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
+        return Err(AppError::Forbidden("admin access required".into()));
     }
     if reposync_core::managed_remove::validate_repo_id(&id).is_err() {
         return Err(AppError::BadRequest(
             "repository id is not a single safe path component".into(),
         ));
+    }
+    if opts.explicit_remote_deletion_opts
+        && (opts.delete_git.unwrap_or(false) || opts.delete_svn.unwrap_or(false))
+    {
+        return Ok((StatusCode::CONFLICT,Json(serde_json::json!({
+            "ok":false,"action":"managed_remove","state":"blocked","remote_git":"untouched","remote_svn":"untouched",
+            "registration_listed":registration_listed(&state.db,&id)?,"retryable":false,"review_required":true,
+            "message":"Remote deletion requires an exact-target review and explicit approval through /removal/review and /removal/approve. This legacy request performed no remote deletion or local cleanup."
+        }))).into_response());
     }
     let request_id = headers
         .get("idempotency-key")
@@ -924,10 +1049,8 @@ async fn remove_repo(
         }
     };
 
-    use reposync_core::db::managed_remove::{
-        remote_branch_delete_already_applied, ManagedRemoveRemoteOutcome,
-    };
-    let mut remote_outcome = ManagedRemoveRemoteOutcome {
+    use reposync_core::db::managed_remove::ManagedRemoveRemoteOutcome;
+    let remote_outcome = ManagedRemoveRemoteOutcome {
         remote_git: if operation.remote_git.is_empty() {
             "untouched".into()
         } else {
@@ -939,78 +1062,6 @@ async fn remove_repo(
             operation.remote_svn.clone()
         },
     };
-    if opts.explicit_remote_deletion_opts {
-        let (delete_git, delete_svn) = remote_deletion_flags(
-            opts.explicit_remote_deletion_opts,
-            opts.delete_git,
-            opts.delete_svn,
-        );
-        let delete_git =
-            delete_git && !remote_branch_delete_already_applied(&remote_outcome.remote_git);
-        let delete_svn =
-            delete_svn && !remote_branch_delete_already_applied(&remote_outcome.remote_svn);
-        if delete_git || delete_svn {
-            let repo = state
-                .db
-                .get_repository(&id)
-                .map_err(|e| AppError::Internal(e.to_string()))?
-                .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
-            if let Some(parent_id) = repo.parent_id.as_deref() {
-                let parent = match state.db.get_repository(parent_id) {
-                    Ok(Some(parent)) => parent,
-                    Ok(None) => {
-                        let detail =
-                            "parent registration is missing; remote deletion cannot proceed";
-                        let operation = state
-                            .db
-                            .fail_managed_remove(&id, &operation.id, detail)
-                            .map_err(|e| AppError::Internal(e.to_string()))?;
-                        let listed = registration_listed(&state.db, &id)?;
-                        let (status, body) = removal_response(&state.db, &operation, listed)?;
-                        return Ok((status, body).into_response());
-                    }
-                    Err(error) => {
-                        return Err(AppError::Internal(error.to_string()));
-                    }
-                };
-                let deletion = optional_branch_pair_remote_deletion(
-                    &state.db, &parent, &repo, delete_git, delete_svn,
-                )
-                .await;
-                if delete_git {
-                    remote_outcome.remote_git = deletion.remote_git;
-                }
-                if delete_svn {
-                    remote_outcome.remote_svn = deletion.remote_svn;
-                }
-                if (delete_git && remote_outcome.remote_git == "failed")
-                    || (delete_svn && remote_outcome.remote_svn == "failed")
-                {
-                    let detail = if deletion.warnings.is_empty() {
-                        "requested remote deletion failed".into()
-                    } else {
-                        deletion.warnings.join("; ")
-                    };
-                    let operation = state
-                        .db
-                        .fail_managed_remove_with_remote(
-                            &id,
-                            &operation.id,
-                            &detail,
-                            Some(&remote_outcome),
-                        )
-                        .map_err(|e| AppError::Internal(e.to_string()))?;
-                    let listed = registration_listed(&state.db, &id)?;
-                    let (status, body) = removal_response(&state.db, &operation, listed)?;
-                    return Ok((status, body).into_response());
-                }
-                state
-                    .db
-                    .record_managed_remove_remote_progress(&id, &operation.id, &remote_outcome)
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
-            }
-        }
-    }
 
     let data_dir = state.config.daemon.data_dir.clone();
     let cleanup = reposync_core::managed_remove::remove_owned_repo_tree(&data_dir, &id);
@@ -1204,6 +1255,119 @@ fn import_write_error(error: DatabaseError) -> AppError {
         DatabaseError::Other(message) => AppError::BadRequest(message),
         other => AppError::Internal(format!("import operation persistence failed: {other}")),
     }
+}
+
+/// Record a terminal import outcome on the database that already admitted the
+/// operation. Returns the original detail when that write fails. Does not open
+/// another database or acquire a lease.
+fn persist_admitted_outcome(
+    db: &Database,
+    repo_id: &str,
+    operation_id: &str,
+    state: ImportOperationState,
+    detail: &str,
+) -> Option<String> {
+    match db.finish_import_operation(repo_id, operation_id, state, detail) {
+        Ok(_) => None,
+        Err(error) => {
+            error!(
+                repo_id,
+                first_error = detail,
+                error = %error,
+                "failure persistence failed"
+            );
+            Some(detail.to_string())
+        }
+    }
+}
+
+fn note_unpersisted_import_failure(slot: &mut Option<String>, missed: Option<String>) {
+    if slot.is_none() {
+        *slot = missed;
+    }
+}
+
+/// Stored by `resume_import_operation` while the resumed run is still
+/// non-terminal. It is not a failure, so it must not hide an unpersisted one.
+const RESUME_CHECKPOINT_DETAIL: &str = "Resuming import from durable checkpoint";
+
+/// A stored failure detail wins. The resume checkpoint note does not: an
+/// unpersisted failure from `errors` is shown instead. `errors` must be this
+/// attempt only; resume clears the reused progress list when it starts.
+/// Lifecycle on `object` is left unchanged.
+fn apply_import_failure_evidence(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    outcome_detail: Option<&str>,
+    errors: &[String],
+) {
+    let durable = outcome_detail
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty());
+    let unpersisted = errors
+        .iter()
+        .map(|detail| detail.trim())
+        .find(|detail| !detail.is_empty());
+    if let Some(detail) = durable {
+        if detail == RESUME_CHECKPOINT_DETAIL {
+            if let Some(first) = unpersisted {
+                object.insert("outcome_detail".into(), serde_json::json!(first));
+                object.insert("error".into(), serde_json::json!(first));
+                return;
+            }
+        }
+        object.insert("outcome_detail".into(), serde_json::json!(detail));
+        return;
+    }
+    if let Some(first) = unpersisted {
+        object.insert("outcome_detail".into(), serde_json::json!(first));
+        object.insert("error".into(), serde_json::json!(first));
+    }
+}
+
+struct ChildAdmissionIdentity<'a> {
+    fingerprint: &'a str,
+    git_branch: &'a str,
+    svn_branch: &'a str,
+}
+
+/// Propagate a child-admission refusal from the admitted handle. A stored
+/// first detail is included only when the latest operation matches this
+/// request's fingerprint, branches, and non-terminal lifecycle. A missing
+/// identity, or a completed operation for another branch, returns only the
+/// current refusal. This does not open a database or repair a lease.
+fn propagate_child_admission_refusal(
+    db: &Database,
+    parent_id: &str,
+    refusal: &LatePairPublishRefusal,
+    identity: Option<ChildAdmissionIdentity<'_>>,
+) -> AppError {
+    let reported = refusal.error_message();
+    let Some(identity) = identity else {
+        return AppError::BadRequest(reported);
+    };
+    if refusal.reason == "database_error" {
+        if let Ok(Some(op)) = db.latest_late_pair_publish_operation(parent_id) {
+            let same_operation = op.target_fingerprint == identity.fingerprint
+                && op.git_branch == identity.git_branch
+                && op.svn_branch == identity.svn_branch
+                && !op.state.is_terminal();
+            if same_operation {
+                if let Some(first) = op
+                    .outcome_detail
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|detail| !detail.is_empty())
+                {
+                    if first != refusal.detail.trim() && !reported.contains(first) {
+                        return AppError::BadRequest(format!(
+                            "{first}; persistence reported {reported}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    AppError::BadRequest(reported)
 }
 
 struct ImportPreparationGuard<'a> {
@@ -1508,19 +1672,15 @@ async fn start_repo_import(
     );
 
     // 5. Build SVN import URL
-    let svn_import_url = {
-        let base = repo.svn_url.trim_end_matches('/');
-        let branch = if repo.svn_branch.is_empty() {
+    let svn_import_url = reposync_core::svn::operand::configured_branch_url(
+        &repo.svn_url,
+        if repo.svn_branch.is_empty() {
             "trunk"
         } else {
             &repo.svn_branch
-        };
-        if branch.is_empty() || branch == "/" {
-            base.to_string()
-        } else {
-            format!("{}/{}", base, branch.trim_start_matches('/'))
-        }
-    };
+        },
+    )
+    .map_err(|error| AppError::BadRequest(redact_vcs_error_detail(&error.to_string())))?;
 
     info!(repo_id = %id, svn_import_url = %svn_import_url, "starting per-repo import");
 
@@ -1686,11 +1846,6 @@ async fn start_repo_import(
     };
     let file_policy = FilePolicy::with_lfs(0, vec![], lfs_threshold_bytes, &[]);
 
-    // 10. Open a separate DB connection for the import task
-    let db_path = data_dir.join("reposync.db");
-    let import_db = Database::new(&db_path)
-        .map_err(|e| AppError::Internal(format!("failed to open db: {}", e)))?;
-
     // 11. Build ImportConfig from repo settings
     let import_config = ImportConfig {
         committer_name: "RepoSync".into(),
@@ -1708,12 +1863,16 @@ async fn start_repo_import(
     let cancel_signal = progress.read().await.cancel_signal.clone();
     let worker_pin = snapshot_pin.clone();
 
-    // 12. Spawn the import task (tracked for graceful shutdown)
+    // 12. Spawn the import task (tracked for graceful shutdown).
+    // The worker uses the database that admitted this operation.
     let state_for_handle = state.clone();
+    let worker_state = state.clone();
     let handle = tokio::spawn(async move {
+        let import_db = &worker_state.db;
         // Hold the busy guard for the entire lifetime of the import so
         // the scheduler skips this repo until we're done.
         let _busy_guard = busy_guard;
+        let mut unpersisted_detail = None;
         let current = import_db.get_import_operation(&repo_id_clone, &worker_operation_id);
         let result = match current {
             Ok(Some(op)) if op.cancel_requested => {
@@ -1733,7 +1892,7 @@ async fn start_repo_import(
                             import::run_snapshot_import(
                                 &svn_client,
                                 &git_client,
-                                &import_db,
+                                import_db,
                                 &file_policy,
                                 &import_config,
                                 &pin,
@@ -1745,7 +1904,7 @@ async fn start_repo_import(
                                 &svn_client,
                                 &git_client,
                                 &identity_mapper,
-                                &import_db,
+                                import_db,
                                 &file_policy,
                                 &import_config,
                                 run_state,
@@ -1777,11 +1936,16 @@ async fn start_repo_import(
                     }
                     Err(e) => {
                         error!(repo_id = %repo_id_clone, error = %e, "import finalization failed");
-                        let _ = import_db.finish_import_operation(
-                            &repo_id_clone,
-                            &worker_operation_id,
-                            ImportOperationState::ReconciliationRequired,
-                            &format!("finalization failed: {e}"),
+                        let detail = format!("finalization failed: {e}");
+                        note_unpersisted_import_failure(
+                            &mut unpersisted_detail,
+                            persist_admitted_outcome(
+                                import_db,
+                                &repo_id_clone,
+                                &worker_operation_id,
+                                ImportOperationState::ReconciliationRequired,
+                                &detail,
+                            ),
                         );
                         ImportPhase::Failed
                     }
@@ -1801,13 +1965,15 @@ async fn start_repo_import(
                 let detail = format!(
                     "stopped after {commits} local commits; published history is not undone"
                 );
-                if let Err(e) = import_db.finish_import_operation(
+                if let Some(missed) = persist_admitted_outcome(
+                    import_db,
                     &repo_id_clone,
                     &worker_operation_id,
                     state,
                     &detail,
                 ) {
-                    error!(repo_id = %repo_id_clone, error = %e, "cancel finalization failed");
+                    error!(repo_id = %repo_id_clone, first_error = %detail, "cancel finalization failed");
+                    note_unpersisted_import_failure(&mut unpersisted_detail, Some(missed));
                     ImportPhase::Failed
                 } else if uncertain {
                     ImportPhase::Failed
@@ -1816,31 +1982,41 @@ async fn start_repo_import(
                 }
             }
             Ok(import::ImportOutcome::ReconciliationRequired { reason, .. }) => {
-                if let Err(e) = import_db.finish_import_operation(
-                    &repo_id_clone,
-                    &worker_operation_id,
-                    ImportOperationState::ReconciliationRequired,
-                    &reason,
-                ) {
-                    error!(repo_id = %repo_id_clone, error = %e, "uncertain outcome persistence failed");
-                }
+                note_unpersisted_import_failure(
+                    &mut unpersisted_detail,
+                    persist_admitted_outcome(
+                        import_db,
+                        &repo_id_clone,
+                        &worker_operation_id,
+                        ImportOperationState::ReconciliationRequired,
+                        &reason,
+                    ),
+                );
                 ImportPhase::Failed
             }
             Err(e) => {
+                error!(repo_id = %repo_id_clone, error = %e, "per-repo import failed");
                 let detail = format!("import stopped with error; inspect local work: {e:#}");
-                if let Err(write_error) = import_db.finish_import_operation(
-                    &repo_id_clone,
-                    &worker_operation_id,
-                    ImportOperationState::Failed,
-                    &detail,
-                ) {
-                    error!(repo_id = %repo_id_clone, error = %write_error, "failure persistence failed");
-                }
+                note_unpersisted_import_failure(
+                    &mut unpersisted_detail,
+                    persist_admitted_outcome(
+                        import_db,
+                        &repo_id_clone,
+                        &worker_operation_id,
+                        ImportOperationState::Failed,
+                        &detail,
+                    ),
+                );
                 ImportPhase::Failed
             }
         };
         let mut p = progress.write().await;
         p.phase = terminal;
+        if let Some(detail) = unpersisted_detail {
+            if !p.errors.iter().any(|existing| existing == &detail) {
+                p.errors.push(detail);
+            }
+        }
         p.completed_at = Some(chrono::Utc::now().to_rfc3339());
 
         if let Err(e) = import_db.persist_import_progress(&p) {
@@ -1986,6 +2162,7 @@ async fn repo_import_status(
             "outcome_detail".into(),
             serde_json::json!(op.outcome_detail),
         );
+        apply_import_failure_evidence(object, op.outcome_detail.as_deref(), &p.errors);
         object.insert(
             "resume_authorized".into(),
             serde_json::json!(op.resume_authorized),
@@ -2281,6 +2458,11 @@ async fn resume_repo_import(
         p.commits_created = resumed.local_commits;
         p.batches_pushed = resumed.confirmed_batches;
         p.current_rev = resumed.processed_revisions as i64;
+        // This Arc outlives the previous attempt. Drop its errors so a healthy
+        // resume is not labeled with that history, and so a new unpersisted
+        // failure is the first error for this attempt. Durable outcome detail
+        // is unchanged here.
+        p.errors.clear();
     }
 
     let svn_password_repo = db
@@ -2294,19 +2476,15 @@ async fn resume_repo_import(
     let git_token_state = db.resolve_credential_chain_state(&id, "secret_git_token");
     let git_token = git_token_state.value.clone();
 
-    let svn_import_url = {
-        let base = repo.svn_url.trim_end_matches('/');
-        let branch = if repo.svn_branch.is_empty() {
+    let svn_import_url = reposync_core::svn::operand::configured_branch_url(
+        &repo.svn_url,
+        if repo.svn_branch.is_empty() {
             "trunk"
         } else {
             &repo.svn_branch
-        };
-        if branch.is_empty() || branch == "/" {
-            base.to_string()
-        } else {
-            format!("{}/{}", base, branch.trim_start_matches('/'))
-        }
-    };
+        },
+    )
+    .map_err(|error| AppError::BadRequest(redact_vcs_error_detail(&error.to_string())))?;
     let svn_client = SvnClient::new(&svn_import_url, &repo.svn_username, &svn_password)
         .with_cancel_signal(progress.read().await.cancel_signal.clone());
     let git_client = Arc::new(std::sync::Mutex::new(
@@ -2339,17 +2517,17 @@ async fn resume_repo_import(
         trunk_path: repo.svn_branch.clone(),
     };
 
-    let db_path = data_dir.join("reposync.db");
-    let import_db = Database::new(&db_path)
-        .map_err(|e| AppError::Internal(format!("failed to open db: {e}")))?;
     let ws_broadcast = Some(state.ws_broadcast.clone());
     let repo_id_clone = id.clone();
     let worker_operation_id = operation_id.clone();
     let cancel_signal = progress.read().await.cancel_signal.clone();
     let state_for_handle = state.clone();
+    let worker_state = state.clone();
 
     let handle = tokio::spawn(async move {
+        let import_db = &worker_state.db;
         let _busy_guard = busy_guard;
+        let mut unpersisted_detail = None;
         let result = {
             let run_state = ImportRunState {
                 progress: progress.clone(),
@@ -2362,7 +2540,7 @@ async fn resume_repo_import(
                 &svn_client,
                 &git_client,
                 &identity_mapper,
-                &import_db,
+                import_db,
                 &file_policy,
                 &import_config,
                 run_state,
@@ -2387,11 +2565,16 @@ async fn resume_repo_import(
                     }
                     Err(e) => {
                         error!(repo_id = %repo_id_clone, error = %e, "import resume finalization failed");
-                        let _ = import_db.finish_import_operation(
-                            &repo_id_clone,
-                            &worker_operation_id,
-                            ImportOperationState::ReconciliationRequired,
-                            &format!("finalization failed: {e}"),
+                        let detail = format!("finalization failed: {e}");
+                        note_unpersisted_import_failure(
+                            &mut unpersisted_detail,
+                            persist_admitted_outcome(
+                                import_db,
+                                &repo_id_clone,
+                                &worker_operation_id,
+                                ImportOperationState::ReconciliationRequired,
+                                &detail,
+                            ),
                         );
                         ImportPhase::Failed
                     }
@@ -2411,38 +2594,57 @@ async fn resume_repo_import(
                 let detail = format!(
                     "stopped after {commits} local commits; published history is not undone"
                 );
-                if import_db
-                    .finish_import_operation(&repo_id_clone, &worker_operation_id, state, &detail)
-                    .is_err()
-                    || uncertain
-                {
+                if let Some(missed) = persist_admitted_outcome(
+                    import_db,
+                    &repo_id_clone,
+                    &worker_operation_id,
+                    state,
+                    &detail,
+                ) {
+                    note_unpersisted_import_failure(&mut unpersisted_detail, Some(missed));
+                    ImportPhase::Failed
+                } else if uncertain {
                     ImportPhase::Failed
                 } else {
                     ImportPhase::Cancelled
                 }
             }
             Ok(import::ImportOutcome::ReconciliationRequired { reason, .. }) => {
-                let _ = import_db.finish_import_operation(
-                    &repo_id_clone,
-                    &worker_operation_id,
-                    ImportOperationState::ReconciliationRequired,
-                    &reason,
+                note_unpersisted_import_failure(
+                    &mut unpersisted_detail,
+                    persist_admitted_outcome(
+                        import_db,
+                        &repo_id_clone,
+                        &worker_operation_id,
+                        ImportOperationState::ReconciliationRequired,
+                        &reason,
+                    ),
                 );
                 ImportPhase::Failed
             }
             Err(e) => {
+                error!(repo_id = %repo_id_clone, error = %e, "per-repo import resume failed");
                 let detail = format!("import resume stopped with error: {e:#}");
-                let _ = import_db.finish_import_operation(
-                    &repo_id_clone,
-                    &worker_operation_id,
-                    ImportOperationState::Failed,
-                    &detail,
+                note_unpersisted_import_failure(
+                    &mut unpersisted_detail,
+                    persist_admitted_outcome(
+                        import_db,
+                        &repo_id_clone,
+                        &worker_operation_id,
+                        ImportOperationState::Failed,
+                        &detail,
+                    ),
                 );
                 ImportPhase::Failed
             }
         };
         let mut p = progress.write().await;
         p.phase = terminal;
+        if let Some(detail) = unpersisted_detail {
+            if !p.errors.iter().any(|existing| existing == &detail) {
+                p.errors.push(detail);
+            }
+        }
         p.completed_at = Some(chrono::Utc::now().to_rfc3339());
         let _ = import_db.persist_import_progress(&p);
         if let Some(ref sender) = ws_broadcast {
@@ -2834,118 +3036,85 @@ async fn get_credentials(
     }))
 }
 
+fn save_error(error: RepositorySaveError) -> AppError {
+    match error {
+        RepositorySaveError::InvalidRequest => AppError::BadRequest(error.to_string()),
+        RepositorySaveError::Conflict => AppError::Conflict(error.to_string()),
+        RepositorySaveError::NotFound => AppError::NotFound(error.to_string()),
+        RepositorySaveError::Database(_) => AppError::Internal(error.to_string()),
+    }
+}
+
+async fn get_global_save_request(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(request_id): Path<String>,
+) -> Result<Json<RepositorySaveReceipt>, AppError> {
+    let (actor, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Forbidden("admin access required".into()));
+    }
+    let receipt = state
+        .db
+        .repository_save_receipt(&actor, &request_id)
+        .map_err(save_error)?
+        .ok_or_else(|| AppError::NotFound("save request not found".into()))?;
+    Ok(Json(receipt))
+}
+
+async fn get_save_request(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path((id, request_id)): Path<(String, String)>,
+) -> Result<Json<RepositorySaveReceipt>, AppError> {
+    let (actor, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Forbidden("admin access required".into()));
+    }
+    let receipt = state
+        .db
+        .repository_save_receipt(&actor, &request_id)
+        .map_err(save_error)?
+        .filter(|receipt| receipt.repo_id == id)
+        .ok_or_else(|| AppError::NotFound("save request not found".into()))?;
+    Ok(Json(receipt))
+}
+
 async fn save_credentials(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<SaveCredentialsRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let (_user_id, role) = validate_session_with_role(
+    let (actor, role) = validate_session_with_role(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
     .await?;
-
     if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
+        return Err(AppError::Forbidden("admin access required".into()));
     }
-
-    let db = &state.db;
-
-    // Verify repo exists
-    let _repo = db
-        .get_repository(&id)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
-        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
-
-    let now = Utc::now().to_rfc3339();
-
-    if let Some(ref password) = body.svn_password {
-        let key = format!("secret_svn_password_{}", id);
-        db.conn()
-            .execute(
-                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![key, password, now],
-            )
-            .map_err(|e| AppError::Internal(format!("failed to store SVN password: {}", e)))?;
-        if password.is_empty() {
-            tracing::info!(repo_id = %id, "SVN password revoked for repository");
-        } else {
-            tracing::info!(repo_id = %id, "SVN password stored for repository");
-            let mut queue: Vec<String> = vec![id.clone()];
-            let mut propagated = 0;
-            while let Some(current) = queue.pop() {
-                if let Ok(children) = db.list_child_repositories(&current) {
-                    for child in children {
-                        let child_key = format!("secret_svn_password_{}", child.id);
-                        db.conn()
-                            .execute(
-                                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                                rusqlite::params![child_key, password, now],
-                            )
-                            .map_err(|e| {
-                                AppError::Internal(format!(
-                                    "failed to propagate SVN password: {}",
-                                    e
-                                ))
-                            })?;
-                        queue.push(child.id);
-                        propagated += 1;
-                    }
-                }
-            }
-            if propagated > 0 {
-                tracing::info!(
-                    repo_id = %id,
-                    propagated_to_children = propagated,
-                    "SVN password propagated to descendants"
-                );
-            }
-        }
-    }
-
-    if let Some(ref token) = body.git_token {
-        let key = format!("secret_git_token_{}", id);
-        db.conn()
-            .execute(
-                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![key, token, now],
-            )
-            .map_err(|e| AppError::Internal(format!("failed to store Git token: {}", e)))?;
-        if token.is_empty() {
-            tracing::info!(repo_id = %id, "Git token revoked for repository");
-        } else {
-            let mut queue: Vec<String> = vec![id.clone()];
-            let mut propagated = 0;
-            while let Some(current) = queue.pop() {
-                if let Ok(children) = db.list_child_repositories(&current) {
-                    for child in children {
-                        let child_key = format!("secret_git_token_{}", child.id);
-                        db.conn()
-                            .execute(
-                                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                                rusqlite::params![child_key, token, now],
-                            )
-                            .map_err(|e| {
-                                AppError::Internal(format!(
-                                    "failed to propagate Git token: {}",
-                                    e
-                                ))
-                            })?;
-                        queue.push(child.id);
-                        propagated += 1;
-                    }
-                }
-            }
-            tracing::info!(
-                repo_id = %id,
-                propagated_to_children = propagated,
-                "Git token stored and propagated to descendants"
-            );
-        }
-    }
-
-    Ok(Json(serde_json::json!({ "ok": true })))
+    let receipt = state
+        .db
+        .save_repository_credentials(
+            &id,
+            body.svn_password.as_deref(),
+            body.git_token.as_deref(),
+            &actor,
+            body.save_request_id.as_deref(),
+            body.expected_updated_at.as_deref(),
+        )
+        .map_err(save_error)?;
+    // Only field names/counts are returned. Credential bytes and receipt MACs never leave the handler.
+    Ok(Json(serde_json::json!({"ok":true,"save_receipt":receipt})))
 }
 
 // ---------------------------------------------------------------------------
@@ -2968,6 +3137,14 @@ struct CreateBranchPairRequest {
     /// Alias for dry_run. When true, forces preview mode.
     #[serde(default)]
     preview: Option<bool>,
+    /// Explicit v2 contract; it never falls back to legacy publication.
+    #[serde(default)]
+    reconciliation: bool,
+    #[serde(default)]
+    include_parent: bool,
+    review_pin: Option<String>,
+    operation_id: Option<String>,
+    action: Option<String>,
     /// Auto-create the SVN branch via `svn copy` from the parent's branch.
     /// Ignored in preview; this slice does not copy.
     auto_create_svn_branch: Option<bool>,
@@ -3115,6 +3292,173 @@ async fn create_branch_pair(
         compatibility_skip_import: body.compatibility_skip_import,
         dry_run,
     };
+    if body.reconciliation {
+        use reposync_core::late_pair_publish as publisher;
+        let action = body
+            .action
+            .as_deref()
+            .unwrap_or(if dry_run { "preview" } else { "publish" });
+        let svn_password = db
+            .resolve_credential_chain(&parent.id, "secret_svn_password")
+            .unwrap_or_default();
+        let git_workdir = state
+            .config
+            .daemon
+            .data_dir
+            .join("repos")
+            .join(&parent.id)
+            .join("git-repo");
+        if matches!(action, "status" | "resume" | "cancel") {
+            let operation = match body.operation_id.as_deref() {
+                Some(operation_id) => db.get_late_pair_publish_operation(&parent.id, operation_id),
+                None if action == "status" => db.latest_late_pair_publish_operation(&parent.id),
+                None => return Err(AppError::BadRequest("operation_id is required".into())),
+            }
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("late-pair operation not found".into()))?;
+            let operation_id = operation.id.clone();
+            if operation.version != 2
+                || operation.initiator_id != _user_id
+                || operation.git_branch != git_branch
+                || operation.svn_branch != svn_branch
+            {
+                return Err(AppError::BadRequest(
+                    "late-pair operation actor, version or branch identity differs".into(),
+                ));
+            }
+            let mut action_error = None;
+            let current = match action {
+                "cancel" => publisher::cancel_reviewed_reconciliation(
+                    db,
+                    &parent.id,
+                    &operation_id,
+                    &_user_id,
+                )
+                .map_err(|e| AppError::BadRequest(redact_vcs_error_detail(&format!("{e:#}"))))?,
+                "resume" => {
+                    publisher::continue_reviewed_reconciliation(
+                        db,
+                        &parent.id,
+                        &operation_id,
+                        &_user_id,
+                        body.review_pin.as_deref().unwrap_or(""),
+                    )
+                    .map_err(|e| {
+                        AppError::BadRequest(redact_vcs_error_detail(&format!("{e:#}")))
+                    })?;
+                    // Errors retain a durable held operation; return its
+                    // truthful state instead of inventing a published result.
+                    if let Err(error) = publisher::reviewed::run(
+                        db,
+                        &state.config,
+                        &parent,
+                        &svn_password,
+                        &git_workdir,
+                        &operation_id,
+                        &_user_id,
+                    )
+                    .await
+                    {
+                        action_error = Some(redact_vcs_error_detail(&format!("{error:#}")));
+                    }
+                    db.get_late_pair_publish_operation(&parent.id, &operation_id)
+                        .map_err(|e| AppError::Internal(e.to_string()))?
+                        .ok_or_else(|| AppError::Internal("operation disappeared".into()))?
+                }
+                _ => operation,
+            };
+            let mut view = late_pair_reconciliation_view(
+                &current
+                    .reconciliation
+                    .as_ref()
+                    .ok_or_else(|| AppError::Internal("v2 progress absent".into()))?
+                    .plan,
+                Some(&current),
+            );
+            if let Some(error) = action_error {
+                view["action_error"] = serde_json::json!(error);
+            }
+            return Ok(Json(view));
+        }
+        if !matches!(action, "preview" | "publish") {
+            return Err(AppError::BadRequest("unknown late-pair action".into()));
+        }
+        if existing_children
+            .iter()
+            .any(|child| child.git_branch == git_branch || child.svn_branch == svn_branch)
+        {
+            return Err(AppError::BadRequest(
+                "branch pair already registered; inspect its existing operation".into(),
+            ));
+        }
+        let mappings = collect_verified_mappings(db, &parent.id)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let token = db.resolve_credential_chain(&parent.id, "secret_git_token");
+        let admission = evaluate_admission(
+            &mappings,
+            Some(&git_workdir),
+            None,
+            &request,
+            token.as_deref(),
+        )
+        .map_err(|e| AppError::BadRequest(e.error_message()))?;
+        let prepare = || reposync_core::late_pair::reconciliation::PrepareContext {
+            db,
+            parent: &parent,
+            git_workdir: &git_workdir,
+            request: &request,
+            admission: &admission,
+            svn_password: &svn_password,
+            actor: &_user_id,
+            include_parent: body.include_parent,
+        };
+        if action == "preview" {
+            let plan = reposync_core::late_pair::reconciliation::prepare(prepare())
+                .await
+                .map_err(|e| AppError::BadRequest(redact_vcs_error_detail(&format!("{e:#}"))))?;
+            return Ok(Json(late_pair_reconciliation_view(&plan, None)));
+        }
+        if dry_run {
+            return Err(AppError::BadRequest(
+                "publish requires explicit dry_run=false and preview=false".into(),
+            ));
+        }
+        let operation = publisher::begin_reviewed_reconciliation(
+            prepare(),
+            body.review_pin.as_deref().unwrap_or(""),
+            &Uuid::new_v4().to_string(),
+        )
+        .await
+        .map_err(|e| AppError::BadRequest(redact_vcs_error_detail(&format!("{e:#}"))))?;
+        let action_error = publisher::reviewed::run(
+            db,
+            &state.config,
+            &parent,
+            &svn_password,
+            &git_workdir,
+            &operation.id,
+            &_user_id,
+        )
+        .await
+        .err();
+        let current = db
+            .get_late_pair_publish_operation(&parent.id, &operation.id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .ok_or_else(|| AppError::Internal("operation disappeared".into()))?;
+        let mut view = late_pair_reconciliation_view(
+            &current
+                .reconciliation
+                .as_ref()
+                .ok_or_else(|| AppError::Internal("v2 progress absent".into()))?
+                .plan,
+            Some(&current),
+        );
+        if let Some(error) = action_error {
+            view["action_error"] =
+                serde_json::json!(redact_vcs_error_detail(&format!("{error:#}")));
+        }
+        return Ok(Json(view));
+    }
     let mappings = collect_verified_mappings(db, &parent.id)
         .map_err(|e| AppError::Internal(format!("failed to read verified mappings: {e}")))?;
     let git_workdir = state
@@ -3233,7 +3577,7 @@ async fn create_branch_pair(
         &baseline.git_sha,
         baseline.svn_revision,
     );
-    let fallback_child = Uuid::new_v4().to_string();
+    let fallback_child = reposync_core::db::repo_scope_identity::new_human_repository_id();
     let child_id = resolve_publish_child_id(db, &parent.id, &fingerprint, &fallback_child)
         .map_err(|e| AppError::Internal(format!("database error: {e}")))?;
     if existing_children
@@ -3261,7 +3605,18 @@ async fn create_branch_pair(
         &Arc::new(identity_mapper),
     )
     .await
-    .map_err(|refuse| AppError::BadRequest(refuse.error_message()))?;
+    .map_err(|refuse| {
+        propagate_child_admission_refusal(
+            db,
+            &parent.id,
+            &refuse,
+            Some(ChildAdmissionIdentity {
+                fingerprint: &fingerprint,
+                git_branch: &git_branch,
+                svn_branch: &svn_branch,
+            }),
+        )
+    })?;
     if let Some(pending) = take_pending_publish_refusal(&parent.id) {
         return Err(AppError::BadRequest(pending.error_message()));
     }
@@ -3280,6 +3635,38 @@ async fn create_branch_pair(
     })?))
 }
 
+fn late_pair_reconciliation_view(
+    plan: &reposync_core::late_pair::reconciliation::PreparedPlan,
+    operation: Option<&reposync_core::db::late_pair_publish_operations::LatePairPublishOperation>,
+) -> serde_json::Value {
+    use reposync_core::db::late_pair_publish_operations::LatePairPublishState;
+    let published = operation.is_some_and(|op| op.state == LatePairPublishState::Completed);
+    let progress = operation.and_then(|op| op.reconciliation.as_deref());
+    serde_json::json!({
+        "mode":if published {"published"} else if operation.is_some() {"durable_operation"} else {"review"},
+        "published":published,"admitted":plan.conflicts.is_empty(),
+        "pair_state":operation.map(|op|serde_json::to_value(&op.state).unwrap_or_default()).unwrap_or(serde_json::json!("preview")),
+        "scheduler_active":published,"policy_version":plan.policy,"parent_id":plan.parent_id,
+        "git_branch":plan.git_branch,"svn_branch":plan.svn_branch,"git_tip":plan.git_tip,
+        "svn_source_revision":plan.parent_revision,"svn_target_revision":progress.and_then(|p|p.svn_revision).or(plan.target_revision),
+        "verified_baseline":{"git_sha":plan.baseline_git_sha,"svn_revision":plan.baseline_svn_revision,"evidence":"scoped producer and exact tree"},
+        "baseline_missing_reason":null,"inherited_work":[plan.baseline_git_sha],
+        "pending_git":{"count":plan.pending_git_shas.len(),"summary":plan.pending_git_shas},
+        "pending_svn":{"knowable":true,"parent_head_revision":plan.parent_revision,"baseline_revision":plan.baseline_svn_revision,
+            "note":if plan.include_parent {"Parent advancement explicitly included"} else {"Parent advancement remains outside this pairing"}},
+        "conflicts":plan.conflicts.iter().map(|c|format!("{}: {}",c.path,c.reason)).collect::<Vec<_>>(),
+        "unknowns":operation.and_then(|op|op.outcome_detail.as_ref()).into_iter().collect::<Vec<_>>(),
+        "proposed_svn_copy_source_revision":if plan.target_revision.is_none() {Some(plan.baseline_svn_revision)} else {None},
+        "existing_svn_target":{"exists":plan.target_revision.is_some(),"equivalent":false,"uuid":plan.svn_uuid,
+            "revision":plan.target_revision,"url":plan.target_url,"note":"Independent target work is retained by the pinned reconciliation"},
+        "skip_import_requested":false,"skip_import_applied":false,"skip_import_note":"Every pending Git commit is accounted for; no start-from-now acknowledgement",
+        "review_pin":plan.review_pin,"include_parent":plan.include_parent,"result_git_sha":plan.intended_git_sha,
+        "result_tree_digest":plan.intended_tree_digest,"operation_id":operation.map(|op|&op.id),
+        "updated_at":operation.map(|op|&op.updated_at),"observation":if operation.is_some() {"durable state; remote tips are checked before effects"} else {"fresh captured source and result"},
+        "handled_steps":progress.map(|p|p.receipts.len()).unwrap_or(0),"total_steps":plan.steps.len(),
+    })
+}
+
 async fn attach_svn_probe(
     parent: &reposync_core::models::Repository,
     db: &Database,
@@ -3288,20 +3675,23 @@ async fn attach_svn_probe(
     let svn_password = db
         .resolve_credential_chain(&parent.id, "secret_svn_password")
         .unwrap_or_default();
-    let parent_svn_url = if parent.svn_branch.is_empty() {
-        parent.svn_url.clone()
-    } else {
-        format!(
-            "{}/{}",
-            parent.svn_url.trim_end_matches('/'),
-            parent.svn_branch.trim_start_matches('/')
-        )
+    let urls =
+        reposync_core::svn::operand::configured_branch_url(&parent.svn_url, &parent.svn_branch)
+            .and_then(|parent_url| {
+                reposync_core::svn::operand::configured_branch_url(
+                    &parent.svn_url,
+                    &plan.svn_branch,
+                )
+                .map(|target_url| (parent_url, target_url))
+            });
+    let (parent_svn_url, target_url) = match urls {
+        Ok(urls) => urls,
+        Err(error) => {
+            plan.unknowns
+                .push(redact_vcs_error_detail(&error.to_string()));
+            return;
+        }
     };
-    let target_url = format!(
-        "{}/{}",
-        parent.svn_url.trim_end_matches('/'),
-        plan.svn_branch.trim_start_matches('/')
-    );
     let parent_client = SvnClient::new(&parent_svn_url, &parent.svn_username, &svn_password);
     let target_client = SvnClient::new(&target_url, &parent.svn_username, &svn_password);
     let (probe, pending) = probe_svn_target(
@@ -3417,8 +3807,10 @@ async fn preview_pair_refresh(
     let pair_password = db
         .resolve_credential_chain(&pair.id, "secret_svn_password")
         .unwrap_or_default();
-    let parent_url = branch_svn_url(&parent.svn_url, &parent.svn_branch);
-    let pair_url = branch_svn_url(&pair.svn_url, &pair.svn_branch);
+    let parent_url = branch_svn_url(&parent.svn_url, &parent.svn_branch)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let pair_url = branch_svn_url(&pair.svn_url, &pair.svn_branch)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
     let parent_client = SvnClient::new(&parent_url, &parent.svn_username, &parent_password);
     let pair_client = SvnClient::new(&pair_url, &pair.svn_username, &pair_password);
     let parent_pin = read_svn_pin(
@@ -3577,214 +3969,58 @@ fn branch_pair_remote_delete_flags(opts: &DeleteBranchPairQuery) -> (bool, bool)
     )
 }
 
-struct BranchPairRemoteDeletionOutcome {
-    remote_git: String,
-    remote_svn: String,
-    warnings: Vec<String>,
-}
-
-fn remote_branch_outcome(requested: bool, branch_nonempty: bool, succeeded: bool) -> String {
-    if !requested || !branch_nonempty {
-        "untouched".into()
-    } else if succeeded {
-        "deleted".into()
-    } else {
-        "failed".into()
-    }
-}
-
-async fn optional_branch_pair_remote_deletion(
-    db: &Database,
-    parent: &reposync_core::models::Repository,
-    repo: &reposync_core::models::Repository,
-    delete_git: bool,
-    delete_svn: bool,
-) -> BranchPairRemoteDeletionOutcome {
-    let mut warnings: Vec<String> = Vec::new();
-    let mut git_ok = !delete_git || repo.git_branch.is_empty();
-    let mut svn_ok = !delete_svn || repo.svn_branch.is_empty();
-    if delete_git && !repo.git_branch.is_empty() {
-        let git_token = db
-            .resolve_credential_chain(&repo.id, "secret_git_token")
-            .unwrap_or_default();
-        let provider = match parent.git_provider.as_str() {
-            "gitea" => reposync_core::config::GitProvider::Gitea,
-            _ => reposync_core::config::GitProvider::GitHub,
-        };
-        let github_client = reposync_core::git::github::GitHubClient::new(
-            &parent.git_api_url,
-            &git_token,
-            provider,
-        );
-        match github_client
-            .delete_branch(&parent.git_repo, &repo.git_branch)
-            .await
-        {
-            Ok(()) => {
-                git_ok = true;
-                info!(branch = %repo.git_branch, "deleted Git branch");
-            }
-            Err(e) => {
-                git_ok = false;
-                let msg = format!("failed to delete Git branch '{}': {}", repo.git_branch, e);
-                warn!(%msg);
-                warnings.push(msg);
-            }
-        }
-    }
-    if delete_svn && !repo.svn_branch.is_empty() {
-        let svn_password = db
-            .resolve_credential_chain(&repo.id, "secret_svn_password")
-            .unwrap_or_default();
-        let svn_client = reposync_core::svn::SvnClient::new(
-            &parent.svn_url,
-            &parent.svn_username,
-            &svn_password,
-        );
-        match svn_client.delete_branch(&repo.svn_branch).await {
-            Ok(()) => {
-                svn_ok = true;
-                info!(branch = %repo.svn_branch, "deleted SVN branch");
-            }
-            Err(e) => {
-                svn_ok = false;
-                let msg = format!("failed to delete SVN branch '{}': {}", repo.svn_branch, e);
-                warn!(%msg);
-                warnings.push(msg);
-            }
-        }
-    }
-    BranchPairRemoteDeletionOutcome {
-        remote_git: remote_branch_outcome(delete_git, !repo.git_branch.is_empty(), git_ok),
-        remote_svn: remote_branch_outcome(delete_svn, !repo.svn_branch.is_empty(), svn_ok),
-        warnings,
-    }
-}
-
 async fn delete_branch_pair(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Query(opts): Query<DeleteBranchPairQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let (_user_id, role) = validate_session_with_role(
+) -> Result<axum::response::Response, AppError> {
+    let (_, role) = validate_session_with_role(
         &state,
-        headers.get("authorization").and_then(|v| v.to_str().ok()),
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
     )
     .await?;
-
     if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
+        return Ok((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"admin access required"})),
+        )
+            .into_response());
     }
-
-    let db = &state.db;
-
-    // Load the branch pair
-    let repo = db
+    let repo = state
+        .db
         .get_repository(&id)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
-        .ok_or_else(|| AppError::NotFound(format!("repository {} not found", id)))?;
-
-    // Only branch pairs (with a parent) can be hard-deleted
-    let parent_id = repo.parent_id.as_ref().ok_or_else(|| {
-        AppError::BadRequest("only branch pairs can be deleted (this is a root repository)".into())
-    })?;
-
-    // Block if it has children
-    let children = db
-        .list_child_repositories(&id)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-    if !children.is_empty() {
-        return Err(AppError::BadRequest(format!(
-            "cannot delete: branch pair has {} child pair(s) — delete them first",
-            children.len()
-        )));
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+    if repo.parent_id.is_none() {
+        return Err(AppError::BadRequest(
+            "only branch pairs can be deleted (this is a root repository)".into(),
+        ));
     }
-
-    // Acquire busy guard to prevent sync/import racing
-    reject_held_import(&state.db, &id)?;
-    let _busy_guard = reposync_core::busy::try_acquire(&id).ok_or_else(|| {
-        AppError::BadRequest("branch pair is currently busy (sync or import in progress)".into())
-    })?;
-
-    // Load parent for credential resolution
-    let parent = db
-        .get_repository(parent_id)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
-        .ok_or_else(|| AppError::Internal("parent repository not found".into()))?;
-
     let (delete_git, delete_svn) = branch_pair_remote_delete_flags(&opts);
-    let remote_deletion =
-        optional_branch_pair_remote_deletion(db, &parent, &repo, delete_git, delete_svn).await;
-    let mut warnings = remote_deletion.warnings;
-
-    // Delete local filesystem (git clone)
-    let repo_dir = state.config.daemon.data_dir.join("repos").join(&id);
-    if repo_dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&repo_dir) {
-            let msg = format!("failed to remove local repo dir: {}", e);
-            warn!(%msg);
-            warnings.push(msg);
-        } else {
-            debug!(path = %repo_dir.display(), "removed local repo directory");
-        }
-    }
-
-    // Hard-delete all DB records
-    let repo_name = repo.name.clone();
-    db.hard_delete_repository(&id)
-        .map_err(|e| AppError::Internal(format!("database error during deletion: {}", e)))?;
-
-    // Audit log (written to parent's audit trail since the child repo no longer exists)
-    let _ = db.insert_audit_log_with_repo(AuditLogInput {
-        action: "deleted_branch_pair",
-        direction: None,
-        svn_rev: None,
-        git_sha: None,
-        author: None,
-        details: Some(&format!(
-            "Deleted branch pair '{}' (git: {}, svn: {})",
-            repo_name, repo.git_branch, repo.svn_branch
-        )),
-        success: true,
-        repo_id: Some(parent_id),
-    });
-
-    info!(
-        repo_id = %id,
-        repo_name = %repo_name,
-        git_branch = %repo.git_branch,
-        svn_branch = %repo.svn_branch,
-        warnings = ?warnings,
-        "branch pair deleted"
-    );
-
-    // Send Teams notification for deletion
-    let teams_url = db
-        .get_state("teams_webhook_url")
-        .ok()
-        .flatten()
-        .filter(|v| !v.is_empty());
-    if let Some(url) = teams_url {
-        let card =
-            reposync_core::notify::teams::format_branch_deleted(&repo_name, &repo.git_branch);
-        let notifier = reposync_core::notify::teams::TeamsNotifier::new(url);
-        let _ = notifier.send_card(card).await;
-    }
-
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "message": format!("Branch pair '{}' deleted", repo_name),
-        "warnings": warnings,
-        "registration_listed": false,
-        "remote_deletion": {
-            "explicit_opts": opts.explicit_remote_deletion_opts,
-            "delete_git_requested": delete_git,
-            "delete_svn_requested": delete_svn,
-            "git_ref": if delete_git { repo.git_branch.clone() } else { String::new() },
-            "svn_path": if delete_svn { repo.svn_branch.clone() } else { String::new() },
-        },
-    })))
+    // Legacy callers retain their documented option interpretation, but never
+    // bypass the durable ownership, confinement, outcome and tombstone path.
+    let response = remove_repo(
+        State(state),
+        headers,
+        Path(id),
+        Query(ManagedRemoveQuery {
+            explicit_remote_deletion_opts: true,
+            delete_git: Some(delete_git),
+            delete_svn: Some(delete_svn),
+        }),
+    )
+    .await?;
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 1_048_576)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| AppError::Internal(e.to_string()))?;
+    value["remote_deletion"] = serde_json::json!({"delete_git_requested":delete_git,"delete_svn_requested":delete_svn,"explicit_opts":opts.explicit_remote_deletion_opts});
+    Ok((parts.status, Json(value)).into_response())
 }
 
 /// Optional form-value overrides for the SVN test endpoint.
@@ -3850,52 +4086,28 @@ async fn test_repo_svn(
         .or_else(|| db.resolve_credential_chain(&id, "secret_svn_password"))
         .unwrap_or_default();
 
-    let svn_url = if svn_branch.is_empty() {
-        svn_url_base
-    } else {
-        format!(
-            "{}/{}",
-            svn_url_base.trim_end_matches('/'),
-            svn_branch.trim_start_matches('/')
-        )
+    let svn_url = match reposync_core::svn::operand::configured_branch_url(
+        &svn_url_base,
+        &svn_branch,
+    ) {
+        Ok(url) => url,
+        Err(error) => {
+            return Ok(Json(
+                serde_json::json!({"ok":false,"message":redact_vcs_error_detail(&error.to_string())}),
+            ))
+        }
     };
 
-    let result = tokio::process::Command::new("svn")
-        .args([
-            "info",
-            "--non-interactive",
-            "--username",
-            &svn_username,
-            "--password",
-            &password,
-            &svn_url,
-        ])
-        .output()
+    let result = reposync_core::svn::SvnClient::new(&svn_url, &svn_username, &password)
+        .info()
         .await;
 
     match result {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let info = stdout
-                .lines()
-                .find(|l| l.starts_with("Repository Root:") || l.starts_with("URL:"))
-                .unwrap_or("SVN server responded successfully");
-            Ok(Json(
-                serde_json::json!({"ok": true, "message": info.trim()}),
-            ))
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let msg = stderr
-                .lines()
-                .find(|l| l.contains("E1") || l.contains("Unable") || l.contains("Authentication"))
-                .unwrap_or("SVN command failed");
-            Ok(Json(
-                serde_json::json!({"ok": false, "message": redact_vcs_error_detail(msg.trim())}),
-            ))
-        }
-        Err(e) => Ok(Json(
-            serde_json::json!({"ok": false, "message": format!("Failed to run svn: {}", e)}),
+        Ok(info) => Ok(Json(
+            serde_json::json!({"ok":true,"message":format!("Repository Root: {}",info.root_url)}),
+        )),
+        Err(error) => Ok(Json(
+            serde_json::json!({"ok":false,"message":redact_vcs_error_detail(&error.to_string())}),
         )),
     }
 }
@@ -4075,6 +4287,48 @@ async fn skip_commit_context(
     Ok(Json(serde_json::json!({ "ok": true, "context": context })))
 }
 
+async fn acquire_skip_commit_writer<'db>(
+    db: &'db Database,
+    id: &str,
+) -> Result<
+    (
+        reposync_core::busy::BusyGuard,
+        reposync_core::db::ordinary_writer_windows::OrdinaryWriterWindow<'db>,
+    ),
+    AppError,
+> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        reposync_core::db::pair_refresh_operations::require_no_pair_refresh_hold(
+            &db.conn(),
+            Some(id),
+        )
+        .map_err(|error| AppError::Conflict(error.to_string()))?;
+        if let Some(busy) = reposync_core::busy::try_acquire(id) {
+            reposync_core::db::late_pair_publish_operations::require_no_reconciliation_hold(
+                &db.conn(),
+                id,
+            )
+            .map_err(AppError::Conflict)?;
+            if let Some(window) = db
+                .try_begin_ordinary_writer_window(Some(id))
+                .map_err(|error| AppError::Conflict(error.to_string()))?
+            {
+                return Ok((busy, window));
+            }
+            // Release this attempt before waiting for the existing writer.
+            drop(busy);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::Conflict(format!(
+                "{}: existing writer has not released its scope",
+                skip_reason::WRITER_HELD
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 async fn skip_commit(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -4092,6 +4346,7 @@ async fn skip_commit(
 
     let db = &state.db;
     reject_held_import(db, &id)?;
+    let (_busy, writer_window) = acquire_skip_commit_writer(db, &id).await?;
     let repo = db
         .get_repository(&id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
@@ -4122,8 +4377,16 @@ async fn skip_commit(
         })
         .ok();
 
-    let outcome = execute_exact_skip(db, &id, &workdir, &remote_tip, bridge_tip.as_deref(), &body)
-        .map_err(|refuse| AppError::Conflict(refuse.message()))?;
+    let outcome = reposync_core::skip_commit::execute_exact_skip_with_writer_window(
+        db,
+        &id,
+        &workdir,
+        &remote_tip,
+        bridge_tip.as_deref(),
+        &body,
+        writer_window,
+    )
+    .map_err(|refuse| AppError::Conflict(refuse.message()))?;
 
     let _ = db.reset_consecutive_errors(&id);
     let _ = db.conn().execute(
@@ -4247,4 +4510,233 @@ async fn get_pre_commit_hook(
         .header("Content-Disposition", "attachment; filename=\"pre-commit\"")
         .body(axum::body::Body::from(script))
         .unwrap())
+}
+
+// #65 additive reviewed-removal API. DTOs do not accept a client-authored plan,
+// actor, remote endpoint, result receipt or cleanup-completed flag.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewRemovalV2 {
+    #[serde(default)]
+    delete_git: bool,
+    #[serde(default)]
+    delete_svn: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveRemovalV2 {
+    delete_git: bool,
+    delete_svn: bool,
+    review_pin: String,
+    request_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContinueRemovalV2 {
+    operation_id: String,
+}
+
+async fn removal_actor_v2(
+    state: &Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+) -> Result<Result<String, axum::response::Response>, AppError> {
+    let (actor, role) = validate_session_with_role(
+        state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Ok(Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"admin access required"})),
+        )
+            .into_response()));
+    }
+    Ok(Ok(actor))
+}
+
+fn removal_v2_refusal(error: impl std::fmt::Display) -> axum::response::Response {
+    (StatusCode::CONFLICT,Json(serde_json::json!({"ok":false,"action":"managed_remove","state":"blocked","registration_listed":null,"error":reposync_core::errors::redact_vcs_error_detail(&error.to_string())}))).into_response()
+}
+
+async fn review_removal_v2(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ReviewRemovalV2>,
+) -> Result<axum::response::Response, AppError> {
+    let actor = match removal_actor_v2(&state, &headers).await? {
+        Ok(actor) => actor,
+        Err(response) => return Ok(response),
+    };
+    let choices = reposync_core::db::managed_remove::RemovalChoices {
+        delete_git: body.delete_git,
+        delete_svn: body.delete_svn,
+    };
+    let plan = match reposync_core::managed_remove::reviewed::capture(
+        &state.db,
+        &state.config.daemon.data_dir,
+        &id,
+        &actor,
+        choices,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(error) => return Ok(removal_v2_refusal(error)),
+    };
+    let dependency = removal_dependency_preview_json(&state.db, &id)?;
+    Ok(Json(serde_json::json!({"ok":true,"action":"reviewed_removal","protocol":2,"repo_id":id,"review_pin":plan.approval_digest,"delete_git":plan.choices.delete_git,"delete_svn":plan.choices.delete_svn,"git":plan.git,"svn":plan.svn,"dependency_preview":dependency,"retention":"Indefinite tombstone, audit and mapping retention; no automatic purge. Restore returns a disabled registration and does not recreate deleted remote branches."})).into_response())
+}
+
+async fn run_removal_v2(
+    state: &Arc<AppState>,
+    id: &str,
+    actor: &str,
+    op: reposync_core::db::managed_remove::ManagedRemoveOperation,
+) -> Result<axum::response::Response, AppError> {
+    let progress = state.get_repo_import_progress(id).await;
+    let phase = progress.read().await.phase.clone();
+    if !matches!(
+        phase,
+        ImportPhase::Idle | ImportPhase::Completed | ImportPhase::Failed | ImportPhase::Cancelled
+    ) {
+        signal_import_stop(state, id).await;
+        let (code, body) = removal_response(&state.db, &op, registration_listed(&state.db, id)?)?;
+        return Ok((code, body).into_response());
+    }
+    match reposync_core::managed_remove::reviewed::run(
+        &state.db,
+        &state.config.daemon.data_dir,
+        id,
+        actor,
+        &op.id,
+    )
+    .await
+    {
+        Ok(operation) => {
+            let (code, body) =
+                removal_response(&state.db, &operation, registration_listed(&state.db, id)?)?;
+            Ok((code, body).into_response())
+        }
+        Err(error) => {
+            let Some(current) = state
+                .db
+                .managed_removal_operation(id, &op.id)
+                .map_err(|e| AppError::Internal(e.to_string()))?
+            else {
+                return Ok(removal_v2_refusal("the operation document is unavailable; retain the original request and do not infer completion"));
+            };
+            let (_, mut body) =
+                removal_response(&state.db, &current, registration_listed(&state.db, id)?)?;
+            body.0["ok"] = serde_json::json!(false);
+            body.0["message"] = serde_json::json!(reposync_core::errors::redact_vcs_error_detail(
+                &error.to_string()
+            ));
+            Ok((StatusCode::CONFLICT, body).into_response())
+        }
+    }
+}
+
+async fn approve_removal_v2(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ApproveRemovalV2>,
+) -> Result<axum::response::Response, AppError> {
+    let actor = match removal_actor_v2(&state, &headers).await? {
+        Ok(actor) => actor,
+        Err(response) => return Ok(response),
+    };
+    let choices = reposync_core::db::managed_remove::RemovalChoices {
+        delete_git: body.delete_git,
+        delete_svn: body.delete_svn,
+    };
+    let op = match reposync_core::managed_remove::reviewed::begin(
+        &state.db,
+        &state.config.daemon.data_dir,
+        &id,
+        &actor,
+        choices,
+        &body.review_pin,
+        &body.request_id,
+    )
+    .await
+    {
+        Ok(op) => op,
+        Err(error) => {
+            // A failed claim response may itself be uncertain. Read the real
+            // durable identity before telling the browser it may retire its
+            // pending request. This branch never launches native effects.
+            match state.db.managed_removal(&id) {
+                Ok(Some(op)) if op.version==2 && op.initiator_id==actor && op.request_id==body.request_id && op.target_fingerprint==body.review_pin && !op.state.is_terminal_success()=>{
+                    let (code,body)=removal_response(&state.db,&op,registration_listed(&state.db,&id)?)?;
+                    return Ok((code,body).into_response());
+                },
+                Ok(_)=>return Ok((StatusCode::CONFLICT,Json(serde_json::json!({"ok":false,"action":"managed_remove","state":"blocked","request_rejected":true,"registration_listed":registration_listed(&state.db,&id)?,"error":reposync_core::errors::redact_vcs_error_detail(&error.to_string())}))).into_response()),
+                Err(_)=>return Ok(removal_v2_refusal("removal admission could not be confirmed; retain the original request for operation lookup")),
+            }
+        }
+    };
+    run_removal_v2(&state, &id, &actor, op).await
+}
+
+async fn continue_removal_v2(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ContinueRemovalV2>,
+) -> Result<axum::response::Response, AppError> {
+    let actor = match removal_actor_v2(&state, &headers).await? {
+        Ok(actor) => actor,
+        Err(response) => return Ok(response),
+    };
+    let op = state
+        .db
+        .managed_removal_operation(&id, &body.operation_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("removal operation not found".into()))?;
+    if op.version != 2 || op.initiator_id != actor {
+        return Ok((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"this removal belongs to another actor or protocol"})),
+        )
+            .into_response());
+    }
+    run_removal_v2(&state, &id, &actor, op).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LookupRemovalRequestV2 {
+    request_id: String,
+    review_pin: String,
+}
+
+async fn lookup_removal_request_v2(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<LookupRemovalRequestV2>,
+) -> Result<axum::response::Response, AppError> {
+    let actor = match removal_actor_v2(&state, &headers).await? {
+        Ok(actor) => actor,
+        Err(response) => return Ok(response),
+    };
+    match state
+        .db
+        .reviewed_removal_request(&id, &actor, &query.request_id, &query.review_pin)
+    {
+        Ok(Some(op)) => {
+            let (code, body) =
+                removal_response(&state.db, &op, registration_listed(&state.db, &id)?)?;
+            Ok((code, body).into_response())
+        }
+        Ok(None) => Err(AppError::NotFound(
+            "no matching removal request has a retained operation receipt".into(),
+        )),
+        Err(error) => Ok(removal_v2_refusal(error)),
+    }
 }

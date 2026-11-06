@@ -3,12 +3,16 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{rejection::JsonRejection, Query, RawQuery, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use reposync_core::db::queries::{ErrorAcknowledgementError, ErrorObservation, ErrorScope};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
+
+#[path = "status_observation.rs"]
+mod observation;
 
 /// Optional query parameter to scope status to a specific repository.
 #[derive(Deserialize)]
@@ -17,16 +21,24 @@ struct RepoQuery {
 }
 
 /// Health check response.
+///
+/// A running scheduler omits `status` and `reason`, so the healthy body stays
+/// `{ok, version, git_commit}`. A degraded or fatal scheduler adds both.
 #[derive(Serialize)]
 struct HealthResponse {
     ok: bool,
     version: String,
     git_commit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 /// Status response wrapping the core SyncStatus.
 #[derive(Serialize)]
 struct StatusResponse {
+    observation: observation::Observation,
     state: String,
     last_sync_at: Option<String>,
     last_svn_revision: Option<i64>,
@@ -36,6 +48,7 @@ struct StatusResponse {
     active_conflicts: i64,
     total_errors: i64,
     last_error_at: Option<String>,
+    error_observation: ErrorObservation,
     uptime_secs: u64,
 }
 
@@ -74,15 +87,41 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/status", get(get_status))
         .route("/api/status/health", get(health_check))
         .route("/api/status/system", get(get_system_metrics))
-        .route("/api/status/reset-errors", post(reset_errors))
+        .route("/api/status/acknowledge-errors", post(acknowledge_errors))
+        // Compatibility route requires the same explicit JSON contract; never deletes.
+        .route("/api/status/reset-errors", post(acknowledge_errors))
 }
 
-async fn health_check() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        ok: true,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        git_commit: env!("GIT_COMMIT_SHA").to_string(),
-    })
+fn health_http(service: &crate::SchedulerServiceState) -> (axum::http::StatusCode, HealthResponse) {
+    let ok = service.is_running();
+    let (status_code, status) = match service.level {
+        crate::SchedulerServiceLevel::Running => (axum::http::StatusCode::OK, None),
+        crate::SchedulerServiceLevel::Degraded => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Some("degraded".to_string()),
+        ),
+        crate::SchedulerServiceLevel::Fatal => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Some("fatal".to_string()),
+        ),
+    };
+    (
+        status_code,
+        HealthResponse {
+            ok,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            git_commit: env!("GIT_COMMIT_SHA").to_string(),
+            status,
+            reason: if ok { None } else { service.reason.clone() },
+        },
+    )
+}
+
+async fn health_check(
+    State(state): State<Arc<AppState>>,
+) -> (axum::http::StatusCode, Json<HealthResponse>) {
+    let (status, body) = health_http(&state.scheduler_service_state());
+    (status, Json(body))
 }
 
 async fn get_status(
@@ -90,7 +129,7 @@ async fn get_status(
     headers: axum::http::HeaderMap,
     Query(query): Query<RepoQuery>,
 ) -> Result<Json<StatusResponse>, AppError> {
-    crate::api::auth::validate_session(
+    let (actor, role) = crate::api::auth::validate_session_with_role(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
@@ -106,15 +145,27 @@ async fn get_status(
             .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
             .ok_or_else(|| AppError::NotFound(format!("repository {} not found", repo_id)))?;
 
-        let active_conflicts = db.count_active_conflicts_for_repo(repo_id).unwrap_or(0);
+        let active_conflicts = db
+            .count_active_conflicts_for_repo(repo_id)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let total_conflicts: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM conflicts WHERE repo_id=?1",
+                [repo_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let observation = observation::repository(&state, &repo, &actor, role == "admin");
 
-        // Use 24h rolling window for errors (same as global status)
-        let errors_24h = db
-            .count_errors_for_repo(repo_id)
-            .unwrap_or(repo.total_errors);
-        let last_error = db.last_error_at_for_repo(repo_id).unwrap_or(None);
+        let errors = db
+            .error_snapshot(&ErrorScope::Repository {
+                repo_id: repo_id.clone(),
+            })
+            .map_err(|e| AppError::Internal(e.to_string()))?;
 
         return Ok(Json(StatusResponse {
+            observation,
             state: repo.sync_status,
             last_sync_at: repo.last_sync_at,
             last_svn_revision: if repo.last_svn_rev != 0 {
@@ -128,10 +179,11 @@ async fn get_status(
                 Some(repo.last_git_sha)
             },
             total_syncs: repo.total_syncs,
-            total_conflicts: 0,
+            total_conflicts,
             active_conflicts,
-            total_errors: errors_24h,
-            last_error_at: last_error,
+            total_errors: errors.count,
+            last_error_at: errors.last_error_at,
+            error_observation: errors.observation,
             uptime_secs: 0,
         }));
     }
@@ -140,7 +192,9 @@ async fn get_status(
     // repos exist; otherwise read the legacy global kv_state key.
     let state_str = reposync_core::sync_status::resolve_unscoped_sync_state(db)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-    let last_sync_str = db.get_state("last_sync_at").unwrap_or(None);
+    let last_sync_str = db
+        .get_state("last_sync_at")
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     let last_sync_at = last_sync_str.and_then(|s| {
         chrono::DateTime::parse_from_rfc3339(&s)
             .ok()
@@ -148,18 +202,37 @@ async fn get_status(
     });
     let last_svn_rev = db
         .get_state("last_svn_rev")
-        .unwrap_or(None)
+        .map_err(|e| AppError::Internal(e.to_string()))?
         .and_then(|s| s.parse::<i64>().ok())
-        .or_else(|| db.get_last_svn_revision().ok().flatten());
+        .or(db
+            .get_last_svn_revision()
+            .map_err(|e| AppError::Internal(e.to_string()))?);
     let last_git_hash = reposync_core::sync_status::resolve_unscoped_last_git_hash(db)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-    let total_syncs = db.count_sync_records().unwrap_or(0);
-    let total_conflicts = db.count_all_conflicts().unwrap_or(0);
-    let active_conflicts = db.count_active_conflicts().unwrap_or(0);
-    let total_errors = db.count_errors().unwrap_or(0);
-    let last_error_at = db.get_state("last_error_at").unwrap_or(None);
+    let total_syncs = db
+        .count_sync_records()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let total_conflicts = db
+        .count_all_conflicts()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let active_conflicts = db
+        .count_active_conflicts()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let errors = db
+        .error_snapshot(&ErrorScope::All {})
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    let repos = db
+        .list_repositories()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let observation = observation::aggregate(
+        repos
+            .iter()
+            .map(|repo| observation::repository(&state, repo, &actor, role == "admin"))
+            .collect(),
+    );
     Ok(Json(StatusResponse {
+        observation,
         state: state_str,
         last_sync_at,
         last_svn_revision: last_svn_rev,
@@ -167,57 +240,66 @@ async fn get_status(
         total_syncs,
         total_conflicts,
         active_conflicts,
-        total_errors,
-        last_error_at,
+        total_errors: errors.count,
+        last_error_at: errors.last_error_at,
+        error_observation: errors.observation,
         uptime_secs: 0, // TODO: track in AppState
     }))
 }
 
-async fn reset_errors(
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcknowledgeErrorsRequest {
+    scope: ErrorScope,
+    observation: ErrorObservation,
+}
+
+async fn acknowledge_errors(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    Query(query): Query<RepoQuery>,
+    RawQuery(query): RawQuery,
+    body: Result<Json<AcknowledgeErrorsRequest>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    crate::api::auth::validate_session(
-        &state,
-        headers.get("authorization").and_then(|v| v.to_str().ok()),
-    )
-    .await?;
-
-    let db = &state.db;
-
-    let cleared = if let Some(ref repo_id) = query.repo_id {
-        // Clear errors for a specific repo (also resets total_errors column)
-        db.clear_errors_for_repo(repo_id)
-            .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
-    } else {
-        // Clear all errors
-        db.clear_errors()
-            .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
-    };
-
-    let _ = db.insert_audit_log(
-        "errors_cleared",
-        query.repo_id.as_deref(),
-        None,
-        None,
-        None,
-        Some(&format!(
-            "Cleared {} error entries{}",
-            cleared,
-            query
-                .repo_id
-                .as_ref()
-                .map(|id| format!(" for repo {}", id))
-                .unwrap_or_default()
-        )),
-        true,
-    );
-
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "cleared": cleared
-    })))
+    let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
+    // Authentication precedes request validation. Unauthenticated requests are 401,
+    // while a valid non-admin session is 403, including malformed request bodies.
+    if authorization
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .is_none_or(str::is_empty)
+        || (state.config.web.admin_password.is_none()
+            && state
+                .db
+                .count_users()
+                .map_err(|e| AppError::Internal(e.to_string()))?
+                == 0)
+    {
+        return Err(AppError::Unauthorized("authentication required".into()));
+    }
+    let (actor, role) = crate::api::auth::validate_session_with_role(&state, authorization).await?;
+    if role != "admin" {
+        return Err(AppError::Forbidden(
+            "administrator role required to acknowledge errors".into(),
+        ));
+    }
+    if query.is_some_and(|q| !q.is_empty()) {
+        return Err(AppError::BadRequest(
+            "scope must be explicit in the JSON body; query scope is not accepted".into(),
+        ));
+    }
+    let Json(request) = body.map_err(|_| {
+        AppError::BadRequest("explicit scope and status observation required".into())
+    })?;
+    let acknowledged = state
+        .db
+        .acknowledge_errors(&request.scope, &request.observation, &actor)
+        .map_err(|e| match e {
+            ErrorAcknowledgementError::InvalidObservation => AppError::BadRequest(e.to_string()),
+            ErrorAcknowledgementError::UnknownRepository => AppError::NotFound(e.to_string()),
+            ErrorAcknowledgementError::Database(_) => AppError::Internal(e.to_string()),
+        })?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "acknowledged": acknowledged }),
+    ))
 }
 
 async fn get_system_metrics(
@@ -630,5 +712,51 @@ impl axum::response::IntoResponse for AppError {
 
         let body = serde_json::json!({ "error": client_message });
         (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use crate::{SchedulerServiceLevel, SchedulerServiceState};
+
+    #[test]
+    fn running_scheduler_stays_ok_without_a_reason() {
+        let (code, body) = health_http(&SchedulerServiceState::running());
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert!(body.ok);
+        assert!(body.status.is_none());
+        assert!(body.reason.is_none());
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json.get("reason").is_none());
+        assert!(json.get("status").is_none());
+    }
+
+    #[test]
+    fn fatal_scheduler_is_not_ok_and_includes_the_reason() {
+        let (code, body) = health_http(&SchedulerServiceState {
+            level: SchedulerServiceLevel::Fatal,
+            reason: Some("scheduler task panicked: boom".into()),
+        });
+        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!body.ok);
+        assert_eq!(body.status.as_deref(), Some("fatal"));
+        assert_eq!(
+            body.reason.as_deref(),
+            Some("scheduler task panicked: boom")
+        );
+    }
+
+    #[test]
+    fn degraded_scheduler_is_not_ok_and_includes_the_reason() {
+        let (code, body) = health_http(&SchedulerServiceState {
+            level: SchedulerServiceLevel::Degraded,
+            reason: Some("scheduler missed maintenance".into()),
+        });
+        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!body.ok);
+        assert_eq!(body.status.as_deref(), Some("degraded"));
+        assert_eq!(body.reason.as_deref(), Some("scheduler missed maintenance"));
     }
 }

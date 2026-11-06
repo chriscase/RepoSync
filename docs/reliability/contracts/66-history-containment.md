@@ -93,7 +93,8 @@ them. `fetch_git_changes` records the same durable block when its second-line
 | Observed-remote rewrite (`observed_remote_rewrite`) | **NOT RUN** — team polling cases cover O→R; personal inherits inspect |
 | >1000 linear inspect admission | **proven** — `candidate_r66_personal_linear_over_1000_admitted` |
 | >1000 legacy backlog durable restart | **proven** — team `candidate_r10_durable_backlog_block_survives_restart` (seeded block), personal `candidate_r66_personal_backlog_block_survives_restart` |
-| >1000 team replay continuation + restart | **proven** — `candidate_r10_over_1000_pending_commits_batched`, `candidate_r66_team_history_continuation_survives_restart` |
+| Small-cap linear continuation and restart | **proven** — `candidate_r10_over_1000_pending_commits_batched` and `candidate_r66_team_history_continuation_survives_restart` install `PendingCapGuard(..., 3)` and replay 7 commits in batches 3, 3, 1. That is not a 1001-commit drain at `DEFAULT_PENDING_COMMIT_CAP`. |
+| Team replay of 1001 commits at the default cap of 1000 | **proven** — `candidate_r10_over_1000_pending_commits_default_cap` calls team `run_sync_cycle` with no cap override and drains batches of 1000 then 1. Restart of that default-cap drain is not covered. |
 | >1000 continuation with pending SVN work | **proven** — `candidate_r66_continuation_mixed_pending_fail_closed` (cycle deferred with no bridge reset or writes) |
 | Merge-DAG team replay (engine cycle) | **proven** — `candidate_r10_merge_dag_replayed`, `candidate_r10_merge_dag_older_side_replayed_with_delta` |
 | Merge-DAG continuation over cap | **proven** — `candidate_r10_merge_dag_continuation_batched` (cap=1/2/3), `candidate_r10_merge_dag_continuation_batched_distinct_trees_cap1` / `cap3`, `candidate_r66_merge_dag_continuation_survives_restart`, `pending_frontier::merge_dag_continuation_batches_without_reordering_or_skips` |

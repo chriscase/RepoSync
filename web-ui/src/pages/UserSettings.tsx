@@ -1,3 +1,5 @@
+import { useId } from 'react';
+import { clientSession } from '../session';
 import { useState, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, type User, type CredentialSummary, type StoreCredentialRequest } from '../api';
@@ -16,6 +18,7 @@ interface CredentialCardProps {
 }
 
 function CredentialCard({ title, service, userId, existing, showUsername, onSaved }: CredentialCardProps) {
+  const fieldId = useId();
   const [serverUrl, setServerUrl] = useState('');
   const [username, setUsername] = useState('');
   const [value, setValue] = useState('');
@@ -93,7 +96,7 @@ function CredentialCard({ title, service, userId, existing, showUsername, onSave
           className={`text-xs font-medium px-2 py-1 rounded ${
             existing
               ? 'bg-green-900/50 text-green-400 border border-green-700'
-              : 'bg-gray-700 text-gray-400 border border-gray-600'
+              : 'bg-gray-700 text-gray-200 border border-gray-600'
           }`}
         >
           {existing ? 'Configured' : 'Not configured'}
@@ -101,38 +104,38 @@ function CredentialCard({ title, service, userId, existing, showUsername, onSave
       </div>
 
       {error && (
-        <div className="mb-3 bg-red-900/40 border border-red-700 text-red-300 px-3 py-2 rounded text-sm">
+        <div className="mb-3 bg-red-900/40 border border-red-700 text-red-300 px-3 py-2 rounded text-sm" id={`${fieldId}-error`} role="alert">
           {error}
         </div>
       )}
 
       <div className="space-y-3">
         <div>
-          <label className="block text-sm font-medium text-gray-400 mb-1">Server URL</label>
+          <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-1`}>Server URL</label>
           <input
             type="text"
             value={serverUrl}
             onChange={(e) => setServerUrl(e.target.value)}
             placeholder="https://svn.example.com or https://github.com"
-            className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+            className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-1`} aria-describedby={error ? `${fieldId}-error` : undefined}
           />
         </div>
 
         {showUsername && (
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1">Username</label>
+            <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-2`}>Username</label>
             <input
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               placeholder="Username"
-              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-2`} aria-describedby={error ? `${fieldId}-error` : undefined}
             />
           </div>
         )}
 
         <div>
-          <label className="block text-sm font-medium text-gray-400 mb-1">
+          <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-3`}>
             {valueLabel} {existing && '(leave blank to keep current)'}
           </label>
           <input
@@ -140,7 +143,7 @@ function CredentialCard({ title, service, userId, existing, showUsername, onSave
             value={value}
             onChange={(e) => setValue(e.target.value)}
             placeholder={existing ? `Current ${valueLabel.toLowerCase()} is set` : `Enter ${valueLabel.toLowerCase()}`}
-            className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+            className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-3`} aria-describedby={error ? `${fieldId}-error` : undefined}
           />
         </div>
       </div>
@@ -193,6 +196,7 @@ function CredentialCard({ title, service, userId, existing, showUsername, onSave
 // ---------------------------------------------------------------------------
 
 function ProfileSection({ user }: { user: User }) {
+  const fieldId = useId();
   const [displayName, setDisplayName] = useState(user.display_name);
   const [email, setEmail] = useState(user.email);
   const [currentPassword, setCurrentPassword] = useState('');
@@ -206,12 +210,13 @@ function ProfileSection({ user }: { user: User }) {
   const isLdap = user.role === 'ldap';
 
   const handleSaveProfile = async () => {
+    const session = clientSession(); const origin = session.snapshot();
     setSaving(true);
     setError('');
     setMessage('');
     try {
       const updated = await api.updateUser(user.id, { display_name: displayName, email });
-      localStorage.setItem('user', JSON.stringify(updated));
+      session.updateUser(updated, origin);
       setMessage('Profile updated successfully');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update profile');
@@ -259,32 +264,32 @@ function ProfileSection({ user }: { user: User }) {
         </div>
       )}
       {error && (
-        <div className="mb-4 bg-red-900/40 border border-red-700 text-red-300 px-4 py-3 rounded text-sm">
+        <div className="mb-4 bg-red-900/40 border border-red-700 text-red-300 px-4 py-3 rounded text-sm" id={`${fieldId}-error`} role="alert">
           {error}
         </div>
       )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
         <div>
-          <label className="block text-sm font-medium text-gray-400 mb-1">Username</label>
+          <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-4`}>Username</label>
           <input
             type="text"
             value={user.username}
             disabled
-            className="w-full px-3 py-2 border border-gray-600 bg-gray-900 text-gray-500 rounded-md sm:text-sm cursor-not-allowed"
+            className="w-full px-3 py-2 border border-gray-600 bg-gray-900 text-gray-300 rounded-md sm:text-sm cursor-not-allowed" id={`${fieldId}-4`} aria-describedby={error ? `${fieldId}-error` : undefined}
           />
         </div>
         <div>
-          <label className="block text-sm font-medium text-gray-400 mb-1">Role</label>
+          <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-5`}>Role</label>
           <input
             type="text"
             value={user.role}
             disabled
-            className="w-full px-3 py-2 border border-gray-600 bg-gray-900 text-gray-500 rounded-md sm:text-sm cursor-not-allowed"
+            className="w-full px-3 py-2 border border-gray-600 bg-gray-900 text-gray-300 rounded-md sm:text-sm cursor-not-allowed" id={`${fieldId}-5`} aria-describedby={error ? `${fieldId}-error` : undefined}
           />
         </div>
         <div>
-          <label className="block text-sm font-medium text-gray-400 mb-1">Display Name</label>
+          <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-6`}>Display Name</label>
           <input
             type="text"
             value={displayName}
@@ -292,13 +297,13 @@ function ProfileSection({ user }: { user: User }) {
             disabled={isLdap}
             className={`w-full px-3 py-2 border border-gray-600 rounded-md sm:text-sm ${
               isLdap
-                ? 'bg-gray-900 text-gray-500 cursor-not-allowed'
+                ? 'bg-gray-900 text-gray-300 cursor-not-allowed'
                 : 'bg-gray-700 text-gray-100 focus:outline-none focus:ring-blue-500 focus:border-blue-500'
-            }`}
+            }`} id={`${fieldId}-6`} aria-describedby={error ? `${fieldId}-error` : undefined}
           />
         </div>
         <div>
-          <label className="block text-sm font-medium text-gray-400 mb-1">Email</label>
+          <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-7`}>Email</label>
           <input
             type="email"
             value={email}
@@ -306,9 +311,9 @@ function ProfileSection({ user }: { user: User }) {
             disabled={isLdap}
             className={`w-full px-3 py-2 border border-gray-600 rounded-md sm:text-sm ${
               isLdap
-                ? 'bg-gray-900 text-gray-500 cursor-not-allowed'
+                ? 'bg-gray-900 text-gray-300 cursor-not-allowed'
                 : 'bg-gray-700 text-gray-100 focus:outline-none focus:ring-blue-500 focus:border-blue-500'
-            }`}
+            }`} id={`${fieldId}-7`} aria-describedby={error ? `${fieldId}-error` : undefined}
           />
         </div>
       </div>
@@ -329,30 +334,30 @@ function ProfileSection({ user }: { user: User }) {
           <h3 className="text-lg font-semibold text-gray-100 mb-4">Change Password</h3>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
             <div>
-              <label className="block text-sm font-medium text-gray-400 mb-1">Current Password</label>
+              <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-8`}>Current Password</label>
               <input
                 type="password"
                 value={currentPassword}
                 onChange={(e) => setCurrentPassword(e.target.value)}
-                className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-8`} aria-describedby={error ? `${fieldId}-error` : undefined}
               />
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-400 mb-1">New Password</label>
+              <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-9`}>New Password</label>
               <input
                 type="password"
                 value={newPassword}
                 onChange={(e) => setNewPassword(e.target.value)}
-                className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-9`} aria-describedby={error ? `${fieldId}-error` : undefined}
               />
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-400 mb-1">Confirm Password</label>
+              <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-10`}>Confirm Password</label>
               <input
                 type="password"
                 value={confirmPassword}
                 onChange={(e) => setConfirmPassword(e.target.value)}
-                className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-10`} aria-describedby={error ? `${fieldId}-error` : undefined}
               />
             </div>
           </div>

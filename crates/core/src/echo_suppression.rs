@@ -55,12 +55,18 @@ pub(crate) fn stale_generation_receipt_proves_emitted_git_column(
     repo_id: &str,
     column_sha: &str,
     current_generation: i64,
+    expected_scope_uuid: Option<&str>,
 ) -> bool {
     if record["repo_id"] != repo_id
         || record["git_sha"] != column_sha
         || !is_full_git_oid(column_sha)
     {
         return false;
+    }
+    if let Some(expected) = expected_scope_uuid {
+        if record.get("scope_uuid").and_then(|value| value.as_str()) != Some(expected) {
+            return false;
+        }
     }
     if receipt_generation_accepted(record, current_generation) {
         return false;
@@ -78,9 +84,16 @@ pub(crate) fn verify_no_target_receipt(
     sha: &str,
     projection: &str,
     current_generation: i64,
+    expected_scope_uuid: Option<&str>,
 ) -> NoTargetReceiptVerdict {
     if record["repo_id"] != repo_id || record["git_sha"] != sha || !is_full_git_oid(sha) {
         return NoTargetReceiptVerdict::RepoOrShaMismatch;
+    }
+    if let Some(expected) = expected_scope_uuid {
+        match record.get("scope_uuid").and_then(|value| value.as_str()) {
+            Some(found) if found == expected => {}
+            _ => return NoTargetReceiptVerdict::UnverifiedOutcome,
+        }
     }
     if record["projection"] != projection {
         return NoTargetReceiptVerdict::ProjectionMismatch;
@@ -367,16 +380,24 @@ fn verified_git_no_target_receipt(
     ctx: &TeamEchoContext<'_>,
     sha: &str,
 ) -> Result<bool, DatabaseError> {
+    crate::echo_receipt_scope::quarantine_corrupt_scoped_git_no_target_if_legacy_recovered(
+        ctx.db,
+        ctx.repo_id,
+        sha,
+    )?;
     let Some(record) = read_git_no_target_receipt(ctx.db, ctx.repo_id, sha)? else {
         return Ok(false);
     };
     let generation = repo_echo_generation(ctx.db, ctx.repo_id)?;
+    let scope =
+        crate::db::repo_scope_identity::repository_scope_uuid(&ctx.db.conn(), ctx.repo_id).ok();
     Ok(verify_no_target_receipt(
         &record,
         ctx.repo_id,
         sha,
         ctx.no_target_projection,
         generation,
+        scope.as_deref(),
     ) == NoTargetReceiptVerdict::Accepted)
 }
 
@@ -464,8 +485,16 @@ fn verified_git_no_target_receipt_personal(
             continue;
         };
         let generation = repo_echo_generation(ctx.db, repo_id)?;
-        if verify_no_target_receipt(&record, repo_id, sha, ctx.no_target_projection, generation)
-            == NoTargetReceiptVerdict::Accepted
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&ctx.db.conn(), repo_id).ok();
+        if verify_no_target_receipt(
+            &record,
+            repo_id,
+            sha,
+            ctx.no_target_projection,
+            generation,
+            scope.as_deref(),
+        ) == NoTargetReceiptVerdict::Accepted
         {
             return Ok(true);
         }
@@ -505,9 +534,25 @@ mod tests {
     use crate::db::svn_commit_operations::{svn_commit_target_fingerprint, SvnCommitIntent};
     use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
 
+    fn ensure_test_repo(db: &Database, repo_id: &str) {
+        if db.get_repository(repo_id).unwrap().is_some() {
+            return;
+        }
+        let scope = crate::db::repo_scope_identity::new_scope_uuid();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_at, updated_at, last_svn_rev, last_git_sha, sync_status, total_syncs, total_errors, consecutive_errors, scope_uuid)
+                 VALUES (?1, ?1, 'file:///x', '', '', 'local', '', '', 'main', 'team', 5, 0, 0, 1, 't', 't', 0, '', 'idle', 0, 0, 0, ?2)",
+                rusqlite::params![repo_id, scope],
+            )
+            .unwrap();
+    }
+
     fn setup_db() -> Database {
         let db = Database::in_memory().unwrap();
         db.initialize().unwrap();
+        ensure_test_repo(&db, "repo-a");
+        ensure_test_repo(&db, "repo-b");
         db
     }
 
@@ -554,11 +599,59 @@ mod tests {
     }
 
     fn write_git_no_target_receipt(db: &Database, repo_id: &str, git_sha: &str, receipt: &str) {
+        use crate::db::repo_scope_identity::{attach_scope_uuid_to_receipt, repository_scope_uuid};
+        use crate::echo_receipt_scope::{
+            attach_generation_to_receipt, handled_git_no_target_state_key, repo_echo_generation_tx,
+        };
+        let scoped = {
+            let conn = db.conn();
+            let scope = repository_scope_uuid(&conn, repo_id).ok();
+            let generation = scope
+                .as_ref()
+                .map(|_| repo_echo_generation_tx(&conn, repo_id).unwrap());
+            (scope, generation)
+        };
+        if let (Some(scope), Some(generation)) = scoped {
+            if let Ok(mut record) = serde_json::from_str::<serde_json::Value>(receipt) {
+                attach_scope_uuid_to_receipt(&mut record, &scope);
+                attach_generation_to_receipt(&mut record, generation);
+                let key = handled_git_no_target_state_key(&scope, generation, git_sha);
+                db.set_state(&key, &record.to_string()).unwrap();
+                return;
+            }
+            let key = handled_git_no_target_state_key(&scope, generation, git_sha);
+            db.set_state(&key, receipt).unwrap();
+            return;
+        }
         let key = format!("handled_git_no_target_{}_{}", repo_id, git_sha);
         db.set_state(&key, receipt).unwrap();
     }
 
     fn write_svn_no_target_receipt(db: &Database, repo_id: &str, svn_rev: i64, receipt: &str) {
+        use crate::db::repo_scope_identity::{attach_scope_uuid_to_receipt, repository_scope_uuid};
+        use crate::echo_receipt_scope::{
+            attach_generation_to_receipt, handled_svn_no_target_state_key, repo_echo_generation_tx,
+        };
+        let scoped = {
+            let conn = db.conn();
+            let scope = repository_scope_uuid(&conn, repo_id).ok();
+            let generation = scope
+                .as_ref()
+                .map(|_| repo_echo_generation_tx(&conn, repo_id).unwrap());
+            (scope, generation)
+        };
+        if let (Some(scope), Some(generation)) = scoped {
+            if let Ok(mut record) = serde_json::from_str::<serde_json::Value>(receipt) {
+                attach_scope_uuid_to_receipt(&mut record, &scope);
+                attach_generation_to_receipt(&mut record, generation);
+                let key = handled_svn_no_target_state_key(&scope, generation, svn_rev);
+                db.set_state(&key, &record.to_string()).unwrap();
+                return;
+            }
+            let key = handled_svn_no_target_state_key(&scope, generation, svn_rev);
+            db.set_state(&key, receipt).unwrap();
+            return;
+        }
         let key = format!("handled_svn_no_target_{}_{}", repo_id, svn_rev);
         db.set_state(&key, receipt).unwrap();
     }
@@ -652,10 +745,15 @@ mod tests {
             "projection": projection,
         });
         write_git_no_target_receipt(&db, "repo-b", &sha, &other_repo.to_string());
+        let scope_a =
+            crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), "repo-a").unwrap();
+        let generation = crate::echo_receipt_scope::repo_echo_generation(&db, "repo-a").unwrap();
         db.conn()
             .execute(
                 "DELETE FROM kv_state WHERE key = ?1",
-                [format!("handled_git_no_target_repo-a_{sha}")],
+                [crate::echo_receipt_scope::handled_git_no_target_state_key(
+                    &scope_a, generation, &sha,
+                )],
             )
             .unwrap();
         assert_eq!(
@@ -706,7 +804,8 @@ mod tests {
 
     #[test]
     fn malformed_no_target_receipt_does_not_suppress() {
-        let db = setup_db();
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
         let sha = "1".repeat(40);
         write_git_no_target_receipt(&db, "repo-a", &sha, "{not-json");
         assert_eq!(
@@ -863,10 +962,15 @@ mod tests {
             "projection": projection,
         });
         write_svn_no_target_receipt(&db, "repo-b", svn_rev, &other_repo.to_string());
+        let scope_a =
+            crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), "repo-a").unwrap();
+        let generation = crate::echo_receipt_scope::repo_echo_generation(&db, "repo-a").unwrap();
         db.conn()
             .execute(
                 "DELETE FROM kv_state WHERE key = ?1",
-                [format!("handled_svn_no_target_repo-a_{svn_rev}")],
+                [crate::echo_receipt_scope::handled_svn_no_target_state_key(
+                    &scope_a, generation, svn_rev,
+                )],
             )
             .unwrap();
         assert_eq!(
@@ -909,7 +1013,8 @@ mod tests {
 
     #[test]
     fn malformed_svn_no_target_receipt_does_not_suppress() {
-        let db = setup_db();
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
         let svn_rev = 13_i64;
         write_svn_no_target_receipt(&db, "repo-a", svn_rev, "{not-json");
         assert_eq!(

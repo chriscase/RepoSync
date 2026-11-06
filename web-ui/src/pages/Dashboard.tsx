@@ -1,7 +1,12 @@
-import { LoadingSpinner } from '../components/LoadingSpinner';
-import { useState, useMemo } from 'react';
+import { dashboardListLink } from '../listPagination';
+import { useStatusObservation } from '../useStatusObservation';
+import RepositoryStatusSummary, { StatusObservationPanel } from '../components/StatusObservation';
+import { errorStatusQuery, errorStatusView, refreshErrorStatus } from '../errorStatus';
+import ErrorAcknowledgement from '../components/ErrorAcknowledgement';
+import { errorScope } from '../errorAcknowledgement';
+import { useMemo } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { UIForgeActivityStream } from '@appforgeapps/uiforge';
 import { api, type CommitMapEntry, type Repository } from '../api';
 import { formatTimeAgo } from '../utils/time';
@@ -15,17 +20,22 @@ import { auditEntryToActivityEvent, syncRecordToActivityEvent } from '../utils/a
 export default function Dashboard() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const [selectedRepoId, setSelectedRepoId] = useState<string>('all');
+  const [searchParams,setSearchParams]=useSearchParams();
+  const selectedRepoId=searchParams.get('repo_id') || 'all';
+  const setSelectedRepoId=(value:string)=>{const next=new URLSearchParams(searchParams);if(value==='all')next.delete('repo_id');else next.set('repo_id',value);setSearchParams(next);};
 
   const activeRepoId = selectedRepoId !== 'all' ? selectedRepoId : undefined;
 
-  const { data: status, isLoading: statusLoading, isError, error } = useQuery({
-    queryKey: ['status', activeRepoId],
-    queryFn: () => api.getStatus(activeRepoId),
+  const statusQuery = useQuery({
+    ...errorStatusQuery(activeRepoId),
     refetchInterval: 5000,
   });
 
-  const { data: recentActivity } = useQuery({
+  const {data:status,isError}=statusQuery;
+  const statusView=useStatusObservation(statusQuery);
+  const errorCard=errorStatusView(status,isError);
+
+  const { data: recentActivity,isPending:activityPending,isError:activityError,refetch:refetchActivity } = useQuery({
     queryKey: ['audit', 'recent', activeRepoId],
     queryFn: () => api.getAuditLog(20, undefined, undefined, activeRepoId),
     staleTime: 30000,
@@ -70,18 +80,6 @@ export default function Dashboard() {
     [syncRecords, repoName, repoNameMap],
   );
 
-  if (statusLoading) {
-    return <LoadingSpinner />;
-  }
-
-  if (isError) {
-    return (
-      <div className="text-center py-8 text-red-400">
-        Error loading status: {error?.message ?? 'Unknown error'}
-      </div>
-    );
-  }
-
   const formatUptime = (secs: number) => {
     const days = Math.floor(secs / 86400);
     const hours = Math.floor((secs % 86400) / 3600);
@@ -95,7 +93,7 @@ export default function Dashboard() {
     ? repos?.find(r => r.id === selectedRepoId)
     : null;
 
-  const repoContextLabel = selectedRepo ? selectedRepo.name : 'All Repositories';
+  const repoContextLabel = selectedRepo ? selectedRepo.name : activeRepoId ? `Repository ${activeRepoId}`:'All Repositories';
 
   const cmEntries = commitMap?.entries ?? [];
 
@@ -103,14 +101,16 @@ export default function Dashboard() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-gray-100">Dashboard</h1>
-        {repos && repos.length > 1 && (
+        {(repos || activeRepoId) && (
           <select
+            aria-label="Repository scope"
             value={selectedRepoId}
             onChange={(e) => setSelectedRepoId(e.target.value)}
             className="bg-gray-800 border border-gray-600 text-gray-200 rounded-md px-3 py-1.5 text-sm"
           >
             <option value="all">All Repositories</option>
-            {repos.map(r => (
+            {activeRepoId && !repos?.some(r=>r.id===activeRepoId) && <option value={activeRepoId}>Repository {activeRepoId}</option>}
+            {repos?.map(r => (
               <option key={r.id} value={r.id}>{r.name}</option>
             ))}
           </select>
@@ -166,8 +166,8 @@ export default function Dashboard() {
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 mb-1">
                         <span className="font-semibold text-sm text-gray-100 truncate">{repo.name}</span>
-                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${repo.enabled ? 'bg-green-900/60 text-green-300' : 'bg-gray-700 text-gray-400'}`}>
-                          {repo.enabled ? 'Enabled' : 'Disabled'}
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${repo.enabled ? 'bg-blue-900/60 text-blue-300' : 'bg-gray-700 text-gray-400'}`}>
+                          {repo.enabled ? 'Configured enabled' : 'Configured disabled'}
                         </span>
                       </div>
                       <div className="flex items-center gap-1 text-xs text-gray-400 mb-0.5">
@@ -178,20 +178,10 @@ export default function Dashboard() {
                         <GitBranch className="w-3 h-3 text-purple-400" />
                         <span className="truncate">{repo.git_repo}</span>
                       </div>
-                      <div className="flex items-center gap-3 mt-2 text-xs text-gray-500">
-                        {repo.enabled ? (
-                          <span className="flex items-center gap-1">
-                            <span className="relative w-2 h-2"><span className="absolute inset-0 rounded-full bg-green-400 animate-ping opacity-40" /><span className="relative block w-2 h-2 rounded-full bg-green-400" /></span>
-                            <span className="text-green-300">Active</span>
-                          </span>
-                        ) : (
-                          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-gray-500" /><span>Disabled</span></span>
-                        )}
-                        <span>{formatTimeAgo(repo.updated_at)}</span>
-                      </div>
                     </div>
                   </div>
                 </button>
+                <div className="px-5 pb-4"><RepositoryStatusSummary repoId={repo.id}/></div>
                 {/* Branch pairs inside card (recursive) */}
                 <DashboardBranchTree repoId={repo.id} childMap={childMap} navigate={navigate} depth={0} />
               </div>
@@ -202,61 +192,54 @@ export default function Dashboard() {
         );
       })()}
 
+      <StatusObservationPanel view={statusView}/>
       {/* Status Cards */}
       <div className="mb-1">
         <span className="text-xs text-blue-400">{repoContextLabel}</span>
       </div>
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
         <StatusCard
-          title="Sync State"
-          value={status?.state ?? 'unknown'}
-          color={
-            status?.state === 'idle'
-              ? 'green'
-              : status?.state === 'error'
-                ? 'red'
-                : 'yellow'
-          }
+          title="Effective sync health"
+          value={statusView.healthLabel}
+          color={statusView.health==='idle' ? 'green':'gray'}
         />
         <StatusCard
           title="Total Syncs"
-          value={String(status?.total_syncs ?? 0)}
+          value={statusView.metric('total_syncs')}
           color="blue"
-          onClick={() => navigate('/audit')}
+          navigationHref={dashboardListLink('/audit',activeRepoId)}
         />
         <StatusCard
           title="Active Conflicts"
-          value={String(status?.active_conflicts ?? 0)}
-          color={status?.active_conflicts ? 'red' : 'green'}
-          onClick={() => navigate('/conflicts')}
+          value={statusView.metric('active_conflicts')}
+          color={status?.active_conflicts ? 'red' : 'gray'}
+          navigationHref={dashboardListLink('/conflicts',activeRepoId)}
         />
         <StatusCard
           title="Errors (24h)"
-          value={String(status?.total_errors ?? 0)}
+          value={statusView.metric('total_errors')}
           color={status?.total_errors ? 'red' : 'gray'}
-          onClick={() => navigate('/audit?success=false')}
+          navigationHref={dashboardListLink('/audit',activeRepoId,{success:'false'})}
           subtitle={
             status?.last_error_at
               ? `Last: ${formatTimeAgo(status.last_error_at)}`
-              : 'No recent errors'
+              : errorCard.description
           }
-          onClear={
-            (status?.total_errors ?? 0) > 0
-              ? async () => {
-                  await api.resetErrors();
-                  queryClient.invalidateQueries({ queryKey: ['status'] });
-                }
-              : undefined
+          action={
+            <ErrorAcknowledgement key={activeRepoId ?? 'all'} scope={errorScope(activeRepoId)}
+              repositoryName={repoContextLabel} observation={errorCard.observation}
+              count={errorCard.count}
+              onSuccess={() => { void refreshErrorStatus(queryClient); }} />
           }
         />
         <StatusCard
           title="Uptime"
-          value={status ? formatUptime(status.uptime_secs) : '-'}
+          value={status?.observation?.uptime_available ? formatUptime(status.uptime_secs) : 'Unavailable'}
           color="gray"
         />
         <StatusCard
           title="Last Sync"
-          value={status?.last_sync_at ? formatTimeAgo(status.last_sync_at) : 'Never'}
+          value={status?.observation?.scope==='aggregate' ? 'See scoped observations' : status?.last_sync_at ? formatTimeAgo(status.last_sync_at) : status ? 'Not recorded':'Unknown'}
           color="gray"
         />
       </div>
@@ -276,7 +259,7 @@ export default function Dashboard() {
             <p className="text-lg font-mono text-gray-100">
               {status?.last_svn_revision != null
                 ? `r${status.last_svn_revision}`
-                : 'Not synced'}
+                : status ? 'Not recorded':'Unknown'}
             </p>
           </div>
           <div>
@@ -284,7 +267,7 @@ export default function Dashboard() {
             <p className="text-lg font-mono truncate text-gray-100">
               {status?.last_git_hash
                 ? status.last_git_hash.substring(0, 12)
-                : 'Not synced'}
+                : status ? 'Not recorded':'Unknown'}
             </p>
           </div>
           <div>
@@ -292,13 +275,13 @@ export default function Dashboard() {
             <p className="text-lg text-gray-100">
               {status?.last_sync_at
                 ? new Date(status.last_sync_at).toLocaleString()
-                : 'Never'}
+                : status ? 'Not recorded':'Unknown'}
             </p>
           </div>
           <div>
             <span className="text-sm text-gray-400">Total Conflicts</span>
             <p className="text-lg text-gray-100">
-              {status?.total_conflicts ?? 0}
+              {statusView.metric('total_conflicts')}
             </p>
           </div>
         </div>
@@ -318,7 +301,7 @@ export default function Dashboard() {
             Individual commits synced between SVN and Git (click to expand)
           </p>
           {!selectedRepo && repos && repos.length > 1 && (
-            <p className="text-xs text-gray-500 mt-1">
+            <p className="text-xs text-gray-300 mt-1">
               Showing data from all repositories. Select a specific repository to filter.
             </p>
           )}
@@ -403,7 +386,9 @@ export default function Dashboard() {
             <span className="ml-2 text-sm font-normal text-blue-400">— {selectedRepo.name}</span>
           )}
         </h2>
-        <UIForgeActivityStream
+        {activityError ? <div role="alert">Error loading recent activity. Results are unknown. <button onClick={()=>void refetchActivity()}>Retry</button></div>
+        : activityPending || !recentActivity ? <div role="status">Loading recent activity…</div>
+        : <UIForgeActivityStream
           events={activityEvents}
           theme="dark"
           density="compact"
@@ -415,8 +400,8 @@ export default function Dashboard() {
           renderEvent={renderAuditEvent}
           renderIcon={renderAuditIcon}
           maxHeight="600px"
-          emptyMessage="No activity yet"
-        />
+          emptyMessage="No matching activity"
+        />}
       </div>
 
       {/* Server Monitor */}
@@ -433,16 +418,16 @@ function StatusCard({
   title,
   value,
   color,
-  onClick,
+  navigationHref,
   subtitle,
-  onClear,
+  action,
 }: {
   title: string;
   value: string;
   color: string;
-  onClick?: () => void;
+  navigationHref?: string;
   subtitle?: string;
-  onClear?: () => void;
+  action?: React.ReactNode;
 }) {
   const colorClasses: Record<string, string> = {
     green: 'bg-green-900/30 border-green-700',
@@ -452,34 +437,21 @@ function StatusCard({
     gray: 'bg-gray-800 border-gray-700',
   };
 
-  const clickableClasses = onClick
+  const clickableClasses = navigationHref
     ? 'cursor-pointer hover:border-blue-500/50 transition-colors'
     : '';
 
   return (
     <div
-      className={`rounded-lg border p-4 ${colorClasses[color] ?? colorClasses.gray} ${clickableClasses}`}
-      onClick={onClick}
-      role={onClick ? 'button' : undefined}
-      tabIndex={onClick ? 0 : undefined}
-      onKeyDown={onClick ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick(); } } : undefined}
+      className={`relative rounded-lg border p-4 ${colorClasses[color] ?? colorClasses.gray} ${clickableClasses}`}
     >
+      {navigationHref && <Link to={navigationHref} aria-label={`View ${title}`} className="absolute inset-0 rounded-lg focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-400"/>}
       <div className="flex items-center justify-between">
         <p className="text-sm text-gray-400">{title}</p>
-        {onClear && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onClear();
-            }}
-            className="text-xs text-gray-400 hover:text-red-400 transition-colors px-1.5 py-0.5 rounded border border-gray-600 hover:border-red-500/50"
-          >
-            Clear
-          </button>
-        )}
+        {action && <div className="relative z-10">{action}</div>}
       </div>
       <p className="text-2xl font-bold capitalize text-gray-100">{value}</p>
-      {subtitle && <p className="text-xs text-gray-500 mt-1">{subtitle}</p>}
+      {subtitle && <p className="text-xs text-gray-300 mt-1">{subtitle}</p>}
     </div>
   );
 }
@@ -502,7 +474,7 @@ function DashboardBranchTree({
   return (
     <div className={`border-t border-gray-700/50 bg-gray-900/30 px-4 py-2 space-y-0.5 ${depth > 0 ? 'border-t-0 pl-6' : ''}`}>
       {depth === 0 && (
-        <div className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-gray-500 mb-1">
+        <div className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-gray-300 mb-1">
           <GitBranch className="w-2.5 h-2.5" />
           <span>Branches</span>
         </div>
@@ -515,14 +487,14 @@ function DashboardBranchTree({
           >
             <GitBranch className="w-3 h-3 text-purple-400 flex-shrink-0" />
             <span className="text-xs font-medium text-gray-300 truncate">{child.name.split(' / ').pop()}</span>
-            <span className="text-[10px] text-blue-400/60">{child.svn_branch}</span>
-            <ArrowRight className="w-2.5 h-2.5 text-gray-600 flex-shrink-0" />
-            <span className="text-[10px] text-purple-400/60">{child.git_branch}</span>
+            <span className="text-[10px] text-blue-300">{child.svn_branch}</span>
+            <ArrowRight className="w-2.5 h-2.5 text-gray-400 flex-shrink-0" />
+            <span className="text-[10px] text-purple-300">{child.git_branch}</span>
             <span className="ml-auto flex items-center gap-1.5 flex-shrink-0">
-              <span className="text-[10px] text-gray-600">{formatTimeAgo(child.updated_at)}</span>
-              {child.enabled ? <span className="w-1.5 h-1.5 rounded-full bg-green-400" /> : <span className="w-1.5 h-1.5 rounded-full bg-gray-500" />}
+              <span className="text-[10px] text-gray-400">Configuration: {child.enabled ? 'enabled':'disabled'}</span>
             </span>
           </button>
+          <RepositoryStatusSummary repoId={child.id}/>
           <DashboardBranchTree repoId={child.id} childMap={childMap} navigate={navigate} depth={depth + 1} />
         </div>
       ))}

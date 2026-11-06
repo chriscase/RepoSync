@@ -1,12 +1,24 @@
-import React, { useEffect, useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useId } from 'react';
+import Dialog from '../components/Dialog';
+import { useViewMutation as useMutation, useViewOwnership } from '../useViewMutation';
+import { clientSession, sessionFetch } from '../session';
+import { canConfirmObservedSkip, runObservedSkip, latestScopedSkipObservation, type ScopedSkipObservation } from '../statusActions';
+import { useStatusObservation } from '../useStatusObservation';
+import RepositoryStatusSummary, { StatusObservationPanel } from '../components/StatusObservation';
+import { useRepositorySave } from '../useRepositorySave';
+import { samePublicConfiguration, retainUnsavedCredentials, repositoryEditorKey, type PublicConfiguration } from '../repositorySave';
+import RepositorySaveNotice from '../components/RepositorySaveNotice';
+import { errorStatusQuery, errorStatusView, refreshErrorStatus } from '../errorStatus';
+import ErrorAcknowledgement from '../components/ErrorAcknowledgement';
+import { errorScope } from '../errorAcknowledgement';
+import React, { useEffect, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useParams, useNavigate, useLocation, Link } from 'react-router-dom';
 import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry, type LatePairPlan, type PairRefreshPlan, type SkipCommitContext } from '../api';
 import {
   type BranchPairRemovalNotice as RemovalNotice,
-  branchPairRemovalOutcome,
+  removeBranchPairForView,
   isNotFoundError,
-  removalDestination,
   repoDetailQueryKeys,
   readBranchPairRemovalNotice,
   persistBranchPairRemovalNotice,
@@ -30,6 +42,9 @@ import {
   managedRemovalReceiptFromStatus,
   managedRemovalStatusFromReceipt,
   removalDependencyPreviewConfirmReady,
+  reviewedRemovalReady,
+  readPendingRemovalReview,
+  clearPendingRemovalReview,
   shouldPersistPolledManagedRemovalReceipt,
   persistManagedRemovalReceipt,
   readManagedRemovalReceipt,
@@ -92,6 +107,14 @@ const selectClass =
   'w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
 
 export default function RepoDetail() {
+  const {id}=useParams<{id:string}>();
+  const key=repositoryEditorKey({owner:getStoredUser()?.id ?? 'legacy',targetId:id,session:clientSession().snapshot().token,epoch:clientSession().snapshot().epoch});
+  return <RepositoryDetailEditor key={key} />;
+}
+
+function RepositoryDetailEditor() {
+  const fieldId = useId();
+  const view = useViewOwnership();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const location = useLocation();
@@ -106,7 +129,14 @@ export default function RepoDetail() {
 
   const [syncTriggered, setSyncTriggered] = useState(false);
   const [editing, setEditing] = useState(false);
+  const saveFlow=useRepositorySave(id,editing);
+  const [saveMessage,setSaveMessage]=useState<string | null>(null);
+  const [saveError,setSaveError]=useState<string | null>(null);
+  const editVersion=useRef(0);
+  const restoredSave=useRef<string | null>(null);
+
   const [form, setForm] = useState<EditForm | null>(null);
+  const currentForm=useRef(form);currentForm.current=form;
   const [showDisableConfirm, setShowDisableConfirm] = useState(false);
   const [showRemoveConfirm, setShowRemoveConfirm] = useState(false);
   const [removalReceipt, setRemovalReceipt] = useState<ManagedRemovalReceipt | null>(null);
@@ -129,6 +159,32 @@ export default function RepoDetail() {
     auto_create_svn_branch: true,
     auto_create_git_branch: true,
   });
+  const gitBranchValidation = (() => {
+    const v = branchForm.git_branch;
+    const invalid = /[^a-zA-Z0-9._/-]/.test(v);
+    const traversal = v.includes('..');
+    const doubleSlash = v.includes('//');
+    const badEdges = v.startsWith('/') || v.endsWith('/') || v.startsWith('-');
+    const reserved = v === 'HEAD' || v.startsWith('refs/') || v.endsWith('.lock');
+    return {
+      error: !v ? null : invalid ? 'Invalid characters (use letters, numbers, . _ - / only)'
+        : traversal ? 'Must not contain ".."'
+        : doubleSlash ? 'Must not contain "//"'
+        : badEdges ? 'Must not start/end with "/" or start with "-"'
+        : reserved ? 'Reserved name not allowed' : null,
+      // Preserve the existing preview refusal contract, independently of presentation.
+      previewRefused: !v.trim() || invalid || traversal || doubleSlash || badEdges || v === 'HEAD' || v.endsWith('.lock'),
+    };
+  })();
+  const svnBranchValidation = (() => {
+    const v = branchForm.svn_branch;
+    const invalid = /[^a-zA-Z0-9._/-]/.test(v);
+    const traversal = v.includes('..');
+    return {
+      error: !v ? null : invalid ? 'Invalid characters' : traversal ? 'Must not contain ".."' : null,
+      previewRefused: !v.trim() || invalid || traversal,
+    };
+  })();
   const [branchSuccess, setBranchSuccess] = useState(false);
   const [branchPlan, setBranchPlan] = useState<LatePairPlan | null>(null);
   const [refreshPlan, setRefreshPlan] = useState<PairRefreshPlan | null>(null);
@@ -151,13 +207,15 @@ export default function RepoDetail() {
   const detailLive = !!id && id !== retiredId && !repoMissing;
 
   // Status query scoped to this repo. Stop it once this detail is gone.
-  const { data: status } = useQuery<SyncStatus>({
-    queryKey: ['status', id],
-    queryFn: () => fetch(`/api/status?repo_id=${id}`, { headers: { Authorization: `Bearer ${localStorage.getItem('session_token')}` } }).then(r => r.json()),
+  const statusQuery = useQuery<SyncStatus>({
+    ...errorStatusQuery(id),
     refetchInterval: (query) => (detailLive && !isNotFoundError(query.state.error) ? 5000 : false),
     retry: (failureCount, queryError) => !isNotFoundError(queryError) && failureCount < 2,
     enabled: detailLive,
   });
+  const {data:status,isError:statusUnavailable}=statusQuery;
+  const statusView=useStatusObservation(statusQuery);
+  const errorCard = errorStatusView(status, statusUnavailable);
 
   // Sync records
   const detailRetry = (failureCount: number, queryError: unknown) =>
@@ -213,7 +271,7 @@ export default function RepoDetail() {
     queryKey: ['import-status', id],
     queryFn: async () => {
       const token = localStorage.getItem('session_token');
-      const res = await fetch(`/api/repos/${id}/import/status`, {
+      const res = await sessionFetch(`/api/repos/${id}/import/status`, {
         headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       });
       if (!res.ok) throw new Error(`Import status unavailable (${res.status})`);
@@ -248,7 +306,9 @@ export default function RepoDetail() {
     retry: detailRetry,
   });
 
-  const skipContextEnabled = detailLive && isAdmin && status?.state === 'error_paused';
+  const skipState=useRef<ScopedSkipObservation>({repoId:id,detailLive,administrator:isAdmin,query:statusQuery});
+  skipState.current={repoId:id,detailLive,administrator:isAdmin,query:statusQuery};
+  const skipContextEnabled = !!id && canConfirmObservedSkip(skipState.current,id);
   const { data: skipContextResponse } = useQuery({
     queryKey: ['skip-commit-context', id],
     queryFn: () => api.getSkipCommitContext(id!),
@@ -258,8 +318,10 @@ export default function RepoDetail() {
   });
   const skipContext: SkipCommitContext | null = skipContextResponse?.context ?? null;
 
+  useEffect(()=>{if(!skipContextEnabled){setShowSkipModal(false);setSkipSelectedCount(0);}},[skipContextEnabled]);
+
   const skipMutation = useMutation({
-    mutationFn: (selected: string[]) => {
+    mutationFn: (selected: string[]) => runObservedSkip(()=>latestScopedSkipObservation(queryClient,skipState.current),id!,async () => {
       if (!skipContext?.observed_remote_tip) {
         throw new Error('Observed remote tip is unavailable for exact skip');
       }
@@ -270,7 +332,7 @@ export default function RepoDetail() {
         expected_bridge_tip: skipContext.observed_bridge_tip ?? undefined,
         reason: 'operator_exact_skip',
       });
-    },
+    }),
     onSuccess: () => {
       setShowSkipModal(false);
       setSkipSelectedCount(0);
@@ -285,16 +347,24 @@ export default function RepoDetail() {
     },
   });
 
+  const [branchIncludeParent, setBranchIncludeParent] = useState(false);
+  const branchPlanMatches = !!branchPlan && branchPlan.git_branch === branchForm.git_branch
+    && branchPlan.svn_branch === branchForm.svn_branch && branchPlan.include_parent === branchIncludeParent;
   const branchMutation = useMutation({
-    mutationFn: (data: { svn_branch: string; git_branch: string; skip_import: boolean; auto_create_svn_branch: boolean; auto_create_git_branch: boolean }) =>
+    mutationFn: (data: { svn_branch: string; git_branch: string; skip_import: boolean; auto_create_svn_branch: boolean; auto_create_git_branch: boolean;
+      action?: 'preview' | 'publish' | 'status' | 'resume' | 'cancel'; review_pin?: string; operation_id?: string }) =>
       api.createBranchPair(id!, {
         ...data,
-        dry_run: true,
-        preview: true,
+        reconciliation: true,
+        include_parent: branchIncludeParent,
+        dry_run: !data.action || data.action === 'preview' || data.action === 'status',
+        preview: !data.action || data.action === 'preview' || data.action === 'status',
       }),
     onSuccess: (plan) => {
       setBranchPlan(plan);
       setBranchSuccess(true);
+      if (plan.operation_id) setBranchIncludeParent(plan.include_parent ?? false);
+      for (const queryKey of repoDetailQueryKeys(id!)) queryClient.invalidateQueries({ queryKey });
     },
   });
 
@@ -321,16 +391,6 @@ export default function RepoDetail() {
     },
   });
 
-  const updateMutation = useMutation({
-    mutationFn: (data: Partial<Repository>) => api.updateRepo(id!, data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['repo', id] });
-      queryClient.invalidateQueries({ queryKey: ['repos'] });
-      setEditing(false);
-      setForm(null);
-    },
-  });
-
   const toggleMutation = useMutation({
     mutationFn: (enabled: boolean) => api.updateRepo(id!, { enabled }),
     onSuccess: () => {
@@ -352,6 +412,30 @@ export default function RepoDetail() {
   const removalSubjectId = removalSubject?.id ?? id;
   const branchPairDeleteSubject = branchPairDeleteTarget;
 
+  const reviewedRemovalTarget = branchPairDeleteTarget ?? removalTarget ?? repo;
+  const reviewedRemovalOptions = reviewedRemovalTarget?.parent_id
+    ? removeBranchOpts : { delete_git: false, delete_svn: false };
+  const reviewedRemovalQuery = useQuery({
+    queryKey: ['reviewed-removal', id, reviewedRemovalTarget?.id, reviewedRemovalOptions.delete_git, reviewedRemovalOptions.delete_svn],
+    queryFn: ({ signal }) => api.reviewManagedRemoval(reviewedRemovalTarget!.id, reviewedRemovalOptions, signal),
+    enabled: isAdmin && detailLive && !!reviewedRemovalTarget?.id && (showRemoveConfirm || !!branchPairDeleteTarget),
+    staleTime: 0,
+    retry: false,
+  });
+  const reviewedRemovalConfirmReady = reviewedRemovalReady(reviewedRemovalQuery.data, reviewedRemovalTarget?.id, reviewedRemovalOptions,
+    reviewedRemovalQuery.isFetching || reviewedRemovalQuery.isError);
+  const pendingRemovalReview = (() => {
+    try { return { review: reviewedRemovalTarget?.id ? readPendingRemovalReview(reviewedRemovalTarget.id) : null, error: null }; }
+    catch (error) { return { review: null, error: error instanceof Error ? error.message : String(error) }; }
+  })();
+  const branchRemovalStatusQuery = useQuery({
+    queryKey: ['managed-removal-target', id, branchPairDeleteSubject?.id],
+    queryFn: () => api.getManagedRemoval(branchPairDeleteSubject!.id),
+    enabled: isAdmin && detailLive && !!branchPairDeleteSubject?.id,
+    retry: false,
+    refetchInterval: query => managedRemovalNeedsPoll(query.state.data?.state) ? 2000 : false,
+  });
+
   const removeMutation = useMutation({
     mutationFn: async () => {
       setBranchPairDeleteError(null);
@@ -359,36 +443,56 @@ export default function RepoDetail() {
       if (!target?.id || !id) {
         throw new Error('No repository selected for removal');
       }
-      if (target.parent_id) {
-        const gitOpt = document.querySelector('[data-testid="delete-git-opt"]') as HTMLInputElement | null;
-        const svnOpt = document.querySelector('[data-testid="delete-svn-opt"]') as HTMLInputElement | null;
-        const options = {
-          delete_git: gitOpt?.checked ?? removeBranchOpts.delete_git,
-          delete_svn: svnOpt?.checked ?? removeBranchOpts.delete_svn,
-        };
-        let parentExists: boolean | null = null;
-        if (target.id === id && target.parent_id) {
-          try {
-            await api.getRepo(target.parent_id);
-            parentExists = true;
-          } catch (lookupError) {
-            parentExists = isNotFoundError(lookupError) ? false : null;
-          }
+      const pending = readPendingRemovalReview(target.id);
+      if (pending) {
+        view.assertCurrent();
+        const matching = await api.lookupRemovalRequest(target.id, pending.review_pin);
+        view.assertCurrent();
+        if (matching) {
+          persistManagedRemovalReceipt(managedRemovalReceiptFromStatus(target.id, matching), true);
+          clearPendingRemovalReview(target.id, pending.review_pin);
         }
-        const destination = removalDestination({
-          viewedId: id,
-          targetId: target.id,
-          parentId: target.parent_id,
-          parentExists,
-        });
-        const result = await api.deleteBranchPair(target.id, options);
-        const outcome = branchPairRemovalOutcome(result);
-        if (outcome === 'rejected') {
-          throw new Error(result.message || 'Branch pair was not removed');
-        }
-        return { kind: 'branch_pair' as const, result, target, destination, outcome };
+        const result = matching
+          ? matching.state === 'completed' ? matching : await api.continueManagedRemoval(target.id, matching.operation_id)
+          : await api.approveManagedRemoval(target.id, pending, view);
+        return { kind: 'managed' as const, result, target };
       }
-      const result = await api.removeManagedRepo(target.id);
+      const retained = readManagedRemovalReceipt(target.id);
+      if (retained && retained.protocol !== 2 && retained.state !== 'completed') {
+        view.assertCurrent();
+        const result = await api.removeManagedRepo(target.id, { delete_git: false, delete_svn: false });
+        return { kind: 'managed' as const, result, target };
+      }
+      if (retained?.protocol === 2 && retained.state !== 'completed') {
+        view.assertCurrent();
+        const result = await api.continueManagedRemoval(target.id, retained.operationId);
+        return { kind: 'managed' as const, result, target };
+      }
+      view.assertCurrent();
+      const observed = await api.getManagedRemoval(target.id);
+      view.assertCurrent();
+      if (observed?.protocol === 2 && observed.state !== 'completed') {
+        const result = await api.continueManagedRemoval(target.id, observed.operation_id);
+        return { kind: 'managed' as const, result, target };
+      }
+      if (!reviewedRemovalConfirmReady || reviewedRemovalQuery.data?.repo_id !== target.id) {
+        throw new Error('A fresh exact-target removal review is required');
+      }
+      const review = reviewedRemovalQuery.data;
+      if (target.parent_id) {
+        const options = {
+          delete_git: review.delete_git,
+          delete_svn: review.delete_svn,
+        };
+        const { result, destination, outcome } = await removeBranchPairForView(
+          { viewedId: id, target: { id: target.id, parent_id: target.parent_id }, options },
+          view,
+          { lookupParent: api.getRepo, remove: () => api.approveManagedRemoval(target.id, review, view) },
+        );
+        return { kind: 'branch_pair' as const, result: result as ManagedRemovalStatus, target, destination, outcome };
+      }
+      view.assertCurrent();
+      const result = await api.approveManagedRemoval(target.id, review, view);
       return { kind: 'managed' as const, result, target };
     },
     onError: (error) => {
@@ -397,6 +501,16 @@ export default function RepoDetail() {
       }
     },
     onSuccess: async (payload) => {
+      const durableReceipt = managedRemovalReceiptFromStatus(payload.target.id, payload.result);
+      persistManagedRemovalReceipt(durableReceipt);
+      setRemovalReceipt(durableReceipt);
+      queryClient.setQueryData(['managed-removal', payload.target.id, payload.result.operation_id], payload.result);
+      queryClient.invalidateQueries({ queryKey: ['managed-removal-target', id, payload.target.id] });
+      if (!payload.result.ok) {
+        setBranchPairDeleteError(payload.result.message);
+        queryClient.invalidateQueries({ queryKey: ['repos'] });
+        return;
+      }
       setShowRemoveConfirm(false);
       setRemovalTarget(null);
       setBranchPairDeleteTarget(null);
@@ -423,6 +537,7 @@ export default function RepoDetail() {
           for (const queryKey of repoDetailQueryKeys(target.id)) {
             await queryClient.cancelQueries({ queryKey });
           }
+          if (!view.isCurrent()) return;
           setRetiredId(target.id);
           setLocalNotice(null);
           persistBranchPairRemovalNotice(notice);
@@ -454,6 +569,7 @@ export default function RepoDetail() {
         for (const queryKey of repoDetailQueryKeys(target.id)) {
           await queryClient.cancelQueries({ queryKey });
         }
+        if (!view.isCurrent()) return;
         setRetiredId(target.id);
         navigate('/repos', { replace: true });
       }
@@ -463,6 +579,7 @@ export default function RepoDetail() {
   const restoreMutation = useMutation({
     mutationFn: () => api.restoreManagedRepo(id!),
     onSuccess: () => {
+      removeMutation.reset();
       clearManagedRemovalReceipt(id!);
       setRemovalReceipt(null);
       queryClient.removeQueries({ queryKey: ['managed-removal', id] });
@@ -497,6 +614,56 @@ export default function RepoDetail() {
   });
   const removalDependencyPreview = removalPreviewQuery.data?.dependency_preview;
 
+  useEffect(() => {
+    const target = branchPairDeleteSubject?.id;
+    const status = branchRemovalStatusQuery.data;
+    if (!target || !status || !view.isCurrent()) return;
+    const stored = readManagedRemovalReceipt(target);
+    let pending;
+    try { pending = readPendingRemovalReview(target); } catch { return; }
+    const matchesPending = pending && status.protocol === 2 && status.review_pin === pending.review_pin && status.request_id === `ui-remove-v2-${pending.review_pin}`;
+    if (!matchesPending && !shouldPersistPolledManagedRemovalReceipt(stored, status)) return;
+    try {
+      persistManagedRemovalReceipt(managedRemovalReceiptFromStatus(target, status), !!matchesPending);
+      if (matchesPending && pending) clearPendingRemovalReview(target, pending.review_pin);
+    } catch (error) {
+      setBranchPairDeleteError(`The original request is retained because its result could not be saved: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    if (status.state === 'completed' && status.registration_listed === false) queryClient.invalidateQueries({ queryKey: ['branch-pairs', id] });
+  }, [branchPairDeleteSubject?.id, branchRemovalStatusQuery.data, id, queryClient, view]);
+
+  useEffect(() => {
+    if (!id || !isAdmin) return;
+    let pending;
+    try { pending = readPendingRemovalReview(id); }
+    catch (error) {
+      setLocalNotice({ outcome: 'in_progress', message: error instanceof Error ? error.message : String(error), warnings: ['Retained request evidence is unavailable. No automatic action was taken.'] });
+      return;
+    }
+    if (!pending) return;
+    const captured = pending;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const status = await api.lookupRemovalRequest(id, captured.review_pin);
+        if (cancelled || !view.isCurrent() || readPendingRemovalReview(id)?.review_pin !== captured.review_pin) return;
+        if (!status) {
+          setLocalNotice({ outcome: 'in_progress', message: 'No matching server operation was found for the retained request. It remains available for explicit recovery; no automatic retry was sent.', warnings: [] });
+          return;
+        }
+        const receipt = managedRemovalReceiptFromStatus(id, status);
+        persistManagedRemovalReceipt(receipt, true);
+        clearPendingRemovalReview(id, captured.review_pin);
+        setRemovalReceipt(receipt);
+        setLocalNotice({ outcome: status.state === 'completed' && status.registration_listed === false ? 'completed' : 'in_progress', message: status.state === 'completed' && status.registration_listed ? 'The historical removal completed, but this registration currently exists or was restored. No new removal was started.' : status.message, operationId: status.operation_id, warnings: [] });
+      } catch (error) {
+        if (!cancelled && view.isCurrent()) setLocalNotice({ outcome: 'in_progress', message: error instanceof Error ? error.message : String(error), warnings: ['The original request is retained. Outcome verification is unavailable; no automatic retry was sent.'] });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [id, isAdmin, view]);
+
   const trackedRemovalOperationId =
     removalReceipt && removalReceipt.repoId === id ? removalReceipt.operationId : undefined;
 
@@ -506,8 +673,7 @@ export default function RepoDetail() {
     enabled:
       !!id
       && isAdmin
-      && detailLive
-      && !repo?.parent_id
+      && id !== retiredId
       && !branchPairDeleteTarget
       && (showRemoveConfirm
         || removeMutation.isPending
@@ -538,6 +704,32 @@ export default function RepoDetail() {
     dependencyPreview: removalDependencyPreview,
   });
   const removalConfirmLabel = childRemovalConfirm ? 'Remove branch pair' : 'Remove from RepoSync';
+  const displayedRemovalStatus = removeMutation.data && removeMutation.data.target.id === reviewedRemovalTarget?.id
+    ? removeMutation.data.result
+    : branchPairDeleteSubject ? branchRemovalStatusQuery.data : removalPanelStatus;
+
+  const reviewedRemovalPanel = ((branchPairDeleteSubject || showRemoveConfirm) && (
+        <div className="border border-gray-600 rounded p-3 text-sm space-y-2" role="status" data-testid="reviewed-removal-targets">
+          {reviewedRemovalQuery.isFetching && <p>Observing exact removal targets…</p>}
+          {reviewedRemovalQuery.isError && <p role="alert">Removal review unavailable: {reviewedRemovalQuery.error.message}. No new deletion is authorized.</p>}
+          {pendingRemovalReview.error && <p role="alert">{pendingRemovalReview.error}</p>}
+          {branchPairDeleteError && <p role="alert">{branchPairDeleteError}</p>}
+          {pendingRemovalReview.review && <div role="alert">
+            <p>A previously approved removal request has no retained outcome receipt. Recover that same request before approving different work. Git deletion: {String(pendingRemovalReview.review.delete_git)}; SVN deletion: {String(pendingRemovalReview.review.delete_svn)}.</p>
+            <button type="button" disabled={removeMutation.isPending} onClick={() => removeMutation.mutate()}>Recover retained removal request</button>
+          </div>}
+          {reviewedRemovalConfirmReady && reviewedRemovalQuery.data && <>
+            <p>Review for {reviewedRemovalQuery.data.repo_id}</p>
+            <p className="break-all">Git: {reviewedRemovalQuery.data.git ? `${reviewedRemovalQuery.data.git.remote_url} · ${reviewedRemovalQuery.data.git.reference} · ${reviewedRemovalQuery.data.git.expected_sha ?? 'already absent'}` : 'preserved'}</p>
+            <p className="break-all">SVN: {reviewedRemovalQuery.data.svn ? `${reviewedRemovalQuery.data.svn.url} · UUID ${reviewedRemovalQuery.data.svn.uuid} · r${reviewedRemovalQuery.data.svn.base_revision} · ${reviewedRemovalQuery.data.svn.expected_present ? 'present' : 'already absent'}` : 'preserved'}</p>
+            <p>{reviewedRemovalQuery.data.retention}</p>
+          </>}
+          <button type="button" disabled={reviewedRemovalQuery.isFetching || removeMutation.isPending} onClick={() => reviewedRemovalQuery.refetch()}>Refresh exact-target review</button>
+          {displayedRemovalStatus && (
+            <ManagedRemovalPanel status={displayedRemovalStatus} onRetry={displayedRemovalStatus.retryable ? () => removeMutation.mutate() : undefined} retryPending={removeMutation.isPending} />
+          )}
+        </div>
+      ));
 
   const auditEntries = auditLog?.entries ?? [];
 
@@ -555,42 +747,68 @@ export default function RepoDetail() {
   }
   const auditGroups = groupAuditEntries(auditEntries);
 
+  useEffect(()=>{
+    const previous=saveFlow.initial;
+    if(editing && previous && repo && restoredSave.current!==previous.configRequestId) {
+      try {setForm(repoToForm({...repo,...(previous.draftConfiguration ?? previous.configuration)}));restoredSave.current=previous.configRequestId;}
+      catch {setSaveError('The recovery draft could not be read. Keep the existing repository ID and review its settings.');}
+    }
+  },[editing,saveFlow.initial,repo]);
+  useEffect(()=>{
+    if(saveFlow.attempt?.configurationReceipt) {
+      void queryClient.invalidateQueries({queryKey:['repo',id]});
+      void queryClient.invalidateQueries({queryKey:['repos']});
+    }
+  },[saveFlow.attempt?.configurationReceipt,id,queryClient]);
+
+  function editConfiguration(value: EditForm): PublicConfiguration {
+    const {svn_password,git_token,allowed_paths,blocked_patterns,...data}=value;
+    void svn_password;void git_token;
+    return {...data,
+      allowed_paths:allowed_paths.trim() ? JSON.stringify(allowed_paths.split('\n').map(v=>v.trim()).filter(Boolean)) : null,
+      blocked_patterns:blocked_patterns.trim() ? JSON.stringify(blocked_patterns.split('\n').map(v=>v.trim()).filter(Boolean)) : null};
+  }
   function startEdit() {
-    if (!repo) return;
-    setForm(repoToForm(repo));
-    setEditing(true);
+    if(!repo)return;editVersion.current++;restoredSave.current=null;
+    setForm(repoToForm(repo));setEditing(true);setSaveError(null);setSaveMessage(null);
   }
-
+  async function loadCurrentSettingsForReview() {
+    const generation=editVersion.current;
+    try {
+      const current=await saveFlow.loadCurrentForReview();
+      if(!saveFlow.viewActive() || generation!==editVersion.current)return;
+      setForm(repoToForm(current));setSaveError(null);setSaveMessage('Review these current settings. Required credential fields were cleared; choose a new save explicitly.');
+      void queryClient.invalidateQueries({queryKey:['repo',id]});
+    } catch(cause) {if(saveFlow.viewActive() && generation===editVersion.current)setSaveError(cause instanceof Error ? cause.message : 'Current settings could not be read.');}
+  }
+  function useReviewedSettings() {
+    if(!currentForm.current)return;
+    try {saveFlow.useReviewedSettings(editConfiguration(currentForm.current),{svn_password:currentForm.current.svn_password || undefined,git_token:currentForm.current.git_token || undefined});setSaveError(null);setSaveMessage('New attempt prepared on the same repository. Save will submit only the reviewed snapshot.');}
+    catch(cause) {setSaveError(cause instanceof Error ? cause.message : 'Reviewed recovery could not be prepared.');}
+  }
   function cancelEdit() {
-    setEditing(false);
-    setForm(null);
+    if(currentForm.current)saveFlow.rememberDraft(editConfiguration(currentForm.current));
+    editVersion.current++;setEditing(false);setForm(null);setSaveError(null);setSaveMessage(null);
   }
-
   async function handleSave() {
-    if (!form) return;
-    // Save repo config (exclude credential fields, convert path rules to JSON)
-    const { svn_password, git_token, allowed_paths, blocked_patterns, ...repoData } = form;
-    const pathData = {
-      ...repoData,
-      allowed_paths: allowed_paths.trim()
-        ? JSON.stringify(allowed_paths.split('\n').map(s => s.trim()).filter(Boolean))
-        : null,
-      blocked_patterns: blocked_patterns.trim()
-        ? JSON.stringify(blocked_patterns.split('\n').map(s => s.trim()).filter(Boolean))
-        : null,
-    };
-    updateMutation.mutate(pathData);
-    // Save credentials if provided
-    if (svn_password || git_token) {
-      const credData: { svn_password?: string; git_token?: string } = {};
-      if (svn_password) credData.svn_password = svn_password;
-      if (git_token) credData.git_token = git_token;
-      try {
-        await api.saveRepoCredentials(id!, credData);
-        queryClient.invalidateQueries({ queryKey: ['repo-credentials', id] });
-      } catch (e) {
-        // update mutation error will show in UI
+    if(!currentForm.current || !repo)return;
+    const generation=editVersion.current;
+    const submitted={...currentForm.current};setSaveError(null);setSaveMessage(null);
+    try {
+      const result=await saveFlow.save(editConfiguration(submitted),{svn_password:submitted.svn_password || undefined,git_token:submitted.git_token || undefined},repo.updated_at);
+      if(!result.viewActive || editVersion.current!==generation)return;
+      void queryClient.invalidateQueries({queryKey:['repo',id]});void queryClient.invalidateQueries({queryKey:['repos']});
+      void queryClient.invalidateQueries({queryKey:['repo-credentials',id]});
+      const live=currentForm.current;
+      if(!live || !samePublicConfiguration(editConfiguration(live),result.configuration)
+        || (live.svn_password || '')!==(result.credentials.svn_password || '')
+        || (live.git_token || '')!==(result.credentials.git_token || '')) {
+        setForm(previous=>previous ? {...previous,...retainUnsavedCredentials(previous,result.credentials)} : previous);
+        setSaveMessage('The earlier save completed. Newer entered changes remain unsaved; save again after reviewing the refreshed settings.');return;
       }
+      saveFlow.finish(result.attempt.configRequestId);setEditing(false);setForm(null);
+    } catch(cause) {
+      if(saveFlow.viewActive() && editVersion.current===generation)setSaveError(cause instanceof Error ? cause.message : 'Save is not confirmed; recovery data was retained.');
     }
   }
 
@@ -608,7 +826,7 @@ export default function RepoDetail() {
         if (form.svn_username) body.svn_username = form.svn_username;
         if (form.svn_password) body.svn_password = form.svn_password;
       }
-      const res = await fetch(`/api/repos/${id}/test-svn`, {
+      const res = await sessionFetch(`/api/repos/${id}/test-svn`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -637,7 +855,7 @@ export default function RepoDetail() {
         if (form.git_repo) body.git_repo = form.git_repo;
         if (form.git_token) body.git_token = form.git_token;
       }
-      const res = await fetch(`/api/repos/${id}/test-git`, {
+      const res = await sessionFetch(`/api/repos/${id}/test-git`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -655,7 +873,9 @@ export default function RepoDetail() {
   }
 
   function setField<K extends keyof EditForm>(key: K, value: EditForm[K]) {
-    setForm((prev) => (prev ? { ...prev, [key]: value } : prev));
+    const next=currentForm.current ? {...currentForm.current,[key]:value} : null;
+    currentForm.current=next;setForm(next);
+    if(next)saveFlow.rememberDraft(editConfiguration(next));
   }
 
   useEffect(() => {
@@ -696,6 +916,19 @@ export default function RepoDetail() {
     return (
         <div className="max-w-lg mx-auto py-16 text-center space-y-4" data-testid="repo-not-found">
           {removalNotice && <BranchPairRemovalNotice notice={removalNotice} />}
+          {isAdmin && (
+            <section data-testid="removed-registration-recovery" className="text-left space-y-3">
+              <p className="text-sm text-gray-400">Retained removal evidence. Actions require a fresh operation-status read.</p>
+              {removalStatusQuery.isFetching && <p role="status">Verifying the retained removal receipt…</p>}
+              {removalStatusQuery.isError && <p role="alert">Current removal verification is unavailable: {removalStatusQuery.error.message}. Recovery actions remain disabled.</p>}
+              {removalPanelStatus && <ManagedRemovalPanel status={removalPanelStatus}
+                retryPending={removeMutation.isPending}
+                onRestore={removalStatusQuery.data?.recovery?.restore_supported && removalStatusQuery.data.state === 'completed' && removalStatusQuery.data.registration_listed === false && !removalStatusQuery.isFetching && !removalStatusQuery.isError ? () => restoreMutation.mutate() : undefined}
+                restorePending={restoreMutation.isPending} />}
+              {removalPanelStatus && removalPanelStatus.state !== 'completed' && <p role="alert">An incomplete operation with a missing registration needs evidence reconciliation. No cleanup retry is sent from this missing-registration view.</p>}
+              {restoreMutation.isError && <p role="alert">Restore failed: {restoreMutation.error.message}</p>}
+            </section>
+          )}
           <h1 className="text-xl font-semibold text-gray-100">Repository not found</h1>
           <p className="text-sm text-gray-400">
             This repository or branch pair is no longer available. It may have been removed.
@@ -775,11 +1008,11 @@ export default function RepoDetail() {
           <span
             className={`inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium ${
               repo.enabled
-                ? 'bg-green-900/50 text-green-300'
+                ? 'bg-blue-900/50 text-blue-300'
                 : 'bg-gray-700 text-gray-400'
             }`}
           >
-            {repo.enabled ? 'Sync enabled' : 'Sync paused'}
+            {repo.enabled ? 'Sync configured enabled' : 'Sync configured disabled'}
           </span>
         </div>
         <div className="flex items-center gap-3">
@@ -810,11 +1043,11 @@ export default function RepoDetail() {
             <>
               <button
                 onClick={handleSave}
-                disabled={updateMutation.isPending}
+                disabled={saveFlow.pending}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
                 <Save className="w-4 h-4" />
-                {updateMutation.isPending ? 'Saving...' : 'Save'}
+                {saveFlow.pending ? 'Saving...' : 'Save'}
               </button>
               <button
                 onClick={cancelEdit}
@@ -838,7 +1071,7 @@ export default function RepoDetail() {
           )}
           <button
             onClick={() => syncMutation.mutate()}
-            disabled={syncMutation.isPending || syncTriggered}
+            disabled={syncMutation.isPending || syncTriggered || !statusView.canAct}
             className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium transition-colors"
           >
             <RefreshCw className={`w-4 h-4 ${syncMutation.isPending ? 'animate-spin' : ''}`} />
@@ -849,15 +1082,12 @@ export default function RepoDetail() {
 
       {/* Mutation errors */}
       {syncMutation.isError && (
-        <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-300 text-sm">
+        <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-300 text-sm" role="alert">
           Failed to trigger sync: {syncMutation.error?.message}
         </div>
       )}
-      {updateMutation.isError && (
-        <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-300 text-sm">
-          Failed to save: {updateMutation.error?.message}
-        </div>
-      )}
+      {editing && <RepositorySaveNotice attempt={saveFlow.attempt} error={saveError ?? saveFlow.error} pending={saveFlow.pending} onLoadCurrent={loadCurrentSettingsForReview} onUseReviewed={useReviewedSettings} reviewed={!!saveFlow.reviewedCurrent} />}
+      {editing && saveMessage && <p role="status" className="text-yellow-300 mb-3">{saveMessage}</p>}
 
       {/* Config Cards - SVN and Git side by side */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -875,13 +1105,13 @@ export default function RepoDetail() {
                 <FieldInput label="Branch" value={form.svn_branch} onChange={(v) => setField('svn_branch', v)} />
                 <FieldInput label="Username" value={form.svn_username} onChange={(v) => setField('svn_username', v)} />
                 <div>
-                  <label className="block text-sm text-gray-400 mb-1">SVN Password</label>
+                  <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-1`}>SVN Password</label>
                   <input
                     type="password"
                     className={inputClass}
                     value={form.svn_password}
                     onChange={(e) => setField('svn_password', e.target.value)}
-                    placeholder={credStatus?.svn_password_set ? '\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF (saved)' : 'Enter password'}
+                    placeholder={credStatus?.svn_password_set ? '\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF (saved)' : 'Enter password'} id={`${fieldId}-1`}
                   />
                 </div>
                 <button
@@ -932,13 +1162,13 @@ export default function RepoDetail() {
                 <FieldInput label="Repository" value={form.git_repo} onChange={(v) => setField('git_repo', v)} placeholder="owner/repo" />
                 <FieldInput label="Default Branch" value={form.git_branch} onChange={(v) => setField('git_branch', v)} />
                 <div>
-                  <label className="block text-sm text-gray-400 mb-1">Git Token</label>
+                  <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-2`}>Git Token</label>
                   <input
                     type="password"
                     className={inputClass}
                     value={form.git_token}
                     onChange={(e) => setField('git_token', e.target.value)}
-                    placeholder={credStatus?.git_token_set ? '\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF (saved)' : 'Enter token'}
+                    placeholder={credStatus?.git_token_set ? '\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF (saved)' : 'Enter token'} id={`${fieldId}-2`}
                   />
                 </div>
                 <button
@@ -990,26 +1220,26 @@ export default function RepoDetail() {
             <FieldToggle label="Auto Merge" checked={form.auto_merge} onChange={(v) => setField('auto_merge', v)} />
             <div className="col-span-full grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-sm text-gray-400 mb-1">Allowed SVN Paths <span className="text-gray-600">(one per line)</span></label>
+                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-3`}>Allowed SVN Paths <span className="text-gray-600">(one per line)</span></label>
                 <textarea
                   className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 font-mono placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   rows={3}
                   value={form.allowed_paths}
                   onChange={(e) => setField('allowed_paths', e.target.value)}
-                  placeholder={"source/\nconfig/"}
+                  placeholder={"source/\nconfig/"} id={`${fieldId}-3`}
                 />
-                <p className="text-xs text-gray-500 mt-1">Files must be under these path prefixes. Leave empty for no restriction.</p>
+                <p className="text-xs text-gray-300 mt-1">Files must be under these path prefixes. Leave empty for no restriction.</p>
               </div>
               <div>
-                <label className="block text-sm text-gray-400 mb-1">Blocked Patterns <span className="text-gray-600">(one per line)</span></label>
+                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-4`}>Blocked Patterns <span className="text-gray-600">(one per line)</span></label>
                 <textarea
                   className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 font-mono placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   rows={3}
                   value={form.blocked_patterns}
                   onChange={(e) => setField('blocked_patterns', e.target.value)}
-                  placeholder={"*.exe\ntemp/"}
+                  placeholder={"*.exe\ntemp/"} id={`${fieldId}-4`}
                 />
-                <p className="text-xs text-gray-500 mt-1">Files matching these patterns will be excluded from SVN sync.</p>
+                <p className="text-xs text-gray-300 mt-1">Files matching these patterns will be excluded from SVN sync.</p>
               </div>
             </div>
           </div>
@@ -1062,7 +1292,7 @@ export default function RepoDetail() {
       {/* ===== NEW DASHBOARD SECTIONS ===== */}
 
       {/* Circuit Breaker: Error Paused Banner */}
-      {status?.state === 'error_paused' && isAdmin && (
+      {statusView.canAct && status?.state === 'error_paused' && isAdmin && (
         <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 flex items-center justify-between">
           <div>
             <p className="text-red-300 font-medium">Sync Paused — Permanent Error</p>
@@ -1106,10 +1336,10 @@ export default function RepoDetail() {
         </div>
       )}
 
-      {showSkipModal && skipContext && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" data-testid="skip-commit-modal">
+      {showSkipModal && skipContextEnabled && skipContext && (
+        <Dialog title="Skip selected pending commits" description="Only the selected observed pending prefix will be excluded. Unselected work stays pending." onClose={() => { setShowSkipModal(false); setSkipError(null); }} busy={skipMutation.isPending} testId="skip-commit-modal">
           <div className="bg-gray-800 border border-gray-600 rounded-lg p-6 max-w-lg w-full mx-4 shadow-xl">
-            <h3 className="text-lg font-semibold text-gray-100 mb-2">Skip selected pending commits</h3>
+
             <p className="text-sm text-gray-400 mb-4">
               Select the oldest contiguous pending prefix to exclude. Unselected commits remain pending.
               Observed remote tip: <span className="font-mono text-gray-300">{skipContext.observed_remote_tip?.slice(0, 12) ?? 'unavailable'}</span>
@@ -1130,79 +1360,73 @@ export default function RepoDetail() {
                 </label>
               ))}
             </div>
-            {skipError && <p className="text-sm text-red-400 mb-3">{skipError}</p>}
+            {skipError && <p className="text-sm text-red-400 mb-3" role="alert">{skipError}</p>}
             <div className="flex justify-end gap-2">
               <button
                 type="button"
                 onClick={() => { setShowSkipModal(false); setSkipError(null); }}
                 className="px-3 py-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 text-sm text-gray-200"
-              >
+               data-dialog-cancel disabled={skipMutation.isPending}>
                 Cancel
               </button>
               <button
                 type="button"
-                disabled={skipSelectedCount === 0 || skipMutation.isPending}
+                disabled={!skipContextEnabled || skipSelectedCount === 0 || skipMutation.isPending}
                 data-testid="skip-commit-confirm"
                 onClick={() => {
+                  if(!id || !canConfirmObservedSkip(latestScopedSkipObservation(queryClient,skipState.current),id)){setSkipError('Status changed; no Skip request was sent.');return;}
                   const pending = skipContext.pending_commits.filter((c) => !c.excluded);
                   const selected = pending.slice(0, skipSelectedCount).map((c) => c.sha);
                   skipMutation.mutate(selected);
                 }}
-                className="px-3 py-1.5 rounded-lg bg-yellow-600 hover:bg-yellow-700 disabled:opacity-50 text-sm text-white font-medium"
+                className="px-3 py-1.5 rounded-lg bg-yellow-700 hover:bg-yellow-800 disabled:opacity-50 text-sm text-white font-medium"
               >
                 {skipMutation.isPending ? 'Skipping…' : 'Skip selected'}
               </button>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
+      <StatusObservationPanel view={statusView}/>
       {/* Status Cards Row */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
         <StatusCard
-          title="Sync State"
-          value={status?.state ?? 'unknown'}
-          color={
-            status?.state === 'idle'
-              ? 'green'
-              : status?.state === 'error'
-                ? 'red'
-                : 'yellow'
-          }
+          title="Effective sync health"
+          value={statusView.healthLabel}
+          color={statusView.health==='idle' ? 'green':'gray'}
         />
         <StatusCard
           title="Last Sync"
-          value={status?.last_sync_at ? formatTimeAgo(status.last_sync_at) : 'Never'}
+          value={status?.last_sync_at ? formatTimeAgo(status.last_sync_at) : status ? 'Not recorded':'Unknown'}
           color="gray"
         />
         <StatusCard
           title="Total Syncs"
-          value={String(status?.total_syncs ?? 0)}
+          value={statusView.metric('total_syncs')}
           color="blue"
         />
         <StatusCard
           title="Active Conflicts"
-          value={String(status?.active_conflicts ?? 0)}
-          color={status?.active_conflicts ? 'red' : 'green'}
-          onClick={() => navigate('/conflicts')}
+          value={statusView.metric('active_conflicts')}
+          color={status?.active_conflicts ? 'red' : 'gray'}
+          to="/conflicts"
         />
         <StatusCard
           title="Errors (24h)"
-          value={String(status?.total_errors ?? 0)}
-          color={status?.total_errors ? 'red' : 'gray'}
+          value={errorCard.value}
+          color={errorCard.count ? 'red' : 'gray'}
           subtitle={
-            status?.last_error_at
-              ? `Last: ${formatTimeAgo(status.last_error_at)}`
-              : 'No recent errors'
+            errorCard.lastErrorAt
+              ? `Last: ${formatTimeAgo(errorCard.lastErrorAt)}`
+              : errorCard.description
           }
-          onClick={() => navigate(`/audit?success=false&repo_id=${id}`)}
-          onClear={
-            (status?.total_errors ?? 0) > 0
-              ? async () => {
-                  await api.resetErrors(id);
-                  queryClient.invalidateQueries({ queryKey: ['repo-status', id] });
-                }
-              : undefined
+          to={`/audit?success=false&repo_id=${id}`}
+          action={
+            <ErrorAcknowledgement key={id ?? 'all'} scope={errorScope(id)}
+              repositoryName={repo?.name ?? id ?? ''} observation={errorCard.observation}
+              count={errorCard.count}
+              onSuccess={() => { void refreshErrorStatus(queryClient); }} />
           }
         />
       </div>
@@ -1302,7 +1526,7 @@ export default function RepoDetail() {
             <table className="min-w-full divide-y divide-gray-700">
               <thead>
                 <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Status</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Sync configuration</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Action</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Author</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Details</th>
@@ -1321,18 +1545,18 @@ export default function RepoDetail() {
                     <React.Fragment key={group.key}>
                       <tr
                         className={`hover:bg-gray-700/50 ${isGroup ? 'cursor-pointer' : ''}`}
-                        onClick={() => {
+
+                      >
+                        <td className="px-6 py-3">
+                          <div className="flex items-center space-x-1">
+                            {isGroup && <button type="button" onClick={() => {
                           if (!isGroup) return;
                           setExpandedAuditGroups(prev => {
                             const next = new Set(prev);
                             if (next.has(group.key)) next.delete(group.key); else next.add(group.key);
                             return next;
                           });
-                        }}
-                      >
-                        <td className="px-6 py-3">
-                          <div className="flex items-center space-x-1">
-                            {isGroup && <span className="text-gray-500 text-xs">{isGrpExpanded ? '\u25BE' : '\u25B8'}</span>}
+                        }} aria-expanded={isGrpExpanded} aria-label={`Audit group: ${latest.action}, ${group.entries.length} entries`} className="text-blue-300 underline">{isGrpExpanded ? 'Hide group' : 'Show group'}</button>}
                             {latest.success ? (
                               <CheckCircle className="w-4 h-4 text-green-400" />
                             ) : (
@@ -1353,9 +1577,7 @@ export default function RepoDetail() {
                         <td className="px-6 py-3 text-sm text-gray-300">{latest.author ?? '-'}</td>
                         <td className="px-6 py-3 text-sm text-gray-400">
                           <div>
-                            <span
-                              className={isLong ? 'cursor-pointer hover:text-gray-200' : ''}
-                              onClick={(e) => {
+                            {isLong ? <button type="button" onClick={(e) => {
                                 if (!isLong) return;
                                 e.stopPropagation();
                                 setExpandedDetails(prev => {
@@ -1363,10 +1585,7 @@ export default function RepoDetail() {
                                   if (next.has(latest.id)) next.delete(latest.id); else next.add(latest.id);
                                   return next;
                                 });
-                              }}
-                            >
-                              {isDetExpanded ? detailText : (isLong ? `${detailText.substring(0, 80)}...` : detailText)}
-                            </span>
+                              }} aria-expanded={isDetExpanded} className="text-left text-blue-300 underline">{isDetExpanded ? detailText : (isLong ? `${detailText.substring(0, 80)}...` : detailText)}</button> : <span>{detailText}</span>}
                             {isDetExpanded && (
                               <pre className="mt-2 p-3 bg-gray-900 rounded text-xs font-mono text-gray-300 whitespace-pre-wrap break-words max-w-lg">
                                 {detailText}
@@ -1374,7 +1593,7 @@ export default function RepoDetail() {
                             )}
                           </div>
                         </td>
-                        <td className="px-6 py-3 text-sm text-gray-500">
+                        <td className="px-6 py-3 text-sm text-gray-300">
                           {new Date(latest.created_at).toLocaleString()}
                         </td>
                       </tr>
@@ -1383,7 +1602,7 @@ export default function RepoDetail() {
                           <td className="px-6 py-2"></td>
                           <td className="px-6 py-2"><ActionBadge action={entry.action} /></td>
                           <td className="px-6 py-2 text-sm text-gray-400">{entry.author ?? '-'}</td>
-                          <td className="px-6 py-2 text-sm text-gray-500 truncate max-w-[300px]">{entry.details || entry.action}</td>
+                          <td className="px-6 py-2 text-sm text-gray-300 truncate max-w-[300px]">{entry.details || entry.action}</td>
                           <td className="px-6 py-2 text-sm text-gray-600">{new Date(entry.created_at).toLocaleString()}</td>
                         </tr>
                       ))}
@@ -1461,7 +1680,7 @@ export default function RepoDetail() {
                 <p className="text-amber-200">Conflicts: {refreshPlan.conflicts.join(', ')}. Resolution is not in this slice.</p>
               )}
               <p>{refreshPlan.intended_result.summary}</p>
-              <p className="text-xs text-gray-500">
+              <p className="text-xs text-gray-300">
                 Discards unsynced work: {String(refreshPlan.intended_result.discards_unsynced_work)}. Execute: {refreshPlan.execute_status}. Re-anchor: {refreshPlan.reanchor_status}.
               </p>
             </div>
@@ -1491,10 +1710,9 @@ export default function RepoDetail() {
         </div>
         {branchSuccess && branchPlan && (
           <div className="mx-6 mb-3 bg-blue-900/30 border border-blue-700 rounded-lg p-3 text-blue-200 text-sm">
-            Preview only — pair stays preparing. Git tip {branchPlan.git_tip?.slice(0, 8) || 'unknown'},
-            SVN baseline r{branchPlan.svn_source_revision ?? '?'},
-            {branchPlan.pending_git.count} pending Git commit{branchPlan.pending_git.count === 1 ? '' : 's'}.
-            Replay/publish is not enabled in this slice.
+            {branchPlan.published ? 'Pair publication completed.' : branchPlan.operation_id ? `Pair operation: ${branchPlan.pair_state}.` : 'Preview only; no repository changes.'}
+            {' '}Git tip {branchPlan.git_tip?.slice(0, 8) || 'unknown'}, baseline r{branchPlan.verified_baseline?.svn_revision ?? '?'},
+            {' '}{branchPlan.pending_git.count} pending Git commits. Scheduler {branchPlan.scheduler_active ? 'active' : 'inactive'}.
           </div>
         )}
         {(branchPairs ?? []).length > 0 ? (
@@ -1505,8 +1723,8 @@ export default function RepoDetail() {
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Name</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">SVN Branch</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Git Branch</th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Status</th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Last Sync</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Sync configuration</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Health / freshness</th>
                   {isAdmin && <th className="px-6 py-3 text-right text-xs font-medium text-gray-400 uppercase"></th>}
                 </tr>
               </thead>
@@ -1515,20 +1733,19 @@ export default function RepoDetail() {
                   <tr
                     key={bp.id}
                     data-testid={`branch-pair-row-${bp.id}`}
-                    onClick={() => navigate(`/repos/${bp.id}`)}
                     className="hover:bg-gray-700/50 cursor-pointer transition-colors"
                   >
-                    <td className="px-6 py-3 text-sm text-gray-200 font-medium">{bp.name}</td>
+                    <td className="px-6 py-3 text-sm text-gray-200 font-medium"><Link to={`/repos/${bp.id}`} className="text-blue-300 underline">{bp.name}</Link></td>
                     <td className="px-6 py-3 text-sm font-mono text-blue-400">{bp.svn_branch}</td>
                     <td className="px-6 py-3 text-sm font-mono text-purple-400">{bp.git_branch}</td>
                     <td className="px-6 py-3">
                       <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
-                        bp.enabled ? 'bg-green-900/50 text-green-300' : 'bg-gray-700 text-gray-400'
+                        bp.enabled ? 'bg-blue-900/50 text-blue-300' : 'bg-gray-700 text-gray-400'
                       }`}>
-                        {bp.enabled ? 'Active' : 'Disabled'}
+                        {bp.enabled ? 'Configured enabled' : 'Configured disabled'}
                       </span>
                     </td>
-                    <td className="px-6 py-3 text-sm text-gray-400">{formatTimeAgo(bp.updated_at)}</td>
+                    <td className="px-6 py-3 text-sm text-gray-400"><RepositoryStatusSummary repoId={bp.id}/></td>
                     {isAdmin && (
                       <td className="px-6 py-3 text-right">
                         <div className="inline-flex items-center gap-2">
@@ -1564,7 +1781,7 @@ export default function RepoDetail() {
                               setRemoveBranchOpts({ delete_git: false, delete_svn: false });
                               removeMutation.reset();
                             }}
-                            className="text-gray-500 hover:text-red-400 transition-colors p-1"
+                            className="text-gray-300 hover:text-red-400 transition-colors p-1"
                             title="Delete branch pair"
                           >
                             <Trash2 className="w-4 h-4" />
@@ -1584,31 +1801,38 @@ export default function RepoDetail() {
 
       {/* Add Branch Pair Modal */}
       {showBranchModal && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+        <Dialog title="Review Branch Pair" description="Capture both sides, inspect the intended result, then explicitly publish or recover the pinned operation." onClose={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: false, auto_create_svn_branch: true, auto_create_git_branch: true }); setBranchPlan(null); branchMutation.reset(); }} busy={branchMutation.isPending}>
           <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
             <div className="flex items-center justify-between p-6 border-b border-gray-700">
-              <h2 className="text-lg font-semibold text-gray-100">Preview Branch Pair</h2>
+
               <button
                 onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: false, auto_create_svn_branch: true, auto_create_git_branch: true }); setBranchPlan(null); branchMutation.reset(); }}
                 className="text-gray-400 hover:text-gray-200 transition-colors"
-              >
+               aria-label="Close dialog" data-dialog-cancel disabled={branchMutation.isPending}>
                 <X className="w-5 h-5" />
               </button>
             </div>
             <div className="p-6 space-y-4">
               {branchMutation.isError && (
-                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm">
+                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" role="alert">
                   Pairing refused: {branchMutation.error?.message}
                 </div>
               )}
               {branchPlan && (
                 <div className="bg-gray-900/70 border border-gray-600 rounded-lg p-3 text-xs text-gray-300 space-y-1 font-mono">
-                  <div>mode: {branchPlan.mode} · state: {branchPlan.pair_state}</div>
+                  <div role="status">mode: {branchPlan.mode} · state: {branchPlan.pair_state}</div>
+                  <div>intended Git result: {branchPlan.result_git_sha || 'blocked'}</div>
+                  <div>result digest: {branchPlan.result_tree_digest || 'unknown'}</div>
+                  <div>handled steps: {branchPlan.handled_steps ?? 0}/{branchPlan.total_steps ?? 0}</div>
+                  <div>{branchPlan.observation}</div>
+                  {branchPlan.conflicts.map((conflict) => <div key={conflict} role="alert" className="text-red-300">{conflict}</div>)}
+                  {branchPlan.unknowns.map((unknown) => <div key={unknown} role="alert" className="text-amber-300">{unknown}</div>)}
+                  {branchPlan.action_error && <div role="alert">{branchPlan.action_error}</div>}
                   <div>git tip: {branchPlan.git_tip || 'unknown'}</div>
                   <div>SVN source: r{branchPlan.svn_source_revision ?? 'unknown'} · copy from r{branchPlan.proposed_svn_copy_source_revision ?? 'n/a'}</div>
                   <div>pending Git: {branchPlan.pending_git.count} · published: {String(branchPlan.published)} · scheduler: {String(branchPlan.scheduler_active)}</div>
                   {branchPlan.existing_svn_target.exists && (
-                    <div className="text-amber-300">existing SVN target is not equivalent</div>
+                    <div className="text-amber-300">Independent SVN work will be reconciled against the verified baseline</div>
                   )}
                   {branchPlan.skip_import_note && <div className="text-amber-200">{branchPlan.skip_import_note}</div>}
                 </div>
@@ -1616,20 +1840,22 @@ export default function RepoDetail() {
 
               {/* Parent context */}
               <div className="bg-gray-900/50 border border-gray-700/50 rounded-lg px-3 py-2 text-xs text-gray-400">
-                <span className="text-gray-500">Branching from:</span>{' '}
+                <span className="text-gray-300">Branching from:</span>{' '}
                 <span className="text-blue-400 font-mono">{repo?.svn_branch || 'trunk'}</span>
                 {' \u2192 '}
                 <span className="text-purple-400 font-mono">{repo?.git_branch || 'main'}</span>
               </div>
 
               <div>
-                <label className="block text-sm text-gray-400 mb-1">Branch Name <span className="text-gray-600 text-xs">({branchForm.git_branch.length}/200)</span></label>
+                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-5`}>Branch Name <span className="text-gray-300 text-xs">({branchForm.git_branch.length}/200)</span></label>
                 <input
                   type="text"
                   className={inputClass}
+                  disabled={branchMutation.isPending || !!branchPlan?.operation_id}
                   value={branchForm.git_branch}
                   maxLength={200}
                   onChange={(e) => {
+                    setBranchPlan(null);
                     const name = e.target.value;
                     setBranchForm(prev => ({
                       ...prev,
@@ -1637,87 +1863,58 @@ export default function RepoDetail() {
                       svn_branch: name ? `branches/${name}` : '',
                     }));
                   }}
-                  placeholder="e.g., fix-123, dev/james-wilson"
+                  placeholder="e.g., fix-123, dev/james-wilson" id={`${fieldId}-5`}
+                  aria-invalid={gitBranchValidation.error ? true : undefined}
+                  aria-describedby={gitBranchValidation.error ? `${fieldId}-git-branch-error` : undefined}
                 />
-                {(() => {
-                  const v = branchForm.git_branch;
-                  if (!v) return null;
-                  const invalid = /[^a-zA-Z0-9._/-]/.test(v);
-                  const hasTraversal = v.includes('..');
-                  const hasDoubleSlash = v.includes('//');
-                  const badEdges = v.startsWith('/') || v.endsWith('/') || v.startsWith('-');
-                  const reserved = v === 'HEAD' || v.startsWith('refs/') || v.endsWith('.lock');
-                  const err = invalid ? 'Invalid characters (use letters, numbers, . _ - / only)'
-                    : hasTraversal ? 'Must not contain ".."'
-                    : hasDoubleSlash ? 'Must not contain "//"'
-                    : badEdges ? 'Must not start/end with "/" or start with "-"'
-                    : reserved ? 'Reserved name not allowed'
-                    : null;
-                  return err ? <p className="mt-1 text-xs text-red-400">{err}</p> : null;
-                })()}
+                {gitBranchValidation.error && <p id={`${fieldId}-git-branch-error`} role="alert" className="mt-1 text-xs text-red-400">{gitBranchValidation.error}</p>}
               </div>
               <div>
-                <label className="block text-sm text-gray-400 mb-1">SVN Branch Path <span className="text-gray-600">(auto-derived, editable)</span></label>
+                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-6`}>SVN Branch Path <span className="text-gray-300">(auto-derived, editable)</span></label>
                 <input
                   type="text"
                   className={inputClass}
+                  disabled={branchMutation.isPending || !!branchPlan?.operation_id}
                   value={branchForm.svn_branch}
                   maxLength={200}
-                  onChange={(e) => setBranchForm(prev => ({ ...prev, svn_branch: e.target.value }))}
-                  placeholder="branches/fix-123"
+                  onChange={(e) => { setBranchPlan(null); setBranchForm(prev => ({ ...prev, svn_branch: e.target.value })); }}
+                  placeholder="branches/fix-123" id={`${fieldId}-6`}
+                  aria-invalid={svnBranchValidation.error ? true : undefined}
+                  aria-describedby={svnBranchValidation.error ? `${fieldId}-svn-branch-error` : undefined}
                 />
-                {(() => {
-                  const v = branchForm.svn_branch;
-                  if (!v) return null;
-                  const invalid = /[^a-zA-Z0-9._/-]/.test(v);
-                  const hasTraversal = v.includes('..');
-                  const err = invalid ? 'Invalid characters' : hasTraversal ? 'Must not contain ".."' : null;
-                  return err ? <p className="mt-1 text-xs text-red-400">{err}</p> : null;
-                })()}
+                {svnBranchValidation.error && <p id={`${fieldId}-svn-branch-error`} role="alert" className="mt-1 text-xs text-red-400">{svnBranchValidation.error}</p>}
               </div>
 
-              {/* Auto-create options */}
-              <div className="space-y-2">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={branchForm.auto_create_svn_branch}
-                    onChange={(e) => setBranchForm(prev => ({ ...prev, auto_create_svn_branch: e.target.checked }))}
-                    className="rounded border-gray-600 bg-gray-700 text-blue-600"
-                  />
-                  <span className="text-sm text-gray-300">Create SVN branch <span className="text-gray-500">(svn copy)</span></span>
-                </label>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={branchForm.auto_create_git_branch}
-                    onChange={(e) => setBranchForm(prev => ({ ...prev, auto_create_git_branch: e.target.checked }))}
-                    className="rounded border-gray-600 bg-gray-700 text-purple-600"
-                  />
-                  <span className="text-sm text-gray-300">Create Git branch <span className="text-gray-500">(from {repo?.git_branch || 'main'})</span></span>
-                </label>
-              </div>
+              <label className="flex items-center gap-2 text-sm text-gray-300">
+                <input type="checkbox" checked={branchIncludeParent}
+                  disabled={branchMutation.isPending || !!branchPlan?.operation_id}
+                  onChange={(event) => { setBranchIncludeParent(event.target.checked); setBranchPlan(null); }} />
+                Include parent SVN advancement in this reviewed result
+              </label>
+              <p className="text-xs text-gray-400">The Git branch must already exist. A missing SVN target is copied at the proven baseline; an existing related target keeps its independent work.</p>
 
               {/* Import mode */}
               <div>
-                <label className="block text-sm text-gray-400 mb-2">Pairing mode</label>
-                <div className="space-y-2">
+                <p id="pairing-mode-label" className="block text-sm text-gray-400 mb-2">Pairing mode</p>
+                <div role="radiogroup" aria-labelledby="pairing-mode-label" className="space-y-2">
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
                       type="radio"
                       name="importMode"
+                      disabled={branchMutation.isPending || !!branchPlan?.operation_id}
                       checked={!branchForm.skip_import}
-                      onChange={() => setBranchForm(prev => ({ ...prev, skip_import: false }))}
+                      onChange={() => { setBranchPlan(null); setBranchForm(prev => ({ ...prev, skip_import: false })); }}
                       className="text-blue-600"
                     />
-                    <span className="text-sm text-gray-300">Preview from verified SVN baseline <span className="text-gray-500">(this slice)</span></span>
+                    <span className="text-sm text-gray-300">Reconcile from the verified SVN baseline</span>
                   </label>
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
                       type="radio"
                       name="importMode"
+                      disabled={branchMutation.isPending || !!branchPlan?.operation_id}
                       checked={branchForm.skip_import}
-                      onChange={() => setBranchForm(prev => ({ ...prev, skip_import: true }))}
+                      onChange={() => { setBranchPlan(null); setBranchForm(prev => ({ ...prev, skip_import: true })); }}
                       className="text-blue-600"
                     />
                     <span className="text-sm text-gray-300">Start from now <span className="text-amber-400">(unsafe — refused)</span></span>
@@ -1725,29 +1922,40 @@ export default function RepoDetail() {
                 </div>
               </div>
             </div>
-            <div className="flex items-center justify-end gap-3 p-6 border-t border-gray-700">
+            <div className="flex flex-wrap items-center justify-end gap-3 p-6 border-t border-gray-700">
               <button
                 onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: false, auto_create_svn_branch: true, auto_create_git_branch: true }); setBranchPlan(null); branchMutation.reset(); }}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
-              >
+               data-dialog-cancel disabled={branchMutation.isPending}>
                 Cancel
               </button>
               <button
-                onClick={() => branchMutation.mutate(branchForm)}
-                disabled={branchMutation.isPending || !branchForm.svn_branch.trim() || !branchForm.git_branch.trim()
-                  || /[^a-zA-Z0-9._/-]/.test(branchForm.git_branch) || /[^a-zA-Z0-9._/-]/.test(branchForm.svn_branch)
-                  || branchForm.git_branch.includes('..') || branchForm.svn_branch.includes('..')
-                  || branchForm.git_branch.includes('//') || branchForm.git_branch.startsWith('/') || branchForm.git_branch.endsWith('/')
-                  || branchForm.git_branch.startsWith('-') || branchForm.git_branch === 'HEAD' || branchForm.git_branch.endsWith('.lock')
-                }
+                onClick={() => branchMutation.mutate({ ...branchForm, action: 'preview' })}
+                disabled={branchMutation.isPending || !!branchPlan?.operation_id || gitBranchValidation.previewRefused || svnBranchValidation.previewRefused}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
                 <GitBranch className="w-4 h-4" />
-                {branchMutation.isPending ? 'Previewing...' : 'Preview Pair'}
+                {branchMutation.isPending ? 'Working...' : 'Preview Pair'}
               </button>
+              {!branchPlan?.operation_id && <button
+                onClick={() => branchMutation.mutate({ ...branchForm, action: 'publish', review_pin: branchPlan?.review_pin })}
+                disabled={branchMutation.isPending || !branchPlanMatches || !branchPlan?.review_pin || !branchPlan.admitted || branchPlan.conflicts.length > 0 || branchForm.skip_import}
+                className="px-4 py-2 rounded bg-green-700 disabled:opacity-50 text-white text-sm">Publish reviewed result</button>}
+              <button disabled={branchMutation.isPending || gitBranchValidation.previewRefused || svnBranchValidation.previewRefused}
+                onClick={() => branchMutation.mutate({ ...branchForm, action: 'status', operation_id: branchPlan?.operation_id ?? undefined })}
+                className="px-3 py-2 rounded border border-gray-600 text-sm">Inspect operation</button>
+              {branchPlan?.operation_id && !branchPlan.published && branchPlan.pair_state !== 'cancelled' && <>
+                <button disabled={branchMutation.isPending}
+                  onClick={() => branchMutation.mutate({ ...branchForm, action: 'resume', operation_id: branchPlan.operation_id!, review_pin: branchPlan.review_pin })}
+                  className="px-3 py-2 rounded border border-gray-600 text-sm">Reconcile / resume</button>
+                <button disabled={branchMutation.isPending}
+                  onClick={() => branchMutation.mutate({ ...branchForm, action: 'cancel', operation_id: branchPlan.operation_id! })}
+                  className="px-3 py-2 rounded border border-gray-600 text-sm">Cancel operation</button>
+                <p className="text-xs text-amber-200">Cancellation after intent retains the hold; it does not undo remote work.</p>
+              </>}
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
       {/* Server Monitor */}
@@ -1761,14 +1969,14 @@ export default function RepoDetail() {
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-sm text-gray-300 font-medium">Reset & Reimport</p>
-                <p className="text-sm text-gray-500 mt-0.5">Unavailable during safe import cancellation. Request a reviewed recovery plan for an existing repository.</p>
+                <p className="text-sm text-gray-300 mt-0.5">Unavailable during safe import cancellation. Request a reviewed recovery plan for an existing repository.</p>
               </div>
             </div>
             {!repo?.parent_id && (
               <div className="flex items-center justify-between">
                 <div>
                   <p className="text-sm text-gray-300 font-medium">Pause / disable sync (explicit API)</p>
-                  <p className="text-sm text-gray-500 mt-0.5">
+                  <p className="text-sm text-gray-300 mt-0.5">
                     Calls POST /disable (same contract as legacy DELETE). Stops scheduling; registration,
                     mappings, secrets, local files, and remotes stay. The header toggle only updates
                     enabled on the registration.
@@ -1789,7 +1997,7 @@ export default function RepoDetail() {
                 <p className="text-sm text-gray-300 font-medium">
                   {repo?.parent_id ? 'Remove branch pair' : 'Remove from RepoSync'}
                 </p>
-                <p className="text-sm text-gray-500 mt-0.5">
+                <p className="text-sm text-gray-300 mt-0.5">
                   {repo?.parent_id
                     ? 'Remove this pair from RepoSync. Remote Git/SVN deletion is opt-in in the dialog.'
                     : 'Stop work, clean only owned local data, and drop the registration from active views. Remotes and history stay unless you separately authorize branch deletion.'}
@@ -1833,15 +2041,15 @@ export default function RepoDetail() {
       )}
 
       {showDisableConfirm && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+        <Dialog title="Pause / disable sync" description="Disable syncing without removing data or changing remotes." onClose={() => setShowDisableConfirm(false)} busy={disableMutation.isPending}>
           <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 max-w-md w-full shadow-xl">
-            <h3 className="text-lg font-semibold text-gray-100 mb-2">Pause / disable sync</h3>
+
             <p className="text-sm text-gray-400 mb-6">
               Disable <span className="font-semibold text-gray-200">{repo.name}</span>? This does not remove
               data or touch remotes. You can re-enable later.
             </p>
             {disableMutation.isError && (
-              <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4">
+              <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4" role="alert">
                 Failed to disable: {disableMutation.error?.message}
               </div>
             )}
@@ -1849,7 +2057,7 @@ export default function RepoDetail() {
               <button
                 onClick={() => setShowDisableConfirm(false)}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
-              >
+               data-dialog-cancel disabled={disableMutation.isPending}>
                 Cancel
               </button>
               <button
@@ -1862,15 +2070,25 @@ export default function RepoDetail() {
               </button>
             </div>
           </div>
-        </div>
+        </Dialog>
+      )}
+
+      {isAdmin && repo.parent_id && removalPanelStatus && (
+        <ManagedRemovalPanel status={removalPanelStatus} onRetry={removalPanelStatus.retryable ? () => removeMutation.mutate() : undefined} retryPending={removeMutation.isPending} />
       )}
 
       {branchPairDeleteSubject && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" data-testid="delete-branch-modal">
+        <Dialog title="Delete branch pair" description="Review dependency and remote-deletion choices. Remote deletion is off by default." onClose={() => {
+                  setBranchPairDeleteTarget(null);
+                  setBranchPairDeleteError(null);
+                  setRemoveConfirmText('');
+                  removeMutation.reset();
+                }} busy={removeMutation.isPending} testId="delete-branch-modal">
           <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
             <div className="p-6 space-y-4">
+              {reviewedRemovalPanel}
               {removeMutation.isError && (
-                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" data-testid="delete-branch-error">
+                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" data-testid="delete-branch-error" role="alert">
                   {removeMutation.error?.message}
                 </div>
               )}
@@ -1925,7 +2143,7 @@ export default function RepoDetail() {
                 </div>
               )}
               {branchPairPreviewQuery.isError && (
-                <div className="text-sm text-red-300 space-y-2">
+                <div className="text-sm text-red-300 space-y-2" role="alert">
                   <p data-testid="branch-removal-preview-error">
                     Could not load dependency preview: {branchPairPreviewQuery.error?.message}
                   </p>
@@ -1933,8 +2151,7 @@ export default function RepoDetail() {
                     className="text-amber-200 text-xs"
                     data-testid="branch-removal-preview-unavailable"
                   >
-                    Dependency preview is unavailable. You can still remove this branch pair from
-                    RepoSync; remote deletion stays opt-in below and defaults to off.
+                    Dependency preview is unavailable. Removal is blocked until current dependency and exact-target evidence are available.
                   </p>
                   <button
                     type="button"
@@ -1949,26 +2166,28 @@ export default function RepoDetail() {
               <div className="space-y-2">
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="checkbox" checked={removeBranchOpts.delete_git}
+                    disabled={removeMutation.isPending}
                     data-testid="delete-git-opt"
                     onChange={(e) => setRemoveBranchOpts((p) => ({ ...p, delete_git: e.target.checked }))}
                     className="rounded border-gray-600 bg-gray-700 text-red-600" />
-                  <span className="text-sm text-gray-300">Delete Git branch <span className="text-gray-500 font-mono">({branchPairDeleteSubject.git_branch})</span></span>
+                  <span className="text-sm text-gray-300">Delete Git branch <span className="text-gray-300 font-mono">({branchPairDeleteSubject.git_branch})</span></span>
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="checkbox" checked={removeBranchOpts.delete_svn}
+                    disabled={removeMutation.isPending}
                     data-testid="delete-svn-opt"
                     onChange={(e) => setRemoveBranchOpts((p) => ({ ...p, delete_svn: e.target.checked }))}
                     className="rounded border-gray-600 bg-gray-700 text-red-600" />
-                  <span className="text-sm text-gray-300">Delete SVN branch <span className="text-gray-500 font-mono">({branchPairDeleteSubject.svn_branch})</span></span>
+                  <span className="text-sm text-gray-300">Delete SVN branch <span className="text-gray-300 font-mono">({branchPairDeleteSubject.svn_branch})</span></span>
                 </label>
               </div>
               <div>
-                <p className="text-sm text-gray-400 mb-2">
+                <label htmlFor="branch-removal-name" className="block text-sm text-gray-400 mb-2">
                   Type <span className="font-mono text-yellow-300">{branchPairDeleteSubject.git_branch}</span> to confirm:
-                </p>
+                </label>
                 <input
                   type="text"
-                  data-testid="delete-branch-confirm-input"
+                  id="branch-removal-name" data-testid="delete-branch-confirm-input"
                   className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-500"
                   value={removeConfirmText}
                   onChange={(e) => setRemoveConfirmText(e.target.value)}
@@ -1986,7 +2205,7 @@ export default function RepoDetail() {
                   removeMutation.reset();
                 }}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
-              >
+               data-dialog-cancel disabled={removeMutation.isPending}>
                 Cancel
               </button>
               <button
@@ -1996,6 +2215,8 @@ export default function RepoDetail() {
                   removeMutation.isPending
                   || removeConfirmText !== branchPairDeleteSubject.git_branch
                   || !branchPairPreviewReady
+                  || !reviewedRemovalConfirmReady
+                  || !!pendingRemovalReview.review || !!pendingRemovalReview.error
                   || branchPairDependencyPreview?.parent_removal_blocked
                 }
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
@@ -2005,16 +2226,18 @@ export default function RepoDetail() {
               </button>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
       {showRemoveConfirm && removalSubject && !branchPairDeleteSubject && (
-        <div
-          className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
-          data-testid="managed-remove-modal"
-        >
+        <Dialog title={removalConfirmLabel} description="Remove the managed registration and owned local data. Remote history is preserved." onClose={() => {
+                  setShowRemoveConfirm(false);
+                  setRemovalTarget(null);
+                  setRemoveConfirmText('');
+                }} busy={removeMutation.isPending} testId="managed-remove-modal">
           <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 max-w-md w-full shadow-xl">
-            <h3 className="text-lg font-semibold text-gray-100 mb-2">{removalConfirmLabel}</h3>
+            {reviewedRemovalPanel}
+
             <p className="text-sm text-gray-400 mb-4">
               Remove <span className="font-semibold text-gray-200">{removalSubject.name}</span> from active listings and
               clean only RepoSync-owned local data. Remote Git and SVN history are not modified by this action.
@@ -2096,13 +2319,12 @@ export default function RepoDetail() {
               </div>
             )}
             {removalPreviewQuery.isError && (
-              <div className="text-sm text-red-300 mb-4 space-y-2">
+              <div className="text-sm text-red-300 mb-4 space-y-2" role="alert">
                 <p data-testid="removal-preview-error">
                   Could not load dependency preview: {removalPreviewQuery.error?.message}
                 </p>
                 <p className="text-amber-200 text-xs" data-testid="removal-preview-unavailable">
-                  Dependency preview is unavailable. Confirm only if you accept proceeding without
-                  shared-credential and child-dependency metadata from the server.
+                  Dependency preview is unavailable. Removal is blocked until current shared-credential, child-dependency and exact-target evidence are available.
                 </p>
                 <button
                   type="button"
@@ -2115,7 +2337,7 @@ export default function RepoDetail() {
               </div>
             )}
             {removeMutation.isError && (
-              <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4">
+              <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4" role="alert">
                 {removeMutation.error?.message}
               </div>
             )}
@@ -2128,7 +2350,7 @@ export default function RepoDetail() {
                   setRemoveConfirmText('');
                 }}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
-              >
+               data-dialog-cancel disabled={removeMutation.isPending}>
                 Cancel
               </button>
               <button
@@ -2137,6 +2359,8 @@ export default function RepoDetail() {
                 disabled={
                   removeMutation.isPending
                   || !removalPreviewReady
+                  || !reviewedRemovalConfirmReady
+                  || !!pendingRemovalReview.review || !!pendingRemovalReview.error
                   || removalDependencyPreview?.parent_removal_blocked
                 }
                 className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
@@ -2145,7 +2369,7 @@ export default function RepoDetail() {
               </button>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
     </div>
@@ -2174,15 +2398,16 @@ function FieldInput({
   onChange: (v: string) => void;
   placeholder?: string;
 }) {
+  const fieldId = useId();
   return (
     <div>
-      <label className="block text-sm text-gray-400 mb-1">{label}</label>
+      <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-7`}>{label}</label>
       <input
         type="text"
         className={inputClass}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
+        placeholder={placeholder} id={`${fieldId}-7`}
       />
     </div>
   );
@@ -2199,15 +2424,16 @@ function FieldNumber({
   onChange: (v: number) => void;
   min?: number;
 }) {
+  const fieldId = useId();
   return (
     <div>
-      <label className="block text-sm text-gray-400 mb-1">{label}</label>
+      <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-8`}>{label}</label>
       <input
         type="number"
         className={inputClass}
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
-        min={min}
+        min={min} id={`${fieldId}-8`}
       />
     </div>
   );
@@ -2224,10 +2450,11 @@ function FieldSelect({
   options: { value: string; label: string }[];
   onChange: (v: string) => void;
 }) {
+  const fieldId = useId();
   return (
     <div>
-      <label className="block text-sm text-gray-400 mb-1">{label}</label>
-      <select className={selectClass} value={value} onChange={(e) => onChange(e.target.value)}>
+      <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-9`}>{label}</label>
+      <select className={selectClass} value={value} onChange={(e) => onChange(e.target.value)} id={`${fieldId}-9`}>
         {options.map((o) => (
           <option key={o.value} value={o.value}>
             {o.label}
@@ -2238,33 +2465,13 @@ function FieldSelect({
   );
 }
 
-function FieldToggle({
-  label,
-  checked,
-  onChange,
-}: {
-  label: string;
-  checked: boolean;
-  onChange: (v: boolean) => void;
-}) {
-  return (
-    <div>
-      <label className="block text-sm text-gray-400 mb-1">{label}</label>
-      <button
-        type="button"
-        onClick={() => onChange(!checked)}
-        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors mt-1 ${
-          checked ? 'bg-blue-600' : 'bg-gray-600'
-        }`}
-      >
-        <span
-          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-            checked ? 'translate-x-6' : 'translate-x-1'
-          }`}
-        />
-      </button>
-    </div>
-  );
+function FieldToggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
+  const fieldId = useId();
+  return <div>
+    <label htmlFor={fieldId} className="block text-sm text-gray-300 mb-1">{label}</label>
+    <input id={fieldId} type="checkbox" checked={checked} onChange={event => onChange(event.target.checked)}
+      className="h-5 w-5 rounded border-gray-500 accent-blue-500" />
+  </div>;
 }
 
 function StatCard({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
@@ -2283,16 +2490,16 @@ function StatusCard({
   title,
   value,
   color,
-  onClick,
+  to,
   subtitle,
-  onClear,
+  action,
 }: {
   title: string;
   value: string;
   color: string;
-  onClick?: () => void;
+  to?: string;
   subtitle?: string;
-  onClear?: () => void;
+  action?: React.ReactNode;
 }) {
   const colorClasses: Record<string, string> = {
     green: 'bg-green-900/30 border-green-700',
@@ -2302,31 +2509,20 @@ function StatusCard({
     gray: 'bg-gray-800 border-gray-700',
   };
 
-  const clickableClasses = onClick
+  const clickableClasses = to
     ? 'cursor-pointer hover:border-blue-500/50 transition-colors'
     : '';
 
   return (
     <div
       className={`rounded-lg border p-4 ${colorClasses[color] ?? colorClasses.gray} ${clickableClasses}`}
-      onClick={onClick}
     >
       <div className="flex items-center justify-between">
-        <p className="text-sm text-gray-400">{title}</p>
-        {onClear && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onClear();
-            }}
-            className="text-xs text-gray-400 hover:text-red-400 transition-colors px-1.5 py-0.5 rounded border border-gray-600 hover:border-red-500/50"
-          >
-            Clear
-          </button>
-        )}
+        {to ? <Link to={to} className="text-sm text-blue-300 underline">{title}</Link> : <p className="text-sm text-gray-400">{title}</p>}
+        {action}
       </div>
       <p className="text-2xl font-bold capitalize text-gray-100">{value}</p>
-      {subtitle && <p className="text-xs text-gray-500 mt-1">{subtitle}</p>}
+      {subtitle && <p className="text-xs text-gray-300 mt-1">{subtitle}</p>}
     </div>
   );
 }
@@ -2344,6 +2540,7 @@ function SyncRecordRow({ record }: { record: SyncRecord }) {
   return (
     <div>
       <button
+        aria-expanded={expanded}
         onClick={() => setExpanded(!expanded)}
         className="w-full px-6 py-3 flex items-center justify-between hover:bg-gray-700/50 text-left transition-colors"
       >
@@ -2362,7 +2559,7 @@ function SyncRecordRow({ record }: { record: SyncRecord }) {
           {record.git_sha && (
             <span className="text-xs font-mono text-purple-400">{record.git_sha.substring(0, 8)}</span>
           )}
-          <span className="text-xs text-gray-500">
+          <span className="text-xs text-gray-300">
             {new Date(record.synced_at).toLocaleString()}
           </span>
           <ChevronDown
@@ -2375,38 +2572,38 @@ function SyncRecordRow({ record }: { record: SyncRecord }) {
           <div className="bg-gray-900 rounded-lg p-4 border border-gray-700">
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4 text-sm">
               <div>
-                <span className="text-gray-500 text-xs uppercase">Record ID</span>
+                <span className="text-gray-300 text-xs uppercase">Record ID</span>
                 <p className="font-mono text-gray-300 truncate">{record.id}</p>
               </div>
               <div>
-                <span className="text-gray-500 text-xs uppercase">SVN Revision</span>
+                <span className="text-gray-300 text-xs uppercase">SVN Revision</span>
                 <p className="font-mono text-blue-400">{record.svn_rev ? `r${record.svn_rev}` : 'N/A'}</p>
               </div>
               <div>
-                <span className="text-gray-500 text-xs uppercase">Git SHA</span>
+                <span className="text-gray-300 text-xs uppercase">Git SHA</span>
                 <p className="font-mono text-purple-400">{record.git_sha || 'N/A'}</p>
               </div>
               <div>
-                <span className="text-gray-500 text-xs uppercase">Status</span>
+                <span className="text-gray-300 text-xs uppercase">Status</span>
                 <p className={statusColor + ' font-medium capitalize'}>{record.status}</p>
               </div>
             </div>
             <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
               <div>
-                <span className="text-gray-500 text-xs uppercase">Author</span>
+                <span className="text-gray-300 text-xs uppercase">Author</span>
                 <p className="text-gray-300">{record.author}</p>
               </div>
               <div>
-                <span className="text-gray-500 text-xs uppercase">Committed</span>
+                <span className="text-gray-300 text-xs uppercase">Committed</span>
                 <p className="text-gray-300">{new Date(record.timestamp).toLocaleString()}</p>
               </div>
               <div>
-                <span className="text-gray-500 text-xs uppercase">Synced At</span>
+                <span className="text-gray-300 text-xs uppercase">Synced At</span>
                 <p className="text-gray-300">{new Date(record.synced_at).toLocaleString()}</p>
               </div>
             </div>
             <div className="mt-4">
-              <span className="text-gray-500 text-xs uppercase">Commit Message</span>
+              <span className="text-gray-300 text-xs uppercase">Commit Message</span>
               <div className="mt-1 bg-gray-800 rounded p-3 border border-gray-700">
                 <pre className="text-sm text-gray-200 whitespace-pre-wrap font-mono">{record.message}</pre>
               </div>

@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use reposync_core::config::GitProvider;
+use reposync_core::db::Database;
 use reposync_core::git::github::GitHubClient;
 use reposync_core::git::GitClient;
 use reposync_core::personal_config::PersonalConfig;
@@ -19,7 +20,17 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
     println!("Importing SVN history to GitHub...");
     println!();
 
-    let db = super::open_personal_database(data_dir)?;
+    // Ensure data directory
+    std::fs::create_dir_all(data_dir).context("failed to create data directory")?;
+
+    // Initialize database
+    let db = Database::open_personal_writer(data_dir)
+        .context("Personal import startup writer admission refused")?;
+    let writer_window = db
+        .begin_personal_startup_writer_window()
+        .context("Personal import startup writer admission refused")?;
+    db.require_legacy_import_watermarks_available()
+        .context("Personal import startup checkpoint admission refused")?;
 
     // SVN client
     let svn_client = SvnClient::new(
@@ -59,11 +70,12 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
             Err(_) => GitClient::init(&git_repo_path).context("failed to init git repository")?,
         }
     };
-    // The push uses github.default_branch. A clone of an empty fixture can
-    // leave HEAD on another unborn name, so align before the first commit.
-    git_client
-        .ensure_head_on_branch(&config.github.default_branch)
-        .context("failed to align the personal import with its default branch")?;
+
+    if git_client.repo().is_empty()? {
+        git_client
+            .ensure_head_on_branch(&config.github.default_branch)
+            .context("failed to select configured branch for fresh import")?;
+    }
 
     let git_client = std::sync::Arc::new(std::sync::Mutex::new(git_client));
     let formatter = reposync_personal::commit_format::CommitFormatter::new(&config.commit_format);
@@ -93,7 +105,9 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
     spinner.set_message(format!("Importing ({} mode)...", mode));
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let count = importer.import(import_mode).await?;
+    let count = importer
+        .import_with_writer_window(import_mode, writer_window)
+        .await?;
 
     spinner.finish_and_clear();
 

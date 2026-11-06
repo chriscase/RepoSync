@@ -1,38 +1,29 @@
 #!/usr/bin/env bash
-# Execute exact reviewed base and candidate under the same locked container runtime.
+# Run every reviewed source with its own pinned graph; retain every result.
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-base_sha=87379741779a6259f7eeb52a68cc6f061174e5ef
-previous_sha=f74fce855a1f1d80dd631397f436ba33906272e6
-base_tree="$(git rev-parse "$base_sha^{tree}")"
-previous_tree="$(git rev-parse "$previous_sha^{tree}")"
-immediate_sha=ab097580d9415ae2f8df44bed4041f740a1b38f2
-immediate_tree="$(git rev-parse "$immediate_sha^{tree}")"
-# Current merged starting point for #64-B; older review baselines remain above.
-merged_sha=54e183484961bd9ad12bd03505b3b00610de7cd9
-merged_tree="$(git rev-parse "$merged_sha^{tree}")"
 candidate_sha="$(git rev-parse HEAD)"
 candidate_tree="$(git rev-parse HEAD^{tree})"
-comparison_dir="$repo_root/artifacts/reliability-compare/$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "$comparison_dir/base" "$comparison_dir/previous" "$comparison_dir/immediate" "$comparison_dir/merged" "$comparison_dir/candidate"
-base_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-reviewed-base.XXXXXX")"
-previous_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-previous-head.XXXXXX")"
-immediate_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-immediate-reviewed.XXXXXX")"
-merged_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-merged-start.XXXXXX")"
-trap 'rm -rf "$base_context" "$previous_context" "$immediate_context" "$merged_context"' EXIT
-git archive "$base_sha" | tar -x -C "$base_context"
-git archive "$previous_sha" | tar -x -C "$previous_context"
-git archive "$immediate_sha" | tar -x -C "$immediate_context"
-git archive "$merged_sha" | tar -x -C "$merged_context"
-python3 scripts/reliability-lock-overlay.py "$base_context" > "$comparison_dir/base-lock-overlay.json"
-python3 scripts/reliability-lock-overlay.py "$previous_context" > "$comparison_dir/previous-lock-overlay.json"
-python3 scripts/reliability-lock-overlay.py "$immediate_context" > "$comparison_dir/immediate-lock-overlay.json"
-python3 scripts/reliability-lock-overlay.py "$merged_context" > "$comparison_dir/merged-lock-overlay.json"
+comparison_dir="${REPOSYNC_COMPARISON_DIR:-$repo_root/artifacts/reliability-compare/$(date -u +%Y%m%dT%H%M%SZ)}"
+mkdir -p "$comparison_dir"
+contexts="$(mktemp -d "${TMPDIR:-/tmp}/reposync-comparison-contexts.XXXXXX")"
+trap 'rm -rf "$contexts"' EXIT
+labels=(base previous immediate merged)
+sources=(87379741779a6259f7eeb52a68cc6f061174e5ef f74fce855a1f1d80dd631397f436ba33906272e6 ab097580d9415ae2f8df44bed4041f740a1b38f2 54e183484961bd9ad12bd03505b3b00610de7cd9)
 
-# This overlay changes no base runtime source. The old test fixture needs an
-# explicit synthetic SVN author when running as the container's numeric user.
-python3 - "$base_context/crates/core/tests/team_mode_e2e.rs" <<'PY'
+prepare_source() {
+  local source="$1" label="$2" context="$contexts/$2"
+  mkdir -p "$context" || return $?
+  printf '%s\n' archive > "$comparison_dir/$label-setup-stage.txt" || return $?
+  git archive "$source" | tar -x -C "$context" || return $?
+  printf '%s\n' lock_staging > "$comparison_dir/$label-setup-stage.txt" || return $?
+  python3 scripts/reliability-lock-overlay.py stage "$context" --source "$source" \
+    --receipt "$comparison_dir/$label-lock.json" || return $?
+  printf '%s\n' harness_overlay > "$comparison_dir/$label-setup-stage.txt" || return $?
+  # Keep the reviewed synthetic author adapter; no production source changes.
+  if [[ "$label" == base ]]; then
+    python3 - "$context/crates/core/tests/team_mode_e2e.rs" <<'PY' || return $?
 from pathlib import Path
 import sys
 p = Path(sys.argv[1])
@@ -42,57 +33,68 @@ assert source.count(needle) == 1, 'reviewed-base fixture shape changed'
 p.write_text(source.replace(needle,
     '            message,\n            wc_path.to_str().unwrap(),\n            "--username",\n            "fixture",\n            "--non-interactive",'))
 PY
-mkdir -p "$base_context/docs/reliability/fixtures"
-cp Dockerfile.reliability .dockerignore "$base_context/"
-cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py scripts/reliability-copy-consumer.mjs scripts/reliability-scoped-consumer.mjs "$base_context/scripts/"
-cp docs/reliability/fixtures/Cargo.lock "$base_context/docs/reliability/fixtures/"
-cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$base_context/docs/reliability/"
-shasum -a 256 "$base_context/crates/core/tests/team_mode_e2e.rs" | awk '{print $1}' > "$comparison_dir/base-test-overlay.sha256"
-cp Dockerfile.reliability .dockerignore "$previous_context/"
-cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py scripts/reliability-copy-consumer.mjs scripts/reliability-scoped-consumer.mjs "$previous_context/scripts/"
-cp docs/reliability/fixtures/Cargo.lock "$previous_context/docs/reliability/fixtures/"
-cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$previous_context/docs/reliability/"
+    shasum -a 256 "$context/crates/core/tests/team_mode_e2e.rs" | awk '{print $1}' > "$comparison_dir/base-test-overlay.sha256" || return $?
+  fi
+  cp Dockerfile.reliability .dockerignore "$context/" || return $?
+  cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py \
+    scripts/reliability-inventory.py scripts/reliability-inventory-probes.py \
+    scripts/reliability-copy-consumer.mjs scripts/reliability-scoped-consumer.mjs "$context/scripts/" || return $?
+  mkdir -p "$context/docs/reliability/fixtures" || return $?
+  cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$context/docs/reliability/" || return $?
+}
 
-cp Dockerfile.reliability .dockerignore "$immediate_context/"
-cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py scripts/reliability-copy-consumer.mjs scripts/reliability-scoped-consumer.mjs "$immediate_context/scripts/"
-cp docs/reliability/fixtures/Cargo.lock "$immediate_context/docs/reliability/fixtures/"
-cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$immediate_context/docs/reliability/"
-
-cp Dockerfile.reliability .dockerignore "$merged_context/"
-cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py scripts/reliability-copy-consumer.mjs scripts/reliability-scoped-consumer.mjs "$merged_context/scripts/"
-cp docs/reliability/fixtures/Cargo.lock "$merged_context/docs/reliability/fixtures/"
-cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$merged_context/docs/reliability/"
-
-REPOSYNC_BUILD_CONTEXT="$base_context" \
-REPOSYNC_SOURCE_HEAD_OVERRIDE="$base_sha" \
-REPOSYNC_SOURCE_TREE_OVERRIDE="$base_tree" \
-REPOSYNC_ARTIFACT_DIR="$comparison_dir/base" \
-  scripts/reliability-container.sh --baseline
-REPOSYNC_BUILD_CONTEXT="$previous_context" \
-REPOSYNC_SOURCE_HEAD_OVERRIDE="$previous_sha" \
-REPOSYNC_SOURCE_TREE_OVERRIDE="$previous_tree" \
-REPOSYNC_ARTIFACT_DIR="$comparison_dir/previous" \
-  scripts/reliability-container.sh --baseline
-REPOSYNC_BUILD_CONTEXT="$immediate_context" \
-REPOSYNC_SOURCE_HEAD_OVERRIDE="$immediate_sha" \
-REPOSYNC_SOURCE_TREE_OVERRIDE="$immediate_tree" \
-REPOSYNC_ARTIFACT_DIR="$comparison_dir/immediate" \
-  scripts/reliability-container.sh --baseline
-REPOSYNC_BUILD_CONTEXT="$merged_context" \
-REPOSYNC_SOURCE_HEAD_OVERRIDE="$merged_sha" \
-REPOSYNC_SOURCE_TREE_OVERRIDE="$merged_tree" \
-REPOSYNC_ARTIFACT_DIR="$comparison_dir/merged" \
-  scripts/reliability-container.sh --baseline
+aggregate_status=0
+for index in "${!sources[@]}"; do
+  source="${sources[$index]}"
+  label="${labels[$index]}"
+  mkdir -p "$comparison_dir/$label"
+  status=0
+  prepare_source "$source" "$label" > "$comparison_dir/$label-setup.log" 2>&1 || status=$?
+  printf '%s\n' "$status" > "$comparison_dir/$label-setup-exit-code.txt"
+  if [[ "$status" -eq 0 ]]; then
+    REPOSYNC_BUILD_CONTEXT="$contexts/$label" \
+    REPOSYNC_LOCK_SOURCE="$source" \
+    REPOSYNC_SOURCE_HEAD_OVERRIDE="$source" \
+    REPOSYNC_SOURCE_TREE_OVERRIDE="$(git rev-parse "$source^{tree}")" \
+    REPOSYNC_ARTIFACT_DIR="$comparison_dir/$label" \
+      scripts/reliability-container.sh --baseline || status=$?
+  fi
+  printf '%s\n' "$status" > "$comparison_dir/$label-exit-code.txt"
+  [[ "$status" -eq 0 ]] || aggregate_status=1
+done
+status=0
 REPOSYNC_SOURCE_HEAD_OVERRIDE="$candidate_sha" \
 REPOSYNC_SOURCE_TREE_OVERRIDE="$candidate_tree" \
 REPOSYNC_ARTIFACT_DIR="$comparison_dir/candidate" \
-  scripts/reliability-container.sh --baseline
-python3 scripts/reliability-compare.py "$comparison_dir/base/baseline-results.json" \
-  "$comparison_dir/candidate/baseline-results.json" "$comparison_dir/comparison.json"
-python3 scripts/reliability-compare.py "$comparison_dir/previous/baseline-results.json" \
-  "$comparison_dir/candidate/baseline-results.json" "$comparison_dir/previous-comparison.json"
-echo "Matched comparison artifact: $comparison_dir"
-python3 scripts/reliability-compare.py "$comparison_dir/immediate/baseline-results.json" \
-  "$comparison_dir/candidate/baseline-results.json" "$comparison_dir/immediate-comparison.json"
-python3 scripts/reliability-compare.py "$comparison_dir/merged/baseline-results.json" \
-  "$comparison_dir/candidate/baseline-results.json" "$comparison_dir/merged-comparison.json"
+  scripts/reliability-container.sh --baseline || status=$?
+printf '%s\n' "$status" > "$comparison_dir/candidate-exit-code.txt"
+[[ "$status" -eq 0 ]] || aggregate_status=1
+
+for index in "${!sources[@]}"; do
+  source="${sources[$index]}"
+  label="${labels[$index]}"
+  report="$comparison_dir/$label-comparison.json"
+  status=0
+  if [[ -f "$comparison_dir/$label/baseline-results.json" && -f "$comparison_dir/candidate/baseline-results.json" ]]; then
+    python3 scripts/reliability-lock-overlay.py compare \
+      "$comparison_dir/$label/baseline-results.json" "$comparison_dir/candidate/baseline-results.json" \
+      "$report" --source "$source" --candidate-sha "$candidate_sha" || status=$?
+  else
+    status=2
+  fi
+  if [[ ! -f "$report" ]]; then
+    python3 - "$report" "$source" "$candidate_sha" "$status" <<'PY'
+import json, sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({
+    "outcome": "NOT_RUN" if sys.argv[4] == "2" else "FAIL",
+    "base_head": sys.argv[2], "candidate_head": sys.argv[3],
+    "blocker": "Missing execution report or rejected comparison provenance; inspect per-source build/runtime receipts.",
+    "exit_code": int(sys.argv[4]),
+}, indent=2) + "\n")
+PY
+  fi
+  [[ "$status" -eq 0 ]] || aggregate_status=1
+done
+echo "Complete comparison artifact: $comparison_dir; exit: $aggregate_status"
+exit "$aggregate_status"

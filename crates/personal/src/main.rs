@@ -8,7 +8,6 @@ mod commit_format;
 mod daemon;
 mod engine;
 mod git_to_svn;
-mod initial_import;
 mod pr_monitor;
 mod scheduler;
 mod signals;
@@ -31,7 +30,7 @@ use reposync_core::personal_config::PersonalConfig;
 use reposync_core::svn::SvnClient;
 
 use crate::engine::PersonalSyncEngine;
-use crate::initial_import::{ImportMode, InitialImport};
+use reposync_personal::initial_import::{ImportMode, InitialImport};
 
 /// RepoSync Personal Branch Mode — individual SVN↔Git sync daemon.
 #[derive(Parser)]
@@ -183,8 +182,11 @@ async fn build_engine(config_path: &str) -> Result<(PersonalSyncEngine, Personal
         .with_context(|| format!("failed to create data directory: {}", data_dir.display()))?;
 
     // Initialize database.
-    let db_path = data_dir.join("personal.db");
-    let db = Database::new(&db_path).context("failed to initialize database")?;
+    let db = Database::open_personal_writer(data_dir)
+        .context("Personal sync startup writer admission refused")?;
+    let writer_window = db
+        .begin_personal_startup_writer_window()
+        .context("Personal sync startup writer admission refused")?;
 
     // Create SVN client.
     let svn_client = SvnClient::new(
@@ -221,6 +223,9 @@ async fn build_engine(config_path: &str) -> Result<(PersonalSyncEngine, Personal
     let github_client =
         GitHubClient::new(&config.github.api_url, github_token, GitProvider::default());
 
+    writer_window
+        .finish_preparation()
+        .context("Personal sync startup writer completion refused")?;
     let engine = PersonalSyncEngine::new(config.clone(), db, svn_client, git_client, github_client);
     Ok((engine, config))
 }
@@ -231,15 +236,14 @@ async fn cmd_start(config_path: &str, foreground: bool) -> Result<()> {
     let data_dir = &config.personal.data_dir;
 
     // Check if already running.
-    if let Some(pid) = daemon::is_running(data_dir)? {
+    if let Some((pid, true)) = daemon::inspect_pid_file(data_dir)? {
         anyhow::bail!("daemon is already running (PID {})", pid);
     }
 
     if foreground {
         info!("starting personal sync daemon in foreground mode");
-        daemon::write_pid_file(&daemon::pid_file_path(data_dir))?;
-
         let shutdown = signals::setup_signal_handlers();
+        daemon::write_pid_file(&daemon::pid_file_path(data_dir))?;
         let interval = Duration::from_secs(config.personal.poll_interval_secs);
 
         let result = scheduler::run_polling_loop(&engine, interval, shutdown).await;
@@ -253,9 +257,8 @@ async fn cmd_start(config_path: &str, foreground: bool) -> Result<()> {
         eprintln!("         Or use the provided systemd service file.");
         eprintln!();
         info!("starting personal sync daemon (note: not truly daemonized, use systemd for production)");
-        daemon::write_pid_file(&daemon::pid_file_path(data_dir))?;
-
         let shutdown = signals::setup_signal_handlers();
+        daemon::write_pid_file(&daemon::pid_file_path(data_dir))?;
         let interval = Duration::from_secs(config.personal.poll_interval_secs);
 
         let result = scheduler::run_polling_loop(&engine, interval, shutdown).await;
@@ -289,8 +292,9 @@ fn cmd_status(config_path: &str) -> Result<()> {
         PersonalConfig::load_and_resolve(config_path).context("failed to load personal config")?;
     let data_dir = &config.personal.data_dir;
 
-    match daemon::is_running(data_dir)? {
-        Some(pid) => println!("● Running (PID {})", pid),
+    match daemon::inspect_pid_file(data_dir)? {
+        Some((pid, true)) => println!("● Running (PID {})", pid),
+        Some((pid, false)) => println!("○ Not running (stale PID {})", pid),
         None => println!("○ Not running"),
     }
     Ok(())
@@ -321,8 +325,13 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
         .with_context(|| format!("failed to create data directory: {}", data_dir.display()))?;
 
     // Initialize database.
-    let db_path = data_dir.join("personal.db");
-    let db = Database::new(&db_path).context("failed to initialize database")?;
+    let db = Database::open_personal_writer(data_dir)
+        .context("Personal import startup writer admission refused")?;
+    let writer_window = db
+        .begin_personal_startup_writer_window()
+        .context("Personal import startup writer admission refused")?;
+    db.require_legacy_import_watermarks_available()
+        .context("Personal import startup checkpoint admission refused")?;
 
     // Create SVN client.
     let svn_client = SvnClient::new(
@@ -364,9 +373,15 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
             }
         }
     };
+    if git_client.repo().is_empty()? {
+        git_client
+            .ensure_head_on_branch(&config.github.default_branch)
+            .context("failed to select configured branch for fresh import")?;
+    }
     let git_client = std::sync::Arc::new(std::sync::Mutex::new(git_client));
 
-    let commit_format = crate::commit_format::CommitFormatter::new(&config.commit_format);
+    let commit_format =
+        reposync_personal::commit_format::CommitFormatter::new(&config.commit_format);
 
     let importer = InitialImport {
         svn_client: &svn_client,
@@ -377,7 +392,9 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
         formatter: &commit_format,
     };
 
-    let count = importer.import(mode).await?;
+    let count = importer
+        .import_with_writer_window(mode, writer_window)
+        .await?;
     println!("✓ Import complete! {} commits created.", count);
     Ok(())
 }

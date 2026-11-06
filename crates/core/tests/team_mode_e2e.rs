@@ -36,9 +36,518 @@ use reposync_core::models::{Repository, SyncState};
 use reposync_core::svn::SvnClient;
 use reposync_core::sync_engine::SyncEngine;
 
+// #196 uses the same verified SVN-origin fixture and real engine as the other
+// team tests. Keep it here rather than introducing a parallel bootstrap model.
+mod svn_trunk_projection_196 {
+    use super::*;
+    use std::sync::Mutex;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<String>>>);
+
+    struct Fields(String);
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            write!(&mut self.0, " {}={value:?}", field.name()).unwrap();
+        }
+    }
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = Fields(format!("{}", event.metadata().level()));
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    fn configure(
+        pair: &mut QualifiedPair,
+        layout: reposync_core::config::SvnLayout,
+        trunk: &str,
+        trailing_slash: bool,
+    ) {
+        let mut config = make_app_config(&pair.svn_repo_root, pair.tmp.path());
+        config.svn.layout = layout;
+        config.svn.trunk_path = trunk.into();
+        config.sync.auto_merge = false;
+        let url = format!("{}{}", pair.svn_url, if trailing_slash { "/" } else { "" });
+        let mut engine = SyncEngine::new(
+            config,
+            Database::new(&pair.db_path).unwrap(),
+            SvnClient::new(url, "", ""),
+            GitClient::new(&pair.bridge).unwrap(),
+            Arc::new(make_identity_mapper()),
+        );
+        engine.set_repo_id(pair.repo_id.clone());
+        pair.engine = engine;
+    }
+
+    async fn cycle(
+        pair: &QualifiedPair,
+    ) -> (
+        Result<reposync_core::sync_engine::SyncStats, SyncError>,
+        Vec<String>,
+    ) {
+        let capture = Capture::default();
+        let result = pair
+            .engine
+            .run_sync_cycle()
+            .with_subscriber(capture.clone())
+            .await;
+        let events = capture.0.lock().unwrap().clone();
+        (result, events)
+    }
+
+    fn assert_no_path_warnings(events: &[String]) {
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.starts_with("WARN")
+                    && (event.contains("NOT at expected path")
+                        || event.contains("path differs from branch-relative")
+                        || event.contains("path diagnostics unavailable"))
+            })
+            .collect();
+        assert!(
+            warnings.is_empty(),
+            "erroneous post-apply diagnostics: {warnings:#?}"
+        );
+    }
+
+    fn svn(wc: &Path, args: &[&str]) {
+        let output = Command::new("svn")
+            .args(args)
+            .arg("--non-interactive")
+            .current_dir(wc)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "svn {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn write(wc: &Path, path: &str, bytes: &str) {
+        let target = wc.join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, bytes).unwrap();
+    }
+
+    fn commit_all(wc: &Path, url: &str) -> i64 {
+        svn(wc, &["add", "--force", "."]);
+        svn(wc, &["commit", "-m", "196 projection fixture"]);
+        // svnlook's filesystem helper accepts only a repository root, while
+        // these fixtures deliberately select trunk and nested branch URLs.
+        let output = Command::new("svn")
+            .args(["info", "--show-item", "revision", url, "--non-interactive"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "svn info {url}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn assert_mapping(pair: &QualifiedPair, revision: i64, sha: &str) {
+        assert_eq!(
+            pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+            (revision, sha.into())
+        );
+        let count: i64 = pair.engine.db().conn().query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND direction='svn_to_git' AND svn_rev=?2 AND git_sha=?3",
+            rusqlite::params![&pair.repo_id, revision, sha], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1, "exact durable SVN-to-Git mapping required");
+        let operation = pair
+            .engine
+            .db()
+            .latest_git_push_operation(&pair.repo_id)
+            .unwrap()
+            .expect("durable publication intent");
+        assert_eq!(operation.source_svn_rev, revision);
+        assert_eq!(
+            operation.state,
+            reposync_core::db::git_push_operations::GitPushOperationState::Completed
+        );
+        assert_eq!(operation.intended_local_git_sha, sha);
+        assert_eq!(
+            operation.intended_local_git_tree,
+            git_output(&pair.bare, &["rev-parse", "refs/heads/main^{tree}"])
+        );
+    }
+
+    async fn sync_one(pair: &QualifiedPair, revision: i64) -> Vec<String> {
+        let (result, events) = cycle(pair).await;
+        let stats = result.unwrap();
+        assert_eq!(stats.svn_to_git_count, 1);
+        assert_eq!(stats.git_to_svn_count, 0);
+        let sha = git_output(&pair.bare, &["rev-parse", "refs/heads/main"]);
+        assert_mapping(pair, revision, &sha);
+        assert_no_path_warnings(&events);
+        let repeated = pair.engine.run_sync_cycle().await.unwrap();
+        assert_eq!(
+            (repeated.svn_to_git_count, repeated.git_to_svn_count),
+            (0, 0)
+        );
+        assert_eq!(
+            git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+            sha
+        );
+        events
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn custom_trunk_branch_and_nested_urls_use_one_relative_namespace() {
+        for branch in ["trunk", "branches/custom", "projects/nested/trunk"] {
+            let mut pair = QualifiedPair::new_with_svn_branch("196-custom", branch).await;
+            configure(
+                &mut pair,
+                reposync_core::config::SvnLayout::Custom,
+                "",
+                true,
+            );
+            let revision =
+                svn_commit_file(&pair.wc, "feature.txt", "canonical root\n", "196 custom");
+            let events = sync_one(&pair, revision).await;
+            assert!(
+                events.iter().any(|event| event.contains("path=feature.txt")
+                    && event.contains("path matches branch-relative")),
+                "{events:#?}"
+            );
+            let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+            assert_eq!(tree.get("feature.txt").unwrap(), b"canonical root\n");
+            assert!(!tree
+                .keys()
+                .any(|path| path.starts_with(&format!("{branch}/"))));
+        }
+    }
+
+    /// Ordinary Standard/trunk transfer is an unchanged positive on both versions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standard_trunk_ordinary_file_is_an_unchanged_positive() {
+        let mut pair = QualifiedPair::new_with_svn_branch("196-standard", "trunk").await;
+        configure(
+            &mut pair,
+            reposync_core::config::SvnLayout::Standard,
+            "/trunk/",
+            false,
+        );
+        let revision = svn_commit_file(&pair.wc, "feature.txt", "standard root\n", "196 standard");
+        sync_one(&pair, revision).await;
+        assert_eq!(
+            tracked_tree_at(&pair.bare, "refs/heads/main")
+                .get("feature.txt")
+                .unwrap(),
+            b"standard root\n"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standard_literal_trunk_paths_and_payloads_survive_without_rewriting() {
+        let pair = QualifiedPair::new_with_svn_branch("196-literal", "trunk").await;
+        let payload = "a/trunk/payload\nb/trunk/payload\n";
+        for path in [
+            "a/trunk/literal.txt",
+            "trunk/keep.txt",
+            "Trunk/case.txt",
+            "trunk-other/peer.txt",
+        ] {
+            write(&pair.wc, path, payload);
+        }
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+        for path in [
+            "a/trunk/literal.txt",
+            "trunk/keep.txt",
+            "Trunk/case.txt",
+            "trunk-other/peer.txt",
+        ] {
+            assert_eq!(tree.get(path).unwrap(), payload.as_bytes(), "{path}");
+        }
+        assert!(!tree.contains_key("a/literal.txt"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn custom_mixed_revision_excludes_outside_and_sibling_prefix_paths() {
+        let mut pair = QualifiedPair::new_with_svn_branch("196-outside", "trunk").await;
+        configure(
+            &mut pair,
+            reposync_core::config::SvnLayout::Custom,
+            "",
+            false,
+        );
+        let root_wc = pair.tmp.path().join("root-wc");
+        svn_checkout(&pair.svn_repo_root, &root_wc);
+        write(&root_wc, "trunk/inside.txt", "inside\n");
+        write(&root_wc, "trunk-other/outside.txt", "outside\n");
+        write(&root_wc, "branches/other/outside.txt", "outside\n");
+        let revision = commit_all(&root_wc, &pair.svn_repo_root);
+        sync_one(&pair, revision).await;
+        let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+        assert_eq!(tree.get("inside.txt").unwrap(), b"inside\n");
+        assert!(!tree.keys().any(|path| path.contains("outside.txt")));
+        let checkpoint = pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap();
+        write(&root_wc, "trunk-other/outside.txt", "later outside\n");
+        commit_all(&root_wc, &pair.svn_repo_root);
+        let (result, events) = cycle(&pair).await;
+        let stats = result.unwrap();
+        assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (0, 0));
+        assert_eq!(
+            pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+            checkpoint
+        );
+        assert_no_path_warnings(&events);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deletes_renames_and_empty_directories_do_not_emit_missing_file_warnings() {
+        let mut pair = QualifiedPair::new_with_svn_branch("196-actions", "branches/custom").await;
+        configure(
+            &mut pair,
+            reposync_core::config::SvnLayout::Custom,
+            "",
+            false,
+        );
+        write(&pair.wc, "dir/old.txt", "rename me\n");
+        write(&pair.wc, "gone.txt", "delete me\n");
+        std::fs::create_dir(pair.wc.join("empty")).unwrap();
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        svn(&pair.wc, &["mv", "dir/old.txt", "dir/new.txt"]);
+        svn(&pair.wc, &["rm", "gone.txt", "empty"]);
+        svn(&pair.wc, &["mkdir", "another-empty"]);
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+        assert_eq!(tree.get("dir/new.txt").unwrap(), b"rename me\n");
+        for absent in ["dir/old.txt", "gone.txt", "empty", "another-empty"] {
+            assert!(!tree.contains_key(absent));
+        }
+        svn(&pair.wc, &["update"]);
+        svn(&pair.wc, &["mv", "dir", "relocated"]);
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+        assert_eq!(tree.get("relocated/new.txt").unwrap(), b"rename me\n");
+        assert!(!tree.keys().any(|path| path.starts_with("dir/")));
+        svn(&pair.wc, &["rm", "relocated"]);
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        assert!(!tracked_tree_at(&pair.bare, "refs/heads/main")
+            .keys()
+            .any(|path| path.starts_with("relocated/")));
+        // An empty-directory-only revision has no Git content but still needs a durable receipt.
+        let before_sha = git_output(&pair.bare, &["rev-parse", "refs/heads/main"]);
+        svn(&pair.wc, &["mkdir", "only-empty"]);
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        let (result, events) = cycle(&pair).await;
+        assert_eq!(result.unwrap().svn_to_git_count, 0);
+        assert_eq!(
+            pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+            (revision, before_sha.clone())
+        );
+        assert_eq!(
+            git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+            before_sha
+        );
+        let count: i64 = pair.engine.db().conn().query_row("SELECT COUNT(*) FROM audit_log WHERE repo_id=?1 AND action='svn_to_git_no_target' AND svn_rev=?2 AND success=1", rusqlite::params![&pair.repo_id, revision], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1);
+        assert_no_path_warnings(&events);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standard_file_deletion_reports_expected_absence() {
+        let pair = QualifiedPair::new_with_svn_branch("196-delete", "trunk").await;
+        svn(&pair.wc, &["rm", "origin.txt"]);
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        assert!(!tracked_tree_at(&pair.bare, "refs/heads/main").contains_key("origin.txt"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn custom_same_relative_path_conflict_is_not_falsely_accepted() {
+        for branch in ["trunk", "branches/custom"] {
+            let mut pair = QualifiedPair::new_with_svn_branch("196-conflict", branch).await;
+            configure(
+                &mut pair,
+                reposync_core::config::SvnLayout::Custom,
+                "",
+                false,
+            );
+            let before = pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap();
+            svn_commit_file(&pair.wc, "origin.txt", "SVN edit\n", "196 svn overlap");
+            let git_sha = pair.developer_commit("origin.txt", "Git edit\n", "196 git overlap");
+            git_cli(&pair.developer, &["push", "origin", "main"]);
+            let (result, _) = cycle(&pair).await;
+            assert!(
+                matches!(result, Err(SyncError::UnresolvableConflict { ref file_path, .. }) if file_path == "origin.txt"),
+                "{result:?}"
+            );
+            let conflicts = pair.engine.db().list_conflicts(None, 10).unwrap();
+            assert!(conflicts
+                .iter()
+                .any(|conflict| conflict.file_path == "origin.txt"
+                    && conflict.repo_id.as_deref() == Some(pair.repo_id.as_str())));
+            assert_eq!(
+                pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+                before
+            );
+            assert_eq!(
+                git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+                git_sha
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn literal_trunk_and_sibling_prefixes_do_not_falsely_reject_disjoint_changes() {
+        for (svn_path, git_path) in [
+            ("trunk/shared.txt", "shared.txt"),
+            ("trunk-other/shared.txt", "-other/shared.txt"),
+        ] {
+            let mut pair = QualifiedPair::new_with_svn_branch("196-disjoint", "trunk").await;
+            configure(
+                &mut pair,
+                reposync_core::config::SvnLayout::Standard,
+                "trunk",
+                false,
+            );
+            write(&pair.wc, svn_path, "base svn\n");
+            write(&pair.wc, git_path, "base git\n");
+            let revision = commit_all(&pair.wc, &pair.svn_url);
+            sync_one(&pair, revision).await;
+            git_cli(&pair.developer, &["pull", "--ff-only"]);
+            svn_commit_file(&pair.wc, svn_path, "SVN edit\n", "196 disjoint svn");
+            pair.developer_commit(&format!("./{git_path}"), "Git edit\n", "196 disjoint git");
+            git_cli(&pair.developer, &["push", "origin", "main"]);
+            let (result, events) = cycle(&pair).await;
+            let stats = result.unwrap();
+            assert_eq!(stats.conflicts_detected, 0);
+            assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (1, 1));
+            assert!(pair
+                .engine
+                .db()
+                .list_conflicts(None, 10)
+                .unwrap()
+                .is_empty());
+            let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+            assert_eq!(tree.get(svn_path).unwrap(), b"SVN edit\n");
+            assert_eq!(tree.get(git_path).unwrap(), b"Git edit\n");
+            assert_no_path_warnings(&events);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lfs_scan_uses_literal_trunk_path_without_a_second_strip() {
+        for layout in [
+            reposync_core::config::SvnLayout::Standard,
+            reposync_core::config::SvnLayout::Custom,
+        ] {
+            let mut pair = QualifiedPair::new_with_svn_branch("196-lfs", "trunk").await;
+            let trunk = if layout == reposync_core::config::SvnLayout::Standard {
+                "trunk"
+            } else {
+                ""
+            };
+            configure(&mut pair, layout, trunk, false);
+            pair.engine.set_lfs_threshold_bytes(512);
+            let revision = svn_commit_file(
+                &pair.wc,
+                "trunk/asset",
+                &"fixture data\n".repeat(100),
+                "196 lfs path",
+            );
+            let (result, events) = cycle(&pair).await;
+            assert_eq!(result.unwrap().svn_to_git_count, 1);
+            assert_no_path_warnings(&events);
+            let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+            let attributes = String::from_utf8(
+                tree.get(".gitattributes")
+                    .expect("canonical file must be scanned for LFS")
+                    .clone(),
+            )
+            .unwrap();
+            assert!(
+                attributes
+                    .lines()
+                    .any(|line| line.starts_with("trunk/asset ") && line.contains("filter=lfs")),
+                "{attributes}"
+            );
+            assert!(
+                !attributes.lines().any(|line| line.starts_with("trunk ")),
+                "a directory must not be tracked as an LFS file: {attributes}"
+            );
+            assert!(tree.contains_key("trunk/asset"));
+            assert!(!tree.contains_key("asset"));
+            assert_mapping(
+                &pair,
+                revision,
+                &git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+            );
+        }
+    }
+}
+
 // ===========================================================================
 // Helpers
 // ===========================================================================
+
+fn load_repo_history_block(db: &Database, repo_id: &str) -> serde_json::Value {
+    reposync_core::history_inspect::load_history_block_for_repo(db, repo_id)
+        .unwrap()
+        .expect("expected durable history block in kv_state")
+}
+
+fn set_repo_git_checkpoint_kv(db: &Database, repo_id: &str, sha: &str) {
+    db.conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = ?2",
+            rusqlite::params![sha, repo_id],
+        )
+        .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    reposync_core::echo_receipt_scope::write_scoped_last_git_sha_kv(&db.conn(), repo_id, sha, &now)
+        .unwrap();
+}
+
+fn inbound_git_sha_kv(db: &Database, repo_id: &str) -> Option<String> {
+    reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)
+        .expect("read scoped inbound git sha kv")
+}
+
+fn clear_inbound_git_sha_kv(db: &Database, repo_id: &str) {
+    if let Ok(scoped_key) = db.scoped_last_git_sha_kv_key_for_repo(repo_id) {
+        let _ = db.delete_kv_state(&scoped_key);
+    }
+    let legacy = reposync_core::db::repo_scope_identity::legacy_last_git_sha_kv_key(repo_id);
+    db.conn()
+        .execute("DELETE FROM kv_state WHERE key = ?1", [legacy])
+        .unwrap();
+}
+
+fn set_inbound_git_sha_kv_only(db: &Database, repo_id: &str, sha: &str) {
+    let now = chrono::Utc::now().to_rfc3339();
+    reposync_core::echo_receipt_scope::write_scoped_last_git_sha_kv(&db.conn(), repo_id, sha, &now)
+        .unwrap();
+}
 
 fn svn_available() -> bool {
     let svn_ok = Command::new("svn")
@@ -73,15 +582,7 @@ fn assert_fixture_owned(path: &Path) {
 }
 
 fn branch_svn_url(repo_root: &str, svn_branch: &str) -> String {
-    if svn_branch.is_empty() {
-        repo_root.to_string()
-    } else {
-        format!(
-            "{}/{}",
-            repo_root.trim_end_matches('/'),
-            svn_branch.trim_start_matches('/')
-        )
-    }
+    reposync_core::svn::operand::configured_branch_url(repo_root, svn_branch).unwrap()
 }
 
 fn copy_export_tree(source: &Path, dest: &Path) {
@@ -132,8 +633,14 @@ fn seed_svn_to_git_baseline(db: &Database, repo_id: &str, svn_rev: i64, git_sha:
             rusqlite::params![svn_rev, git_sha, now.to_rfc3339(), repo_id],
         )
         .unwrap();
-    db.set_state(&format!("last_git_sha_{repo_id}"), git_sha)
-        .unwrap();
+    let now_kv = chrono::Utc::now().to_rfc3339();
+    reposync_core::echo_receipt_scope::write_scoped_last_git_sha_kv(
+        &db.conn(),
+        repo_id,
+        git_sha,
+        &now_kv,
+    )
+    .unwrap();
     db.set_state(&format!("last_svn_rev_{repo_id}"), &svn_rev.to_string())
         .unwrap();
     db.insert_sync_record(&reposync_core::models::SyncRecord {
@@ -877,10 +1384,10 @@ impl QualifiedPair {
                         std::fs::create_dir_all(parent).unwrap();
                     }
                     std::fs::write(&path, bytes).unwrap();
-                    git_cli(&self.developer, &["add", name]);
+                    git_cli(&self.developer, &["add", "--", name]);
                 }
                 None => {
-                    git_cli(&self.developer, &["rm", "-f", name]);
+                    git_cli(&self.developer, &["rm", "-f", "--", name]);
                 }
             }
         }
@@ -927,11 +1434,11 @@ impl QualifiedPair {
             bridge_status,
             bridge_feature: std::fs::read_to_string(self.bridge.join("feature.txt")).ok(),
             watermark: self.engine.db().get_repo_watermark(&self.repo_id).unwrap(),
-            kv_cursor: self
-                .engine
-                .db()
-                .get_state(&format!("last_git_sha_{}", self.repo_id))
-                .unwrap(),
+            kv_cursor: reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(
+                self.engine.db(),
+                &self.repo_id,
+            )
+            .unwrap(),
             mapping_count,
             repo_sync_count,
         }
@@ -968,15 +1475,7 @@ async fn assert_pair_blocked_without_damage(fixture: &QualifiedPair, reason: &st
         before,
         "rejected pair changed protected state"
     );
-    let block: serde_json::Value = serde_json::from_str(
-        &fixture
-            .engine
-            .db()
-            .get_state(&format!("team_history_block_{}", fixture.repo_id))
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
+    let block = load_repo_history_block(fixture.engine.db(), &fixture.repo_id);
     assert_eq!(block["reason"], reason);
     assert_eq!(
         fixture
@@ -1305,15 +1804,7 @@ async fn run_candidate_r09_rewrite(metadata_only_amend: bool) {
         restarted.get_status().unwrap().state,
         SyncState::ReconciliationRequired
     );
-    let block: serde_json::Value = serde_json::from_str(
-        &fixture
-            .engine
-            .db()
-            .get_state(&format!("team_history_block_{}", fixture.repo_id))
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
+    let block = load_repo_history_block(fixture.engine.db(), &fixture.repo_id);
     assert_eq!(block["reason"], "non_fast_forward");
     assert_eq!(block["p_handled"], old_synced);
     assert_eq!(block["r_fresh_remote"], replacement);
@@ -1350,15 +1841,7 @@ fn unique_pair_id(label: &str) -> String {
 }
 
 fn history_block_json(fixture: &QualifiedPair) -> serde_json::Value {
-    serde_json::from_str(
-        &fixture
-            .engine
-            .db()
-            .get_state(&format!("team_history_block_{}", fixture.repo_id))
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap()
+    load_repo_history_block(fixture.engine.db(), &fixture.repo_id)
 }
 
 /// Named polling-only force-push: no webhook is delivered; inspection still
@@ -1763,7 +2246,7 @@ async fn candidate_r01_alternating_directional_cursors_survive_restart() {
         git_sha
     );
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(git_sha.clone())
     );
 
@@ -1789,7 +2272,7 @@ async fn candidate_r01_alternating_directional_cursors_survive_restart() {
         (svn_rev, emitted.clone())
     );
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(git_sha.clone())
     );
     let mapped: i64 = fixture.engine.db().conn().query_row(
@@ -1821,7 +2304,7 @@ async fn candidate_r01_alternating_directional_cursors_survive_restart() {
         further_git
     );
     assert_eq!(
-        restarted.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(restarted.db(), "pair"),
         Some(further_git.clone())
     );
     assert_eq!(
@@ -1837,7 +2320,7 @@ async fn candidate_r01_alternating_directional_cursors_survive_restart() {
         serde_json::json!({
             "case":"R01_ALTERNATING_DUAL_CURSOR", "git_handled":git_sha,
             "svn_emitted":emitted, "svn_revision":svn_rev,
-            "legacy_copy":fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+            "legacy_copy":inbound_git_sha_kv(fixture.engine.db(), "pair"),
             "restarted_noop":true, "further_git":further_git, "mapped":mapped
         })
     );
@@ -1878,7 +2361,7 @@ async fn candidate_r01_pending_both_directions_after_legacy_split() {
         emitted_sha
     );
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(handled.clone())
     );
 
@@ -1962,19 +2445,14 @@ async fn candidate_r10_legacy_stale_copy_requires_mapped_transition() {
         (revision, emitted.clone())
     );
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(handled.clone())
     );
     let before = fixture.snapshot().await;
     let repeat = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!((repeat.git_to_svn_count, repeat.svn_to_git_count), (0, 0));
     assert_eq!(fixture.snapshot().await, before);
-    fixture
-        .engine
-        .db()
-        .conn()
-        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
-        .unwrap();
+    clear_inbound_git_sha_kv(fixture.engine.db(), "pair");
     let missing_kv = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!(
         (missing_kv.git_to_svn_count, missing_kv.svn_to_git_count),
@@ -1984,10 +2462,7 @@ async fn candidate_r10_legacy_stale_copy_requires_mapped_transition() {
         fixture.engine.db().get_repo_watermark("pair").unwrap(),
         (revision, emitted.clone())
     );
-    assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
-        None
-    );
+    assert_eq!(inbound_git_sha_kv(fixture.engine.db(), "pair"), None);
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
@@ -2035,7 +2510,12 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         .map(|text| serde_json::from_str::<serde_json::Value>(text).unwrap())
         .expect("old generator did not report production import provenance");
     let original = old_root.join("install");
-    let candidate = tmp.path().join("candidate-install");
+    let installer_spec = std::env::var_os("REPOSYNC_INSTALL_UPDATE_SPEC");
+    let candidate = if installer_spec.is_some() {
+        tmp.path().join("installed-prefix/data")
+    } else {
+        tmp.path().join("candidate-install")
+    };
     let restored = tmp.path().join("restored-prewrite-install");
     copy_install_tree(&original, &candidate);
     copy_install_tree(&original, &restored);
@@ -2066,6 +2546,39 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         git_output(&bare, &["rev-parse", "refs/heads/main"]),
         old_tip
     );
+    // Opt-in installer qualification uses this SAME authentic old-state copy.
+    // A supplied bad specification fails; it never falls back to library-only proof.
+    let installer_receipt = installer_spec.as_ref().map(|spec| {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/test_install.py");
+        let output = Command::new("python3")
+            .arg(script)
+            .arg("--qualify-existing-update")
+            .arg("--root")
+            .arg(candidate.parent().unwrap())
+            .arg("--spec")
+            .arg(spec)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .expect("run the owned installer qualification fixture");
+        assert!(
+            output.status.success(),
+            "installed update qualification: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("complete installer qualification receipt");
+        assert_eq!(receipt["case"], "R12_PINNED_INSTALLER_UPDATE");
+        assert_eq!(receipt["old_source"], old_generation["generator_code"]);
+        let expected_head = std::env::var("REPOSYNC_INSTALL_UPDATE_HEAD")
+            .expect("installer qualification must bind the exact candidate head");
+        assert_eq!(receipt["candidate_source"], expected_head);
+        assert_eq!(receipt["installer_preserved_state_bytes_and_modes"], true);
+        assert_eq!(receipt["installed_cli_executed"], true);
+        assert_eq!(receipt["omitted_mode_full_import_revisions"], 2);
+        assert_eq!(receipt["full_import_repeat_noop"], true);
+        receipt
+    });
     let mut config = make_app_config(&svn_url, &candidate);
     config.svn.layout = reposync_core::config::SvnLayout::Custom;
     let db_path = candidate.join("reposync.db");
@@ -2329,6 +2842,11 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
             "repository_mapping_rows":mapped_rows,
         })
     );
+    // Publish the installer-tier receipt only after every retained engine,
+    // preservation, bidirectional and reconstructed-no-op assertion succeeds.
+    if let Some(receipt) = installer_receipt {
+        eprintln!("RELIABILITY_EVIDENCE {}", receipt);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2357,7 +2875,7 @@ async fn candidate_r01_empty_git_no_target_cursor_survives_svn_publication() {
         (old_svn_rev, empty_sha.clone())
     );
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(empty_sha.clone())
     );
     let receipt_key = format!("handled_git_no_target_pair_{empty_sha}");
@@ -2403,7 +2921,7 @@ async fn candidate_r01_empty_git_no_target_cursor_survives_svn_publication() {
         (svn_rev, emitted.clone())
     );
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(empty_sha.clone())
     );
     let before_remote = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
@@ -2504,10 +3022,7 @@ async fn candidate_r10_retention_preserves_missing_kv_pending_frontier() {
         fixture.engine.db().get_repo_watermark("pair").unwrap(),
         (verified, emitted.clone())
     );
-    assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
-        None
-    );
+    assert_eq!(inbound_git_sha_kv(fixture.engine.db(), "pair"), None);
     {
         let conn = fixture.engine.db().conn();
         let old_time = "2000-01-01 00:00:00";
@@ -2595,10 +3110,7 @@ async fn candidate_r10_prior_pruned_baseline_blocks_without_guessing() {
         fixture.engine.db().get_repo_watermark("pair").unwrap(),
         (verified, emitted.clone())
     );
-    assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
-        None
-    );
+    assert_eq!(inbound_git_sha_kv(fixture.engine.db(), "pair"), None);
     // Model an installation already pruned by the original maintenance code.
     // Candidate retention cannot recreate a lost authority from the next row.
     {
@@ -2625,10 +3137,7 @@ async fn candidate_r10_prior_pruned_baseline_blocks_without_guessing() {
         fixture.engine.db().get_repo_watermark("pair").unwrap(),
         (verified, emitted.clone())
     );
-    assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
-        None
-    );
+    assert_eq!(inbound_git_sha_kv(fixture.engine.db(), "pair"), None);
     assert_eq!(
         git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
         before_remote
@@ -2690,7 +3199,7 @@ async fn candidate_r10_retention_preserves_present_kv_applied_mapping() {
     );
     let emitted = get_head_sha(&fixture.bridge);
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(handled.clone())
     );
     assert_eq!(
@@ -2749,11 +3258,7 @@ async fn candidate_r10_unmapped_stale_copy_rejected() {
     let fixture = QualifiedPair::new().await;
     let before = fixture.snapshot().await;
     let false_cursor = "a".repeat(40);
-    fixture
-        .engine
-        .db()
-        .set_state("last_git_sha_pair", &false_cursor)
-        .unwrap();
+    set_inbound_git_sha_kv_only(fixture.engine.db(), "pair", &false_cursor);
     assert_pair_blocked_without_damage(&fixture, "ambiguous_checkpoint").await;
     assert_eq!(
         fixture.engine.db().get_repo_watermark("pair").unwrap(),
@@ -3546,11 +4051,7 @@ async fn candidate_r10_missing_repository_cursor_does_not_borrow_global() {
 async fn candidate_r10_ambiguous_repository_cursor_blocks() {
     let fixture = QualifiedPair::new().await;
     let other = git_output(&fixture.bridge, &["rev-parse", "HEAD^"]);
-    fixture
-        .engine
-        .db()
-        .set_state("last_git_sha_pair", &other)
-        .unwrap();
+    set_inbound_git_sha_kv_only(fixture.engine.db(), "pair", &other);
     assert_pair_blocked_without_damage(&fixture, "ambiguous_checkpoint").await;
 }
 
@@ -4341,6 +4842,88 @@ async fn candidate_r10_over_1000_pending_commits_batched() {
             "mapping_before":before.mapping_count,
             "mapping_after":after_third.mapping_count,
             "mapping_delta":7,
+            "continuation":true
+        })
+    );
+}
+
+/// 1001 linear commits drain through team `run_sync_cycle` at
+/// [`DEFAULT_PENDING_COMMIT_CAP`](reposync_core::pending_frontier::DEFAULT_PENDING_COMMIT_CAP)
+/// (1000). No `PendingCapGuard` is installed. The cap-3 test above does not
+/// cover this path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_over_1000_pending_commits_default_cap() {
+    assert_eq!(
+        reposync_core::pending_frontier::DEFAULT_PENDING_COMMIT_CAP,
+        1000,
+        "this replay is the default cap of 1000, not a test override"
+    );
+    let fixture = QualifiedPair::new().await;
+    let synced = fixture.developer_commit("feature.txt", "first version\n", "Handled Git baseline");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let before = fixture.snapshot().await;
+    let (tip, chain) = build_linear_commit_chain(&fixture, 1001);
+    assert_eq!(chain.len(), 1001);
+
+    let first = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        first.git_to_svn_count, 1000,
+        "first batch must replay the default cap, not a reduced override"
+    );
+    assert_eq!(first.git_pending_total, 1001);
+    assert!(
+        first.git_replay_has_more,
+        "1001 commits leave one commit pending"
+    );
+    let after_first = fixture.snapshot().await;
+    assert_eq!(after_first.watermark.1, chain[999]);
+    assert_eq!(after_first.bridge_sha, chain[999]);
+    assert_ne!(after_first.bridge_sha, tip);
+    assert_eq!(after_first.svn_rev, before.svn_rev + 1000);
+
+    let second = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        second.git_to_svn_count, 1,
+        "final batch drains the last commit"
+    );
+    assert!(!second.git_replay_has_more);
+    let after_second = fixture.snapshot().await;
+    assert_eq!(after_second.watermark.1, tip);
+    assert_eq!(after_second.bridge_sha, tip);
+    assert_eq!(after_second.svn_rev, before.svn_rev + 1001);
+    assert_eq!(
+        after_second.mapping_count,
+        before.mapping_count + 1001,
+        "each replayed Git commit must add a mapping"
+    );
+
+    let idle = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((idle.git_to_svn_count, idle.svn_to_git_count), (0, 0));
+    assert!(!idle.git_replay_has_more);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_DEFAULT_CAP_1001",
+            "p":synced,
+            "r":tip,
+            "batch_cap":1000,
+            "pending_total":1001,
+            "batches":[1000,1],
+            "cap_override":false,
+            "svn_revision_before_after":before.svn_rev,
+            "svn_revision_final":after_second.svn_rev,
+            "mapping_before":before.mapping_count,
+            "mapping_after":after_second.mapping_count,
+            "mapping_delta":1001,
             "continuation":true
         })
     );
@@ -5666,12 +6249,7 @@ async fn candidate_rs05_fetch_git_changes_global_watermark_fails_closed() {
         .db()
         .update_repo_watermark("pair", repo_rev, "")
         .unwrap();
-    fixture
-        .engine
-        .db()
-        .conn()
-        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
-        .unwrap();
+    clear_inbound_git_sha_kv(fixture.engine.db(), "pair");
     fixture
         .engine
         .db()
@@ -5733,7 +6311,7 @@ async fn candidate_rs05_fetch_git_changes_scoped_checkpoint_ignores_global() {
         "fetch_git_changes must replay from scoped checkpoint, not stale global"
     );
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(second.clone())
     );
     assert_eq!(
@@ -5839,13 +6417,7 @@ async fn candidate_rs05_fetch_git_changes_missing_scoped_one_repo_other_syncs() 
         })
         .unwrap();
     seed_svn_to_git_baseline(&shared_db, "blocked", blocked_svn_rev, &blocked_head);
-    shared_db
-        .conn()
-        .execute(
-            "DELETE FROM kv_state WHERE key = 'last_git_sha_blocked'",
-            [],
-        )
-        .unwrap();
+    clear_inbound_git_sha_kv(&shared_db, "blocked");
     shared_db
         .conn()
         .execute(
@@ -5884,7 +6456,7 @@ async fn candidate_rs05_fetch_git_changes_missing_scoped_one_repo_other_syncs() 
     let healthy_stats = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!(healthy_stats.git_to_svn_count, 1);
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(healthy_git.clone())
     );
 
@@ -5989,7 +6561,7 @@ async fn candidate_rs05_fetch_git_two_incremental_cycles_no_replay_skip() {
     let first_stats = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!(first_stats.git_to_svn_count, 1);
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(first.clone())
     );
 
@@ -5998,7 +6570,7 @@ async fn candidate_rs05_fetch_git_two_incremental_cycles_no_replay_skip() {
     let second_stats = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!(second_stats.git_to_svn_count, 1);
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(second.clone())
     );
 
@@ -6032,11 +6604,7 @@ async fn candidate_rs05_get_status_scoped_git_cursor_ignores_global() {
         .db()
         .set_state("last_git_hash", stale_global)
         .unwrap();
-    fixture
-        .engine
-        .db()
-        .set_state("last_git_sha_pair", &pair_sha)
-        .unwrap();
+    set_inbound_git_sha_kv_only(fixture.engine.db(), "pair", &pair_sha);
 
     let shared_db = Database::new(&fixture.db_path).unwrap();
     shared_db.initialize().unwrap();
@@ -6073,9 +6641,7 @@ async fn candidate_rs05_get_status_scoped_git_cursor_ignores_global() {
             teams_webhook_url: None,
         })
         .unwrap();
-    shared_db
-        .set_state("last_git_sha_other", other_sha)
-        .unwrap();
+    set_inbound_git_sha_kv_only(&shared_db, "other", other_sha);
 
     let status_pair = fixture.engine.get_status().unwrap();
     assert_eq!(
@@ -6099,11 +6665,7 @@ async fn candidate_rs05_get_status_scoped_git_cursor_ignores_global() {
         "other get_status must report its own scoped cursor"
     );
 
-    other_engine
-        .db()
-        .conn()
-        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_other'", [])
-        .unwrap();
+    clear_inbound_git_sha_kv(other_engine.db(), "other");
     other_engine
         .db()
         .conn()
@@ -6274,7 +6836,7 @@ async fn candidate_rs05_get_status_git_sha_after_git_then_svn_to_git() {
     let (_, table_sha) = fixture.engine.db().get_repo_watermark("pair").unwrap();
     assert_eq!(table_sha, emitted);
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(handled.clone()),
         "svn-to-git finalize must not collapse inbound scoped git cursor kv"
     );
@@ -6286,7 +6848,7 @@ async fn candidate_rs05_get_status_git_sha_after_git_then_svn_to_git() {
         "get_status must report repositories.last_git_sha after svn-to-git finalize"
     );
     assert_ne!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         status.last_git_hash,
         "get_status display must not advance inbound scoped git cursor kv"
     );
@@ -6305,7 +6867,7 @@ async fn candidate_rs05_get_status_git_sha_after_git_then_svn_to_git() {
         "pending Git must still replay after svn-to-git finalize"
     );
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(pending.clone())
     );
 
@@ -6342,7 +6904,7 @@ async fn candidate_rs05_advance_git_team_scoped_not_global() {
     let stats = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!(stats.git_to_svn_count, 1);
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(git_sha.clone())
     );
     assert_eq!(
@@ -6965,9 +7527,7 @@ async fn diagnostic_r06_late_pair_checkpoint_omits_existing_git_work() {
     child_db
         .set_state("last_svn_rev_child", &target_rev.to_string())
         .unwrap();
-    child_db
-        .set_state("last_git_sha_child", &feature_tip)
-        .unwrap();
+    set_inbound_git_sha_kv_only(&child_db, "child", &feature_tip);
     config.svn.url = target_url.clone();
     config.github.default_branch = "feature".into();
     let mut child_engine = SyncEngine::new(
@@ -7002,7 +7562,7 @@ async fn diagnostic_r06_late_pair_checkpoint_omits_existing_git_work() {
         .unwrap();
     assert_eq!(child_records, 0);
     assert_eq!(
-        child_engine.db().get_state("last_git_sha_child").unwrap(),
+        inbound_git_sha_kv(child_engine.db(), "child"),
         Some(feature_tip.clone())
     );
     let exported = tmp.path().join("feature_export");
@@ -7727,7 +8287,7 @@ async fn candidate_r10_policy_equal_cursor_filtered_commit_rejected() {
         filtered
     );
     assert_eq!(
-        pair.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(pair.engine.db(), "pair"),
         Some(filtered.clone())
     );
     let receipt_key = format!("handled_git_no_target_pair_{filtered}");
@@ -7750,9 +8310,23 @@ async fn candidate_r10_policy_equal_cursor_filtered_commit_rejected() {
     assert_eq!(pair.snapshot().await, before);
     drop(changed);
     let saved_receipt = pair.engine.db().get_state(&receipt_key).unwrap().unwrap();
+    let generation =
+        reposync_core::echo_receipt_scope::repo_echo_generation(pair.engine.db(), "pair").unwrap();
+    let scope = reposync_core::db::repo_scope_identity::repository_scope_uuid(
+        &pair.engine.db().conn(),
+        "pair",
+    )
+    .unwrap();
+    let scoped_receipt_key = reposync_core::echo_receipt_scope::handled_git_no_target_state_key(
+        &scope, generation, &filtered,
+    );
     pair.engine
         .db()
         .set_state(&receipt_key, "{malformed")
+        .unwrap();
+    pair.engine
+        .db()
+        .set_state(&scoped_receipt_key, "{malformed")
         .unwrap();
     assert!(matches!(pair.engine.run_sync_cycle().await,
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "unverified_no_target_receipt"));
@@ -7844,7 +8418,7 @@ async fn candidate_r10_policy_split_cursor_filtered_commit_rejected() {
         filtered
     );
     assert_eq!(
-        pair.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(pair.engine.db(), "pair"),
         Some(filtered.clone())
     );
     let before = pair.snapshot().await;
@@ -7907,7 +8481,7 @@ async fn candidate_r10_policy_kv_only_filtered_commit_rejected() {
         )
         .unwrap();
     assert_eq!(
-        pair.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(pair.engine.db(), "pair"),
         Some(filtered.clone())
     );
     let before = pair.snapshot().await;
@@ -9201,8 +9775,159 @@ async fn candidate_rsc03_success_stores_observed_not_intended_svn_tree() {
 // RS-C02 / #89: projected changeset before SVN WC mutation
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
+struct Rsc02WorkingCopyProbeState {
+    working_copy: Option<PathBuf>,
+    filtered: Vec<Option<std::process::Output>>,
+}
+
+/// Observe the real reused WC at the existing all-filtered event, while its
+/// TempDir is still alive. This never changes engine behavior or WC contents.
+#[derive(Clone, Default)]
+struct Rsc02WorkingCopyProbe(Arc<std::sync::Mutex<Rsc02WorkingCopyProbeState>>);
+
+#[derive(Default)]
+struct Rsc02EventFields {
+    message: String,
+    working_copy: Option<PathBuf>,
+}
+
+impl tracing::field::Visit for Rsc02EventFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "wc_path" => self.working_copy = Some(PathBuf::from(format!("{value:?}"))),
+            _ => {}
+        }
+    }
+}
+
+impl tracing::Subscriber for Rsc02WorkingCopyProbe {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = Rsc02EventFields::default();
+        event.record(&mut fields);
+        let mut state = self.0.lock().unwrap();
+        if fields
+            .message
+            .contains("checking out SVN HEAD into temp working copy")
+        {
+            state.working_copy = Some(
+                fields
+                    .working_copy
+                    .expect("checkout event must identify WC"),
+            );
+        }
+        if fields
+            .message
+            .contains("skipping entire commit: all files are outside the active projection")
+        {
+            let status = state.working_copy.as_ref().map(|wc| {
+                assert!(
+                    wc.join(".svn").is_dir(),
+                    "observe the actual initialized WC"
+                );
+                Command::new("svn")
+                    .args(["status", "--no-ignore", "--non-interactive", "--"])
+                    .arg(format!("{}@", wc.display()))
+                    .output()
+                    .expect("inspect the owned WC before filtered receipt")
+            });
+            state.filtered.push(status);
+        }
+    }
+}
+
+impl Rsc02WorkingCopyProbe {
+    fn assert_filtered_pristine(&self, initialized: bool) {
+        let state = self.0.lock().unwrap();
+        assert_eq!(
+            state.filtered.len(),
+            1,
+            "must observe the all-filtered boundary"
+        );
+        if initialized {
+            let status = state.filtered[0]
+                .as_ref()
+                .expect("reused WC must be observed");
+            assert!(
+                status.status.success(),
+                "{}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            assert!(
+                status.stderr.is_empty(),
+                "status warnings cannot prove a pristine WC"
+            );
+            assert!(
+                status.stdout.is_empty(),
+                "filtered WC has residue: {}",
+                String::from_utf8_lossy(&status.stdout)
+            );
+        } else {
+            assert!(state.working_copy.is_none());
+            assert!(
+                state.filtered[0].is_none(),
+                "all-filtered first commit must not initialize WC"
+            );
+        }
+    }
+}
+
+async fn assert_rsc02_revision(
+    pair: &QualifiedPair,
+    revision: i64,
+    expected_tree: &BTreeMap<String, Vec<u8>>,
+    expected_paths: &[(&str, &str)],
+) {
+    assert_eq!(
+        &svn_tree(pair, revision).await,
+        expected_tree,
+        "full SVN tree at r{revision}"
+    );
+    let output = Command::new("svnlook")
+        .args([
+            "changed",
+            "-r",
+            &revision.to_string(),
+            pair.svn_repo_root.strip_prefix("file://").unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut actual: Vec<_> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (action, path) = line.split_at(4);
+            (action.trim().to_string(), path.to_string())
+        })
+        .collect();
+    let mut expected: Vec<_> = expected_paths
+        .iter()
+        .map(|(a, p)| (a.to_string(), p.to_string()))
+        .collect();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected, "exact SVN changed paths at r{revision}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_rsc02_filtered_then_allowed_cycle_leaves_no_blocked_residue() {
+    use tracing::instrument::WithSubscriber;
     let mut pair = QualifiedPair::new().await;
     pair.developer_commit(
         "handled.txt",
@@ -9232,11 +9957,30 @@ async fn candidate_rsc02_filtered_then_allowed_cycle_leaves_no_blocked_residue()
         "Allowed commit after filtered",
     );
     git_cli(&pair.developer, &["push", "origin", "main"]);
+    let probe = Rsc02WorkingCopyProbe::default();
     assert_eq!(
-        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        pair.engine
+            .run_sync_cycle()
+            .with_subscriber(probe.clone())
+            .await
+            .unwrap()
+            .git_to_svn_count,
         2
     );
+    probe.assert_filtered_pristine(true);
     assert_eq!(svn_youngest(&pair.svn_url), svn_before + 2);
+    let mut after_prime = before_tree.clone();
+    after_prime.insert("public0.txt".into(), b"prime wc\n".to_vec());
+    assert_rsc02_revision(&pair, svn_before + 1, &after_prime, &[("A", "public0.txt")]).await;
+    let mut after_allowed = after_prime;
+    after_allowed.insert("public.txt".into(), b"allowed successor\n".to_vec());
+    assert_rsc02_revision(
+        &pair,
+        svn_before + 2,
+        &after_allowed,
+        &[("A", "public.txt")],
+    )
+    .await;
     let receipt_key = format!("handled_git_no_target_pair_{filtered}");
     let receipt: serde_json::Value =
         serde_json::from_str(&pair.engine.db().get_state(&receipt_key).unwrap().unwrap()).unwrap();
@@ -9280,8 +10024,266 @@ async fn candidate_rsc02_filtered_then_allowed_cycle_leaves_no_blocked_residue()
             "case":"RS_C02_FILTERED_THEN_ALLOWED",
             "primed":primed, "filtered":filtered, "allowed":allowed,
             "svn_rev_delta":2, "blocked_residue":false,
-            "journal_paths":journal_paths, "restart_quiet":true
+            "journal_paths":journal_paths, "restart_quiet":true,
+            "actual_filtered_wc_status_pristine":true,
+            "each_revision_full_tree_and_changed_paths_verified":true
         })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs89_rsc02_filtered_restart_allowed_preserves_receipt_and_tree() {
+    use tracing::instrument::WithSubscriber;
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit("handled.txt", "baseline\n", "Establish outbound baseline");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let blocked = vec!["secret/".to_string()];
+    pair.engine.set_path_rules(Vec::new(), blocked.clone());
+    let before_rev = svn_youngest(&pair.svn_repo_root);
+    let before_tree = svn_tree(&pair, before_rev).await;
+    let before_watermark = pair.engine.db().get_repo_watermark("pair").unwrap();
+    let before_mappings = git_to_svn_mappings(pair.engine.db(), "pair");
+    let filtered =
+        pair.developer_commit("secret/leak.txt", "excluded\n", "All-filtered first cycle");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let probe = Rsc02WorkingCopyProbe::default();
+    assert_eq!(
+        pair.engine
+            .run_sync_cycle()
+            .with_subscriber(probe.clone())
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        0
+    );
+    probe.assert_filtered_pristine(false);
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before_rev);
+    assert_eq!(svn_tree(&pair, before_rev).await, before_tree);
+    assert_eq!(
+        git_to_svn_mappings(pair.engine.db(), "pair"),
+        before_mappings
+    );
+    assert_eq!(
+        pair.engine.db().get_repo_watermark("pair").unwrap(),
+        (before_watermark.0, filtered.clone())
+    );
+    let key = format!("handled_git_no_target_pair_{filtered}");
+    let receipt = pair.engine.db().get_state(&key).unwrap().unwrap();
+    let decoded: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(decoded["outcome"], "filtered");
+    assert_eq!(decoded["git_sha"], filtered);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(decoded["projection"].as_str().unwrap()).unwrap(),
+        serde_json::json!({"allowed_paths":[],"blocked_patterns":blocked})
+    );
+    let mut restarted = reopen_pair(&pair);
+    restarted.set_path_rules(Vec::new(), blocked.clone());
+    assert_eq!(
+        restarted.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    assert_eq!(
+        restarted.db().get_state(&key).unwrap().as_deref(),
+        Some(receipt.as_str())
+    );
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before_rev);
+    assert_eq!(
+        git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+        filtered
+    );
+    let allowed = pair.developer_commit(
+        "public.txt",
+        "allowed after restart\n",
+        "Allowed second cycle",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        restarted.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let mut expected = before_tree;
+    expected.insert("public.txt".into(), b"allowed after restart\n".to_vec());
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before_rev + 1);
+    assert_rsc02_revision(&pair, before_rev + 1, &expected, &[("A", "public.txt")]).await;
+    assert_eq!(
+        restarted.db().get_repo_watermark("pair").unwrap().1,
+        allowed
+    );
+    assert_eq!(
+        git_to_svn_mappings(restarted.db(), "pair"),
+        before_mappings + 1
+    );
+    assert_eq!(
+        restarted.db().get_state(&key).unwrap().as_deref(),
+        Some(receipt.as_str())
+    );
+    let mut repeated = reopen_pair(&pair);
+    repeated.set_path_rules(Vec::new(), blocked);
+    let checkpoint = repeated.db().get_repo_watermark("pair").unwrap();
+    assert_eq!(repeated.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
+    assert_eq!(
+        repeated.db().get_repo_watermark("pair").unwrap(),
+        checkpoint
+    );
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before_rev + 1);
+    assert_eq!(svn_tree(&pair, before_rev + 1).await, expected);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"RS89_TWO_CYCLES_RESTART","filtered":filtered,"allowed":allowed,"no_wc_initialized_for_filtered":true,"filtered_receipt_unchanged":true,"svn_revision_delta":1,"full_tree_and_paths":true,"repeat_quiet":true})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs89_rsc02_mixed_lost_reply_reconciles_only_projected_paths() {
+    use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
+    let mut pair = QualifiedPair::new_with_repo_id("rs89-mixed-lost-reply").await;
+    pair.developer_commit_tree(
+        &[
+            ("team/base.txt", Some("base\n")),
+            ("team/retained.exe", Some("blocked suffix baseline\n")),
+            ("secret/keep.txt", Some("excluded baseline\n")),
+            ("team-other/keep.txt", Some("sibling baseline\n")),
+        ],
+        "Seed excluded files and directories",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let allowed = vec!["team".to_string()];
+    let blocked = vec!["*.exe".to_string()];
+    pair.engine.set_path_rules(allowed.clone(), blocked.clone());
+    let projection =
+        serde_json::json!({"allowed_paths":allowed,"blocked_patterns":blocked}).to_string();
+    let before_rev = svn_youngest(&pair.svn_repo_root);
+    let mut expected = svn_tree(&pair, before_rev).await;
+    let watermark = pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap();
+    let mappings = git_to_svn_mappings(pair.engine.db(), &pair.repo_id);
+    let mixed = pair.developer_commit_tree(
+        &[
+            ("team/allowed.txt", Some("published exactly once\n")),
+            ("team/retained.exe", Some("blocked replacement\n")),
+            ("secret/keep.txt", None),
+            ("team-other/keep.txt", Some("sibling replacement\n")),
+        ],
+        "Mixed projected commit with lost reply",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let fault = SvnCommitFaultGuard::set("REPOSYNC_SVN_COMMIT_LOST_REPLY", &pair.repo_id);
+    let result = pair.engine.run_sync_cycle().await;
+    drop(fault);
+    assert!(
+        matches!(&result, Err(SyncError::SvnCommitHeld{reason,..}) if reason=="lost_commit_reply"),
+        "{result:?}"
+    );
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before_rev + 1);
+    expected.insert(
+        "team/allowed.txt".into(),
+        b"published exactly once\n".to_vec(),
+    );
+    assert_rsc02_revision(
+        &pair,
+        before_rev + 1,
+        &expected,
+        &[("A", "team/allowed.txt")],
+    )
+    .await;
+    assert_eq!(
+        pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+        watermark
+    );
+    assert_eq!(
+        git_to_svn_mappings(pair.engine.db(), &pair.repo_id),
+        mappings
+    );
+    let op = pair
+        .engine
+        .db()
+        .active_svn_commit_operation(&pair.repo_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(op.state, SvnCommitOperationState::ReconciliationRequired);
+    assert_eq!(op.source_git_sha, mixed);
+    assert_eq!(op.projection, projection);
+    assert_eq!(
+        op.intended_changed_paths
+            .iter()
+            .map(|p| (p.action.as_str(), p.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("A", "team/allowed.txt")]
+    );
+    let mut restarted = reopen_pair(&pair);
+    restarted.set_path_rules(allowed.clone(), blocked.clone());
+    let svn = SvnClient::new(&pair.svn_url, "", "");
+    let reconciled = reposync_core::svn_commit::apply_svn_commit_reconciliation(
+        restarted.db(),
+        &pair.repo_id,
+        &op.id,
+        &svn,
+        &projection,
+    )
+    .await
+    .unwrap();
+    assert!(reconciled.finalized, "{reconciled:?}");
+    assert!(!reconciled.resume_authorized);
+    assert_eq!(
+        reconciled.operation.state,
+        SvnCommitOperationState::Completed
+    );
+    assert_eq!(
+        reconciled.operation.last_confirmed_svn_rev,
+        Some(before_rev + 1)
+    );
+    assert_eq!(
+        svn_youngest(&pair.svn_repo_root),
+        before_rev + 1,
+        "reconciliation must not publish again"
+    );
+    assert_eq!(
+        git_to_svn_mappings(restarted.db(), &pair.repo_id),
+        mappings + 1
+    );
+    assert_eq!(
+        restarted.db().get_repo_watermark(&pair.repo_id).unwrap().1,
+        mixed
+    );
+    assert!(restarted
+        .db()
+        .active_svn_commit_operation(&pair.repo_id)
+        .unwrap()
+        .is_none());
+    let again = reposync_core::svn_commit::apply_svn_commit_reconciliation(
+        restarted.db(),
+        &pair.repo_id,
+        &op.id,
+        &svn,
+        &projection,
+    )
+    .await
+    .unwrap();
+    assert!(again.finalized);
+    assert_eq!(
+        git_to_svn_mappings(restarted.db(), &pair.repo_id),
+        mappings + 1
+    );
+    let checkpoint = restarted.db().get_repo_watermark(&pair.repo_id).unwrap();
+    let mut repeated = reopen_pair(&pair);
+    repeated.set_path_rules(allowed, blocked);
+    assert_eq!(repeated.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
+    assert_eq!(
+        repeated.db().get_repo_watermark(&pair.repo_id).unwrap(),
+        checkpoint
+    );
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before_rev + 1);
+    assert_eq!(svn_tree(&pair, before_rev + 1).await, expected);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"RS89_FILTERED_LOST_REPLY","operation_id":op.id,"mixed":mixed,"journal_paths":["team/allowed.txt"],"excluded_files_and_dirs_preserved":true,"svn_revision_delta":1,"mapping_added_once":true,"repeat_quiet":true})
     );
 }
 
@@ -12658,17 +13660,14 @@ async fn candidate_echo_generation_stale_receipt_same_sha_split_inbound_checkpoi
 
     bump_repo_echo_generation(pair.engine.db(), "pair").unwrap();
 
-    pair.engine
-        .db()
-        .set_state("last_git_sha_pair", &handled)
-        .unwrap();
+    set_inbound_git_sha_kv_only(pair.engine.db(), "pair", &handled);
     let (_, table_tip) = pair.engine.db().get_repo_watermark("pair").unwrap();
     assert_eq!(
         table_tip, filtered,
         "emitted tip must stay at the handled filtered SHA"
     );
     assert_eq!(
-        pair.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(pair.engine.db(), "pair"),
         Some(handled.clone()),
         "inbound scoped checkpoint rewinds independently of repositories.last_git_sha"
     );
@@ -12920,10 +13919,7 @@ async fn candidate_echo_identity_reimport_bumps_stale_no_target_receipt() {
             status: SyncRecordStatus::Applied,
         })
         .unwrap();
-    pair.engine
-        .db()
-        .set_state(&format!("last_git_sha_{repo_id}"), &handled)
-        .unwrap();
+    set_repo_git_checkpoint_kv(pair.engine.db(), &repo_id, &handled);
     let svn_tip = svn_youngest(&pair.svn_url);
     pair.engine
         .db()
@@ -13208,13 +14204,9 @@ async fn candidate_echo_split_cursor_unproved_emitted_column_ambiguous_checkpoin
         echo_message.contains("[reposync]"),
         "SVN→Git bridge commit must carry the sync marker"
     );
-    fixture
-        .engine
-        .db()
-        .set_state("last_git_sha_pair", &handled)
-        .unwrap();
+    set_inbound_git_sha_kv_only(fixture.engine.db(), "pair", &handled);
     assert_eq!(
-        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        inbound_git_sha_kv(fixture.engine.db(), "pair"),
         Some(handled.clone())
     );
     {
@@ -13275,11 +14267,7 @@ async fn candidate_echo_legacy_unified_cursor_without_provenance_ambiguous_check
         "Unproven unified legacy cursor",
     );
     git_cli(&fixture.developer, &["push", "origin", "main"]);
-    fixture
-        .engine
-        .db()
-        .set_state("last_git_sha_pair", &forged)
-        .unwrap();
+    set_inbound_git_sha_kv_only(fixture.engine.db(), "pair", &forged);
     fixture
         .engine
         .db()
@@ -13432,12 +14420,7 @@ async fn candidate_echo_column_bootstrap_sync_cycle_bounded_no_db_mutex_hang() {
     }
 
     let fixture = QualifiedPair::new().await;
-    fixture
-        .engine
-        .db()
-        .conn()
-        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
-        .unwrap();
+    clear_inbound_git_sha_kv(fixture.engine.db(), "pair");
     let cycle = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         fixture.engine.run_sync_cycle(),
@@ -13476,12 +14459,7 @@ async fn candidate_echo_shape1_column_only_unproved_blocks_sync_cycle_bounded() 
         .unwrap();
     let unproved = fixture.developer_commit("shape1.txt", "n\n", "unproved tip");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
-    fixture
-        .engine
-        .db()
-        .conn()
-        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
-        .unwrap();
+    clear_inbound_git_sha_kv(fixture.engine.db(), "pair");
     fixture
         .engine
         .db()
@@ -13532,12 +14510,7 @@ async fn candidate_echo_unified_bogus_no_target_receipt_ambiguous_checkpoint() {
         pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
         1
     );
-    let handled = pair
-        .engine
-        .db()
-        .get_state("last_git_sha_pair")
-        .unwrap()
-        .unwrap();
+    let handled = inbound_git_sha_kv(pair.engine.db(), "pair").unwrap();
     let child = pair.developer_commit(
         "blocked.txt",
         "bogus probe\n",
@@ -13617,10 +14590,7 @@ async fn candidate_echo_unified_stale_filtered_receipt_after_bump_ambiguous_chec
         0
     );
     bump_repo_echo_generation(pair.engine.db(), "pair").unwrap();
-    pair.engine
-        .db()
-        .set_state("last_git_sha_pair", &filtered)
-        .unwrap();
+    set_inbound_git_sha_kv_only(pair.engine.db(), "pair", &filtered);
     pair.engine
         .db()
         .conn()
@@ -13901,7 +14871,250 @@ async fn candidate_rsc02_ambiguous_null_repo_id_surfaces_row_ids() {
                 detail.contains("id=legacy-null") && detail.contains("path=orphan.txt"),
                 "ambiguous NULL row must name id and path for operators, got {detail:?}"
             );
+            assert!(
+                detail.contains("unattributed legacy conflict row id(s)"),
+                "operator detail must use unattributed legacy row id(s) hint, got {detail:?}"
+            );
         }
         other => panic!("NULL row with ambiguous ownership must block, got {other:?}"),
     }
+}
+
+// #113 uses this existing #62 SVN-origin fixture and the production engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs113_engine_literal_names_rename_delete_repeat_preserve_exact_projection() {
+    let pair = QualifiedPair::new_with_repo_id("rs113-literal").await;
+    let names = [
+        "ordinary.txt",
+        "-dash",
+        "--username",
+        "x@HEAD",
+        " space 雪 ",
+        "xml&<name>",
+        "space name",
+        "nested/深@1",
+    ];
+    let changes: Vec<_> = names
+        .iter()
+        .map(|name| (*name, Some("literal payload\n")))
+        .collect();
+    let first = pair.developer_commit_tree(&changes, "#113 literal names");
+    git_cli(&pair.developer, &["push", "origin", "HEAD:main"]);
+    let before = svn_youngest(&pair.svn_repo_root);
+    let stats = pair.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.git_to_svn_count, 1);
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before + 1);
+    let svn = SvnClient::new(&pair.svn_url, "", "");
+    for name in names {
+        assert_eq!(
+            svn.cat(name, before + 1).await.unwrap(),
+            "literal payload\n",
+            "{name:?}"
+        );
+    }
+    assert_eq!(
+        pair.engine
+            .db()
+            .get_repo_watermark(&pair.repo_id)
+            .unwrap()
+            .1,
+        first
+    );
+    std::fs::create_dir_all(pair.developer.join("renamed")).unwrap();
+    git_cli(&pair.developer, &["mv", "--", "space name", "renamed/雪@9"]);
+    git_cli(&pair.developer, &["rm", "--", "-dash"]);
+    let second = pair.developer_commit_tree(&[], "#113 rename/delete");
+    git_cli(&pair.developer, &["push", "origin", "HEAD:main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let after = svn_youngest(&pair.svn_repo_root);
+    assert_eq!(after, before + 2);
+    assert_eq!(
+        svn.cat("renamed/雪@9", after).await.unwrap(),
+        "literal payload\n"
+    );
+    assert!(svn.cat("space name", after).await.is_err());
+    assert!(svn.cat("-dash", after).await.is_err());
+    let repeated = pair.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        (repeated.git_to_svn_count, repeated.svn_to_git_count),
+        (0, 0)
+    );
+    assert_eq!(svn_youngest(&pair.svn_repo_root), after);
+    // Outbound publication advances the Git cursor; the inbound SVN cursor
+    // deliberately remains at its last imported revision (existing contract).
+    assert_eq!(
+        pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+        (before, second.clone())
+    );
+    let mapped_revision: i64 = pair.engine.db().conn().query_row("SELECT svn_rev FROM sync_records WHERE repo_id=?1 AND git_sha=?2 AND direction='git_to_svn' AND status='applied'", rusqlite::params![&pair.repo_id, &second], |row| row.get(0)).unwrap();
+    assert_eq!(mapped_revision, after);
+    let mapped: i64 = pair.engine.db().conn().query_row("SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND git_sha=?2 AND direction='git_to_svn' AND status='applied'", rusqlite::params![&pair.repo_id, &second], |row| row.get(0)).unwrap();
+    assert_eq!(mapped, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs113_engine_unsupported_component_preserves_svn_and_applied_checkpoints() {
+    let pair = QualifiedPair::new_with_repo_id("rs113-refuse").await;
+    let checkpoint = pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap();
+    let before = svn_youngest(&pair.svn_repo_root);
+    let sha = pair.developer_commit_tree(
+        &[
+            ("ordinary.txt", Some("must not publish")),
+            ("bad:component", Some("refused")),
+        ],
+        "#113 unsupported component",
+    );
+    git_cli(&pair.developer, &["push", "origin", "HEAD:main"]);
+    let error = pair.engine.run_sync_cycle().await.unwrap_err().to_string();
+    assert!(
+        error.contains("confined repository-relative path"),
+        "{error}"
+    );
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before);
+    assert_eq!(
+        pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+        checkpoint
+    );
+    let applied: i64 = pair.engine.db().conn().query_row("SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND git_sha=?2 AND direction='git_to_svn' AND status='applied'", rusqlite::params![&pair.repo_id, &sha], |row| row.get(0)).unwrap();
+    assert_eq!(applied, 0);
+    assert!(SvnClient::new(&pair.svn_url, "", "")
+        .cat("ordinary.txt", before)
+        .await
+        .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs113_engine_encoded_branch_does_not_drop_changes_or_select_decoy() {
+    let pair =
+        QualifiedPair::new_with_svn_branch("rs113-encoded-branch", "branches/a%40b 雪#?").await;
+    let root = SvnClient::new(&pair.svn_repo_root, "", "");
+    root.create_branch(
+        "a@b 雪#?",
+        "branches/a%40b 雪#?",
+        "branches",
+        svn_youngest(&pair.svn_repo_root),
+    )
+    .await
+    .unwrap();
+    let decoy_url = branch_svn_url(&pair.svn_repo_root, "branches/a@b 雪#?");
+    let decoy_wc = pair.tmp.path().join("decoy");
+    SvnClient::new(&decoy_url, "", "")
+        .checkout_head(&decoy_wc)
+        .await
+        .unwrap();
+    let decoy_rev = svn_commit_file(
+        &decoy_wc,
+        "origin.txt",
+        "decoy must remain unchanged\n",
+        "different decoy history",
+    );
+    let inbound = svn_commit_file(
+        &pair.wc,
+        "origin.txt",
+        "literal branch inbound\n",
+        "intended literal branch history",
+    );
+    let stats = pair.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (1, 0));
+    assert_eq!(
+        std::fs::read_to_string(pair.bridge.join("origin.txt")).unwrap(),
+        "literal branch inbound\n"
+    );
+    let sha = get_head_sha(&pair.bridge);
+    let mapped: i64 = pair.engine.db().conn().query_row("SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND direction='svn_to_git' AND svn_rev=?2 AND git_sha=?3 AND status='applied'",rusqlite::params![&pair.repo_id,inbound,&sha],|r|r.get(0)).unwrap();
+    assert_eq!(mapped, 1);
+    assert_eq!(
+        pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+        (inbound, sha)
+    );
+    git_cli(&pair.developer, &["pull", "--ff-only"]);
+    let outgoing = pair.developer_commit(
+        "outbound.txt",
+        "only intended target\n",
+        "outbound literal target",
+    );
+    git_cli(&pair.developer, &["push", "origin", "HEAD:main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let newest = svn_youngest(&pair.svn_repo_root);
+    let intended = SvnClient::new(&pair.svn_url, "", "");
+    let decoy = SvnClient::new(&decoy_url, "", "");
+    assert_eq!(
+        intended.cat("outbound.txt", newest).await.unwrap(),
+        "only intended target\n"
+    );
+    assert_eq!(
+        decoy.cat("origin.txt", newest).await.unwrap(),
+        "decoy must remain unchanged\n"
+    );
+    assert!(decoy.cat("outbound.txt", newest).await.is_err());
+    assert_eq!(decoy.last_changed_revision().await.unwrap(), decoy_rev);
+    assert_eq!(
+        pair.engine
+            .db()
+            .get_repo_watermark(&pair.repo_id)
+            .unwrap()
+            .1,
+        outgoing
+    );
+    let repeat = pair.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+    assert_eq!(svn_youngest(&pair.svn_repo_root), newest);
+    let held_sha = pair.developer_commit(
+        "held.txt",
+        "reconcile exact target\n",
+        "lost reply on literal branch",
+    );
+    git_cli(&pair.developer, &["push", "origin", "HEAD:main"]);
+    let before_hold = pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap();
+    let fault = SvnCommitFaultGuard::set("REPOSYNC_SVN_COMMIT_LOST_REPLY", &pair.repo_id);
+    let held = pair.engine.run_sync_cycle().await;
+    drop(fault);
+    assert!(
+        matches!(held, Err(SyncError::SvnCommitHeld { .. })),
+        "{held:?}"
+    );
+    assert_eq!(
+        pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+        before_hold
+    );
+    let after_effect = svn_youngest(&pair.svn_repo_root);
+    assert_eq!(after_effect, newest + 1);
+    let repo = pair
+        .engine
+        .db()
+        .get_repository(&pair.repo_id)
+        .unwrap()
+        .unwrap();
+    let reconciled =
+        reposync_core::auto_reconcile::reconcile_held_external_writes_with_resolved_credentials(
+            pair.engine.db(),
+            &repo,
+            Some(&pair.bridge),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reconciled.attempts.len(), 1);
+    assert!(reconciled.attempts[0].finalized, "{reconciled:?}");
+    assert_eq!(
+        pair.engine
+            .db()
+            .get_repo_watermark(&pair.repo_id)
+            .unwrap()
+            .1,
+        held_sha
+    );
+    assert_eq!(
+        intended.cat("held.txt", after_effect).await.unwrap(),
+        "reconcile exact target\n"
+    );
+    assert!(decoy.cat("held.txt", after_effect).await.is_err());
+    let repeat = pair.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+    assert_eq!(svn_youngest(&pair.svn_repo_root), after_effect);
 }

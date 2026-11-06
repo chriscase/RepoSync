@@ -11,7 +11,7 @@ use super::style;
 pub fn run_log(config: &PersonalConfig, limit: u32) -> Result<()> {
     let data_dir = &config.personal.data_dir;
     let db_path = data_dir.join("personal.db");
-    let db = Database::new(&db_path).context("failed to open database")?;
+    let db = Database::open_existing_read_only(&db_path).context("failed to open database")?;
 
     let entries = db
         .list_audit_log(limit, 0)
