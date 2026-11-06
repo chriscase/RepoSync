@@ -114,12 +114,19 @@ pub(crate) fn verify_svn_no_target_receipt(
     svn_rev: i64,
     projection: &str,
     current_generation: i64,
+    expected_scope_uuid: Option<&str>,
 ) -> NoTargetReceiptVerdict {
     if record["repo_id"] != repo_id
         || record["svn_revision"].as_i64() != Some(svn_rev)
         || svn_rev <= 0
     {
         return NoTargetReceiptVerdict::RepoOrShaMismatch;
+    }
+    if let Some(expected) = expected_scope_uuid {
+        match record.get("scope_uuid").and_then(|value| value.as_str()) {
+            Some(found) if found == expected => {}
+            _ => return NoTargetReceiptVerdict::UnverifiedOutcome,
+        }
     }
     if record["projection"] != projection {
         return NoTargetReceiptVerdict::ProjectionMismatch;
@@ -351,12 +358,15 @@ fn verified_svn_no_target_receipt(
         return Ok(false);
     };
     let generation = repo_echo_generation(ctx.db, ctx.repo_id)?;
+    let scope =
+        crate::db::repo_scope_identity::repository_scope_uuid(&ctx.db.conn(), ctx.repo_id).ok();
     Ok(verify_svn_no_target_receipt(
         &record,
         ctx.repo_id,
         svn_rev,
         ctx.no_target_projection,
         generation,
+        scope.as_deref(),
     ) == NoTargetReceiptVerdict::Accepted)
 }
 
@@ -462,12 +472,15 @@ fn verified_svn_no_target_receipt_personal(
             continue;
         };
         let generation = repo_echo_generation(ctx.db, repo_id)?;
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&ctx.db.conn(), repo_id).ok();
         if verify_svn_no_target_receipt(
             &record,
             repo_id,
             svn_rev,
             ctx.no_target_projection,
             generation,
+            scope.as_deref(),
         ) == NoTargetReceiptVerdict::Accepted
         {
             return Ok(true);
@@ -1008,6 +1021,25 @@ mod tests {
         assert_eq!(
             classify_incoming_svn_revision(&ctx(&db, "repo-a"), weak_rev, "no marker").unwrap(),
             EchoDisposition::ApplyGenuine
+        );
+
+        let fieldless = serde_json::json!({
+            "version": 1,
+            "repo_id": "repo-a",
+            "svn_revision": svn_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        });
+        assert_eq!(
+            verify_svn_no_target_receipt(
+                &fieldless,
+                "repo-a",
+                svn_rev,
+                projection,
+                1,
+                Some(&scope_a)
+            ),
+            NoTargetReceiptVerdict::UnverifiedOutcome
         );
     }
 

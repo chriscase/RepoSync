@@ -671,8 +671,10 @@ mod tests {
         let receipt = crate::echo_receipt_scope::read_svn_no_target_receipt(&db, "pair", 2)
             .unwrap()
             .unwrap();
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), "pair").unwrap();
         assert_eq!(
-            verify_svn_no_target_receipt(&receipt, "pair", 2, "unfiltered", 1),
+            verify_svn_no_target_receipt(&receipt, "pair", 2, "unfiltered", 1, Some(&scope)),
             NoTargetReceiptVerdict::Accepted
         );
         let echo_ctx = TeamEchoContext {

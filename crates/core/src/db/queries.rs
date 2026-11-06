@@ -199,6 +199,15 @@ impl CredentialChainState {
     pub fn is_read_failure(&self) -> bool {
         self.origin == CredentialOrigin::ReadFailure
     }
+
+    /// True when a nonempty secret is selected. Revocation is never "set" via
+    /// a broader key. Read failure is not absence.
+    pub fn reports_as_set(&self) -> Result<bool, DatabaseError> {
+        if self.is_read_failure() {
+            return Err(DatabaseError::Other("credential chain read failed".into()));
+        }
+        Ok(!self.explicitly_revoked && self.value.as_deref().is_some_and(|v| !v.is_empty()))
+    }
 }
 
 /// A row from the `audit_log` table.
@@ -5002,6 +5011,25 @@ mod tests {
             db.resolve_credential_chain_state("root_b", "secret_git_token"),
             CredentialChainState::resolved("parent-b".into())
         );
+    }
+
+    #[test]
+    fn parent_svn_revocation_blocks_global_and_does_not_report_set() {
+        let db = setup_db();
+        let mut parent = create_test_repo(&db, "root_svn", "Root SVN");
+        parent.sync_mode = "team".into();
+        db.update_repository(&parent).unwrap();
+        let mut child = create_test_repo(&db, "child_svn", "Child SVN");
+        child.sync_mode = "team".into();
+        child.parent_id = Some("root_svn".into());
+        db.update_repository(&child).unwrap();
+        db.set_state("secret_svn_password", "canary-global")
+            .unwrap();
+        db.set_state("secret_svn_password_root_svn", "").unwrap();
+        let state = db.resolve_credential_chain_state("child_svn", "secret_svn_password");
+        assert_eq!(state, CredentialChainState::revoked());
+        assert_eq!(state.reports_as_set().unwrap(), false);
+        assert_eq!(state.value, None);
     }
 
     fn ack_failure(db: &Database, repo: Option<&str>, created: &str) -> i64 {
