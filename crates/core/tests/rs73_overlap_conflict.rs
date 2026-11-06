@@ -14,7 +14,11 @@
 //!    `shared.txt` (an `ApplyFailed`/other error is a test failure, never
 //!    conflict success), persist a `content` conflict row, and leave both
 //!    original histories/trees plus every directional checkpoint and mapping
-//!    unacknowledged. A retry must stay blocked and not mutate either side.
+//!    unacknowledged. A retry must be refused by the persisted-conflict gate
+//!    (`UnresolvableConflict` with the "persisted conflict row(s) block
+//!    apply" detail, same row id/scope/status) and not mutate either side.
+//!    The row is also re-read through a separate `Database` handle; no engine
+//!    or process restart is exercised.
 //!
 //! Known limit (remaining whole-#73 gate): on the unresolved-conflict path the
 //! engine returns `Err(UnresolvableConflict { detail: "N unresolved
@@ -600,6 +604,49 @@ impl Fixture {
     }
 }
 
+/// The database must hold exactly the first-cycle conflict row: same id,
+/// repository scope, path, type, status and metadata, still blocking apply.
+fn assert_single_blocking_row(
+    db: &Database,
+    first: &reposync_core::db::queries::ConflictEntry,
+    context: &str,
+) {
+    let all = db.list_conflicts(None, 10).unwrap();
+    assert_eq!(
+        all.len(),
+        1,
+        "{context}: exactly one conflict row, none added or removed: {all:?}"
+    );
+    let row = &all[0];
+    assert_eq!(row.id, first.id, "{context}: row id must be unchanged");
+    assert_eq!(
+        row.repo_id.as_deref(),
+        Some(REPO_ID),
+        "{context}: repository scope"
+    );
+    assert_eq!(row.repo_id, first.repo_id, "{context}: repository scope");
+    assert_eq!(row.file_path, first.file_path, "{context}: path");
+    assert_eq!(row.conflict_type, first.conflict_type, "{context}: type");
+    assert_eq!(row.status, "detected", "{context}: status");
+    assert_eq!(row.status, first.status, "{context}: status");
+    assert_eq!(row.resolution, first.resolution, "{context}: resolution");
+    assert_eq!(row.resolved_by, first.resolved_by, "{context}: resolved_by");
+    assert_eq!(row.resolved_at, first.resolved_at, "{context}: resolved_at");
+    assert_eq!(row.created_at, first.created_at, "{context}: created_at");
+    assert_eq!(row.svn_rev, first.svn_rev, "{context}: svn_rev");
+    assert_eq!(row.git_sha, first.git_sha, "{context}: git_sha");
+    assert_eq!(
+        db.count_conflicts_blocking_apply_for_repo(REPO_ID).unwrap(),
+        1,
+        "{context}: still exactly one blocking row"
+    );
+    assert_eq!(
+        db.first_conflict_blocking_apply_for_repo(REPO_ID).unwrap(),
+        Some((first.id.clone(), first.file_path.clone())),
+        "{context}: the gate's first blocking row must be the original row"
+    );
+}
+
 /// The bridge checkout is hard-reset by the engine to the admitted Git tip
 /// before conflict detection, so it may legitimately sit on the baseline or
 /// on the (unmodified, already-published) Git edit. It must never gain a new
@@ -720,6 +767,11 @@ async fn rs73_overlapping_shared_file_edits_surface_persisted_conflict_without_a
     assert_eq!(rows[0].file_path, "shared.txt");
     assert_eq!(rows[0].conflict_type, "content");
     assert_eq!(rows[0].status, "detected");
+    // Identity of the first-cycle row; retries and fresh handles must see
+    // this exact row (same id, scope, status), not a replacement.
+    let first_row = (*rows[0]).clone();
+    assert!(!first_row.id.is_empty());
+    assert_eq!(first_row.repo_id.as_deref(), Some(REPO_ID));
     assert_eq!(
         fx.engine
             .db()
@@ -779,18 +831,30 @@ async fn rs73_overlapping_shared_file_edits_surface_persisted_conflict_without_a
     assert_bridge_intact(&fx, &git_edit_sha);
     assert!(after.git_push_active.is_none() && after.svn_commit_active.is_none());
 
-    // Retry stays blocked, is idempotent and publishes nothing.
+    // Retry: the engine's persisted-conflict gate (the first apply gate in
+    // the sync cycle) must be what blocks it. Its wording differs from the
+    // first-cycle detection wording ("N persisted conflict row(s) block
+    // apply; ..." vs "N unresolved conflict(s) recorded; ..."). Any other
+    // error (AlreadyRunning, admission/database failure, history or hold
+    // errors) or success fails here.
     let retry = fx.engine.run_sync_cycle().await;
-    assert!(retry.is_err(), "retry must remain blocked, got {retry:?}");
-    let retry_rows = fx.engine.db().list_conflicts(None, 10).unwrap();
-    assert_eq!(
-        retry_rows
-            .iter()
-            .filter(|c| c.file_path == "shared.txt")
-            .count(),
-        1,
-        "conflict persistence must be idempotent across retries"
-    );
+    match &retry {
+        Err(SyncError::UnresolvableConflict { file_path, detail }) => {
+            assert_eq!(
+                file_path, "shared.txt",
+                "retry must name the first persisted blocking row's path"
+            );
+            assert_eq!(
+                detail,
+                "1 persisted conflict row(s) block apply; only resolved or dismissed rows allow SVN/Git mutation",
+                "retry must be blocked by the persisted gate with exactly one row and no unattributed legacy rows"
+            );
+        }
+        other => panic!(
+            "retry must fail with the persisted-conflict UnresolvableConflict gate, got {other:?}"
+        ),
+    }
+    assert_single_blocking_row(fx.engine.db(), &first_row, "after blocked retry");
     assert_eq!(
         fx.state(),
         before,
@@ -798,15 +862,12 @@ async fn rs73_overlapping_shared_file_edits_surface_persisted_conflict_without_a
     );
     assert_bridge_intact(&fx, &git_edit_sha);
 
-    // Durable across restart: a fresh DB handle still sees the blocking row.
+    // Persistence through a separate Database handle on the same SQLite
+    // file. This is NOT an engine/process restart: no SyncEngine is rebuilt
+    // or run against the reopened handle.
     let reopened = Database::new(&fx.db_path).unwrap();
     reopened.initialize().unwrap();
-    assert_eq!(
-        reopened
-            .count_conflicts_blocking_apply_for_repo(REPO_ID)
-            .unwrap(),
-        1
-    );
+    assert_single_blocking_row(&reopened, &first_row, "via separate Database handle");
     assert_eq!(
         reopened.get_repo_watermark(REPO_ID).unwrap(),
         (fx.baseline_svn_rev, fx.imported_base.clone())
