@@ -301,11 +301,105 @@ static MIGRATIONS: &[(u32, &str, &str)] = &[
         CREATE UNIQUE INDEX IF NOT EXISTS idx_repositories_scope_uuid ON repositories(scope_uuid);
         "#,
     ),
+    (
+        14,
+        "canonical lineage identity and typed directional checkpoints",
+        r#"
+        CREATE TABLE IF NOT EXISTS canonical_lineage (
+            scope_uuid TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            repo_id TEXT NOT NULL,
+            svn_uuid TEXT NOT NULL,
+            svn_root_url TEXT NOT NULL,
+            svn_url TEXT NOT NULL,
+            svn_branch_path TEXT NOT NULL,
+            incarnation_created_rev INTEGER NOT NULL,
+            copy_from_path TEXT,
+            copy_from_rev INTEGER,
+            git_baseline_sha TEXT,
+            git_ref TEXT,
+            projection_version TEXT NOT NULL DEFAULT '',
+            policy_hash TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (scope_uuid, generation),
+            CHECK (generation > 0),
+            CHECK (length(svn_uuid) > 0),
+            CHECK (incarnation_created_rev > 0),
+            CHECK (
+                (copy_from_path IS NULL AND copy_from_rev IS NULL)
+                OR (copy_from_path IS NOT NULL AND copy_from_rev IS NOT NULL AND copy_from_rev > 0)
+            )
+        );
+        CREATE TABLE IF NOT EXISTS canonical_checkpoints (
+            scope_uuid TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            direction TEXT NOT NULL CHECK (direction IN ('svn_to_git', 'git_to_svn')),
+            handled_source_key TEXT NOT NULL,
+            outcome TEXT NOT NULL CHECK (outcome IN (
+                'applied_and_verified',
+                'intentionally_filtered_no_target',
+                'pending',
+                'locally_published_not_remote',
+                'unknown_reconciliation_required'
+            )),
+            target_git_sha TEXT,
+            target_svn_rev INTEGER,
+            reason TEXT,
+            policy_snapshot TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (scope_uuid, generation, direction),
+            CHECK (length(handled_source_key) > 0),
+            CHECK (target_git_sha IS NULL OR length(target_git_sha) > 0),
+            CHECK (target_svn_rev IS NULL OR target_svn_rev > 0),
+            CHECK (
+                outcome NOT IN ('intentionally_filtered_no_target')
+                OR (target_git_sha IS NULL AND target_svn_rev IS NULL)
+            ),
+            CHECK (
+                outcome != 'applied_and_verified'
+                OR (
+                    (direction = 'svn_to_git' AND target_git_sha IS NOT NULL)
+                    OR (direction = 'git_to_svn' AND target_svn_rev IS NOT NULL)
+                )
+            )
+        );
+        CREATE TABLE IF NOT EXISTS canonical_mapping_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope_uuid TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            direction TEXT NOT NULL CHECK (direction IN ('svn_to_git', 'git_to_svn')),
+            source_key TEXT NOT NULL,
+            outcome TEXT NOT NULL CHECK (outcome IN (
+                'applied_and_verified',
+                'intentionally_filtered_no_target',
+                'pending',
+                'locally_published_not_remote',
+                'unknown_reconciliation_required'
+            )),
+            target_git_sha TEXT,
+            target_svn_rev INTEGER,
+            reason TEXT,
+            policy_snapshot TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE (scope_uuid, generation, direction, source_key),
+            CHECK (length(source_key) > 0),
+            CHECK (target_git_sha IS NULL OR length(target_git_sha) > 0),
+            CHECK (target_svn_rev IS NULL OR target_svn_rev > 0),
+            CHECK (
+                outcome NOT IN ('intentionally_filtered_no_target')
+                OR (target_git_sha IS NULL AND target_svn_rev IS NULL)
+            )
+        );
+        CREATE INDEX IF NOT EXISTS idx_canonical_mapping_outcomes_scope
+            ON canonical_mapping_outcomes (scope_uuid, generation, direction);
+        "#,
+    ),
 ];
 
-/// Operational schema version for ordinary startup. Candidate v14+ SQL is
-/// not registered here and must not be applied by [`run_migrations`].
-pub const CURRENT_SCHEMA_VERSION: u32 = 13;
+/// Operational schema version for ordinary startup. Candidate CopySession
+/// `pair_lineages` / `pair_frontiers` / `pair_outcomes` SQL is not registered
+/// here and must not be applied by [`run_migrations`].
+pub const CURRENT_SCHEMA_VERSION: u32 = 14;
 
 /// Bootstrap verified empty storage inside the startup owner's transaction.
 pub(crate) fn initialize_empty_startup_in_transaction(
@@ -359,8 +453,8 @@ pub fn run_migrations_up_to(conn: &Connection, target_version: u32) -> Result<()
             continue;
         }
         if version > current_version {
-            if version == 13 && defer_v13_migration_until_engine(conn)? {
-                continue;
+            if version >= 13 && defer_v13_migration_until_engine(conn)? {
+                break;
             }
             apply_one_migration(conn, version, description, sql)?;
         }
@@ -429,9 +523,10 @@ fn repositories_table_has_scope_uuid_column(conn: &Connection) -> Result<bool, D
     Ok(exists)
 }
 
-/// Apply the v13 repository-scope migration when startup deferred it for a legacy install.
+/// Apply deferred v13 scope identity and any later operational migrations
+/// (currently v14 canonical lineage) when startup deferred them for a legacy install.
 pub fn ensure_v13_migration(conn: &Connection) -> Result<(), DatabaseError> {
-    if get_schema_version(conn)? >= 13 {
+    if get_schema_version(conn)? >= CURRENT_SCHEMA_VERSION {
         return Ok(());
     }
     super::pair_refresh_operations::require_no_pair_refresh_hold(conn, None)?;
@@ -441,16 +536,18 @@ pub fn ensure_v13_migration(conn: &Connection) -> Result<(), DatabaseError> {
             detail: "database must reach schema version 12 before v13 upgrade".into(),
         });
     }
-    let migration = MIGRATIONS
-        .iter()
-        .find(|(version, _, _)| *version == 13)
-        .expect("v13 migration must be registered");
-    let (version, description, sql) = migration;
-    if conn.is_autocommit() {
-        apply_one_migration(conn, *version, description, sql)
-    } else {
-        apply_migration_body(conn, *version, sql)
+    let in_tx = !conn.is_autocommit();
+    for &(version, description, sql) in MIGRATIONS {
+        if version <= get_schema_version(conn)? || version > CURRENT_SCHEMA_VERSION {
+            continue;
+        }
+        if in_tx {
+            apply_migration_body(conn, version, sql)?;
+        } else {
+            apply_one_migration(conn, version, description, sql)?;
+        }
     }
+    Ok(())
 }
 
 /// Refuse a schema written by a newer executable.
@@ -488,7 +585,7 @@ fn apply_one_migration(
 }
 
 fn apply_migration_body(conn: &Connection, version: u32, sql: &str) -> Result<(), DatabaseError> {
-    if version == 13 {
+    if version >= 13 {
         super::pair_refresh_operations::require_no_pair_refresh_hold(conn, None)?;
     }
     conn.execute_batch(sql)
@@ -625,5 +722,16 @@ mod tests {
         assert!(tables.contains(&"pr_sync_log".to_string()));
         assert!(tables.contains(&"import_progress".to_string()));
         assert!(tables.contains(&"repositories".to_string()));
+        assert!(tables.contains(&"canonical_lineage".to_string()));
+        assert!(tables.contains(&"canonical_checkpoints".to_string()));
+        assert!(tables.contains(&"canonical_mapping_outcomes".to_string()));
+        let candidate_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'pair_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(candidate_tables, 0);
     }
 }

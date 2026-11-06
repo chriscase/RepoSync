@@ -1,0 +1,944 @@
+//! Operational canonical lineage identity and typed directional checkpoints (#63).
+//!
+//! These tables are independent of the fixture-only candidate `pair_lineages`
+//! / `pair_frontiers` / `pair_outcomes` registry. `commit_map.git_sha` stays
+//! NOT NULL so this story does not compete with #54's nullable rebuild.
+
+use chrono::Utc;
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+
+use super::repo_scope_identity::repository_scope_uuid;
+use super::Database;
+use crate::echo_receipt_scope::repo_echo_generation_tx;
+use crate::errors::{DatabaseError, SvnError, SyncError};
+use crate::pair_refresh::PAIR_GENERATION;
+use crate::path_projection::svn_path_identity;
+use crate::svn::{SvnClient, SvnInfo, SvnLogEntry};
+
+/// Typed mapping / checkpoint outcome. NULL SHA, empty string, and a missing
+/// row are never aliases of one another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MappingOutcome {
+    AppliedAndVerified,
+    IntentionallyFilteredNoTarget,
+    Pending,
+    LocallyPublishedNotRemote,
+    UnknownReconciliationRequired,
+}
+
+impl MappingOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AppliedAndVerified => "applied_and_verified",
+            Self::IntentionallyFilteredNoTarget => "intentionally_filtered_no_target",
+            Self::Pending => "pending",
+            Self::LocallyPublishedNotRemote => "locally_published_not_remote",
+            Self::UnknownReconciliationRequired => "unknown_reconciliation_required",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, DatabaseError> {
+        match value {
+            "applied_and_verified" => Ok(Self::AppliedAndVerified),
+            "intentionally_filtered_no_target" => Ok(Self::IntentionallyFilteredNoTarget),
+            "pending" => Ok(Self::Pending),
+            "locally_published_not_remote" => Ok(Self::LocallyPublishedNotRemote),
+            "unknown_reconciliation_required" => Ok(Self::UnknownReconciliationRequired),
+            other => Err(DatabaseError::Other(format!(
+                "unknown canonical mapping outcome {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointDirection {
+    SvnToGit,
+    GitToSvn,
+}
+
+impl CheckpointDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SvnToGit => "svn_to_git",
+            Self::GitToSvn => "git_to_svn",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, DatabaseError> {
+        match value {
+            "svn_to_git" => Ok(Self::SvnToGit),
+            "git_to_svn" => Ok(Self::GitToSvn),
+            other => Err(DatabaseError::Other(format!(
+                "unknown canonical checkpoint direction {other}"
+            ))),
+        }
+    }
+}
+
+/// Verified SVN identity for one `(scope_uuid, generation)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalLineage {
+    pub scope_uuid: String,
+    pub generation: i64,
+    pub repo_id: String,
+    pub svn_uuid: String,
+    pub svn_root_url: String,
+    pub svn_url: String,
+    pub svn_branch_path: String,
+    pub incarnation_created_rev: i64,
+    pub copy_from_path: Option<String>,
+    pub copy_from_rev: Option<i64>,
+    pub git_baseline_sha: Option<String>,
+    pub git_ref: Option<String>,
+    pub projection_version: String,
+    pub policy_hash: String,
+}
+
+/// One authoritative directional checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalCheckpoint {
+    pub scope_uuid: String,
+    pub generation: i64,
+    pub direction: CheckpointDirection,
+    pub handled_source_key: String,
+    pub outcome: MappingOutcome,
+    pub target_git_sha: Option<String>,
+    pub target_svn_rev: Option<i64>,
+    pub reason: Option<String>,
+    pub policy_snapshot: Option<String>,
+}
+
+/// Bundled mapping/checkpoint write so helpers stay under clippy's arity limit.
+#[derive(Debug, Clone, Copy)]
+pub struct MappingWrite<'a> {
+    pub direction: CheckpointDirection,
+    pub source_key: &'a str,
+    pub outcome: MappingOutcome,
+    pub target_git_sha: Option<&'a str>,
+    pub target_svn_rev: Option<i64>,
+    pub reason: Option<&'a str>,
+    pub policy_snapshot: Option<&'a str>,
+}
+
+/// Loaded typed mapping without overloading NULL / empty / missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedMapping {
+    pub outcome: MappingOutcome,
+    pub target_git_sha: Option<String>,
+    pub target_svn_rev: Option<i64>,
+}
+
+/// Observed live SVN UUID / URL / path incarnation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveSvnIdentity {
+    pub uuid: String,
+    pub root_url: String,
+    pub url: String,
+    pub branch_path: String,
+    pub incarnation_created_rev: i64,
+    pub copy_from_path: Option<String>,
+    pub copy_from_rev: Option<i64>,
+}
+
+pub fn svn_source_key(revision: i64) -> String {
+    format!("svn:{revision}")
+}
+
+pub fn git_source_key(sha: &str) -> String {
+    format!("git:{sha}")
+}
+
+fn tables_ready(conn: &Connection) -> Result<bool, DatabaseError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='canonical_lineage')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+fn scope_and_generation(conn: &Connection, repo_id: &str) -> Result<(String, i64), DatabaseError> {
+    let scope = repository_scope_uuid(conn, repo_id)?;
+    let generation = repo_echo_generation_tx(conn, repo_id).unwrap_or(PAIR_GENERATION);
+    Ok((scope, generation))
+}
+
+/// Persist a proven lineage identity. Existing rows are immutable: a different
+/// live identity is reconciliation, never a silent overwrite.
+pub fn pin_canonical_lineage(
+    conn: &Connection,
+    lineage: &CanonicalLineage,
+) -> Result<(), DatabaseError> {
+    if !tables_ready(conn)? {
+        return Err(DatabaseError::Other(
+            "canonical lineage tables are not present".into(),
+        ));
+    }
+    if let Some(existing) =
+        load_canonical_lineage_tx(conn, &lineage.scope_uuid, lineage.generation)?
+    {
+        if existing.svn_uuid != lineage.svn_uuid
+            || existing.svn_root_url != lineage.svn_root_url
+            || existing.svn_url != lineage.svn_url
+            || existing.svn_branch_path != lineage.svn_branch_path
+            || existing.incarnation_created_rev != lineage.incarnation_created_rev
+            || existing.copy_from_path != lineage.copy_from_path
+            || existing.copy_from_rev != lineage.copy_from_rev
+        {
+            return Err(DatabaseError::Other(
+                "canonical lineage identity changed; reconciliation required".into(),
+            ));
+        }
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO canonical_lineage (
+            scope_uuid, generation, repo_id, svn_uuid, svn_root_url, svn_url,
+            svn_branch_path, incarnation_created_rev, copy_from_path, copy_from_rev,
+            git_baseline_sha, git_ref, projection_version, policy_hash, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            lineage.scope_uuid,
+            lineage.generation,
+            lineage.repo_id,
+            lineage.svn_uuid,
+            lineage.svn_root_url,
+            lineage.svn_url,
+            lineage.svn_branch_path,
+            lineage.incarnation_created_rev,
+            lineage.copy_from_path,
+            lineage.copy_from_rev,
+            lineage.git_baseline_sha,
+            lineage.git_ref,
+            lineage.projection_version,
+            lineage.policy_hash,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn load_canonical_lineage_tx(
+    conn: &Connection,
+    scope_uuid: &str,
+    generation: i64,
+) -> Result<Option<CanonicalLineage>, DatabaseError> {
+    if !tables_ready(conn)? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT scope_uuid, generation, repo_id, svn_uuid, svn_root_url, svn_url,
+                svn_branch_path, incarnation_created_rev, copy_from_path, copy_from_rev,
+                git_baseline_sha, git_ref, projection_version, policy_hash
+         FROM canonical_lineage WHERE scope_uuid = ?1 AND generation = ?2",
+        params![scope_uuid, generation],
+        |row| {
+            Ok(CanonicalLineage {
+                scope_uuid: row.get(0)?,
+                generation: row.get(1)?,
+                repo_id: row.get(2)?,
+                svn_uuid: row.get(3)?,
+                svn_root_url: row.get(4)?,
+                svn_url: row.get(5)?,
+                svn_branch_path: row.get(6)?,
+                incarnation_created_rev: row.get(7)?,
+                copy_from_path: row.get(8)?,
+                copy_from_rev: row.get(9)?,
+                git_baseline_sha: row.get(10)?,
+                git_ref: row.get(11)?,
+                projection_version: row.get(12)?,
+                policy_hash: row.get(13)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(DatabaseError::from)
+}
+
+pub fn load_canonical_lineage(
+    db: &Database,
+    repo_id: &str,
+) -> Result<Option<CanonicalLineage>, DatabaseError> {
+    let conn = db.conn();
+    let (scope, generation) = match scope_and_generation(&conn, repo_id) {
+        Ok(pair) => pair,
+        Err(DatabaseError::NotFound { .. }) => return Ok(None),
+        Err(other) => return Err(other),
+    };
+    load_canonical_lineage_tx(&conn, &scope, generation)
+}
+
+/// Record a typed mapping outcome. Empty-string targets are refused so they
+/// cannot stand in for NULL (no-target) or a missing row (pending).
+pub fn record_mapping_outcome(
+    conn: &Connection,
+    scope_uuid: &str,
+    generation: i64,
+    write: MappingWrite<'_>,
+) -> Result<(), DatabaseError> {
+    if !tables_ready(conn)? {
+        return Err(DatabaseError::Other(
+            "canonical mapping outcome tables are not present".into(),
+        ));
+    }
+    if write.source_key.is_empty() {
+        return Err(DatabaseError::Other(
+            "canonical mapping source_key must not be empty".into(),
+        ));
+    }
+    if write.target_git_sha.is_some_and(str::is_empty) {
+        return Err(DatabaseError::Other(
+            "canonical mapping must not store an empty-string Git SHA".into(),
+        ));
+    }
+    if matches!(write.outcome, MappingOutcome::IntentionallyFilteredNoTarget)
+        && (write.target_git_sha.is_some() || write.target_svn_rev.is_some())
+    {
+        return Err(DatabaseError::Other(
+            "filtered/no-target outcomes must not store a target".into(),
+        ));
+    }
+    if matches!(write.outcome, MappingOutcome::AppliedAndVerified) {
+        let ok = match write.direction {
+            CheckpointDirection::SvnToGit => write.target_git_sha.is_some(),
+            CheckpointDirection::GitToSvn => write.target_svn_rev.is_some(),
+        };
+        if !ok {
+            return Err(DatabaseError::Other(
+                "applied outcomes require the opposite-direction target".into(),
+            ));
+        }
+    }
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO canonical_mapping_outcomes (
+            scope_uuid, generation, direction, source_key, outcome,
+            target_git_sha, target_svn_rev, reason, policy_snapshot, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(scope_uuid, generation, direction, source_key) DO UPDATE SET
+            outcome = excluded.outcome,
+            target_git_sha = excluded.target_git_sha,
+            target_svn_rev = excluded.target_svn_rev,
+            reason = excluded.reason,
+            policy_snapshot = excluded.policy_snapshot",
+        params![
+            scope_uuid,
+            generation,
+            write.direction.as_str(),
+            write.source_key,
+            write.outcome.as_str(),
+            write.target_git_sha,
+            write.target_svn_rev,
+            write.reason,
+            write.policy_snapshot,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn load_mapping_outcome(
+    conn: &Connection,
+    scope_uuid: &str,
+    generation: i64,
+    direction: CheckpointDirection,
+    source_key: &str,
+) -> Result<Option<LoadedMapping>, DatabaseError> {
+    if !tables_ready(conn)? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT outcome, target_git_sha, target_svn_rev
+         FROM canonical_mapping_outcomes
+         WHERE scope_uuid = ?1 AND generation = ?2 AND direction = ?3 AND source_key = ?4",
+        params![scope_uuid, generation, direction.as_str(), source_key],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        },
+    )
+    .optional()?
+    .map(|(outcome, sha, rev)| {
+        Ok(LoadedMapping {
+            outcome: MappingOutcome::parse(&outcome)?,
+            target_git_sha: sha,
+            target_svn_rev: rev,
+        })
+    })
+    .transpose()
+}
+
+/// Persist a typed checkpoint when canonical tables and a managed
+/// `scope_uuid` exist. Deferred v12 and personal-scope-only databases skip.
+pub(crate) fn try_persist_directional_checkpoint_tx(
+    conn: &Connection,
+    repo_id: &str,
+    write: MappingWrite<'_>,
+) -> Result<(), DatabaseError> {
+    if !tables_ready(conn)? {
+        return Ok(());
+    }
+    let (scope, generation) = match scope_and_generation(conn, repo_id) {
+        Ok(pair) => pair,
+        Err(DatabaseError::NotFound { .. }) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    persist_directional_checkpoint_tx(conn, &scope, generation, write)
+}
+
+/// Write the directional checkpoint in the same SQLite transaction as the
+/// resolved mapping outcome. Cross-repository I/O is not claimed atomic.
+pub fn persist_directional_checkpoint_tx(
+    conn: &Connection,
+    scope_uuid: &str,
+    generation: i64,
+    write: MappingWrite<'_>,
+) -> Result<(), DatabaseError> {
+    record_mapping_outcome(conn, scope_uuid, generation, write)?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO canonical_checkpoints (
+            scope_uuid, generation, direction, handled_source_key, outcome,
+            target_git_sha, target_svn_rev, reason, policy_snapshot, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(scope_uuid, generation, direction) DO UPDATE SET
+            handled_source_key = excluded.handled_source_key,
+            outcome = excluded.outcome,
+            target_git_sha = excluded.target_git_sha,
+            target_svn_rev = excluded.target_svn_rev,
+            reason = excluded.reason,
+            policy_snapshot = excluded.policy_snapshot,
+            updated_at = excluded.updated_at",
+        params![
+            scope_uuid,
+            generation,
+            write.direction.as_str(),
+            write.source_key,
+            write.outcome.as_str(),
+            write.target_git_sha,
+            write.target_svn_rev,
+            write.reason,
+            write.policy_snapshot,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn load_directional_checkpoint(
+    conn: &Connection,
+    scope_uuid: &str,
+    generation: i64,
+    direction: CheckpointDirection,
+) -> Result<Option<CanonicalCheckpoint>, DatabaseError> {
+    if !tables_ready(conn)? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT scope_uuid, generation, direction, handled_source_key, outcome,
+                target_git_sha, target_svn_rev, reason, policy_snapshot
+         FROM canonical_checkpoints
+         WHERE scope_uuid = ?1 AND generation = ?2 AND direction = ?3",
+        params![scope_uuid, generation, direction.as_str()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        },
+    )
+    .optional()?
+    .map(
+        |(scope, generation, direction, key, outcome, sha, rev, reason, policy)| {
+            Ok(CanonicalCheckpoint {
+                scope_uuid: scope,
+                generation,
+                direction: CheckpointDirection::parse(&direction)?,
+                handled_source_key: key,
+                outcome: MappingOutcome::parse(&outcome)?,
+                target_git_sha: sha,
+                target_svn_rev: rev,
+                reason,
+                policy_snapshot: policy,
+            })
+        },
+    )
+    .transpose()
+}
+
+/// Classify a source without overloading NULL / empty / missing.
+pub fn classify_mapping_outcome(
+    conn: &Connection,
+    scope_uuid: &str,
+    generation: i64,
+    direction: CheckpointDirection,
+    source_key: &str,
+) -> Result<MappingOutcome, DatabaseError> {
+    if let Some(loaded) = load_mapping_outcome(conn, scope_uuid, generation, direction, source_key)?
+    {
+        return Ok(loaded.outcome);
+    }
+    Ok(MappingOutcome::Pending)
+}
+
+fn incarnation_from_history(
+    history: &[SvnLogEntry],
+    branch_path: &str,
+) -> (i64, Option<String>, Option<i64>) {
+    let oldest = history.last();
+    let created = oldest
+        .map(|entry| entry.revision)
+        .filter(|rev| *rev > 0)
+        .unwrap_or(1);
+    let wanted = if branch_path.is_empty() {
+        None
+    } else {
+        Some(format!("/{branch_path}"))
+    };
+    if let Some(entry) = oldest {
+        for change in &entry.changed_paths {
+            let matches_path = wanted
+                .as_deref()
+                .is_none_or(|path| change.path == path || change.path == *branch_path);
+            if matches_path && change.copy_from_path.is_some() && change.copy_from_rev.is_some() {
+                return (
+                    entry.revision.max(1),
+                    change.copy_from_path.clone(),
+                    change.copy_from_rev,
+                );
+            }
+        }
+    }
+    (created, None, None)
+}
+
+pub async fn observe_live_svn_identity(
+    svn: &SvnClient,
+    info: &SvnInfo,
+) -> Result<LiveSvnIdentity, SvnError> {
+    if info.uuid.trim().is_empty() {
+        return Err(SvnError::LineageRefused {
+            reason: "svn_uuid_missing".into(),
+            detail: "live SVN info did not report a repository UUID".into(),
+        });
+    }
+    let identity = svn_path_identity(&info.root_url, &info.url)?;
+    let peg = info.latest_rev.max(1);
+    let history = svn.copy_history_at_rev(peg).await?;
+    if history.is_empty() {
+        return Err(SvnError::LineageRefused {
+            reason: "svn_incarnation_unproved".into(),
+            detail: "stop-on-copy history is empty; refusing to guess path incarnation".into(),
+        });
+    }
+    let (created, copy_from_path, copy_from_rev) =
+        incarnation_from_history(&history, &identity.branch_path);
+    Ok(LiveSvnIdentity {
+        uuid: info.uuid.clone(),
+        root_url: identity.root_url,
+        url: info.url.trim_end_matches('/').to_string(),
+        branch_path: identity.branch_path,
+        incarnation_created_rev: created,
+        copy_from_path,
+        copy_from_rev,
+    })
+}
+
+fn identities_match(stored: &CanonicalLineage, live: &LiveSvnIdentity) -> bool {
+    stored.svn_uuid == live.uuid
+        && stored.svn_root_url == live.root_url
+        && stored.svn_url == live.url
+        && stored.svn_branch_path == live.branch_path
+        && stored.incarnation_created_rev == live.incarnation_created_rev
+        && stored.copy_from_path == live.copy_from_path
+        && stored.copy_from_rev == live.copy_from_rev
+}
+
+fn blocked(reason: &str, detail: impl Into<String>) -> SyncError {
+    SyncError::HistoryBlocked {
+        reason: reason.into(),
+        detail: detail.into(),
+    }
+}
+
+/// Compare live SVN UUID/path incarnation with the pinned lineage. A first
+/// verified observation pins identity; a later mismatch holds only this pair.
+pub async fn verify_or_pin_live_svn_identity(
+    db: &Database,
+    repo_id: &str,
+    svn: &SvnClient,
+    info: &SvnInfo,
+) -> Result<(), SyncError> {
+    let live = observe_live_svn_identity(svn, info)
+        .await
+        .map_err(SyncError::SvnError)?;
+    let conn = db.conn();
+    if !tables_ready(&conn).map_err(SyncError::DatabaseError)? {
+        return Ok(());
+    }
+    let (scope, generation) = match scope_and_generation(&conn, repo_id) {
+        Ok(pair) => pair,
+        Err(DatabaseError::NotFound { .. }) => return Ok(()),
+        Err(error) => return Err(SyncError::DatabaseError(error)),
+    };
+    if let Some(stored) =
+        load_canonical_lineage_tx(&conn, &scope, generation).map_err(SyncError::DatabaseError)?
+    {
+        if identities_match(&stored, &live) {
+            return Ok(());
+        }
+        let detail = format!(
+            "live SVN uuid={} url={} created_rev={} copy_from={:?}@{:?} does not match pinned uuid={} url={} created_rev={} copy_from={:?}@{:?}",
+            live.uuid,
+            live.url,
+            live.incarnation_created_rev,
+            live.copy_from_path,
+            live.copy_from_rev,
+            stored.svn_uuid,
+            stored.svn_url,
+            stored.incarnation_created_rev,
+            stored.copy_from_path,
+            stored.copy_from_rev
+        );
+        drop(conn);
+        let _ = db.update_repo_sync_status(repo_id, "reconciliation_required");
+        let identity_key = format!("svn-identity:{}", live.uuid);
+        let _ = db.persist_canonical_checkpoint(
+            repo_id,
+            MappingWrite {
+                direction: CheckpointDirection::SvnToGit,
+                source_key: &identity_key,
+                outcome: MappingOutcome::UnknownReconciliationRequired,
+                target_git_sha: None,
+                target_svn_rev: None,
+                reason: Some("svn_identity_changed"),
+                policy_snapshot: None,
+            },
+        );
+        return Err(blocked("svn_identity_changed", detail));
+    }
+    let lineage = CanonicalLineage {
+        scope_uuid: scope,
+        generation,
+        repo_id: repo_id.to_string(),
+        svn_uuid: live.uuid,
+        svn_root_url: live.root_url,
+        svn_url: live.url,
+        svn_branch_path: live.branch_path,
+        incarnation_created_rev: live.incarnation_created_rev,
+        copy_from_path: live.copy_from_path,
+        copy_from_rev: live.copy_from_rev,
+        git_baseline_sha: None,
+        git_ref: None,
+        projection_version: String::new(),
+        policy_hash: String::new(),
+    };
+    pin_canonical_lineage(&conn, &lineage).map_err(SyncError::DatabaseError)
+}
+
+impl Database {
+    pub fn persist_canonical_checkpoint(
+        &self,
+        repo_id: &str,
+        write: MappingWrite<'_>,
+    ) -> Result<(), DatabaseError> {
+        self.immediate_transaction(|tx| {
+            let (scope, generation) = scope_and_generation(tx, repo_id)?;
+            persist_directional_checkpoint_tx(tx, &scope, generation, write)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::schema;
+
+    fn setup() -> Database {
+        let db = Database::in_memory().unwrap();
+        schema::run_migrations(&db.conn()).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
+                 VALUES ('pair','pair','file:///repo','trunk','','','r','main',1,'t','t',?1)",
+                [crate::db::repo_scope_identity::new_scope_uuid()],
+            )
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn typed_outcomes_do_not_overload_null_empty_or_missing() {
+        let db = setup();
+        let conn = db.conn();
+        let (scope, generation) = scope_and_generation(&conn, "pair").unwrap();
+        assert_eq!(
+            classify_mapping_outcome(
+                &conn,
+                &scope,
+                generation,
+                CheckpointDirection::SvnToGit,
+                &svn_source_key(2)
+            )
+            .unwrap(),
+            MappingOutcome::Pending
+        );
+        let svn_r2 = svn_source_key(2);
+        assert!(record_mapping_outcome(
+            &conn,
+            &scope,
+            generation,
+            MappingWrite {
+                direction: CheckpointDirection::SvnToGit,
+                source_key: &svn_r2,
+                outcome: MappingOutcome::AppliedAndVerified,
+                target_git_sha: Some(""),
+                target_svn_rev: None,
+                reason: None,
+                policy_snapshot: None,
+            },
+        )
+        .is_err());
+        let applied_sha = "a".repeat(40);
+        record_mapping_outcome(
+            &conn,
+            &scope,
+            generation,
+            MappingWrite {
+                direction: CheckpointDirection::SvnToGit,
+                source_key: &svn_r2,
+                outcome: MappingOutcome::AppliedAndVerified,
+                target_git_sha: Some(applied_sha.as_str()),
+                target_svn_rev: None,
+                reason: None,
+                policy_snapshot: None,
+            },
+        )
+        .unwrap();
+        let filtered_sha = "b".repeat(40);
+        let filtered_key = git_source_key(&filtered_sha);
+        record_mapping_outcome(
+            &conn,
+            &scope,
+            generation,
+            MappingWrite {
+                direction: CheckpointDirection::GitToSvn,
+                source_key: &filtered_key,
+                outcome: MappingOutcome::IntentionallyFilteredNoTarget,
+                target_git_sha: None,
+                target_svn_rev: None,
+                reason: Some("filtered"),
+                policy_snapshot: Some("{}"),
+            },
+        )
+        .unwrap();
+        let local_sha = "c".repeat(40);
+        let local_key = git_source_key(&local_sha);
+        persist_directional_checkpoint_tx(
+            &conn,
+            &scope,
+            generation,
+            MappingWrite {
+                direction: CheckpointDirection::GitToSvn,
+                source_key: &local_key,
+                outcome: MappingOutcome::LocallyPublishedNotRemote,
+                target_git_sha: None,
+                target_svn_rev: Some(4),
+                reason: Some("published locally"),
+                policy_snapshot: None,
+            },
+        )
+        .unwrap();
+        let unknown_key = svn_source_key(9);
+        persist_directional_checkpoint_tx(
+            &conn,
+            &scope,
+            generation,
+            MappingWrite {
+                direction: CheckpointDirection::SvnToGit,
+                source_key: &unknown_key,
+                outcome: MappingOutcome::UnknownReconciliationRequired,
+                target_git_sha: None,
+                target_svn_rev: None,
+                reason: Some("conflicting cursors"),
+                policy_snapshot: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            classify_mapping_outcome(
+                &conn,
+                &scope,
+                generation,
+                CheckpointDirection::SvnToGit,
+                &svn_source_key(2)
+            )
+            .unwrap(),
+            MappingOutcome::AppliedAndVerified
+        );
+        let filtered = load_mapping_outcome(
+            &conn,
+            &scope,
+            generation,
+            CheckpointDirection::GitToSvn,
+            &git_source_key(&filtered_sha),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            filtered.outcome,
+            MappingOutcome::IntentionallyFilteredNoTarget
+        );
+        assert!(filtered.target_git_sha.is_none());
+        assert!(filtered.target_svn_rev.is_none());
+        let checkpoint =
+            load_directional_checkpoint(&conn, &scope, generation, CheckpointDirection::SvnToGit)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            checkpoint.outcome,
+            MappingOutcome::UnknownReconciliationRequired
+        );
+    }
+
+    #[test]
+    fn lineage_pin_is_immutable_for_a_scope_generation() {
+        let db = setup();
+        let conn = db.conn();
+        let (scope, generation) = scope_and_generation(&conn, "pair").unwrap();
+        let lineage = CanonicalLineage {
+            scope_uuid: scope.clone(),
+            generation,
+            repo_id: "pair".into(),
+            svn_uuid: "uuid-a".into(),
+            svn_root_url: "file:///repo".into(),
+            svn_url: "file:///repo/trunk".into(),
+            svn_branch_path: "trunk".into(),
+            incarnation_created_rev: 1,
+            copy_from_path: None,
+            copy_from_rev: None,
+            git_baseline_sha: None,
+            git_ref: Some("refs/heads/main".into()),
+            projection_version: String::new(),
+            policy_hash: String::new(),
+        };
+        pin_canonical_lineage(&conn, &lineage).unwrap();
+        pin_canonical_lineage(&conn, &lineage).unwrap();
+        let mut changed = lineage.clone();
+        changed.svn_uuid = "uuid-b".into();
+        assert!(pin_canonical_lineage(&conn, &changed).is_err());
+        let loaded = load_canonical_lineage_tx(&conn, &scope, generation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.svn_uuid, "uuid-a");
+    }
+
+    #[test]
+    fn two_repos_with_equal_revision_keep_separate_lineage() {
+        let db = setup();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
+                 VALUES ('other','other','file:///other','trunk','','','r2','main',1,'t','t',?1)",
+                [crate::db::repo_scope_identity::new_scope_uuid()],
+            )
+            .unwrap();
+        let conn = db.conn();
+        let (scope_a, gen_a) = scope_and_generation(&conn, "pair").unwrap();
+        let (scope_b, gen_b) = scope_and_generation(&conn, "other").unwrap();
+        for (scope, gen, repo, uuid) in [
+            (scope_a.clone(), gen_a, "pair", "uuid-a"),
+            (scope_b.clone(), gen_b, "other", "uuid-b"),
+        ] {
+            pin_canonical_lineage(
+                &conn,
+                &CanonicalLineage {
+                    scope_uuid: scope,
+                    generation: gen,
+                    repo_id: repo.into(),
+                    svn_uuid: uuid.into(),
+                    svn_root_url: format!("file:///{repo}"),
+                    svn_url: format!("file:///{repo}/trunk"),
+                    svn_branch_path: "trunk".into(),
+                    incarnation_created_rev: 2,
+                    copy_from_path: None,
+                    copy_from_rev: None,
+                    git_baseline_sha: None,
+                    git_ref: None,
+                    projection_version: String::new(),
+                    policy_hash: String::new(),
+                },
+            )
+            .unwrap();
+        }
+        assert_ne!(scope_a, scope_b);
+        assert_eq!(
+            load_canonical_lineage_tx(&conn, &scope_a, gen_a)
+                .unwrap()
+                .unwrap()
+                .svn_uuid,
+            "uuid-a"
+        );
+        assert_eq!(
+            load_canonical_lineage_tx(&conn, &scope_b, gen_b)
+                .unwrap()
+                .unwrap()
+                .svn_uuid,
+            "uuid-b"
+        );
+    }
+
+    #[test]
+    fn applied_commit_map_row_writes_typed_checkpoint() {
+        let db = setup();
+        let sha = "d".repeat(40);
+        db.insert_commit_map_with_repo(7, &sha, "svn_to_git", "a", "A", Some("pair"))
+            .unwrap();
+        let conn = db.conn();
+        let (scope, generation) = scope_and_generation(&conn, "pair").unwrap();
+        let checkpoint =
+            load_directional_checkpoint(&conn, &scope, generation, CheckpointDirection::SvnToGit)
+                .unwrap()
+                .unwrap();
+        assert_eq!(checkpoint.outcome, MappingOutcome::AppliedAndVerified);
+        assert_eq!(checkpoint.handled_source_key, svn_source_key(7));
+        assert_eq!(checkpoint.target_git_sha.as_deref(), Some(sha.as_str()));
+        assert!(checkpoint.target_svn_rev.is_none());
+        assert_eq!(
+            classify_mapping_outcome(
+                &conn,
+                &scope,
+                generation,
+                CheckpointDirection::SvnToGit,
+                &svn_source_key(7)
+            )
+            .unwrap(),
+            MappingOutcome::AppliedAndVerified
+        );
+        assert_eq!(
+            classify_mapping_outcome(
+                &conn,
+                &scope,
+                generation,
+                CheckpointDirection::SvnToGit,
+                &svn_source_key(8)
+            )
+            .unwrap(),
+            MappingOutcome::Pending
+        );
+    }
+}

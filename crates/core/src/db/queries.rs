@@ -128,11 +128,23 @@ pub struct WatermarkEntry {
     pub updated_at: String,
 }
 
+/// How a credential value was selected. Read failure is never `Absent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialOrigin {
+    Absent,
+    Explicit,
+    Inherited,
+    Global,
+    Revoked,
+    ReadFailure,
+}
+
 /// Outcome of walking the credential chain for a managed repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialChainState {
     pub value: Option<String>,
     pub explicitly_revoked: bool,
+    pub origin: CredentialOrigin,
 }
 
 impl CredentialChainState {
@@ -140,6 +152,23 @@ impl CredentialChainState {
         Self {
             value: Some(value),
             explicitly_revoked: false,
+            origin: CredentialOrigin::Explicit,
+        }
+    }
+
+    pub fn inherited(value: String) -> Self {
+        Self {
+            value: Some(value),
+            explicitly_revoked: false,
+            origin: CredentialOrigin::Inherited,
+        }
+    }
+
+    pub fn global(value: String) -> Self {
+        Self {
+            value: Some(value),
+            explicitly_revoked: false,
+            origin: CredentialOrigin::Global,
         }
     }
 
@@ -147,6 +176,7 @@ impl CredentialChainState {
         Self {
             value: None,
             explicitly_revoked: false,
+            origin: CredentialOrigin::Absent,
         }
     }
 
@@ -154,7 +184,20 @@ impl CredentialChainState {
         Self {
             value: None,
             explicitly_revoked: true,
+            origin: CredentialOrigin::Revoked,
         }
+    }
+
+    pub fn read_failure() -> Self {
+        Self {
+            value: None,
+            explicitly_revoked: false,
+            origin: CredentialOrigin::ReadFailure,
+        }
+    }
+
+    pub fn is_read_failure(&self) -> bool {
+        self.origin == CredentialOrigin::ReadFailure
     }
 }
 
@@ -216,12 +259,57 @@ impl Database {
     ) -> Result<i64, DatabaseError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![svn_rev, git_sha, direction, now, svn_author, git_author, repo_id],
         )?;
-        let id = conn.last_insert_rowid();
+        let id = tx.last_insert_rowid();
+        if let Some(repo_id) = repo_id.filter(|id| !id.is_empty()) {
+            if !git_sha.is_empty() {
+                use super::lineage_checkpoints::{
+                    git_source_key, svn_source_key, try_persist_directional_checkpoint_tx,
+                    CheckpointDirection, MappingOutcome, MappingWrite,
+                };
+                let (dir, source_key, git_target, svn_target) = match direction {
+                    "svn_to_git" => (
+                        CheckpointDirection::SvnToGit,
+                        svn_source_key(svn_rev),
+                        Some(git_sha),
+                        None,
+                    ),
+                    "git_to_svn" => (
+                        CheckpointDirection::GitToSvn,
+                        git_source_key(git_sha),
+                        None,
+                        Some(svn_rev),
+                    ),
+                    _ => {
+                        tx.commit()?;
+                        debug!(
+                            id,
+                            svn_rev, git_sha, direction, repo_id, "inserted commit_map entry"
+                        );
+                        return Ok(id);
+                    }
+                };
+                try_persist_directional_checkpoint_tx(
+                    &tx,
+                    repo_id,
+                    MappingWrite {
+                        direction: dir,
+                        source_key: &source_key,
+                        outcome: MappingOutcome::AppliedAndVerified,
+                        target_git_sha: git_target,
+                        target_svn_rev: svn_target,
+                        reason: None,
+                        policy_snapshot: None,
+                    },
+                )?;
+            }
+        }
+        tx.commit()?;
         debug!(
             id,
             svn_rev, git_sha, direction, repo_id, "inserted commit_map entry"
@@ -1539,7 +1627,11 @@ impl Database {
             params![key, value, now],
         )?;
         tx.commit()?;
-        debug!(key, value, "set kv_state");
+        if key.starts_with("secret_") {
+            debug!(key, value = "[REDACTED]", "set kv_state");
+        } else {
+            debug!(key, "set kv_state");
+        }
         Ok(())
     }
 
@@ -1917,6 +2009,21 @@ impl Database {
                 git_sha,
                 &receipt.to_string(),
                 &now,
+            )?;
+            let source_key = super::lineage_checkpoints::git_source_key(git_sha);
+            super::lineage_checkpoints::try_persist_directional_checkpoint_tx(
+                &tx,
+                repo_id,
+                super::lineage_checkpoints::MappingWrite {
+                    direction: super::lineage_checkpoints::CheckpointDirection::GitToSvn,
+                    source_key: &source_key,
+                    outcome:
+                        super::lineage_checkpoints::MappingOutcome::IntentionallyFilteredNoTarget,
+                    target_git_sha: None,
+                    target_svn_rev: None,
+                    reason: receipt.get("outcome").and_then(|v| v.as_str()),
+                    policy_snapshot: receipt.get("projection").and_then(|v| v.as_str()),
+                },
             )?;
         }
         tx.commit()?;
@@ -3115,6 +3222,20 @@ impl Database {
             "UPDATE repositories SET last_svn_rev = MAX(last_svn_rev, ?1) WHERE id = ?2",
             params![svn_rev, repo_id],
         )?;
+        let source_key = super::lineage_checkpoints::svn_source_key(svn_rev);
+        super::lineage_checkpoints::try_persist_directional_checkpoint_tx(
+            &tx,
+            repo_id,
+            super::lineage_checkpoints::MappingWrite {
+                direction: super::lineage_checkpoints::CheckpointDirection::SvnToGit,
+                source_key: &source_key,
+                outcome: super::lineage_checkpoints::MappingOutcome::IntentionallyFilteredNoTarget,
+                target_git_sha: None,
+                target_svn_rev: None,
+                reason: Some("metadata-only skip"),
+                policy_snapshot: None,
+            },
+        )?;
         tx.commit()?;
         debug!(
             repo_id,
@@ -3201,47 +3322,50 @@ impl Database {
     }
 
     /// Like [`Self::resolve_credential_chain`] but distinguishes explicit
-    /// revocation from a plain miss so callers can preserve existing secrets.
+    /// revocation, inheritance, global fallback, absence, and read failure.
     pub fn resolve_credential_chain_state(
         &self,
         repo_id: &str,
         key_prefix: &str,
     ) -> CredentialChainState {
-        let repo_key = format!("{}_{}", key_prefix, repo_id);
-        match self.get_state(&repo_key) {
-            Ok(Some(val)) if val.is_empty() => return CredentialChainState::revoked(),
-            Ok(Some(val)) => return CredentialChainState::resolved(val),
-            Ok(None) => {}
-            Err(_) => return CredentialChainState::not_found(),
+        match self.try_resolve_credential_chain_state(repo_id, key_prefix) {
+            Ok(state) => state,
+            Err(_) => CredentialChainState::read_failure(),
         }
-        // 2. Walk parent chain
-        let mut pid = self
-            .get_repository(repo_id)
-            .ok()
-            .flatten()
-            .and_then(|r| r.parent_id);
+    }
+
+    /// Fallible scoped resolver shared by preparation, reload, and commands.
+    pub fn try_resolve_credential_chain_state(
+        &self,
+        repo_id: &str,
+        key_prefix: &str,
+    ) -> Result<CredentialChainState, DatabaseError> {
+        let repo_key = format!("{}_{}", key_prefix, repo_id);
+        match self.get_state(&repo_key)? {
+            Some(val) if val.is_empty() => return Ok(CredentialChainState::revoked()),
+            Some(val) => return Ok(CredentialChainState::resolved(val)),
+            None => {}
+        }
+        let mut pid = match self.get_repository(repo_id)? {
+            Some(repo) => repo.parent_id,
+            None => None,
+        };
         let mut visited = std::collections::HashSet::new();
         while let Some(current_pid) = pid {
             if !visited.insert(current_pid.clone()) {
                 break;
             }
             let ancestor_key = format!("{}_{}", key_prefix, current_pid);
-            match self.get_state(&ancestor_key) {
-                Ok(Some(val)) if val.is_empty() => return CredentialChainState::revoked(),
-                Ok(Some(val)) => return CredentialChainState::resolved(val),
-                Ok(None) => {}
-                Err(_) => return CredentialChainState::not_found(),
+            match self.get_state(&ancestor_key)? {
+                Some(val) if val.is_empty() => return Ok(CredentialChainState::revoked()),
+                Some(val) => return Ok(CredentialChainState::inherited(val)),
+                None => {}
             }
-            pid = self
-                .get_repository(&current_pid)
-                .ok()
-                .flatten()
-                .and_then(|r| r.parent_id);
+            pid = self.get_repository(&current_pid)?.and_then(|r| r.parent_id);
         }
-        // 3. Fall back to global key
-        match self.get_state(key_prefix) {
-            Ok(Some(val)) if !val.is_empty() => CredentialChainState::resolved(val),
-            Ok(Some(_)) | Ok(None) | Err(_) => CredentialChainState::not_found(),
+        match self.get_state(key_prefix)? {
+            Some(val) if !val.is_empty() => Ok(CredentialChainState::global(val)),
+            Some(_) | None => Ok(CredentialChainState::not_found()),
         }
     }
 
@@ -3863,16 +3987,23 @@ impl Database {
         ] {
             if let Some(value) = value {
                 fields.push(field.into());
-                let targets = std::iter::once(repo_id).chain(
-                    descendants
-                        .iter()
-                        .filter(|_| !value.is_empty())
-                        .map(String::as_str),
-                );
-                for target in targets {
-                    tx.execute("INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![format!("{prefix}_{target}"),value,now]).map_err(DatabaseError::from)?;
-                    if target != repo_id {
-                        propagated.insert(target.to_owned());
+                tx.execute("INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![format!("{prefix}_{repo_id}"),value,now]).map_err(DatabaseError::from)?;
+                // Parent rotation never overwrites an explicit child override or
+                // revocation. Keyless descendants inherit at resolve time.
+                if !value.is_empty() {
+                    for child in &descendants {
+                        let child_key = format!("{prefix}_{child}");
+                        let existing: Option<String> = tx
+                            .query_row(
+                                "SELECT value FROM kv_state WHERE key = ?1",
+                                [&child_key],
+                                |row| row.get(0),
+                            )
+                            .optional()
+                            .map_err(DatabaseError::from)?;
+                        if existing.is_none() {
+                            propagated.insert(child.clone());
+                        }
                     }
                 }
             }
@@ -4824,8 +4955,55 @@ mod tests {
         db.conn().execute("DROP TABLE kv_state", []).unwrap();
 
         let state = db.resolve_credential_chain_state("repo_a", "secret_git_token");
-        assert_eq!(state, CredentialChainState::not_found());
+        assert_eq!(state, CredentialChainState::read_failure());
+        assert!(state.is_read_failure());
     }
+
+    #[test]
+    fn resolve_credential_chain_distinguishes_inherited_global_and_explicit() {
+        let db = setup_db();
+        let mut parent = create_test_repo(&db, "root_a", "Root A");
+        parent.sync_mode = "team".into();
+        db.update_repository(&parent).unwrap();
+        let mut child = create_test_repo(&db, "child_a", "Child A");
+        child.sync_mode = "team".into();
+        child.parent_id = Some("root_a".into());
+        db.update_repository(&child).unwrap();
+        let mut root_b = create_test_repo(&db, "root_b", "Root B");
+        root_b.sync_mode = "team".into();
+        db.update_repository(&root_b).unwrap();
+        db.set_state("secret_git_token_root_a", "parent-a").unwrap();
+        db.set_state("secret_git_token_root_b", "parent-b").unwrap();
+        db.set_state("secret_git_token", "canary-global").unwrap();
+        assert_eq!(
+            db.resolve_credential_chain_state("child_a", "secret_git_token"),
+            CredentialChainState::inherited("parent-a".into())
+        );
+        db.set_state("secret_git_token_child_a", "child-override")
+            .unwrap();
+        assert_eq!(
+            db.resolve_credential_chain_state("child_a", "secret_git_token"),
+            CredentialChainState::resolved("child-override".into())
+        );
+        db.save_repository_credentials(
+            "root_a",
+            None,
+            Some("parent-a-rotated"),
+            "admin",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_state("secret_git_token_child_a").unwrap().as_deref(),
+            Some("child-override")
+        );
+        assert_eq!(
+            db.resolve_credential_chain_state("root_b", "secret_git_token"),
+            CredentialChainState::resolved("parent-b".into())
+        );
+    }
+
     fn ack_failure(db: &Database, repo: Option<&str>, created: &str) -> i64 {
         let conn = db.conn();
         conn.execute("INSERT INTO audit_log (action,direction,svn_rev,git_sha,author,details,created_at,success,repo_id)
@@ -5143,7 +5321,7 @@ mod tests {
         db.set_state("secret_git_token_child", "child-git").unwrap();
         db.set_state("encryption_key", "unchanged-existing-key")
             .unwrap();
-        db.conn().execute_batch("CREATE TRIGGER reject_child_git BEFORE INSERT ON kv_state WHEN NEW.key='secret_git_token_child' BEGIN SELECT RAISE(ABORT,'injected credential write failure'); END;").unwrap();
+        db.conn().execute_batch("CREATE TRIGGER reject_parent_git BEFORE UPDATE ON kv_state WHEN NEW.key='secret_git_token_parent' BEGIN SELECT RAISE(ABORT,'injected credential write failure'); END;").unwrap();
         let request = save_id();
         assert!(db
             .save_repository_credentials(
@@ -5173,7 +5351,7 @@ mod tests {
             Some("unchanged-existing-key")
         );
         db.conn()
-            .execute_batch("DROP TRIGGER reject_child_git")
+            .execute_batch("DROP TRIGGER reject_parent_git")
             .unwrap();
         let receipt = db
             .save_repository_credentials(
@@ -5185,16 +5363,24 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(receipt.propagated_repositories, 1);
+        assert_eq!(receipt.propagated_repositories, 0);
         assert_eq!(
             db.get_state("secret_svn_password_child")
                 .unwrap()
                 .as_deref(),
-            Some("new-svn")
+            Some("child-svn")
+        );
+        assert_eq!(
+            db.get_state("secret_git_token_child").unwrap().as_deref(),
+            Some("child-git")
         );
         assert_eq!(
             db.get_state("secret_git_token_parent").unwrap().as_deref(),
             Some("new-git")
+        );
+        assert_eq!(
+            db.resolve_credential_chain_state("child", "secret_git_token"),
+            CredentialChainState::resolved("child-git".into())
         );
     }
 

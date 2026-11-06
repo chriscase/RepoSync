@@ -2,6 +2,12 @@
 //! This qualification API is feature gated and admits only sealed temporary
 //! installation copies. Its registry is the future activation candidate, not a
 //! second migration algorithm maintained by tests.
+//!
+//! Operational #63 activation uses `canonical_lineage` / `canonical_checkpoints`
+//! / `canonical_mapping_outcomes` at schema v14. These candidate `pair_lineages`
+//! / `pair_frontiers` / `pair_outcomes` tables remain fixture-only so ordinary
+//! `STARTUP` still observes zero `pair_%` tables. Candidate v13 (nullable
+//! `commit_map.git_sha`) remains #54's rebuild and is not applied here.
 use super::schema;
 use anyhow::{ensure, Context, Result};
 use rusqlite::{types::Value, Connection, OpenFlags, TransactionBehavior};

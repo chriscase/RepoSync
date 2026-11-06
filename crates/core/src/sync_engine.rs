@@ -13,11 +13,10 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use rusqlite::OptionalExtension;
@@ -237,22 +236,31 @@ fn sync_git_command_output(
     timeout: Duration,
     http_auth_token: Option<String>,
 ) -> Option<std::process::Output> {
-    let repo_path = repo_path.to_path_buf();
-    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let output = crate::git::subprocess_auth::git_cli_output(
-            &repo_path,
-            &arg_refs,
-            http_auth_token.as_deref(),
-        );
-        let _ = tx.send(output);
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(output)) => Some(output),
-        _ => None,
+    let arg_refs: Vec<&str> = args.to_vec();
+    let mut child = crate::git::subprocess_auth::build_git_cli_command(
+        repo_path,
+        &arg_refs,
+        http_auth_token.as_deref(),
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
     }
+    child.wait_with_output().ok()
 }
 
 impl SyncEngine {
@@ -4520,6 +4528,19 @@ impl SyncEngine {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let svn_info = svn.info().await.map_err(SyncError::SvnError)?;
+        if let Some(rid) = self.effective_repo_id() {
+            if self
+                .db
+                .get_repository(rid)
+                .map_err(SyncError::DatabaseError)?
+                .is_some()
+            {
+                crate::db::lineage_checkpoints::verify_or_pin_live_svn_identity(
+                    &self.db, rid, &svn, &svn_info,
+                )
+                .await?;
+            }
+        }
         let head_rev = svn_info.latest_rev;
 
         if head_rev <= last_rev {
@@ -5159,12 +5180,15 @@ impl SyncEngine {
                 .resolve_credential_chain_state(rid, "secret_svn_password"),
             None => match self.db.get_state("secret_svn_password") {
                 Ok(Some(pw)) if !pw.is_empty() => CredentialChainState::resolved(pw),
-                Ok(Some(_)) | Ok(None) | Err(_) => CredentialChainState::not_found(),
+                Ok(Some(_)) | Ok(None) => CredentialChainState::not_found(),
+                Err(_) => CredentialChainState::read_failure(),
             },
         };
         {
             let mut svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(pw) = svn_state.value {
+            if svn_state.is_read_failure() {
+                warn!("SVN credential reload read failed; preserving in-memory secret");
+            } else if let Some(pw) = svn_state.value {
                 svn.set_password(pw);
                 debug!("reloaded SVN password from database");
             } else if svn_state.explicitly_revoked {
@@ -5179,7 +5203,8 @@ impl SyncEngine {
                 .resolve_credential_chain_state(rid, "secret_git_token"),
             None => match self.db.get_state("secret_git_token") {
                 Ok(Some(tok)) if !tok.is_empty() => CredentialChainState::resolved(tok),
-                Ok(Some(_)) | Ok(None) | Err(_) => CredentialChainState::not_found(),
+                Ok(Some(_)) | Ok(None) => CredentialChainState::not_found(),
+                Err(_) => CredentialChainState::read_failure(),
             },
         };
         {
@@ -5190,6 +5215,9 @@ impl SyncEngine {
                 crate::git::apply_git_credential_chain_state_for_sync(&git, "origin", &git_state)
             };
             match apply {
+                Ok(()) if git_state.is_read_failure() => {
+                    warn!("Git credential reload read failed; preserving remote credentials");
+                }
                 Ok(()) if git_state.value.is_some() => {
                     debug!("reloaded Git token from database");
                 }
@@ -5561,6 +5589,30 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn git_probe_timeout_kills_hung_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap()
+            .success());
+        let started = Instant::now();
+        let result = sync_git_command_output(
+            tmp.path(),
+            &["-c", "alias.hang=!exec /bin/sleep 30", "hang"],
+            Duration::from_millis(250),
+            None,
+        );
+        assert!(result.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timed-out git probe must kill the child rather than wait out sleep 30"
+        );
+    }
+
     use crate::config::IdentityConfig;
     use crate::db::git_push_operations::{git_push_target_fingerprint, GitPushIntent};
     use crate::db::svn_commit_operations::{svn_commit_target_fingerprint, SvnCommitIntent};

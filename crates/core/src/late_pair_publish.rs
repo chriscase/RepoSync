@@ -2050,7 +2050,7 @@ pub async fn replay_pending_git_for_integration_test(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::queries::CredentialChainState;
+    use crate::db::queries::{CredentialChainState, CredentialOrigin};
 
     #[test]
     fn parent_git_clone_url_derives_from_api_not_credentials() {
@@ -2094,6 +2094,7 @@ mod tests {
         let state = CredentialChainState {
             value: Some(String::new()),
             explicitly_revoked: false,
+            origin: CredentialOrigin::Explicit,
         };
         let err = http_git_token_for_clone("https://github.com/o/r.git", &state).unwrap_err();
         assert_eq!(err.reason, "git_credentials_missing");
@@ -2104,6 +2105,7 @@ mod tests {
         let state = CredentialChainState {
             value: Some("ghp_secret".into()),
             explicitly_revoked: false,
+            origin: CredentialOrigin::Explicit,
         };
         assert_eq!(
             http_git_token_for_clone("https://github.com/o/r.git", &state).unwrap(),
@@ -2116,6 +2118,7 @@ mod tests {
         let state = CredentialChainState {
             value: None,
             explicitly_revoked: false,
+            origin: CredentialOrigin::Absent,
         };
         assert_eq!(
             http_git_token_for_clone("file:///tmp/repo.git", &state).unwrap(),
