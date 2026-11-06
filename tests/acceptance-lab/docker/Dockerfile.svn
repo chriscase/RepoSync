@@ -1,0 +1,10 @@
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+FROM ${DEBIAN_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      apache2 ca-certificates curl ldap-utils libapache2-mod-svn subversion \
+    && a2enmod dav dav_svn ssl ldap authnz_ldap authz_svn headers \
+    && rm -rf /var/lib/apt/lists/*
+COPY svn/entrypoint.sh /usr/local/bin/svn-entrypoint.sh
+RUN chmod 755 /usr/local/bin/svn-entrypoint.sh
+EXPOSE 8443
+ENTRYPOINT ["/usr/local/bin/svn-entrypoint.sh"]
