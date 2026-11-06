@@ -3942,8 +3942,9 @@ impl Database {
         )
     }
 
-    /// Preserve the existing explicit-empty revocation and nonempty descendant propagation
-    /// policy, but commit both credential fields and every descendant write atomically.
+    /// Write only the target repo's credential keys. Explicit child overrides and
+    /// empty revocations stay untouched; keyless descendants inherit at resolve
+    /// time so a parent rotation is never materialized as a child override.
     fn save_repository_credentials_tx(
         tx: &rusqlite::Connection,
         repo_id: &str,
@@ -3963,7 +3964,6 @@ impl Database {
         if expected_updated_at.is_some_and(|expected| expected != updated_at) {
             return Err(RepositorySaveError::Conflict);
         }
-        let mut descendants = vec![];
         let mut pending =
             if password.is_some_and(|v| !v.is_empty()) || token.is_some_and(|v| !v.is_empty()) {
                 vec![repo_id.to_owned()]
@@ -3982,14 +3982,11 @@ impl Database {
                 .query_map([id], |r| r.get::<_, String>(0))
                 .map_err(DatabaseError::from)?
             {
-                let child = child.map_err(DatabaseError::from)?;
-                pending.push(child.clone());
-                descendants.push(child);
+                pending.push(child.map_err(DatabaseError::from)?);
             }
         }
         let now = Utc::now().to_rfc3339();
         let mut fields = vec![];
-        let mut propagated = std::collections::HashSet::new();
         for (field, prefix, value) in [
             ("svn_password", "secret_svn_password", password),
             ("git_token", "secret_git_token", token),
@@ -3997,27 +3994,9 @@ impl Database {
             if let Some(value) = value {
                 fields.push(field.into());
                 tx.execute("INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![format!("{prefix}_{repo_id}"),value,now]).map_err(DatabaseError::from)?;
-                // Parent rotation never overwrites an explicit child override or
-                // revocation. Keyless descendants inherit at resolve time.
-                if !value.is_empty() {
-                    for child in &descendants {
-                        let child_key = format!("{prefix}_{child}");
-                        let existing: Option<String> = tx
-                            .query_row(
-                                "SELECT value FROM kv_state WHERE key = ?1",
-                                [&child_key],
-                                |row| row.get(0),
-                            )
-                            .optional()
-                            .map_err(DatabaseError::from)?;
-                        if existing.is_none() {
-                            propagated.insert(child.clone());
-                        }
-                    }
-                }
             }
         }
-        Ok((fields, propagated.len(), updated_at))
+        Ok((fields, 0, updated_at))
     }
 
     pub fn save_repository_credentials(

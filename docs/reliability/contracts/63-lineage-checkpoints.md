@@ -56,10 +56,14 @@ refused. Commit messages, trailers, timestamps, short SHAs, patch-ids, and
 equal final trees are hints, not lineage.
 
 Live SVN UUID and path incarnation are compared in `fetch_svn_changes` **before**
-the `head_rev <= last_rev` early return. A first verified observation pins
-`canonical_lineage`. A later UUID or incarnation mismatch holds only that pair
+the `head_rev <= last_rev` early return. Independently established
+initialization (no retained mappings/cursors, or an import snapshot pin whose
+UUID matches live) pins `canonical_lineage` and records the Git baseline/ref
+from the repository row. Legacy adoption with retained mappings and no proved
+UUID holds (`svn_identity_unproved`) rather than pinning a same-URL
+replacement. A later UUID or incarnation mismatch holds only that pair
 (`svn_identity_changed` / `reconciliation_required`) and does not silently
-sync a recreated repo at a low revision under stale lineage.
+sync a recreated repo at a low or equal revision under stale lineage.
 
 ## Directional checkpoints
 
@@ -75,6 +79,17 @@ An SVN revision produced by Git→SVN is that operation’s **effect**, not an
 incoming SVN cursor advance. Advancing a checkpoint requires the same SQLite
 transaction as the resolved mapping/outcome. Observed remote HEAD is never
 adopted merely because it exists.
+
+Ordinary managed sync writes `applied_and_verified` in the directional journal
+`finalize_tx` (SVN→Git in `git_push_operations`, Git→SVN in
+`svn_commit_operations`) together with the applied `sync_records` mapping and
+operation completion. `classify_mapping_outcome` /
+`load_directional_checkpoint` are the canonical readers: a missing row is
+`pending`, not a license to adopt a replacement identity. A generation read
+or persist fault refuses the whole journal transaction (no watermark
+advancement, no completed operation). Legacy `repositories.last_svn_rev` and
+import baseline remain the SVN fetch cursor until an exclusive-owner reader
+cutover.
 
 Typed mapping outcomes, not overloaded NULL/missing:
 

@@ -1120,3 +1120,345 @@ async fn resume_status_ignores_previous_attempt_error_then_shows_current_failure
         Some("Resuming import from durable checkpoint")
     );
 }
+
+async fn credential_http_state(
+    repo_id: &str,
+) -> (tempfile::TempDir, Arc<AppState>, axum::http::HeaderMap) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::new(dir.path().join("reposync.db")).unwrap();
+    db.initialize().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_repository(&Repository {
+        id: repo_id.into(),
+        name: repo_id.into(),
+        svn_url: "file:///nonexistent".into(),
+        svn_branch: "trunk".into(),
+        svn_username: "fixture".into(),
+        git_provider: "gitea".into(),
+        git_api_url: format!("file://{}", dir.path().display()),
+        git_repo: "empty".into(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 30,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: false,
+        created_by: None,
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+        last_svn_rev: 0,
+        last_git_sha: String::new(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[daemon]\ndata_dir = \"{}\"\n[svn]\nurl = \"file:///nonexistent\"\nusername = \"fixture\"\n[github]\nrepo = \"local/import\"\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+    let mut config = AppConfig::load_from_file(&config_path).unwrap();
+    config.web.admin_password = Some("secret".into());
+    let dummy = dir.path().join("dummy-git");
+    std::fs::create_dir_all(&dummy).unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&dummy)
+        .status()
+        .unwrap()
+        .success());
+    let engine = SyncEngine::new(
+        config.clone(),
+        Database::in_memory().unwrap(),
+        SvnClient::new("file:///nonexistent", "fixture", ""),
+        GitClient::new(&dummy).unwrap(),
+        Arc::new(IdentityMapper::new(&reposync_core::config::IdentityConfig::default()).unwrap()),
+    );
+    let (trigger, _rx) = tokio::sync::mpsc::channel(1);
+    let (ws, _) = tokio::sync::broadcast::channel(1);
+    let state = Arc::new(AppState {
+        db,
+        sync_engine: Arc::new(engine),
+        config,
+        sync_trigger: trigger,
+        ws_broadcast: ws,
+        sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        import_progress: Arc::new(tokio::sync::RwLock::new(ImportProgress::default())),
+        config_path,
+        prev_net_snapshot: std::sync::Mutex::new(None),
+        repo_import_progress: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        login_attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
+        import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(crate::SchedulerServiceState::running()),
+    });
+    state.sessions.write().await.insert(
+        "token".into(),
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    );
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer token"),
+    );
+    (dir, state, headers)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn start_import_revocation_does_not_claim_a_worker() {
+    let repo_id = "import-revoked";
+    let (_dir, state, headers) = credential_http_state(repo_id).await;
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{repo_id}"), "")
+        .unwrap();
+    let err = super::start_repo_import(
+        State(state.clone()),
+        headers.clone(),
+        Path(repo_id.into()),
+        Query(super::ImportQuery::default()),
+        axum::body::Bytes::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, AppError::Forbidden(_)),
+        "{}",
+        app_error_message(err)
+    );
+    assert!(state.db.latest_import_operation(repo_id).unwrap().is_none());
+    let progress = state.get_repo_import_progress(repo_id).await;
+    assert_ne!(progress.read().await.phase, ImportPhase::Importing);
+
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{repo_id}"), "restored")
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_git_token_{repo_id}"), "restored")
+        .unwrap();
+    let imported_sha = "a".repeat(40);
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_svn_rev = 5, last_git_sha = ?1 WHERE id = ?2",
+            rusqlite::params![imported_sha, repo_id],
+        )
+        .unwrap();
+    let recovered = super::start_repo_import(
+        State(state.clone()),
+        headers,
+        Path(repo_id.into()),
+        Query(super::ImportQuery::default()),
+        axum::body::Bytes::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(recovered, AppError::BadRequest(_)),
+        "corrected credentials must pass; a non-pending baseline is a later truthful refusal: {}",
+        app_error_message(recovered)
+    );
+    assert!(state.db.latest_import_operation(repo_id).unwrap().is_none());
+    let progress = state.get_repo_import_progress(repo_id).await;
+    assert_ne!(progress.read().await.phase, ImportPhase::Importing);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn start_import_read_failure_does_not_claim_a_worker() {
+    let repo_id = "import-read-fail";
+    let (_dir, state, headers) = credential_http_state(repo_id).await;
+    state
+        .db
+        .conn()
+        .execute("ALTER TABLE kv_state RENAME TO kv_state_hidden", [])
+        .unwrap();
+    let err = super::start_repo_import(
+        State(state.clone()),
+        headers.clone(),
+        Path(repo_id.into()),
+        Query(super::ImportQuery::default()),
+        axum::body::Bytes::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, AppError::Internal(_)),
+        "{}",
+        app_error_message(err)
+    );
+    state
+        .db
+        .conn()
+        .execute("ALTER TABLE kv_state_hidden RENAME TO kv_state", [])
+        .unwrap();
+    assert!(state.db.latest_import_operation(repo_id).unwrap().is_none());
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{repo_id}"), "restored")
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_git_token_{repo_id}"), "restored")
+        .unwrap();
+    let imported_sha = "a".repeat(40);
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_svn_rev = 5, last_git_sha = ?1 WHERE id = ?2",
+            rusqlite::params![imported_sha, repo_id],
+        )
+        .unwrap();
+    let recovered = super::start_repo_import(
+        State(state.clone()),
+        headers,
+        Path(repo_id.into()),
+        Query(super::ImportQuery::default()),
+        axum::body::Bytes::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(recovered, AppError::BadRequest(_)),
+        "restored chain must pass; a non-pending baseline is a later truthful refusal: {}",
+        app_error_message(recovered)
+    );
+    assert!(state.db.latest_import_operation(repo_id).unwrap().is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resume_import_revocation_keeps_resume_authorization() {
+    let repo_id = "import-resume-revoked";
+    let (_dir, state, headers) = credential_http_state(repo_id).await;
+    let operation_id = authorize_partial_resume(&state.db, repo_id);
+    state
+        .db
+        .set_state(&format!("secret_git_token_{repo_id}"), "")
+        .unwrap();
+    let err = super::resume_repo_import(
+        State(state.clone()),
+        headers.clone(),
+        Path((repo_id.into(), operation_id.clone())),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, AppError::Forbidden(_)),
+        "{}",
+        app_error_message(err)
+    );
+    let held = state
+        .db
+        .get_import_operation(repo_id, &operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.state, ImportOperationState::ReconciliationRequired);
+    assert!(held.resume_authorized);
+    let progress = state.get_repo_import_progress(repo_id).await;
+    assert_ne!(progress.read().await.phase, ImportPhase::Importing);
+
+    state
+        .db
+        .set_state(&format!("secret_git_token_{repo_id}"), "restored")
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{repo_id}"), "restored")
+        .unwrap();
+    let recovered = super::resume_repo_import(
+        State(state.clone()),
+        headers,
+        Path((repo_id.into(), operation_id.clone())),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(recovered, AppError::BadRequest(_)),
+        "corrected credentials must pass; missing workdir is a later truthful refusal: {}",
+        app_error_message(recovered)
+    );
+    let after = state
+        .db
+        .get_import_operation(repo_id, &operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, ImportOperationState::ReconciliationRequired);
+    assert!(after.resume_authorized);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resume_import_read_failure_keeps_resume_authorization() {
+    let repo_id = "import-resume-read-fail";
+    let (_dir, state, headers) = credential_http_state(repo_id).await;
+    let operation_id = authorize_partial_resume(&state.db, repo_id);
+    state
+        .db
+        .conn()
+        .execute("ALTER TABLE kv_state RENAME TO kv_state_hidden", [])
+        .unwrap();
+    let err = super::resume_repo_import(
+        State(state.clone()),
+        headers.clone(),
+        Path((repo_id.into(), operation_id.clone())),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, AppError::Internal(_)),
+        "{}",
+        app_error_message(err)
+    );
+    state
+        .db
+        .conn()
+        .execute("ALTER TABLE kv_state_hidden RENAME TO kv_state", [])
+        .unwrap();
+    let held = state
+        .db
+        .get_import_operation(repo_id, &operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.state, ImportOperationState::ReconciliationRequired);
+    assert!(held.resume_authorized);
+
+    state
+        .db
+        .set_state(&format!("secret_git_token_{repo_id}"), "restored")
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{repo_id}"), "restored")
+        .unwrap();
+    let recovered = super::resume_repo_import(
+        State(state.clone()),
+        headers,
+        Path((repo_id.into(), operation_id.clone())),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(recovered, AppError::BadRequest(_)),
+        "restored chain must pass; missing workdir is a later truthful refusal: {}",
+        app_error_message(recovered)
+    );
+    let after = state
+        .db
+        .get_import_operation(repo_id, &operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, ImportOperationState::ReconciliationRequired);
+    assert!(after.resume_authorized);
+}

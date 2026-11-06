@@ -12,9 +12,11 @@
 //! A lock mechanism prevents concurrent sync cycles.
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -211,6 +213,17 @@ pub struct SyncEngine {
     git_blob_reads_recorded: std::sync::Mutex<Vec<String>>,
     #[cfg(debug_assertions)]
     git_blob_read_recording_enabled: std::sync::Mutex<bool>,
+    /// Fixture-only: fail credential reload before any authenticated transport.
+    #[cfg(debug_assertions)]
+    credential_reload_fault: std::sync::Mutex<Option<CredentialReloadTestFault>>,
+}
+
+/// Per-engine credential reload fault (debug builds only).
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Copy)]
+enum CredentialReloadTestFault {
+    ReadFailure,
+    ApplyFailure,
 }
 
 /// Per-engine Git blob read fault (debug builds only).
@@ -230,6 +243,43 @@ struct SvnApplyTestFault {
     bridge: String,
 }
 
+const GIT_PROBE_MAX_OUTPUT: usize = 1024 * 1024;
+
+fn drain_limited(mut pipe: impl Read, max: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len() < max {
+                    let take = n.min(max - buf.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
+fn kill_git_probe_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
+fn remaining_until(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
 fn sync_git_command_output(
     repo_path: &Path,
     args: &[&str],
@@ -237,30 +287,58 @@ fn sync_git_command_output(
     http_auth_token: Option<String>,
 ) -> Option<std::process::Output> {
     let arg_refs: Vec<&str> = args.to_vec();
-    let mut child = crate::git::subprocess_auth::build_git_cli_command(
+    let mut command = crate::git::subprocess_auth::build_git_cli_command(
         repo_path,
         &arg_refs,
         http_auth_token.as_deref(),
-    )
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .ok()?;
+    );
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take()?;
+    let (tx_out, rx_out) = mpsc::channel();
+    let (tx_err, rx_err) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx_out.send(drain_limited(stdout, GIT_PROBE_MAX_OUTPUT));
+    });
+    std::thread::spawn(move || {
+        let _ = tx_err.send(drain_limited(stderr, GIT_PROBE_MAX_OUTPUT));
+    });
     let deadline = Instant::now() + timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(Duration::from_millis(10));
             }
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_git_probe_group(&mut child);
+                let reap_deadline = Instant::now() + Duration::from_millis(500);
+                while Instant::now() < reap_deadline {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let linger = Duration::from_millis(200);
+                let _ = rx_out.recv_timeout(linger);
+                let _ = rx_err.recv_timeout(linger);
                 return None;
             }
         }
-    }
-    child.wait_with_output().ok()
+    };
+    let stdout = rx_out.recv_timeout(remaining_until(deadline)).ok()?;
+    let stderr = rx_err.recv_timeout(remaining_until(deadline)).ok()?;
+    Some(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 impl SyncEngine {
@@ -300,7 +378,23 @@ impl SyncEngine {
             git_blob_reads_recorded: std::sync::Mutex::new(Vec::new()),
             #[cfg(debug_assertions)]
             git_blob_read_recording_enabled: std::sync::Mutex::new(false),
+            #[cfg(debug_assertions)]
+            credential_reload_fault: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Force credential reload to fail before authenticated transport (fixture tests).
+    #[cfg(debug_assertions)]
+    pub fn set_credential_reload_read_fault(&self) {
+        *self.credential_reload_fault.lock().unwrap() =
+            Some(CredentialReloadTestFault::ReadFailure);
+    }
+
+    /// Force credential apply/clear to fail before authenticated transport (fixture tests).
+    #[cfg(debug_assertions)]
+    pub fn set_credential_reload_apply_fault(&self) {
+        *self.credential_reload_fault.lock().unwrap() =
+            Some(CredentialReloadTestFault::ApplyFailure);
     }
 
     /// Install a per-engine replay batch cap for fixture tests.
@@ -575,7 +669,8 @@ impl SyncEngine {
         };
 
         // Hot-reload credentials from DB (changed via Setup Wizard).
-        self.reload_credentials();
+        // Read/apply/revocation failures refuse this cycle's transport.
+        self.reload_credentials()?;
 
         self.db
             .ensure_repository_scope_schema_upgrade()
@@ -5171,24 +5266,53 @@ impl SyncEngine {
     /// saved via the repo detail page take effect without a daemon restart.
     /// Uses the same scoped resolver as the scheduler: repo → parent chain →
     /// global, with explicit per-repo revocation blocking broader fallback.
-    fn reload_credentials(&self) {
+    ///
+    /// Read, apply, and revocation failures refuse subsequent authenticated
+    /// transport for this cycle. In-memory secrets may remain for recovery
+    /// but are not treated as current authority.
+    fn reload_credentials(&self) -> Result<(), SyncError> {
         use crate::db::queries::CredentialChainState;
+
+        #[cfg(debug_assertions)]
+        if let Some(fault) = self.credential_reload_fault.lock().unwrap().take() {
+            return Err(match fault {
+                CredentialReloadTestFault::ReadFailure => {
+                    SyncError::DatabaseError(crate::errors::DatabaseError::Other(
+                        "credential chain read failed; refusing transport with untrusted secrets"
+                            .into(),
+                    ))
+                }
+                CredentialReloadTestFault::ApplyFailure => {
+                    SyncError::DatabaseError(crate::errors::DatabaseError::Other(
+                        "credential chain apply failed; refusing transport with untrusted secrets"
+                            .into(),
+                    ))
+                }
+            });
+        }
 
         let svn_state = match self.repo_id.as_deref() {
             Some(rid) => self
                 .db
-                .resolve_credential_chain_state(rid, "secret_svn_password"),
+                .try_resolve_credential_chain_state(rid, "secret_svn_password")
+                .map_err(SyncError::DatabaseError)?,
             None => match self.db.get_state("secret_svn_password") {
                 Ok(Some(pw)) if !pw.is_empty() => CredentialChainState::resolved(pw),
                 Ok(Some(_)) | Ok(None) => CredentialChainState::not_found(),
-                Err(_) => CredentialChainState::read_failure(),
+                Err(error) => return Err(SyncError::DatabaseError(error)),
             },
         };
+        if svn_state.is_read_failure() {
+            return Err(SyncError::DatabaseError(
+                crate::errors::DatabaseError::Other(
+                    "credential chain read failed; refusing transport with untrusted secrets"
+                        .into(),
+                ),
+            ));
+        }
         {
             let mut svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner());
-            if svn_state.is_read_failure() {
-                warn!("SVN credential reload read failed; preserving in-memory secret");
-            } else if let Some(pw) = svn_state.value {
+            if let Some(pw) = svn_state.value {
                 svn.set_password(pw);
                 debug!("reloaded SVN password from database");
             } else if svn_state.explicitly_revoked {
@@ -5200,13 +5324,22 @@ impl SyncEngine {
         let git_state = match self.repo_id.as_deref() {
             Some(rid) => self
                 .db
-                .resolve_credential_chain_state(rid, "secret_git_token"),
+                .try_resolve_credential_chain_state(rid, "secret_git_token")
+                .map_err(SyncError::DatabaseError)?,
             None => match self.db.get_state("secret_git_token") {
                 Ok(Some(tok)) if !tok.is_empty() => CredentialChainState::resolved(tok),
                 Ok(Some(_)) | Ok(None) => CredentialChainState::not_found(),
-                Err(_) => CredentialChainState::read_failure(),
+                Err(error) => return Err(SyncError::DatabaseError(error)),
             },
         };
+        if git_state.is_read_failure() {
+            return Err(SyncError::DatabaseError(
+                crate::errors::DatabaseError::Other(
+                    "credential chain read failed; refusing transport with untrusted secrets"
+                        .into(),
+                ),
+            ));
+        }
         {
             let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
             let apply = if self.git_credential_apply_clean.load(Ordering::Acquire) {
@@ -5215,9 +5348,6 @@ impl SyncEngine {
                 crate::git::apply_git_credential_chain_state_for_sync(&git, "origin", &git_state)
             };
             match apply {
-                Ok(()) if git_state.is_read_failure() => {
-                    warn!("Git credential reload read failed; preserving remote credentials");
-                }
                 Ok(()) if git_state.value.is_some() => {
                     debug!("reloaded Git token from database");
                 }
@@ -5225,9 +5355,16 @@ impl SyncEngine {
                     debug!("cleared embedded git credentials after explicit revocation");
                 }
                 Ok(()) => {}
-                Err(e) => warn!("failed to apply git credential chain state: {e}"),
+                Err(e) => {
+                    return Err(SyncError::DatabaseError(
+                        crate::errors::DatabaseError::Other(format!(
+                            "credential chain apply failed; refusing transport: {e}"
+                        )),
+                    ));
+                }
             }
         }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -5590,8 +5727,7 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn git_probe_timeout_kills_hung_child() {
+    fn init_git_probe_repo() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         assert!(std::process::Command::new("git")
             .args(["init"])
@@ -5599,6 +5735,12 @@ mod tests {
             .status()
             .unwrap()
             .success());
+        tmp
+    }
+
+    #[test]
+    fn git_probe_timeout_kills_hung_child() {
+        let tmp = init_git_probe_repo();
         let started = Instant::now();
         let result = sync_git_command_output(
             tmp.path(),
@@ -5610,6 +5752,122 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "timed-out git probe must kill the child rather than wait out sleep 30"
+        );
+    }
+
+    #[test]
+    fn git_probe_drains_stdout_beyond_pipe_capacity() {
+        let tmp = init_git_probe_repo();
+        let output = sync_git_command_output(
+            tmp.path(),
+            &[
+                "-c",
+                "alias.big=!dd if=/dev/zero bs=1024 count=200 status=none",
+                "big",
+            ],
+            Duration::from_secs(5),
+            None,
+        )
+        .expect("large probe output must succeed while pipes are drained");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 200 * 1024);
+    }
+
+    #[test]
+    fn git_probe_drains_stdout_and_stderr_concurrently() {
+        let tmp = init_git_probe_repo();
+        let output = sync_git_command_output(
+            tmp.path(),
+            &[
+                "-c",
+                "alias.both=!sh -c 'dd if=/dev/zero bs=1024 count=80 status=none; dd if=/dev/zero bs=1024 count=80 status=none >&2'",
+                "both",
+            ],
+            Duration::from_secs(5),
+            None,
+        )
+        .expect("concurrent stdout/stderr must be drained");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 80 * 1024);
+        assert_eq!(output.stderr.len(), 80 * 1024);
+    }
+
+    #[test]
+    fn git_probe_timeout_during_output_pressure_and_retained_pipe() {
+        let tmp = init_git_probe_repo();
+        let started = Instant::now();
+        let flooded = sync_git_command_output(
+            tmp.path(),
+            &[
+                "-c",
+                "alias.flood=!sh -c 'while true; do dd if=/dev/zero bs=65536 count=1 status=none; done'",
+                "flood",
+            ],
+            Duration::from_millis(250),
+            None,
+        );
+        assert!(
+            flooded.is_none(),
+            "never-ending stdout must time out while drains stay live"
+        );
+        let retained = sync_git_command_output(
+            tmp.path(),
+            &[
+                "-c",
+                "alias.hold=!sh -c 'sleep 30 >/dev/stdout & exec sleep 60'",
+                "hold",
+            ],
+            Duration::from_millis(250),
+            None,
+        );
+        assert!(
+            retained.is_none(),
+            "a grandchild retaining stdout must not hang past the deadline"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "output-pressure and retained-pipe probes must stay inside the deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_read_failure_refuses_sync_cycle_transport() {
+        let engine = team_echo_engine("pair");
+        engine.set_credential_reload_read_fault();
+        let err = engine.run_sync_cycle().await.unwrap_err();
+        assert!(
+            err.to_string().contains("credential chain read failed"),
+            "{err}"
+        );
+        assert_eq!(
+            engine
+                .db()
+                .get_repository("pair")
+                .unwrap()
+                .unwrap()
+                .sync_status,
+            "idle",
+            "failed reload must not claim a running worker or advance transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_apply_failure_refuses_sync_cycle_transport() {
+        let engine = team_echo_engine("pair");
+        engine.set_credential_reload_apply_fault();
+        let err = engine.run_sync_cycle().await.unwrap_err();
+        assert!(
+            err.to_string().contains("credential chain apply failed"),
+            "{err}"
+        );
+        assert_eq!(
+            engine
+                .db()
+                .get_repository("pair")
+                .unwrap()
+                .unwrap()
+                .sync_status,
+            "idle"
         );
     }
 

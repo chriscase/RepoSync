@@ -5,8 +5,9 @@ use std::path::Path;
 use std::process::Command;
 
 use reposync_core::db::lineage_checkpoints::{
-    load_canonical_lineage, load_directional_checkpoint, pin_canonical_lineage,
-    verify_or_pin_live_svn_identity, CanonicalLineage, CheckpointDirection,
+    adopt_or_hold_live_svn_identity, load_canonical_lineage, load_directional_checkpoint,
+    pin_canonical_lineage, verify_or_pin_live_svn_identity, CanonicalLineage, CheckpointDirection,
+    LiveSvnIdentity,
 };
 use reposync_core::db::queries::CredentialOrigin;
 use reposync_core::db::repo_scope_identity::repository_scope_uuid;
@@ -80,7 +81,7 @@ fn insert_pair(db: &Database, svn_url: &str) {
     db.conn()
         .execute(
             "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
-             VALUES ('pair','pair',?1,'trunk','','local','','r','main','team',60,0,0,1,'t','t',1,'','idle',0,0)",
+             VALUES ('pair','pair',?1,'trunk','','local','','r','main','team',60,0,0,1,'t','t',0,'','idle',0,0)",
             [svn_url],
         )
         .unwrap();
@@ -338,6 +339,59 @@ fn recreated_path_incarnation_does_not_reuse_stale_lineage() {
         serde_json::json!({
             "case":"RS63_PATH_INCARNATION_HOLD",
             "stale_lineage_reused":false
+        })
+    );
+}
+
+fn replacement_identity() -> LiveSvnIdentity {
+    LiveSvnIdentity {
+        uuid: "uuid-replacement".into(),
+        root_url: "file:///repo".into(),
+        url: "file:///repo/trunk".into(),
+        branch_path: "trunk".into(),
+        incarnation_created_rev: 1,
+        copy_from_path: None,
+        copy_from_rev: None,
+    }
+}
+
+#[test]
+fn upgraded_engine_same_url_different_uuid_equal_revision_holds_before_any_pin() {
+    let db = Database::in_memory().unwrap();
+    db.initialize().unwrap();
+    insert_pair(&db, "file:///repo/trunk");
+    db.conn()
+        .execute(
+            "UPDATE repositories SET last_svn_rev = 5, last_git_sha = ?1 WHERE id = 'pair'",
+            ["c".repeat(40)],
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+             VALUES (5, ?1, 'svn_to_git', 't', 'a', 'A', 'pair')",
+            ["c".repeat(40)],
+        )
+        .unwrap();
+    assert!(load_canonical_lineage(&db, "pair").unwrap().is_none());
+    let err = adopt_or_hold_live_svn_identity(&db, "pair", &replacement_identity()).unwrap_err();
+    match err {
+        SyncError::HistoryBlocked { reason, .. } => assert_eq!(reason, "svn_identity_unproved"),
+        other => panic!("expected HistoryBlocked, got {other:?}"),
+    }
+    assert!(load_canonical_lineage(&db, "pair").unwrap().is_none());
+    let reopen = adopt_or_hold_live_svn_identity(&db, "pair", &replacement_identity()).unwrap_err();
+    match reopen {
+        SyncError::HistoryBlocked { reason, .. } => assert_eq!(reason, "svn_identity_unproved"),
+        other => panic!("expected HistoryBlocked on reopen, got {other:?}"),
+    }
+    assert!(load_canonical_lineage(&db, "pair").unwrap().is_none());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS63_LEGACY_ADOPTION_UNPROVED_HOLD",
+            "pinned":false,
+            "reopen_held":true
         })
     );
 }

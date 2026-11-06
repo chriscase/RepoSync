@@ -1564,6 +1564,11 @@ async fn start_repo_import(
         ));
     }
 
+    // Resolve credentials before any durable import transition or worker claim.
+    let svn_password = chain_secret(db, &id, "secret_svn_password")?.unwrap_or_default();
+    let git_token_state = chain_state(db, &id, "secret_git_token")?;
+    let git_token = git_token_state.value.clone().filter(|v| !v.is_empty());
+
     if let Some(previous) = db
         .latest_import_operation(&id)
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -1680,19 +1685,13 @@ async fn start_repo_import(
         cleanup_unconfirmed: false,
     };
 
-    // 3. Reset progress
+    // 3. Reset progress only after credentials are known to be usable.
     {
         let mut p = progress.write().await;
         *p = ImportProgress::default();
         p.phase = ImportPhase::Importing;
         p.started_at = Some(chrono::Utc::now().to_rfc3339());
     }
-
-    // 4. Read credentials from the shared scoped chain. Revocation never
-    // falls through to a global key; a read failure is not absence.
-    let svn_password = chain_secret(db, &id, "secret_svn_password")?.unwrap_or_default();
-    let git_token_state = chain_state(db, &id, "secret_git_token")?;
-    let git_token = git_token_state.value.clone().filter(|v| !v.is_empty());
     debug!(
         repo_id = %id,
         git_token_found = git_token.is_some(),
@@ -2431,6 +2430,10 @@ async fn resume_repo_import(
         ));
     }
 
+    let svn_password = chain_secret(db, &id, "secret_svn_password")?.unwrap_or_default();
+    let git_token_state = chain_state(db, &id, "secret_git_token")?;
+    let git_token = git_token_state.value.clone().filter(|v| !v.is_empty());
+
     let progress = state.get_repo_import_progress(&id).await;
     {
         let p = progress.read().await;
@@ -2462,10 +2465,6 @@ async fn resume_repo_import(
         })?
     };
 
-    let resumed = db
-        .resume_import_operation(&id, &operation_id)
-        .map_err(import_write_error)?;
-
     let data_dir = state.config.daemon.data_dir.clone();
     let git_repo_path = data_dir.join("repos").join(&id).join("git-repo");
     if !git_repo_path.join(".git").exists() {
@@ -2473,6 +2472,10 @@ async fn resume_repo_import(
             "managed Git workdir is unavailable for import resume".into(),
         ));
     }
+
+    let resumed = db
+        .resume_import_operation(&id, &operation_id)
+        .map_err(import_write_error)?;
 
     {
         let mut p = progress.write().await;
@@ -2492,10 +2495,6 @@ async fn resume_repo_import(
         // is unchanged here.
         p.errors.clear();
     }
-
-    let svn_password = chain_secret(db, &id, "secret_svn_password")?.unwrap_or_default();
-    let git_token_state = chain_state(db, &id, "secret_git_token")?;
-    let git_token = git_token_state.value.clone().filter(|v| !v.is_empty());
 
     let svn_import_url = reposync_core::svn::operand::configured_branch_url(
         &repo.svn_url,

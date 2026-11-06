@@ -12,7 +12,6 @@ use super::repo_scope_identity::repository_scope_uuid;
 use super::Database;
 use crate::echo_receipt_scope::repo_echo_generation_tx;
 use crate::errors::{DatabaseError, SvnError, SyncError};
-use crate::pair_refresh::PAIR_GENERATION;
 use crate::path_projection::svn_path_identity;
 use crate::svn::{SvnClient, SvnInfo, SvnLogEntry};
 
@@ -163,7 +162,7 @@ fn tables_ready(conn: &Connection) -> Result<bool, DatabaseError> {
 
 fn scope_and_generation(conn: &Connection, repo_id: &str) -> Result<(String, i64), DatabaseError> {
     let scope = repository_scope_uuid(conn, repo_id)?;
-    let generation = repo_echo_generation_tx(conn, repo_id).unwrap_or(PAIR_GENERATION);
+    let generation = repo_echo_generation_tx(conn, repo_id)?;
     Ok((scope, generation))
 }
 
@@ -575,17 +574,114 @@ fn blocked(reason: &str, detail: impl Into<String>) -> SyncError {
     }
 }
 
-/// Compare live SVN UUID/path incarnation with the pinned lineage. A first
-/// verified observation pins identity; a later mismatch holds only this pair.
-pub async fn verify_or_pin_live_svn_identity(
+fn retained_legacy_baseline(conn: &Connection, repo_id: &str) -> Result<bool, DatabaseError> {
+    let (last_svn, last_git): (i64, String) = conn.query_row(
+        "SELECT last_svn_rev, last_git_sha FROM repositories WHERE id = ?1",
+        [repo_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if last_svn > 0 || !last_git.is_empty() {
+        return Ok(true);
+    }
+    let maps: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM commit_map WHERE repo_id = ?1",
+        [repo_id],
+        |row| row.get(0),
+    )?;
+    if maps > 0 {
+        return Ok(true);
+    }
+    let records: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1",
+        [repo_id],
+        |row| row.get(0),
+    )?;
+    Ok(records > 0)
+}
+
+fn independently_established_svn_uuid(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<Option<String>, DatabaseError> {
+    let latest_key = format!("import_operation_v1:latest:{repo_id}");
+    let op_id: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [latest_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(op_id) = op_id else {
+        return Ok(None);
+    };
+    let document_key = format!("import_operation_v1:document:{op_id}");
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [document_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let op: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| DatabaseError::Other(error.to_string()))?;
+    Ok(op
+        .get("snapshot_pin")
+        .and_then(|pin| pin.get("svn_uuid"))
+        .and_then(|uuid| uuid.as_str())
+        .filter(|uuid| !uuid.is_empty())
+        .map(str::to_string))
+}
+
+fn git_baseline_from_repo(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<(Option<String>, Option<String>), DatabaseError> {
+    let (sha, branch): (String, String) = conn.query_row(
+        "SELECT last_git_sha, git_branch FROM repositories WHERE id = ?1",
+        [repo_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((
+        (!sha.is_empty()).then_some(sha),
+        (!branch.is_empty()).then_some(branch),
+    ))
+}
+
+fn hold_unproved_identity(
     db: &Database,
     repo_id: &str,
-    svn: &SvnClient,
-    info: &SvnInfo,
+    live: &LiveSvnIdentity,
+    reason: &str,
+    detail: String,
 ) -> Result<(), SyncError> {
-    let live = observe_live_svn_identity(svn, info)
-        .await
-        .map_err(SyncError::SvnError)?;
+    let _ = db.update_repo_sync_status(repo_id, "reconciliation_required");
+    let identity_key = format!("svn-identity:{}", live.uuid);
+    let _ = db.persist_canonical_checkpoint(
+        repo_id,
+        MappingWrite {
+            direction: CheckpointDirection::SvnToGit,
+            source_key: &identity_key,
+            outcome: MappingOutcome::UnknownReconciliationRequired,
+            target_git_sha: None,
+            target_svn_rev: None,
+            reason: Some(reason),
+            policy_snapshot: None,
+        },
+    );
+    Err(blocked(reason, detail))
+}
+
+/// Adopt a live SVN identity only when independently established, or when this
+/// is a fresh pair with no retained baseline. Legacy upgrades without a proved
+/// UUID hold rather than pinning a replacement at the same URL.
+pub fn adopt_or_hold_live_svn_identity(
+    db: &Database,
+    repo_id: &str,
+    live: &LiveSvnIdentity,
+) -> Result<(), SyncError> {
     let conn = db.conn();
     if !tables_ready(&conn).map_err(SyncError::DatabaseError)? {
         return Ok(());
@@ -598,7 +694,7 @@ pub async fn verify_or_pin_live_svn_identity(
     if let Some(stored) =
         load_canonical_lineage_tx(&conn, &scope, generation).map_err(SyncError::DatabaseError)?
     {
-        if identities_match(&stored, &live) {
+        if identities_match(&stored, live) {
             return Ok(());
         }
         let detail = format!(
@@ -615,39 +711,61 @@ pub async fn verify_or_pin_live_svn_identity(
             stored.copy_from_rev
         );
         drop(conn);
-        let _ = db.update_repo_sync_status(repo_id, "reconciliation_required");
-        let identity_key = format!("svn-identity:{}", live.uuid);
-        let _ = db.persist_canonical_checkpoint(
-            repo_id,
-            MappingWrite {
-                direction: CheckpointDirection::SvnToGit,
-                source_key: &identity_key,
-                outcome: MappingOutcome::UnknownReconciliationRequired,
-                target_git_sha: None,
-                target_svn_rev: None,
-                reason: Some("svn_identity_changed"),
-                policy_snapshot: None,
-            },
-        );
-        return Err(blocked("svn_identity_changed", detail));
+        return hold_unproved_identity(db, repo_id, live, "svn_identity_changed", detail);
     }
+    let proved =
+        independently_established_svn_uuid(&conn, repo_id).map_err(SyncError::DatabaseError)?;
+    if let Some(expected) = proved {
+        if expected != live.uuid {
+            let detail = format!(
+                "live SVN uuid={} does not match independently established uuid={}",
+                live.uuid, expected
+            );
+            drop(conn);
+            return hold_unproved_identity(db, repo_id, live, "svn_identity_changed", detail);
+        }
+    } else if retained_legacy_baseline(&conn, repo_id).map_err(SyncError::DatabaseError)? {
+        let detail = format!(
+            "live SVN uuid={} url={} created_rev={} has no independently established identity for retained mappings/checkpoints",
+            live.uuid, live.url, live.incarnation_created_rev
+        );
+        drop(conn);
+        return hold_unproved_identity(db, repo_id, live, "svn_identity_unproved", detail);
+    }
+    let (git_baseline_sha, git_ref) =
+        git_baseline_from_repo(&conn, repo_id).map_err(SyncError::DatabaseError)?;
     let lineage = CanonicalLineage {
         scope_uuid: scope,
         generation,
         repo_id: repo_id.to_string(),
-        svn_uuid: live.uuid,
-        svn_root_url: live.root_url,
-        svn_url: live.url,
-        svn_branch_path: live.branch_path,
+        svn_uuid: live.uuid.clone(),
+        svn_root_url: live.root_url.clone(),
+        svn_url: live.url.clone(),
+        svn_branch_path: live.branch_path.clone(),
         incarnation_created_rev: live.incarnation_created_rev,
-        copy_from_path: live.copy_from_path,
+        copy_from_path: live.copy_from_path.clone(),
         copy_from_rev: live.copy_from_rev,
-        git_baseline_sha: None,
-        git_ref: None,
+        git_baseline_sha,
+        git_ref,
         projection_version: String::new(),
         policy_hash: String::new(),
     };
     pin_canonical_lineage(&conn, &lineage).map_err(SyncError::DatabaseError)
+}
+
+/// Compare live SVN UUID/path incarnation with the pinned lineage. A first
+/// independently established observation pins identity; a later mismatch or
+/// unproved legacy adoption holds only this pair.
+pub async fn verify_or_pin_live_svn_identity(
+    db: &Database,
+    repo_id: &str,
+    svn: &SvnClient,
+    info: &SvnInfo,
+) -> Result<(), SyncError> {
+    let live = observe_live_svn_identity(svn, info)
+        .await
+        .map_err(SyncError::SvnError)?;
+    adopt_or_hold_live_svn_identity(db, repo_id, &live)
 }
 
 impl Database {
@@ -940,5 +1058,144 @@ mod tests {
             .unwrap(),
             MappingOutcome::Pending
         );
+    }
+
+    fn live_identity(uuid: &str) -> LiveSvnIdentity {
+        LiveSvnIdentity {
+            uuid: uuid.into(),
+            root_url: "file:///repo".into(),
+            url: "file:///repo/trunk".into(),
+            branch_path: "trunk".into(),
+            incarnation_created_rev: 1,
+            copy_from_path: None,
+            copy_from_rev: None,
+        }
+    }
+
+    #[test]
+    fn fresh_pair_pins_as_independently_established_initialization() {
+        let db = setup();
+        adopt_or_hold_live_svn_identity(&db, "pair", &live_identity("uuid-fresh")).unwrap();
+        let loaded = load_canonical_lineage(&db, "pair").unwrap().unwrap();
+        assert_eq!(loaded.svn_uuid, "uuid-fresh");
+        assert_eq!(loaded.git_ref.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn upgraded_engine_holds_unproved_legacy_identity_before_any_pin() {
+        let db = setup();
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev = 5, last_git_sha = ?1 WHERE id = 'pair'",
+                ["a".repeat(40)],
+            )
+            .unwrap();
+        let err = adopt_or_hold_live_svn_identity(&db, "pair", &live_identity("uuid-replacement"))
+            .unwrap_err();
+        match err {
+            SyncError::HistoryBlocked { reason, .. } => {
+                assert_eq!(reason, "svn_identity_unproved")
+            }
+            other => panic!("expected HistoryBlocked, got {other:?}"),
+        }
+        assert!(load_canonical_lineage(&db, "pair").unwrap().is_none());
+        assert_eq!(
+            db.get_repository("pair").unwrap().unwrap().sync_status,
+            "reconciliation_required"
+        );
+        let again =
+            adopt_or_hold_live_svn_identity(&db, "pair", &live_identity("uuid-replacement"));
+        assert!(matches!(
+            again,
+            Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "svn_identity_unproved"
+        ));
+        assert!(load_canonical_lineage(&db, "pair").unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_generation_refuses_checkpoint_without_generation_one_write() {
+        let db = setup();
+        let conn = db.conn();
+        let scope = repository_scope_uuid(&conn, "pair").unwrap();
+        drop(conn);
+        db.set_state(
+            &crate::db::repo_scope_identity::repo_echo_generation_kv_key(&scope),
+            "not-a-number",
+        )
+        .unwrap();
+        let sha = "b".repeat(40);
+        let source = svn_source_key(2);
+        let err = db.persist_canonical_checkpoint(
+            "pair",
+            MappingWrite {
+                direction: CheckpointDirection::SvnToGit,
+                source_key: &source,
+                outcome: MappingOutcome::AppliedAndVerified,
+                target_git_sha: Some(sha.as_str()),
+                target_svn_rev: None,
+                reason: None,
+                policy_snapshot: None,
+            },
+        );
+        assert!(err.is_err());
+        let conn = db.conn();
+        assert!(
+            load_directional_checkpoint(&conn, &scope, 1, CheckpointDirection::SvnToGit)
+                .unwrap()
+                .is_none()
+        );
+        assert!(load_mapping_outcome(
+            &conn,
+            &scope,
+            1,
+            CheckpointDirection::SvnToGit,
+            &svn_source_key(2)
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn generation_read_failure_refuses_checkpoint_without_generation_one_write() {
+        let db = setup();
+        let conn = db.conn();
+        let scope = repository_scope_uuid(&conn, "pair").unwrap();
+        drop(conn);
+        db.conn()
+            .execute("ALTER TABLE kv_state RENAME TO kv_state_hidden", [])
+            .unwrap();
+        let sha = "e".repeat(40);
+        let source = svn_source_key(4);
+        let err = db.persist_canonical_checkpoint(
+            "pair",
+            MappingWrite {
+                direction: CheckpointDirection::SvnToGit,
+                source_key: &source,
+                outcome: MappingOutcome::AppliedAndVerified,
+                target_git_sha: Some(sha.as_str()),
+                target_svn_rev: None,
+                reason: None,
+                policy_snapshot: None,
+            },
+        );
+        assert!(err.is_err());
+        db.conn()
+            .execute("ALTER TABLE kv_state_hidden RENAME TO kv_state", [])
+            .unwrap();
+        let conn = db.conn();
+        assert!(
+            load_directional_checkpoint(&conn, &scope, 1, CheckpointDirection::SvnToGit)
+                .unwrap()
+                .is_none()
+        );
+        assert!(load_mapping_outcome(
+            &conn,
+            &scope,
+            1,
+            CheckpointDirection::SvnToGit,
+            &svn_source_key(4)
+        )
+        .unwrap()
+        .is_none());
     }
 }
