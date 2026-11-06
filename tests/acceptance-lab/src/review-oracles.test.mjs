@@ -8,6 +8,7 @@ import {
   egressOutcome,
   generationOutcome,
   linearPublicationOutcome,
+  linearReceiptEvidence,
   restorePrewriteOutcome,
 } from "../playwright/oracles.ts";
 
@@ -149,6 +150,33 @@ test("cancel acknowledgment is not completion", () => {
   assert.equal(outcome.status, "PARTIAL");
   assert.equal(outcome.qualification, "UNQUALIFIED");
   assert.notEqual(outcome.status, "PASS");
+});
+
+test("a still-pending receipt is not a duplicate or unordered mapping", () => {
+  const commits = [first, mid, tip];
+  const empty = linearReceiptEvidence(commits, []);
+  assert.equal(empty.duplicate, false);
+  assert.equal(empty.unordered, false);
+  assert.deepEqual(Object.values(empty.receipts), [0, 0, 0]);
+  const prefix = linearReceiptEvidence(commits, [{ git_sha: first, svn_rev: "2" }]);
+  assert.equal(prefix.duplicate, false);
+  assert.equal(prefix.unordered, false);
+  assert.equal(prefix.receipts[first], 1);
+  assert.equal(prefix.receipts[mid], 0);
+  const duplicated = linearReceiptEvidence(commits, [
+    { git_sha: first, svn_rev: "2" },
+    { git_sha: first, svn_rev: "3" },
+    { git_sha: mid, svn_rev: "4" },
+    { git_sha: tip, svn_rev: "5" },
+  ]);
+  assert.equal(duplicated.duplicate, true);
+  const unordered = linearReceiptEvidence(commits, [
+    { git_sha: first, svn_rev: "5" },
+    { git_sha: mid, svn_rev: "4" },
+    { git_sha: tip, svn_rev: "6" },
+  ]);
+  assert.equal(unordered.duplicate, false);
+  assert.equal(unordered.unordered, true);
 });
 
 test("duplicate and unordered revision mappings are not a PASS", () => {

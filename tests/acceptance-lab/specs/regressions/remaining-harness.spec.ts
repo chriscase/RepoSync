@@ -3,6 +3,7 @@ import {mkdtempSync, mkdirSync, rmSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {test, expect} from "@playwright/test";
+import {linearReceiptEvidence} from "../../playwright/oracles.ts";
 import {assertCompletedPublishRefusal, assertReplayEndpoints, Lab, loginError, type Pair, type Snap} from "../../playwright/runtime.ts";
 import {labPairKey, requireRepeatIdle, runCase} from "../../playwright/handlers.ts";
 
@@ -553,6 +554,105 @@ for (const fault of ["ordered", "duplicate-receipt", "unordered-revisions", "cur
       await expect(run).rejects.toThrow(/duplicate revision mappings|unordered revision mappings|final bytes|final directional checkpoints/);
       expect(passed).toBe("");
     }
+  });
+}
+
+function linearLab(fault: "progress" | "incomplete" | "duplicate-receipt" | "unordered-revisions") {
+  const shas = ["b".repeat(40), "c".repeat(40), "d".repeat(40)];
+  const tip = shas[2];
+  const settled = {svn: "4", git: tip, maps: "1", records: "4", watermark: "1", gitWatermark: tip, gitColumn: tip};
+  const early = {...settled, git: "a".repeat(40), gitWatermark: "a".repeat(40), gitColumn: "a".repeat(40)};
+  const complete = [
+    {git_sha: shas[0], svn_rev: "2"},
+    {git_sha: shas[1], svn_rev: "3"},
+    {git_sha: shas[2], svn_rev: "4"},
+  ];
+  let reads = 0;
+  let passed = "";
+  const fake: any = {
+    createPair: async () => pair,
+    publicationWaitTimeout: fault === "incomplete" ? 1_200 : fault === "progress" ? undefined : 5_000,
+    snap: async () => fault === "progress" && reads < 2 ? early : settled,
+    commitGit: async () => tip,
+    gitCommitsSince: async () => shas,
+    triggerGit: async () => 200,
+    appliedGitToSvn: async () => {
+      reads += 1;
+      if (fault === "duplicate-receipt") return [complete[0], {git_sha: shas[0], svn_rev: "3"}, complete[1], complete[2]];
+      if (fault === "unordered-revisions") return [{git_sha: shas[0], svn_rev: "5"}, {git_sha: shas[1], svn_rev: "4"}, {git_sha: shas[2], svn_rev: "6"}];
+      if (fault === "incomplete") return reads === 1 ? [] : [complete[0]];
+      if (reads === 1) return [];
+      if (reads === 2) return [complete[0]];
+      return complete;
+    },
+    svnBytesForRevisions: async () => ["A\n", "B\n", "C\n"],
+    svnBytes: async () => "C\n",
+    expectNoWrite: async (_ignored: Pair, action: () => Promise<void>) => { await action(); },
+    waitUntil: (read: () => Promise<boolean>, timeout?: number) => Lab.prototype.waitUntil.call(fake, read, timeout),
+    pass: (reason: string) => { passed = reason; },
+    mark: () => { throw new Error("linear publication must not mark over a failed oracle"); },
+    reads: () => reads,
+    passed: () => passed,
+  };
+  return fake;
+}
+
+test("real waitUntil retries a pending receipt predicate until it completes", async () => {
+  const shas = ["b".repeat(40), "c".repeat(40), "d".repeat(40)];
+  let reads = 0;
+  await Lab.prototype.waitUntil.call({}, async () => {
+    reads += 1;
+    const rows = reads === 1 ? [] : reads === 2 ? [{git_sha: shas[0], svn_rev: "2"}] : [
+      {git_sha: shas[0], svn_rev: "2"},
+      {git_sha: shas[1], svn_rev: "3"},
+      {git_sha: shas[2], svn_rev: "4"},
+    ];
+    const evidence = linearReceiptEvidence(shas, rows);
+    if (evidence.duplicate) throw new Error("duplicate revision mappings");
+    if (evidence.unordered) throw new Error("unordered revision mappings");
+    return reads >= 3 && shas.every(sha => evidence.receipts[sha] === 1);
+  }, 8_000);
+  expect(reads).toBe(3);
+});
+
+test("real waitUntil timeout on a permanently pending receipt is not success", async () => {
+  let reads = 0;
+  const shas = ["b".repeat(40), "c".repeat(40), "d".repeat(40)];
+  await expect(Lab.prototype.waitUntil.call({}, async () => {
+    reads += 1;
+    const evidence = linearReceiptEvidence(shas, []);
+    if (evidence.duplicate) throw new Error("duplicate revision mappings");
+    if (evidence.unordered) throw new Error("unordered revision mappings");
+    return false;
+  }, 1_200)).rejects.toThrow(/Timeout 1200ms exceeded/);
+  expect(reads).toBeGreaterThan(1);
+});
+
+test("linear publication runCase polls empty, then a prefix, then the complete tree", async () => {
+  test.setTimeout(20_000);
+  const fake = linearLab("progress");
+  await runCase(fake, {id: "GIT-MULTI-COMMIT-LINEAR", title: "fixture", suite: "full"});
+  expect(fake.passed()).toMatch(/receipt/);
+  expect(fake.reads()).toBeGreaterThanOrEqual(3);
+});
+
+test("linear publication runCase timeout on a pending prefix is not a PASS", async () => {
+  test.setTimeout(15_000);
+  const fake = linearLab("incomplete");
+  await expect(runCase(fake, {id: "GIT-MULTI-COMMIT-LINEAR", title: "fixture", suite: "full"})).rejects.toThrow(/Timeout 1200ms exceeded/);
+  expect(fake.passed()).toBe("");
+  expect(fake.reads()).toBeGreaterThan(1);
+});
+
+for (const fault of ["duplicate-receipt", "unordered-revisions"] as const) {
+  test(`linear publication real wait rejects ${fault} immediately`, async () => {
+    const started = Date.now();
+    const fake = linearLab(fault);
+    await expect(runCase(fake, {id: "GIT-MULTI-COMMIT-LINEAR", title: "fixture", suite: "full"})).rejects.toThrow(
+      fault === "duplicate-receipt" ? /duplicate revision mappings/ : /unordered revision mappings/,
+    );
+    expect(fake.passed()).toBe("");
+    expect(Date.now() - started).toBeLessThan(4_000);
   });
 }
 

@@ -66,7 +66,8 @@ export function linearReceiptEvidence(commits: string[], rows: GitReceipt[]): {
   const seen = new Set<string>();
   let duplicate = false;
   for (const sha of commits) {
-    if (grouped[sha].length !== 1) duplicate = true;
+    // A missing receipt is still pending. Only a second row is a duplicate.
+    if (grouped[sha].length > 1) duplicate = true;
     for (const revision of grouped[sha]) {
       if (seen.has(revision)) duplicate = true;
       seen.add(revision);
@@ -74,7 +75,9 @@ export function linearReceiptEvidence(commits: string[], rows: GitReceipt[]): {
   }
   let unordered = false;
   let previous = 0;
-  for (const revision of revisions) {
+  for (const sha of commits) {
+    if (grouped[sha].length !== 1) continue;
+    const revision = grouped[sha][0];
     if (!/^[0-9]+$/.test(revision)) {
       unordered = true;
       continue;

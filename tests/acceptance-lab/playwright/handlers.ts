@@ -43,15 +43,20 @@ export async function requireRepeatIdle(lab: Lab, pair: Pair): Promise<void> {
 
 async function requireLinearPublication(lab: Lab, pair: Pair, _before: Snap, commits: string[], path: string, expectedIntermediates: string[], timeout = 90_000): Promise<void> {
   const tip = commits[commits.length - 1] || "";
+  const configured = (lab as Lab & {publicationWaitTimeout?: number}).publicationWaitTimeout;
+  const waitBudget = typeof configured === "number" && configured > 0 ? configured : timeout;
   if (commits.length === expectedIntermediates.length && commits.length > 0) {
     await lab.waitUntil(async () => {
       const evidence = linearReceiptEvidence(commits, await lab.appliedGitToSvn(pair));
+      // expect.poll aborts on a throw. Pending zero counts and a still-missing
+      // prefix must return false so the wait retries. A second row, a repeated
+      // revision, or an invalid mapped order is final.
       if (evidence.duplicate) throw new Error("duplicate revision mappings");
       if (evidence.unordered) throw new Error("unordered revision mappings");
       const now = await lab.snap(pair);
       return now.git === tip && now.gitWatermark === tip && now.gitColumn === tip
         && commits.every(sha => evidence.receipts[sha] === 1);
-    }, timeout);
+    }, waitBudget);
   }
   let idle = false;
   try {
