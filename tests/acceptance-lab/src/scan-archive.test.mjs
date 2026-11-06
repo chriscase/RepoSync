@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { deflateRawSync, crc32 } from "node:zlib";
-import { materializeDiagnostics, scanTree } from "./scan.mjs";
+import { gzipSync } from "node:zlib";
+import { ARCHIVE_LIMITS, archiveEntries, materializeDiagnostics, scanTree } from "./scan.mjs";
 
 function zip(files) {
   const locals = [];
@@ -78,4 +79,25 @@ test("a compressed secret canary fails the scan and readable diagnostics remain"
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("archive budgets reject declared expansion before decompression", () => {
+  const claims = zip([{ name: "one.txt", data: Buffer.from("hello"), method: 8 }]);
+  claims.writeUInt32LE(ARCHIVE_LIMITS.maxEntryExpansion + 1, 22);
+  assert.throws(() => archiveEntries(claims), /declared expansion exceeds budget/);
+  const packed = gzipSync(Buffer.from("hello"));
+  packed.writeUInt32LE(ARCHIVE_LIMITS.maxEntryExpansion + 1, packed.length - 4);
+  assert.throws(() => archiveEntries(packed), /declared expansion exceeds budget/);
+  const many = zip([
+    { name: "a.txt", data: Buffer.from("a") },
+    { name: "b.txt", data: Buffer.from("b") },
+    { name: "c.txt", data: Buffer.from("c") },
+  ]);
+  assert.throws(() => archiveEntries(many, { ...ARCHIVE_LIMITS, maxEntries: 2 }), /entry count exceeds budget/);
+  const wide = zip([
+    { name: "a.txt", data: Buffer.from("0123456789") },
+    { name: "b.txt", data: Buffer.from("0123456789") },
+  ]);
+  assert.throws(() => archiveEntries(wide, { ...ARCHIVE_LIMITS, maxTotalExpansion: 15 }), /declared expansion exceeds budget/);
+  assert.throws(() => archiveEntries(Buffer.alloc(32), { ...ARCHIVE_LIMITS, maxCompressedInput: 16 }), /compressed input exceeds budget/);
 });

@@ -1,5 +1,5 @@
 import { expect } from "@playwright/test";
-import { cancelOutcome, contentIntegrityOutcome, egressOutcome, generationOutcome, linearPublicationOutcome, NUL_SAMPLE_SHA256, restorePrewriteOutcome, type Outcome } from "./oracles.ts";
+import { cancelOutcome, contentIntegrityOutcome, egressOutcome, generationOutcome, linearPublicationOutcome, linearReceiptEvidence, NUL_SAMPLE_SHA256, restorePrewriteOutcome, type Outcome } from "./oracles.ts";
 import { assertAuthRefusal, assertCompletedPublishRefusal, assertLdapUser, assertReplayEndpoints, importOperationId, loginError, readFaultStats, Lab, sharedPair, type LabOp, type Pair, type Snap } from "./runtime.ts";
 
 function slug(id: string): string {
@@ -41,30 +41,18 @@ export async function requireRepeatIdle(lab: Lab, pair: Pair): Promise<void> {
   });
 }
 
-async function requireLinearPublication(lab: Lab, pair: Pair, before: Snap, commits: string[], path: string, expectedIntermediates: string[], timeout = 90_000): Promise<void> {
+async function requireLinearPublication(lab: Lab, pair: Pair, _before: Snap, commits: string[], path: string, expectedIntermediates: string[], timeout = 90_000): Promise<void> {
   const tip = commits[commits.length - 1] || "";
   if (commits.length === expectedIntermediates.length && commits.length > 0) {
     await lab.waitUntil(async () => {
+      const evidence = linearReceiptEvidence(commits, await lab.appliedGitToSvn(pair));
+      if (evidence.duplicate) throw new Error("duplicate revision mappings");
+      if (evidence.unordered) throw new Error("unordered revision mappings");
       const now = await lab.snap(pair);
-      if (now.git !== tip || now.gitWatermark !== tip || now.gitColumn !== tip) return false;
-      const rows = await lab.appliedGitToSvn(pair);
-      const have = new Set(rows.map(row => row.git_sha));
-      return commits.every(sha => have.has(sha));
+      return now.git === tip && now.gitWatermark === tip && now.gitColumn === tip
+        && commits.every(sha => evidence.receipts[sha] === 1);
     }, timeout);
   }
-  const rows = commits.length ? await lab.appliedGitToSvn(pair) : [];
-  const revisionBySha = new Map(rows.map(row => [row.git_sha, row.svn_rev]));
-  const receipts: Record<string, number> = {};
-  const revisions: string[] = [];
-  for (const sha of commits) {
-    const revision = revisionBySha.get(sha);
-    receipts[sha] = revision ? 1 : 0;
-    if (revision) revisions.push(revision);
-  }
-  const intermediates = revisions.length === commits.length && commits.length > 0
-    ? await lab.svnBytesForRevisions(pair, path, revisions)
-    : commits.map(() => null);
-  const after = await lab.snap(pair);
   let idle = false;
   try {
     await requireRepeatIdle(lab, pair);
@@ -72,12 +60,27 @@ async function requireLinearPublication(lab: Lab, pair: Pair, before: Snap, comm
   } catch {
     idle = false;
   }
+  // Receipt counts, the current tree, and directional checkpoints are read
+  // after the idle repeat. Historical revision bytes stay the intermediate proof.
+  const evidence = linearReceiptEvidence(commits, commits.length ? await lab.appliedGitToSvn(pair) : []);
+  const revisionsReady = evidence.revisions.length === commits.length && evidence.revisions.every(revision => /^[0-9]+$/.test(revision));
+  const intermediates = revisionsReady && !evidence.duplicate && !evidence.unordered
+    ? await lab.svnBytesForRevisions(pair, path, evidence.revisions)
+    : commits.map(() => null);
+  let finalBytes: string | null = null;
+  try {
+    finalBytes = await lab.svnBytes(pair, path);
+  } catch {
+    finalBytes = null;
+  }
+  const after = await lab.snap(pair);
   const outcome = linearPublicationOutcome({
     commits,
-    receipts,
+    receipts: evidence.receipts,
+    revisions: evidence.revisions,
     intermediates,
     expectedIntermediates,
-    finalBytes: intermediates.length ? intermediates[intermediates.length - 1] : null,
+    finalBytes,
     expectedFinal: expectedIntermediates[expectedIntermediates.length - 1] || "",
     checkpoints: { git: after.git, watermark: after.gitWatermark, column: after.gitColumn },
     idle,
@@ -335,15 +338,16 @@ rm -f "$body" "$body.err" "$meta"
       const tool = output.includes("LAB_EGRESS_TOOL:present") ? "present" : "absent";
       const http = output.match(/LAB_EGRESS_HTTP:([0-9]+)/);
       const connects = output.match(/LAB_EGRESS_CONNECTS:([0-9]+)/);
-      const exitCode = output.match(/LAB_EGRESS_EXIT:(-?[0-9]+)/);
+      const exitCode = output.match(/LAB_EGRESS_EXIT:([0-9]+)/);
       const bodyMatch = output.match(/LAB_EGRESS_BODY_B64:([A-Za-z0-9+/=]*)/);
+      const metricsComplete = Boolean(http && connects && exitCode && bodyMatch);
       const body = bodyMatch ? Buffer.from(bodyMatch[1], "base64").toString("utf8") : "";
       const outcome = egressOutcome({
         tool,
         context: output.includes("LAB_EGRESS_CONTEXT:application") ? "application" : "unknown",
-        exitCode: exitCode ? Number(exitCode[1]) : null,
-        httpStatus: http ? Number(http[1]) : null,
-        connects: connects ? Number(connects[1]) : null,
+        exitCode: metricsComplete && exitCode ? Number(exitCode[1]) : null,
+        httpStatus: metricsComplete && http ? Number(http[1]) : null,
+        connects: metricsComplete && connects ? Number(connects[1]) : null,
         body,
       });
       lab.observation("egress-rejected", {

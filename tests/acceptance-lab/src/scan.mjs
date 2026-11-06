@@ -10,6 +10,13 @@ const LIVE_BEARER = /Authorization:\s+Bearer\s+\S{8,}/i;
 const LIVE_TOKEN = /Authorization:\s+token\s+(?!\$)[A-Za-z0-9._~+/-]{8,}/i;
 const LEFTOVER_PAYLOAD = /Authorization:\s+\[redacted\]\s+[A-Za-z0-9+/=]{8,}/;
 
+export const ARCHIVE_LIMITS = {
+  maxCompressedInput: 20_000_000,
+  maxEntryExpansion: 1_000_000,
+  maxTotalExpansion: 20_000_000,
+  maxEntries: 256,
+};
+
 function entryFindings(rel, bytes, secrets) {
   const findings = [];
   const decoded = bytes.toString("utf8");
@@ -34,40 +41,60 @@ function safeEntryName(name) {
   return name;
 }
 
-export function archiveEntries(bytes) {
+function boundedInflate(compressed, declared, outputBudget) {
+  if (declared > outputBudget) throw new Error("declared expansion exceeds budget");
+  return inflateRawSync(compressed, { maxOutputLength: declared });
+}
+
+export function archiveEntries(bytes, limits = ARCHIVE_LIMITS) {
+  if (bytes.length > limits.maxCompressedInput) throw new Error("compressed input exceeds budget");
   if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) {
-    return [{ name: "gunzip", data: gunzipSync(bytes) }];
+    if (limits.maxEntries < 1 || bytes.length < 18) throw new Error("unsafe or unsupported archive entry");
+    const declared = bytes.readUInt32LE(bytes.length - 4);
+    if (declared > limits.maxEntryExpansion || declared > limits.maxTotalExpansion) {
+      throw new Error("declared expansion exceeds budget");
+    }
+    const data = gunzipSync(bytes, { maxOutputLength: declared });
+    if (data.length !== declared) throw new Error("archive entry size mismatch");
+    return [{ name: "gunzip", data }];
   }
   if (bytes.length < 4 || bytes.readUInt32LE(0) !== 0x04034b50) return null;
   const entries = [];
   let offset = 0;
+  let total = 0;
   while (offset + 30 <= bytes.length) {
     if (bytes.readUInt32LE(offset) !== 0x04034b50) break;
+    if (entries.length >= limits.maxEntries) throw new Error("entry count exceeds budget");
     const flags = bytes.readUInt16LE(offset + 6);
     const method = bytes.readUInt16LE(offset + 8);
     const compressedSize = bytes.readUInt32LE(offset + 18);
+    const declared = bytes.readUInt32LE(offset + 22);
     const nameLength = bytes.readUInt16LE(offset + 26);
     const extraLength = bytes.readUInt16LE(offset + 28);
     const nameStart = offset + 30;
     const dataStart = nameStart + nameLength + extraLength;
     const name = safeEntryName(bytes.toString("utf8", nameStart, nameStart + nameLength));
-    if (!name || (flags & 0x1) !== 0 || (flags & 0x8) !== 0 || (method !== 0 && method !== 8) || compressedSize > 20_000_000 || dataStart + compressedSize > bytes.length) {
+    if (!name || (flags & 0x1) !== 0 || (flags & 0x8) !== 0 || (method !== 0 && method !== 8) || compressedSize > limits.maxCompressedInput || dataStart + compressedSize > bytes.length) {
       throw new Error("unsafe or unsupported archive entry");
+    }
+    if (declared > limits.maxEntryExpansion || total + declared > limits.maxTotalExpansion) {
+      throw new Error("declared expansion exceeds budget");
     }
     const compressed = bytes.subarray(dataStart, dataStart + compressedSize);
     if (method === 0) {
+      if (compressed.length !== declared) throw new Error("archive entry size mismatch");
       const expected = crc32(compressed) >>> 0;
       const recorded = bytes.readUInt32LE(offset + 14) >>> 0;
       if (expected !== recorded) throw new Error("archive entry checksum mismatch");
       entries.push({ name, data: Buffer.from(compressed) });
     } else {
-      const data = inflateRawSync(compressed);
+      const data = boundedInflate(compressed, declared, limits.maxEntryExpansion);
       const expected = crc32(data) >>> 0;
       const recorded = bytes.readUInt32LE(offset + 14) >>> 0;
-      if (expected !== recorded || data.length !== bytes.readUInt32LE(offset + 22)) throw new Error("archive entry checksum mismatch");
-      if (data.length > 20_000_000) throw new Error("archive entry is oversized");
+      if (expected !== recorded || data.length !== declared) throw new Error("archive entry checksum mismatch");
       entries.push({ name, data });
     }
+    total += declared;
     offset = dataStart + compressedSize;
   }
   return entries;
@@ -106,7 +133,7 @@ export async function scanTree(root, secrets = []) {
         continue;
       }
       if (!info.isFile()) continue;
-      if (info.size > 20_000_000) {
+      if (info.size > ARCHIVE_LIMITS.maxCompressedInput) {
         findings.push({ path: rel, reason: "oversized" });
         continue;
       }
@@ -130,10 +157,6 @@ export async function scanTree(root, secrets = []) {
           continue;
         }
         for (const item of entries) {
-          if (item.data.length > 20_000_000) {
-            findings.push({ path: `${rel}!${item.name}`, reason: "oversized" });
-            continue;
-          }
           findings.push(...entryFindings(`${rel}!${item.name}`, item.data, secrets));
         }
         continue;
@@ -161,6 +184,11 @@ export async function materializeDiagnostics(source, dest, secrets = []) {
       }
       if (!entry.isFile()) {
         findings.push({ path: rel, reason: "symlink" });
+        continue;
+      }
+      const info = await stat(path);
+      if (info.size > ARCHIVE_LIMITS.maxCompressedInput) {
+        findings.push({ path: rel, reason: "oversized" });
         continue;
       }
       const bytes = await readFile(path);

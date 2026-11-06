@@ -46,6 +46,7 @@ test("prefix-only publication is not a PASS", () => {
   const outcome = linearPublicationOutcome({
     commits: [first, mid, tip],
     receipts: { [first]: 1 },
+    revisions: ["2", "3", "4"],
     intermediates: ["0\n", null, null],
     expectedIntermediates: ["0\n", "1\n", "2\n"],
     finalBytes: "0\n",
@@ -61,6 +62,7 @@ test("squash-only publication is not a PASS", () => {
   const outcome = linearPublicationOutcome({
     commits: [first, mid, tip],
     receipts: { [tip]: 1 },
+    revisions: ["2", "3", "4"],
     intermediates: [null, null, "C\n"],
     expectedIntermediates: ["A\n", "B\n", "C\n"],
     finalBytes: "C\n",
@@ -76,6 +78,7 @@ test("complete linear publication can PASS", () => {
   const outcome = linearPublicationOutcome({
     commits: [first, mid, tip],
     receipts: { [first]: 1, [mid]: 1, [tip]: 1 },
+    revisions: ["2", "3", "4"],
     intermediates: ["A\n", "B\n", "C\n"],
     expectedIntermediates: ["A\n", "B\n", "C\n"],
     finalBytes: "C\n",
@@ -148,6 +151,35 @@ test("cancel acknowledgment is not completion", () => {
   assert.notEqual(outcome.status, "PASS");
 });
 
+test("duplicate and unordered revision mappings are not a PASS", () => {
+  const duplicate = linearPublicationOutcome({
+    commits: [first, mid, tip],
+    receipts: { [first]: 2, [mid]: 1, [tip]: 1 },
+    revisions: ["2", "3", "4"],
+    intermediates: ["A\n", "B\n", "C\n"],
+    expectedIntermediates: ["A\n", "B\n", "C\n"],
+    finalBytes: "C\n",
+    expectedFinal: "C\n",
+    checkpoints: { git: tip, watermark: tip, column: tip },
+    idle: true,
+  });
+  assert.notEqual(duplicate.status, "PASS");
+  assert.match(duplicate.reason, /duplicate receipts/);
+  const unordered = linearPublicationOutcome({
+    commits: [first, mid, tip],
+    receipts: { [first]: 1, [mid]: 1, [tip]: 1 },
+    revisions: ["4", "3", "5"],
+    intermediates: ["A\n", "B\n", "C\n"],
+    expectedIntermediates: ["A\n", "B\n", "C\n"],
+    finalBytes: "C\n",
+    expectedFinal: "C\n",
+    checkpoints: { git: tip, watermark: tip, column: tip },
+    idle: true,
+  });
+  assert.notEqual(unordered.status, "PASS");
+  assert.match(unordered.reason, /unordered revision mappings/);
+});
+
 test("egress rejects successful non-HTML responses and distinguishes the probe", () => {
   for (const body of ["", "{\"ok\":true}", "<HTML>example</HTML>"]) {
     const status = body === "" ? 204 : 200;
@@ -175,4 +207,19 @@ test("egress rejects successful non-HTML responses and distinguishes the probe",
     tool: "present", context: "application", exitCode: 7, httpStatus: 0, connects: 0, body: "",
   });
   assert.equal(rejected.status, "PASS");
+  const missingConnects = egressOutcome({
+    tool: "present", context: "application", exitCode: 7, httpStatus: 0, connects: null, body: "",
+  });
+  assert.notEqual(missingConnects.status, "PASS");
+  assert.match(missingConnects.reason, /missing or truncated/);
+  const missingExit = egressOutcome({
+    tool: "present", context: "application", exitCode: null, httpStatus: 0, connects: 0, body: "",
+  });
+  assert.notEqual(missingExit.status, "PASS");
+  assert.match(missingExit.reason, /missing or truncated/);
+  const internal = egressOutcome({
+    tool: "present", context: "application", exitCode: 27, httpStatus: 0, connects: 0, body: "",
+  });
+  assert.equal(internal.status, "FAIL");
+  assert.match(internal.reason, /internal curl error/);
 });

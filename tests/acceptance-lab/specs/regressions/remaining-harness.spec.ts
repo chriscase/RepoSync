@@ -471,7 +471,7 @@ for (const id of ["PAIR-CANCEL-IMPORT", "PAIR-CANCEL-RESTART-GENERATION"]) {
           return {status: 400, text: "exact operation ID required", json: {error: "exact operation ID required"}};
         },
         pass: (reason: string) => {passed = reason;},
-        mark: (status: string, reason: string) => {marked = `${status} ${reason}`;},
+        mark: (status: string, reason: string, qualification = "") => {marked = `${status} ${qualification} ${reason}`;},
       };
       const run = runCase(fake, {id, title: "fixture", suite: "full"});
       if (fault === "missing-operation") {
@@ -482,8 +482,10 @@ for (const id of ["PAIR-CANCEL-IMPORT", "PAIR-CANCEL-RESTART-GENERATION"]) {
       } else if (fault === "none" && id === "PAIR-CANCEL-IMPORT") {
         await run;
         expect(calls).toEqual([`POST /api/repos/${pair.id}/import/op-live/cancel`]);
-        expect(passed).toBe("cancelled import op-live");
-        expect(marked).toBe("");
+        expect(passed).toBe("");
+        expect(marked).toContain("PARTIAL");
+        expect(marked).toContain("UNQUALIFIED");
+        expect(marked).not.toContain("PASS");
       } else if (fault === "none" && id === "PAIR-CANCEL-RESTART-GENERATION") {
         await run;
         expect(calls).toEqual([
@@ -492,14 +494,19 @@ for (const id of ["PAIR-CANCEL-IMPORT", "PAIR-CANCEL-RESTART-GENERATION"]) {
           `POST /api/repos/${pair.id}/import`,
           `GET /api/repos/${pair.id}/import/status`,
         ]);
-        expect(passed).toContain("op-live");
-        expect(passed).toContain("refused");
-        expect(passed).toContain("400");
-        expect(marked).toBe("");
+        expect(passed).toBe("");
+        expect(marked).toContain("PARTIAL");
+        expect(marked).toContain("UNQUALIFIED");
+        expect(marked).toContain("op-live");
+        expect(marked).toContain("400");
+        expect(marked).not.toContain("PASS");
       } else if (id === "PAIR-CANCEL-IMPORT" && fault.startsWith("restart-")) {
         await run;
         expect(calls).toEqual([`POST /api/repos/${pair.id}/import/op-live/cancel`]);
-        expect(passed).toBe("cancelled import op-live");
+        expect(passed).toBe("");
+        expect(marked).toContain("PARTIAL");
+        expect(marked).toContain("UNQUALIFIED");
+        expect(marked).not.toContain("PASS");
       } else {
         await expect(run).rejects.toThrow();
         expect(passed).toBe("");
@@ -509,6 +516,44 @@ for (const id of ["PAIR-CANCEL-IMPORT", "PAIR-CANCEL-RESTART-GENERATION"]) {
       expect(calls.some(call => /\/import\/cancel$/.test(call))).toBe(false);
     });
   }
+}
+
+for (const fault of ["ordered", "duplicate-receipt", "unordered-revisions", "current-bytes-after-repeat", "checkpoints-after-repeat"]) {
+  test(`linear publication runCase ${fault}`, async () => {
+    const shas = ["b".repeat(40), "c".repeat(40), "d".repeat(40)];
+    const tip = shas[2];
+    let phase = "publish";
+    let passed = "";
+    const rows = fault === "duplicate-receipt"
+      ? [{git_sha: shas[0], svn_rev: "2"}, {git_sha: shas[0], svn_rev: "3"}, {git_sha: shas[1], svn_rev: "4"}, {git_sha: shas[2], svn_rev: "5"}]
+      : fault === "unordered-revisions"
+        ? [{git_sha: shas[0], svn_rev: "5"}, {git_sha: shas[1], svn_rev: "4"}, {git_sha: shas[2], svn_rev: "6"}]
+        : [{git_sha: shas[0], svn_rev: "2"}, {git_sha: shas[1], svn_rev: "3"}, {git_sha: shas[2], svn_rev: "4"}];
+    const settled = {svn: "4", git: tip, maps: "1", records: "4", watermark: "1", gitWatermark: tip, gitColumn: tip};
+    const fake: any = {
+      createPair: async () => pair,
+      snap: async () => phase === "after" && fault === "checkpoints-after-repeat" ? {...settled, gitWatermark: "e".repeat(40)} : settled,
+      commitGit: async () => tip,
+      gitCommitsSince: async () => shas,
+      triggerGit: async () => 200,
+      appliedGitToSvn: async () => rows,
+      svnBytesForRevisions: async () => ["A\n", "B\n", "C\n"],
+      svnBytes: async () => phase === "after" && fault === "current-bytes-after-repeat" ? "CORRUPT\n" : "C\n",
+      expectNoWrite: async (_ignored: Pair, action: () => Promise<void>) => { await action(); phase = "after"; },
+      waitUntil: async (read: () => Promise<boolean>) => { if (!await read()) throw new Error("publication did not settle"); },
+      pass: (reason: string) => { passed = reason; },
+      mark: () => { throw new Error("linear publication must not mark over a failed oracle"); },
+    };
+    const run = runCase(fake, {id: "GIT-MULTI-COMMIT-LINEAR", title: "fixture", suite: "full"});
+    if (fault === "ordered") {
+      await run;
+      expect(passed).toMatch(/receipt/);
+      expect(passed).not.toMatch(/CORRUPT/);
+    } else {
+      await expect(run).rejects.toThrow(/duplicate revision mappings|unordered revision mappings|final bytes|final directional checkpoints/);
+      expect(passed).toBe("");
+    }
+  });
 }
 
 test("login error locator excludes the LDAP domain and requires an actual form error", async ({page}) => {
