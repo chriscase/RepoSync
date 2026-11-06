@@ -134,16 +134,34 @@ version you actually use, and test on a throwaway repository first:
 
 ### What rules will and will not interfere with RepoSync
 
-Checked in the source at the pinned commit:
+This table is a reading of the source at the pinned commit. It is **not** a test
+against any host: no ruleset was applied or rehearsed anywhere. It compares each
+RepoSync Git publication with the two illustrated rules only (`deletion` and
+`non_fast_forward`).
 
-| RepoSync action | Is it a fast-forward? | Effect of the recommended rules |
+| RepoSync action | What the source shows | Against the two illustrated rules |
 | --- | --- | --- |
-| Ordinary sync publication | Yes (plain push) | Unaffected. |
-| Late-pair publication to Git | Yes. The code proves the new tip descends from the old one before it pushes, and uses `--force-with-lease` with an exact expected tip only to close a race. | Unaffected: the update is still a fast-forward. |
+| Ordinary sync publication | Plain (non-force) push. | Not a rewrite or a deletion: unaffected. |
+| Late-pair publication to Git | The code proves the new tip descends from the old one before it pushes, and uses `--force-with-lease` with an exact expected tip only to close a race. | Still a fast-forward: unaffected. |
 | v2 pair-refresh publication to Git (draft) | Pushes the prepared commit to the child ref with a refspec that has no force marker, and checks that the remote's old value equals the pinned tip. | Unaffected when the result is a fast-forward; a non-fast-forward would be refused by the remote. |
-| **Initial import** to a destination branch | The first batch is published with a force-style push | Would be rejected if the rule is already in place. Apply the rule **after** the branch is populated and paired. |
-| Setup wizard **Reset & Reimport** | Force-pushes a fresh import | Would be rejected, which is the correct outcome for a paired ref. Don't use it on one. |
-| Legacy `DELETE /api/repos/{id}/branch-pair` | Deletes remote branches by default if the caller doesn't say otherwise | The deletion rule would reject the Git branch delete. Expect a visible failure, not a silent skip. |
+| **Journaled initial import** (snapshot import, or a full import that has an operation record) | The first publication uses `--force-with-lease=refs/heads/<branch>:` with an **empty expected value**. By Git's lease semantics that creates the branch only if it is **absent** and refuses if it already exists. Later batches are plain pushes. | A creation is neither a non-fast-forward update nor a deletion, so these two rules do not address it. It is not a rewrite path. |
+| Older **un-journaled** full-import path (used when no repository and operation record are present) | The first batch is pushed with a plain `git push --force`. | Can overwrite an existing destination branch, so a `non_fast_forward` rule on that ref would be expected to refuse such an update. |
+| Setup wizard **Reset & Reimport** | Deletes RepoSync's local Git clone, then runs `git push --force origin <branch>` with a fresh import. | A rewrite of the configured branch: a `non_fast_forward` rule would be expected to refuse it, which is the correct outcome for a paired ref. Don't use it on one. |
+| Legacy `DELETE /api/repos/{id}/branch-pair` | Does **not** attempt a Git or SVN deletion on this route's default inputs; see the next section. | Nothing for the deletion rule to refuse. |
+
+Expectations about what a host would refuse are inferences from the rule
+descriptions, not observations. They rest on two static references: the
+`--force-with-lease` expected-value semantics in [`git push`][git-push], and the
+rule types in the GitHub [repository rulesets REST reference][gh-rulesets]. Neither
+reference is a host qualification.
+
+**The two illustrated rules are not a complete host policy.** A real policy for a
+paired ref may also restrict *creation*, require pull-request review, status
+checks or signed commits, require linear history, or limit which actors may
+update the ref. Any of those could refuse a RepoSync creation or fast-forward
+publication. Whether a given combination works with RepoSync needs a **separately
+authorized rehearsal** on a throwaway repository and host. Nothing here changes a
+host bypass or configuration, and nothing here qualifies a host.
 
 **A rejected update should stay a visible failure.** If RepoSync is refused by a
 rule, that is the rule working; resolve it with the administrator, not by
@@ -152,8 +170,41 @@ loosening the rule from a script.
 A rule is also not a substitute for RepoSync's own checks. Even with a perfect
 ruleset, RepoSync still validates ancestry before it replays anything.
 
-Sources: [late-pair Git publication][lpp], [v2 refresh publication][refresh-pub], [import publication][import-pub],
-[reset & reimport][reset-reimport], [branch-pair delete defaults][delete-flags].
+Sources: [late-pair Git publication][lpp], [v2 refresh publication][refresh-pub],
+[journaled publication helper and lease][import-pub], [snapshot import call site][import-snap],
+[full-import journaled call sites][import-full] and [final batch][import-final], [un-journaled `--force` (first batch)][import-legacy-a] and [(final batch)][import-legacy-b], [reset & reimport][reset-reimport].
+
+### Legacy branch-pair delete: interpreted defaults versus actual refusal
+
+What the handler *interprets* and what actually *happens* are easy to confuse, and
+there are two separate follow-on routes:
+
+- **What the handler interprets.** If `explicit_remote_deletion_opts=true` is not
+  given, an omitted `delete_git` or `delete_svn` is *interpreted* as `true`. The
+  reply's `remote_deletion` object echoes those requested flags. It describes what
+  was requested, **not** what happened.
+- **What actually happens.** The handler then calls the managed-removal handler with
+  `explicit_remote_deletion_opts` forced to `true`. That handler's guard returns
+  **HTTP 409** with `state: "blocked"`, `review_required: true`, and
+  `remote_git` and `remote_svn` both `"untouched"`, *before* any remote deletion
+  or local cleanup. So a legacy request that omits the flags, or asks for either
+  remote deletion, performs nothing and says that review and approval are required.
+- **Local-only removal.** With `explicit_remote_deletion_opts=true&delete_git=false&delete_svn=false`
+  the legacy route continues into the supported managed removal of RepoSync's own
+  registration and the local data it owns. The remotes stay untouched. It is still
+  an administrator-only, durable operation that can wait or block, and removing a pair
+  from RepoSync is not a repair for a held pair.
+- **Remote deletion** exists only through the separately reviewed v2 removal flow:
+  an administrator reviews the exact target (`POST /api/repos/{id}/removal/review`)
+  and then approves it with the review pin (`POST /api/repos/{id}/removal/approve`).
+  Whether a host deletion rule would then refuse the Git ref delete is host
+  behavior that this guide did not test.
+
+None of this loosens a safeguard, and this guide does not suggest working around
+one. See the [#65 contract][c65] and [closeout][c65-closeout].
+
+Sources: [flag interpretation][delete-flags], [legacy handler forwarding][delete-handler],
+[managed-removal guard][remove-guard], [removal review and approval routes][removal-routes].
 
 ## Safe next steps
 
@@ -173,5 +224,17 @@ Sources: [late-pair Git publication][lpp], [v2 refresh publication][refresh-pub]
 [refresh-pub]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/pair_refresh/publication.rs#L262-L293
 [lpp]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/late_pair_publish.rs#L615-L650
 [import-pub]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L2608-L2640
+[import-snap]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L3121-L3135
+[import-full]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L3846-L3860
+[import-final]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L4099-L4115
+[import-legacy-a]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L3884-L3930
+[import-legacy-b]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L4144-L4162
 [reset-reimport]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/setup.rs#L1515-L1520
-[delete-flags]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L3952-L3962
+[delete-flags]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L3952-L3969
+[delete-handler]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L4002-L4023
+[remove-guard]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L948-L955
+[removal-routes]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L319-L321
+[c65]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/docs/reliability/contracts/65-managed-remove.md
+[c65-closeout]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/docs/reliability/65-managed-removal-closeout.md
+[git-push]: https://git-scm.com/docs/git-push
+[gh-rulesets]: https://docs.github.com/en/rest/repos/rules#create-a-repository-ruleset

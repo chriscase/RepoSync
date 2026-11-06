@@ -38,16 +38,29 @@ that adds commits on top of what RepoSync has already handled is admitted and
 replayed. A push that is not a descendant of what RepoSync has handled is
 **rejected for replay and the pair is held**. The rejection reasons are listed
 in [Status and reconciliation](status-and-reconciliation.md#why-a-pair-gets-held).
+
 RepoSync's ordinary Git publication goes through a plain (non-force) push
-method. The exceptions are the **initial import** paths, which publish their
-first batch to the destination branch with a force-style push (and the admin-only
-setup "Reset & Reimport", which force-pushes). Those are one-time setup and
-recovery actions on a repository's own destination branch, not part of ordinary
-sync; they matter for [branch policy](branch-policy-and-hooks.md#what-rules-will-and-will-not-interfere-with-reposync).
+method. The setup and import paths differ from each other, so they are not
+lumped together:
+
+- **Journaled import publication** (a snapshot import, or a full import with an
+  operation record) publishes its first commit set with
+  `--force-with-lease=refs/heads/<branch>:`. The empty expected value means Git
+  creates the branch only if it is absent and refuses if it already exists. That
+  is a creation, not a rewrite. Later batches are plain pushes.
+- **An older un-journaled full-import path**, used when no repository and
+  operation record are present, pushes its first batch with a plain `git push --force`.
+- **Setup "Reset & Reimport"** (admin-only) deletes RepoSync's local clone and
+  runs `git push --force`, which rewrites the configured branch.
+
+None of these is part of ordinary sync. How they relate to a branch rule is in
+[branch policy](branch-policy-and-hooks.md#what-rules-will-and-will-not-interfere-with-reposync).
 
 Sources: [scheduler tick loop][scheduler-loop], [config example][config-example],
 [the #66 history-containment contract][c66], [ordinary Git push][git-push],
-[import first-batch push][import-force].
+[journaled import lease][import-force], [snapshot import call][import-snap],
+[full-import first batch][import-full], [un-journaled `--force`][import-legacy],
+[setup reset & reimport][reset-reimport].
 
 ## Can I make it sync now?
 
@@ -108,3 +121,7 @@ Sources: [`github_webhook`][gh-webhook], [`svn_webhook`][svn-webhook],
 [trigger-sync]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L1178-L1226
 [gh-webhook]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/webhooks.rs#L87-L205
 [svn-webhook]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/webhooks.rs#L207-L257
+[import-snap]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L3121-L3135
+[import-full]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L3846-L3860
+[import-legacy]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L3884-L3930
+[reset-reimport]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/setup.rs#L1515-L1520

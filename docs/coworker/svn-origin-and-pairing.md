@@ -9,14 +9,26 @@ Git commits that RepoSync itself recorded as the Git form of a specific SVN
 revision. Working mainly in Git does not change this. A branch name, a matching
 file tree, or a commit message that says "from r1200" is not proof.
 
-At the pinned commit, admission of a late pair requires all of these. Any
-failure is a refusal before anything is copied, written or checkpointed:
+At the pinned commit the requirement comes in two layers. Any failure in either
+is a refusal before anything is copied, written or checkpointed.
 
-- a **verified mapping** exists for the parent (an applied Git-SHA ↔ SVN-revision pairing recorded by RepoSync for that repository);
-- your branch tip **descends from** one of those mapped commits (an actual Git ancestor, checked with the equivalent of `git merge-base --is-ancestor`);
-- the Git tree at that mapped commit and the SVN export at the mapped revision have **identical regular-file bytes and executable bits**.
+**Admission** (the shared check, used by both the older v1 and the reviewed v2
+protocols) requires:
 
-Sources: [`evaluate_admission`][admission], [#67 admission contract][c67].
+- a **verified mapping** exists for the parent (an applied Git-SHA ↔ SVN-revision pairing recorded by RepoSync for that repository), otherwise `missing_baseline`;
+- your branch tip can be resolved, and **descends from** one of those mapped commits (an actual Git ancestor, checked with the equivalent of `git merge-base --is-ancestor`), otherwise `unrelated_git_first` or `missing_git_objects`;
+- no unsafe "start from now" (`skip_import`) request.
+
+**Reviewed (v2) preparation** is stronger. Before it produces a preview, it
+also captures the Git tree at the mapped commit and the SVN export at the mapped
+revision and refuses with "verified Git/SVN baseline bytes or modes differ" unless
+they have **identical regular-file bytes and executable modes**. The #67 contract
+states that stronger requirement. This guide did not find that byte-and-mode
+comparison inside the shared admission function, and it did not verify whether the
+older v1 path performs an equivalent check, so don't assume it does.
+
+Sources: admission predicates in [`evaluate_admission`][admission]; byte and mode
+equality in [reviewed preparation][lp-prepare]; [#67 contract][c67].
 
 ## A valid example
 
@@ -200,5 +212,6 @@ effect that may already have happened and its hold.
 [admission]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/late_pair.rs#L388-L556
 [c67]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/docs/reliability/contracts/67-late-pair-admission.md
 [commit-map]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/sync_history.rs#L32-L51
-[create-pair]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L3125-L3199
+[create-pair]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L3125-L3277
+[lp-prepare]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/late_pair.rs#L1666-L1746
 [lp-view]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L3638-L3668

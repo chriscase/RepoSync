@@ -67,7 +67,7 @@ is one of `unique_match`, `absent_unchanged`, `conflict` or `unavailable`, next 
 `publication_proved`, `checkpoint_completed` and `may_resume`. `conflict` and
 `unavailable` are not good news; stop and escalate.
 
-Sources: [import status, cancel, reconcile][import-routes], [svn-commit and git-push][commit-routes], [route table][route-table].
+Sources: [import status authorization][import-status], [import cancel and reconcile][import-routes], [svn-commit and git-push][commit-routes], [route table][route-table].
 
 ## What "reconciliation required" means
 
@@ -106,13 +106,20 @@ not treat it as complete.
 - Do not use the setup wizard's "Reset & Reimport" to "fix" a held repository.
   It deletes RepoSync's local Git clone and force-pushes a fresh import to the
   configured branch.
-- Do not call the legacy `DELETE /api/repos/{id}/branch-pair` without thinking:
-  when called **without** `explicit_remote_deletion_opts=true`, an omitted
-  `delete_git` and `delete_svn` both default to **true**. Removal has its own reviewed APIs; see
-  [docs/reliability/65-managed-removal-closeout.md](../reliability/65-managed-removal-closeout.md).
+- Do not try to "clean up" a held pair with the legacy `DELETE /api/repos/{id}/branch-pair`.
+  Its handler *interprets* an omitted `delete_git` or `delete_svn` as `true` when
+  `explicit_remote_deletion_opts=true` is not given, and the reply's `remote_deletion`
+  object echoes those requested flags. It does not delete anything remote: the
+  managed-removal guard answers **HTTP 409** (`state: "blocked"`, `review_required: true`,
+  `remote_git` and `remote_svn` both `"untouched"`) before any remote deletion or local
+  cleanup. Remote deletion requires the separately reviewed `/removal/review` then
+  `/removal/approve` flow; passing explicit `false` flags requests only RepoSync's own
+  local managed removal. Removing a pair is not a repair for a hold. Details:
+  [Branch policy](branch-policy-and-hooks.md#legacy-branch-pair-delete-interpreted-defaults-versus-actual-refusal)
+  and [docs/reliability/65-managed-removal-closeout.md](../reliability/65-managed-removal-closeout.md).
 - Do not treat "the status page is green again" as proof. Status is a read of recorded state.
 
-Sources: [import reconcile][import-routes], [branch-pair deletion defaults][delete-flags],
+Sources: [import reconcile][import-routes], [flag interpretation][delete-flags], [managed-removal guard][remove-guard],
 [reset & reimport][reset-reimport], [RS64-B reconciliation][rs64b].
 
 ## Why a pair gets held
@@ -169,9 +176,11 @@ hand; it is not something a developer can or should engineer around.
 [import-routes]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L2209-L2368
 [commit-routes]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L2702-L2800
 [route-table]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L308-L383
-[delete-flags]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L3952-L3962
+[delete-flags]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L3952-L3969
 [reset-reimport]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/setup.rs#L1376-L1385
 [rs64b]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/docs/reliability/RS64-B-reconciliation.md
 [c66]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/docs/reliability/contracts/66-history-containment.md
 [reasons]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/history_inspect.rs#L1-L30
 [durable]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/history_inspect.rs#L109-L176
+[remove-guard]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L948-L955
+[import-status]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L2070-L2095
