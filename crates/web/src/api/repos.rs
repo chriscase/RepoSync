@@ -19,7 +19,8 @@ use reposync_core::db::import_operations::{
 };
 use reposync_core::db::late_pair_publish_operations::late_pair_publish_fingerprint;
 use reposync_core::db::queries::{
-    AuditLogInput, RepositorySaveError, RepositorySaveKind, RepositorySaveReceipt,
+    AuditLogInput, CredentialChainState, RepositorySaveError, RepositorySaveKind,
+    RepositorySaveReceipt,
 };
 use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
 use reposync_core::db::Database;
@@ -46,6 +47,46 @@ use reposync_core::svn::SvnClient;
 use crate::api::auth::{validate_session, validate_session_with_role};
 use crate::api::status::AppError;
 use crate::AppState;
+
+/// Shared RS-11 resolver for import/resume/status. Revocation never falls
+/// through to a global key; read failure is not treated as absence.
+fn chain_state(
+    db: &Database,
+    repo_id: &str,
+    key_prefix: &str,
+) -> Result<CredentialChainState, AppError> {
+    let state = db
+        .try_resolve_credential_chain_state(repo_id, key_prefix)
+        .map_err(|_| AppError::Internal("failed to read credential chain".into()))?;
+    if state.is_read_failure() {
+        return Err(AppError::Internal("failed to read credential chain".into()));
+    }
+    if state.explicitly_revoked {
+        return Err(AppError::Forbidden(
+            "credential chain is revoked for this repository".into(),
+        ));
+    }
+    Ok(state)
+}
+
+fn chain_secret(
+    db: &Database,
+    repo_id: &str,
+    key_prefix: &str,
+) -> Result<Option<String>, AppError> {
+    Ok(chain_state(db, repo_id, key_prefix)?
+        .value
+        .filter(|v| !v.is_empty()))
+}
+
+fn chain_reports_as_set(db: &Database, repo_id: &str, key_prefix: &str) -> Result<bool, AppError> {
+    let state = db
+        .try_resolve_credential_chain_state(repo_id, key_prefix)
+        .map_err(|_| AppError::Internal("failed to read credential chain".into()))?;
+    state
+        .reports_as_set()
+        .map_err(|_| AppError::Internal("failed to read credential chain".into()))
+}
 
 #[cfg(test)]
 #[path = "import_failure_persistence.rs"]
@@ -1523,6 +1564,11 @@ async fn start_repo_import(
         ));
     }
 
+    // Resolve credentials before any durable import transition or worker claim.
+    let svn_password = chain_secret(db, &id, "secret_svn_password")?.unwrap_or_default();
+    let git_token_state = chain_state(db, &id, "secret_git_token")?;
+    let git_token = git_token_state.value.clone().filter(|v| !v.is_empty());
+
     if let Some(previous) = db
         .latest_import_operation(&id)
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -1639,36 +1685,17 @@ async fn start_repo_import(
         cleanup_unconfirmed: false,
     };
 
-    // 3. Reset progress
+    // 3. Reset progress only after credentials are known to be usable.
     {
         let mut p = progress.write().await;
         *p = ImportProgress::default();
         p.phase = ImportPhase::Importing;
         p.started_at = Some(chrono::Utc::now().to_rfc3339());
     }
-
-    // 4. Read credentials from kv_state
-    let svn_password_repo = db
-        .get_state(&format!("secret_svn_password_{}", id))
-        .unwrap_or(None);
-    let svn_password_global = db.get_state("secret_svn_password").unwrap_or(None);
-    let svn_password = svn_password_repo
-        .clone()
-        .or(svn_password_global.clone())
-        .unwrap_or_default();
-    debug!(
-        repo_id = %id,
-        source = if svn_password_repo.is_some() { "repo-specific" } else if svn_password_global.is_some() { "global" } else { "none" },
-        "resolved SVN password for import"
-    );
-
-    let git_token_state = db.resolve_credential_chain_state(&id, "secret_git_token");
-    let git_token = git_token_state.value.clone();
     debug!(
         repo_id = %id,
         git_token_found = git_token.is_some(),
-        git_token_revoked = git_token_state.explicitly_revoked,
-        "resolved Git token for import via credential chain"
+        "resolved import credentials via credential chain"
     );
 
     // 5. Build SVN import URL
@@ -2403,6 +2430,10 @@ async fn resume_repo_import(
         ));
     }
 
+    let svn_password = chain_secret(db, &id, "secret_svn_password")?.unwrap_or_default();
+    let git_token_state = chain_state(db, &id, "secret_git_token")?;
+    let git_token = git_token_state.value.clone().filter(|v| !v.is_empty());
+
     let progress = state.get_repo_import_progress(&id).await;
     {
         let p = progress.read().await;
@@ -2434,10 +2465,6 @@ async fn resume_repo_import(
         })?
     };
 
-    let resumed = db
-        .resume_import_operation(&id, &operation_id)
-        .map_err(import_write_error)?;
-
     let data_dir = state.config.daemon.data_dir.clone();
     let git_repo_path = data_dir.join("repos").join(&id).join("git-repo");
     if !git_repo_path.join(".git").exists() {
@@ -2445,6 +2472,10 @@ async fn resume_repo_import(
             "managed Git workdir is unavailable for import resume".into(),
         ));
     }
+
+    let resumed = db
+        .resume_import_operation(&id, &operation_id)
+        .map_err(import_write_error)?;
 
     {
         let mut p = progress.write().await;
@@ -2464,17 +2495,6 @@ async fn resume_repo_import(
         // is unchanged here.
         p.errors.clear();
     }
-
-    let svn_password_repo = db
-        .get_state(&format!("secret_svn_password_{}", id))
-        .unwrap_or(None);
-    let svn_password_global = db.get_state("secret_svn_password").unwrap_or(None);
-    let svn_password = svn_password_repo
-        .clone()
-        .or(svn_password_global.clone())
-        .unwrap_or_default();
-    let git_token_state = db.resolve_credential_chain_state(&id, "secret_git_token");
-    let git_token = git_token_state.value.clone();
 
     let svn_import_url = reposync_core::svn::operand::configured_branch_url(
         &repo.svn_url,
@@ -2911,9 +2931,7 @@ async fn reconcile_svn_commit(
         })));
     }
 
-    let svn_password = db
-        .resolve_credential_chain(&id, "secret_svn_password")
-        .unwrap_or_default();
+    let svn_password = chain_secret(db, &id, "secret_svn_password")?.unwrap_or_default();
     let svn = SvnClient::new(&repo.svn_url, &repo.svn_username, &svn_password);
     let allowed_paths: Vec<String> = repo
         .allowed_paths
@@ -3002,37 +3020,9 @@ async fn get_credentials(
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
 
-    let svn_key = format!("secret_svn_password_{}", id);
-    let git_key = format!("secret_git_token_{}", id);
-
-    let svn_set = db
-        .get_state(&svn_key)
-        .unwrap_or(None)
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let git_set = db
-        .get_state(&git_key)
-        .unwrap_or(None)
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-
-    // Fall back to global keys for repos that were migrated from single-repo config
-    let svn_set = svn_set
-        || db
-            .get_state("secret_svn_password")
-            .unwrap_or(None)
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
-    let git_set = git_set
-        || db
-            .get_state("secret_git_token")
-            .unwrap_or(None)
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
-
     Ok(Json(CredentialStatus {
-        svn_password_set: svn_set,
-        git_token_set: git_set,
+        svn_password_set: chain_reports_as_set(db, &id, "secret_svn_password")?,
+        git_token_set: chain_reports_as_set(db, &id, "secret_git_token")?,
     }))
 }
 
@@ -4079,12 +4069,12 @@ async fn test_repo_svn(
         .filter(|s| !s.is_empty())
         .unwrap_or(repo.svn_username);
 
-    // Password: prefer form value, then stored per-repo → parent → global.
-    let password = overrides
-        .svn_password
-        .filter(|v| !v.is_empty())
-        .or_else(|| db.resolve_credential_chain(&id, "secret_svn_password"))
-        .unwrap_or_default();
+    // Password: prefer form value, then the shared scoped chain. Revocation
+    // never falls through to a global key.
+    let password = match overrides.svn_password.filter(|v| !v.is_empty()) {
+        Some(value) => value,
+        None => chain_secret(db, &id, "secret_svn_password")?.unwrap_or_default(),
+    };
 
     let svn_url = match reposync_core::svn::operand::configured_branch_url(
         &svn_url_base,
@@ -4142,11 +4132,12 @@ async fn test_repo_git(
         .filter(|s| !s.is_empty())
         .unwrap_or(repo.git_repo);
 
-    // Token: prefer form value, then stored per-repo → parent → global.
-    let token = overrides
-        .git_token
-        .filter(|v| !v.is_empty())
-        .or_else(|| db.resolve_credential_chain(&id, "secret_git_token"));
+    // Token: prefer form value, then the shared scoped chain. Revocation
+    // never falls through to a global key.
+    let token = match overrides.git_token.filter(|v| !v.is_empty()) {
+        Some(value) => Some(value),
+        None => chain_secret(db, &id, "secret_git_token")?,
+    };
 
     let check_url = format!("{}/repos/{}", git_api_url.trim_end_matches('/'), git_repo);
 

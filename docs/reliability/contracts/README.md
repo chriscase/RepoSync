@@ -1,12 +1,13 @@
 # Reliability implementation contracts
 
 These documents are the reviewable handoff from the current-main #62 catalog
-to later runtime work. They do not activate schema, operations, or live
-acceptance.
+to later runtime work. They do not claim live acceptance. The #63 row below
+records operational v14 canonical lineage activation on this epic; candidate
+`pair_%` tables and live qualification remain unactivated.
 
 | Issue | Contract | Product merge in this PR |
 | --- | --- | --- |
-| #63 | [63-lineage-checkpoints.md](63-lineage-checkpoints.md) | No |
+| #63 | [63-lineage-checkpoints.md](63-lineage-checkpoints.md) | Operational v14 canonical lineage/checkpoints; candidate `pair_%` tables remain fixture-only; does not close #63 |
 | #64 | [64-durable-jobs.md](64-durable-jobs.md) | No |
 | #66 | [66-history-containment.md](66-history-containment.md) | No |
 | #65 | [65-managed-remove.md](65-managed-remove.md) | Additive removal API only; does not close #65 |

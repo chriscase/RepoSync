@@ -25,10 +25,12 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::db::import_operations::{
-    import_target_fingerprint, ImportOperation, ImportOperationState,
+    import_operation_has_retained_effects, import_target_fingerprint, ImportOperation,
+    ImportOperationState,
 };
+use crate::db::lineage_checkpoints::{record_live_svn_uuid_or_hold_unproved, LiveSvnIdentity};
 use crate::db::Database;
-use crate::errors::DatabaseError;
+use crate::errors::{DatabaseError, SyncError};
 use crate::file_policy::{FilePolicy, FilePolicyDecision};
 use crate::git::remote_url;
 use crate::git::GitClient;
@@ -2979,6 +2981,19 @@ pub async fn run_snapshot_import(
             pin.history_boundary()
         ));
     }
+    if pin.svn_uuid.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "snapshot pin did not report a repository UUID"
+        ));
+    }
+    if let Some(repo) = repo_id.as_deref() {
+        crate::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            db,
+            repo,
+            &pin.svn_uuid,
+        )
+        .context("failed to record independently established SVN UUID")?;
+    }
 
     let repo_path = {
         let git = git_client.lock().unwrap_or_else(|p| p.into_inner());
@@ -3337,6 +3352,55 @@ pub async fn run_full_import(
         }
         Err(e) => return Err(e).context("failed to get SVN info"),
     };
+    if svn_info.uuid.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "live SVN info did not report a repository UUID"
+        ));
+    }
+    let existing_op = match (repo_id.as_deref(), operation_id.as_deref()) {
+        (Some(repo), Some(op_id)) => db
+            .get_import_operation(repo, op_id)
+            .context("failed to load import operation before identity admission")?,
+        _ => None,
+    };
+    let retained_effects = existing_op
+        .as_ref()
+        .is_some_and(import_operation_has_retained_effects);
+    if let Some(repo) = repo_id.as_deref() {
+        let live = LiveSvnIdentity {
+            uuid: svn_info.uuid.clone(),
+            root_url: svn_info.root_url.clone(),
+            url: svn_info.url.trim_end_matches('/').to_string(),
+            branch_path: String::new(),
+            incarnation_created_rev: svn_info.latest_rev.max(1),
+            copy_from_path: None,
+            copy_from_rev: None,
+        };
+        if let Err(error) = record_live_svn_uuid_or_hold_unproved(db, repo, &live, retained_effects)
+        {
+            match error {
+                SyncError::HistoryBlocked { reason, detail } => {
+                    if let Some(op_id) = operation_id.as_deref() {
+                        let held = format!("{reason}: {detail}");
+                        db.finish_import_operation(
+                            repo,
+                            op_id,
+                            ImportOperationState::ReconciliationRequired,
+                            &held,
+                        )
+                        .context("failed to hold import after unproved SVN identity")?;
+                    }
+                    return Ok(ImportOutcome::ReconciliationRequired {
+                        commits: 0,
+                        reason: format!("{reason}: {detail}"),
+                    });
+                }
+                other => {
+                    return Err(other).context("SVN identity admission refused");
+                }
+            }
+        }
+    }
     let head_rev = svn_info.latest_rev;
 
     {

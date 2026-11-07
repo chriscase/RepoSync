@@ -239,6 +239,21 @@ fn finalize_tx(
             write_value(tx, "last_git_hash", &op.source_git_sha)?;
         }
     }
+    if !removed {
+        crate::db::lineage_checkpoints::try_persist_directional_checkpoint_tx(
+            tx,
+            &op.repo_id,
+            crate::db::lineage_checkpoints::MappingWrite {
+                direction: crate::db::lineage_checkpoints::CheckpointDirection::GitToSvn,
+                source_key: &crate::db::lineage_checkpoints::git_source_key(&op.source_git_sha),
+                outcome: crate::db::lineage_checkpoints::MappingOutcome::AppliedAndVerified,
+                target_git_sha: None,
+                target_svn_rev: Some(svn_rev),
+                reason: None,
+                policy_snapshot: None,
+            },
+        )?;
+    }
     if removed {
         op.outcome_detail =
             Some("recorded after repository removal; registration was not restored".into());
@@ -895,6 +910,69 @@ mod tests {
             Some("stale-global"),
             "team-mode git-to-svn finalize must not advance global last_git_hash"
         );
+        let conn = db.conn();
+        let scope = crate::db::repo_scope_identity::repository_scope_uuid(&conn, "pair").unwrap();
+        let generation = crate::echo_receipt_scope::repo_echo_generation_tx(&conn, "pair").unwrap();
+        let checkpoint = crate::db::lineage_checkpoints::load_directional_checkpoint(
+            &conn,
+            &scope,
+            generation,
+            crate::db::lineage_checkpoints::CheckpointDirection::GitToSvn,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            checkpoint.outcome,
+            crate::db::lineage_checkpoints::MappingOutcome::AppliedAndVerified
+        );
+        assert_eq!(checkpoint.target_svn_rev, Some(3));
+    }
+
+    #[test]
+    fn generation_read_failure_refuses_finalize_without_generation_one_record() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES ('pair','p','file:///svn','','','local','','repo','main','team',5,0,0,1,'t','t',2,'old','idle',0,0)",
+                [],
+            )
+            .unwrap();
+        crate::db::repo_scope_identity::migrate_v13_scope_uuid(&db.conn()).unwrap();
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), "pair").unwrap();
+        let generation_key = crate::db::repo_scope_identity::repo_echo_generation_kv_key(&scope);
+        db.set_state(&generation_key, "placeholder").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE kv_state SET value = x'80' WHERE key = ?1",
+                [generation_key],
+            )
+            .unwrap();
+        let paths = vec![IntendedPath {
+            action: "A".into(),
+            path: "feature.txt".into(),
+            content_sha256: Some("d".repeat(64)),
+        }];
+        let (intent, _, _) = sample_intent(paths, "post-tree");
+        let op = db.begin_git_to_svn_commit(intent).unwrap();
+        let err = db.confirm_git_to_svn_commit("pair", &op.id, 3, "post-tree");
+        assert!(err.is_err());
+        let still = db
+            .get_svn_commit_operation("pair", &op.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(still.state, SvnCommitOperationState::Running);
+        let conn = db.conn();
+        assert!(crate::db::lineage_checkpoints::load_directional_checkpoint(
+            &conn,
+            &scope,
+            1,
+            crate::db::lineage_checkpoints::CheckpointDirection::GitToSvn,
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]

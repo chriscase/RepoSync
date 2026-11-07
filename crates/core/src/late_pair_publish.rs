@@ -1368,6 +1368,7 @@ fn apply_baseline_watermarks(
     child_id: &str,
     baseline_git_sha: &str,
     svn_rev: i64,
+    svn_uuid: Option<&str>,
 ) -> Result<(), LatePairPublishRefusal> {
     let now = chrono::Utc::now().to_rfc3339();
     crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
@@ -1422,6 +1423,16 @@ fn apply_baseline_watermarks(
             detail: format!("failed to record baseline provenance: {e}"),
             plan: None,
         })?;
+    if let Some(uuid) = svn_uuid.map(str::trim).filter(|uuid| !uuid.is_empty()) {
+        crate::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            db, child_id, uuid,
+        )
+        .map_err(|e| LatePairPublishRefusal {
+            reason: "watermark_failed".into(),
+            detail: format!("failed to record independently established SVN UUID: {e}"),
+            plan: None,
+        })?;
+    }
     Ok(())
 }
 
@@ -1895,7 +1906,27 @@ pub async fn publish_admitted_late_pair(
                     plan: Some(Box::new(plan.clone())),
                 })?;
         }
-        apply_baseline_watermarks(db, &effective_child_id, &baseline.git_sha, svn_head)?;
+        let child_uuid = if let Some(uuid) = probe
+            .uuid
+            .as_deref()
+            .map(str::trim)
+            .filter(|uuid| !uuid.is_empty())
+        {
+            Some(uuid.to_string())
+        } else {
+            crate::db::lineage_checkpoints::independently_established_svn_uuid(
+                &db.conn(),
+                &parent.id,
+            )
+            .map_err(db_err)?
+        };
+        apply_baseline_watermarks(
+            db,
+            &effective_child_id,
+            &baseline.git_sha,
+            svn_head,
+            child_uuid.as_deref(),
+        )?;
         op.child_repo_id = Some(effective_child_id.clone());
         if take_fail_replay_once(&parent.id) {
             stash_pending_publish_refusal(
@@ -2050,7 +2081,7 @@ pub async fn replay_pending_git_for_integration_test(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::queries::CredentialChainState;
+    use crate::db::queries::{CredentialChainState, CredentialOrigin};
 
     #[test]
     fn parent_git_clone_url_derives_from_api_not_credentials() {
@@ -2094,6 +2125,7 @@ mod tests {
         let state = CredentialChainState {
             value: Some(String::new()),
             explicitly_revoked: false,
+            origin: CredentialOrigin::Explicit,
         };
         let err = http_git_token_for_clone("https://github.com/o/r.git", &state).unwrap_err();
         assert_eq!(err.reason, "git_credentials_missing");
@@ -2104,6 +2136,7 @@ mod tests {
         let state = CredentialChainState {
             value: Some("ghp_secret".into()),
             explicitly_revoked: false,
+            origin: CredentialOrigin::Explicit,
         };
         assert_eq!(
             http_git_token_for_clone("https://github.com/o/r.git", &state).unwrap(),
@@ -2116,6 +2149,7 @@ mod tests {
         let state = CredentialChainState {
             value: None,
             explicitly_revoked: false,
+            origin: CredentialOrigin::Absent,
         };
         assert_eq!(
             http_git_token_for_clone("file:///tmp/repo.git", &state).unwrap(),

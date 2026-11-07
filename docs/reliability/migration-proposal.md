@@ -1,6 +1,6 @@
 # Candidate #54/#63 copy migration contract
 
-**Status:** candidate v13/v14 are implemented only behind `reliability-fixture` and the explicit `CopySession` test entry point. Normal schema registration still ends at v12. Installer, daemon and scheduler activation is outside this review. The previous reviewed proposal is preserved byte-for-byte in [review-6-migration-proposal.md](review/review-6-migration-proposal.md); its illustrative SQL is superseded by the executable candidate SQL and writer. Original GOAL and issue acceptance criteria remain unchanged. No issue is closed by this prototype.
+**Status:** this file remains the sealed-copy **candidate** contract. Candidate v13 (nullable `commit_map.git_sha`) and candidate v14 (`pair_lineages` / `pair_frontiers` / `pair_outcomes`) stay behind `reliability-fixture` and `CopySession`. Ordinary `schema::MIGRATIONS` now ends at operational v14 (`canonical_lineage` / `canonical_checkpoints` / `canonical_mapping_outcomes`) and still never calls this registry; ordinary startup must observe zero `pair_%` tables. Installer/daemon exclusive-owner activation of operational v13/v14 is documented in [contracts/63-lineage-checkpoints.md](contracts/63-lineage-checkpoints.md). The previous reviewed proposal is preserved byte-for-byte in [review-6-migration-proposal.md](review/review-6-migration-proposal.md). Original GOAL and issue acceptance criteria remain unchanged. No issue is closed by this prototype.
 
 ## One implementation and one future activation decision
 

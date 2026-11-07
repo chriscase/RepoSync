@@ -8,6 +8,7 @@ pub mod credential_seeding;
 pub mod git_push_operations;
 pub mod import_operations;
 pub mod late_pair_publish_operations;
+pub mod lineage_checkpoints;
 pub mod managed_remove;
 pub mod ordinary_writer_windows;
 mod pair_refresh_competing_journals;

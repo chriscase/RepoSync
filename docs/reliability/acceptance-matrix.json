@@ -6,7 +6,7 @@
   "authored_against_main": "4f985a24d1fede55bde88b521800ae9e5db0f5a3",
   "deployed_version": "NOT ESTABLISHED",
   "goal_sha256": "16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8",
-  "scope": "Current-main #62 rollup after merged PR #72/#74/#75/#77/#78/#79/#80/#81/#82 plus #69 update-pair preview. Named isolated subcases are mapped; issue-complete PASS is not claimed. Re-anchor and refresh execution remain NOT IMPLEMENTED. Copy-only v13/v14 and candidate inspection routes remain unactivated. Live acceptance is not authorized.",
+  "scope": "Current-main #62 rollup after merged PR #72/#74/#75/#77/#78/#79/#80/#81/#82 plus #69 update-pair preview and operational #63 v14 canonical lineage. Named isolated subcases are mapped; issue-complete PASS is not claimed. Re-anchor and refresh execution remain NOT IMPLEMENTED. Candidate CopySession pair_% tables remain unactivated. Live acceptance is not authorized.",
   "harness_case_ids": [
     "EVIDENCE_SCAN_CLEAN",
     "EVIDENCE_SCAN_CANARY",
@@ -301,6 +301,14 @@
         "RS63_SCOPE_UUID_REREGISTER",
         "RS63_SCOPE_UUID_MIGRATION_IDEMPOTENT",
         "RS63_LEGACY_RECEIPT_NOT_AUTHORITATIVE",
+        "RS63_OPERATIONAL_V14_NO_PAIR_TABLES",
+        "RS63_DEFERRED_V12_THEN_V14",
+        "RS63_CANONICAL_TYPED_OUTCOMES",
+        "RS63_SVN_UUID_IDENTITY_HOLD",
+        "RS63_PATH_INCARNATION_HOLD",
+        "RS63_RS11_REDACTION_AND_PARENT_ROTATION",
+        "RS63_GIT_PROBE_TIMEOUT_KILLS_CHILD",
+        "RS63_FIELDLESS_GEN2_RECEIPT",
         "ECHO_GENERATION_STALE_RECEIPT",
         "ECHO_GENERATION_STALE_RECEIPT_SAME_SHA",
         "ECHO_SPLIT_CURSOR_UNPROVED_COLUMN",
@@ -489,11 +497,13 @@
       "supporting_case_ids": [
         "ECHO_IDENTITY_REIMPORT_RESET",
         "ECHO_IDENTITY_SVN_UUID_AUTO",
-        "ECHO_IDENTITY_PATH_RECREATION"
+        "ECHO_IDENTITY_PATH_RECREATION",
+        "RS63_SVN_UUID_IDENTITY_HOLD",
+        "RS63_PATH_INCARNATION_HOLD"
       ],
       "open": [
         "Normal SVN merge with mergeinfo is not a required exact case",
-        "Automatic UUID swap and path-incarnation detection do not bump echo generation without explicit reimport reset (see ECHO_IDENTITY_SVN_UUID_AUTO and ECHO_IDENTITY_PATH_RECREATION)"
+        "Automatic echo-generation bump on UUID/path swap remains unclaimed (ECHO_IDENTITY_SVN_UUID_AUTO / ECHO_IDENTITY_PATH_RECREATION); operational canonical lineage now holds the pair instead (RS63_SVN_UUID_IDENTITY_HOLD / RS63_PATH_INCARNATION_HOLD)"
       ],
       "evidence": "A property-only SVN revision records an explicit no-target checkpoint and does not invent a Git commit. Revision-number jumps are not treated as Git rewrites by the team gate. Full R15 identity events remain open.",
       "diagnostic_expected_baseline_failure": false
@@ -661,13 +671,14 @@
       ],
       "supporting_case_ids": [
         "R10_PINNED_OLD_TOPOLOGY_INVENTORY",
-        "STARTUP_V12"
+        "STARTUP_V14",
+        "RS63_DEFERRED_V12_THEN_V14"
       ],
       "open": [
         "Actual deployed executable/schema is NOT ESTABLISHED",
         "Installer/update artifact path is not this library fixture"
       ],
-      "evidence": "A pinned original importer at 8737974 writes an installation; the candidate opens a copy and continues an SVN-only poll without resetting cursors. Ordinary startup stays schema v12 with zero candidate tables. This qualifies the pinned fixture, not production.",
+      "evidence": "A pinned original importer at 8737974 writes an installation; the candidate opens a copy and continues an SVN-only poll without resetting cursors. Lone file-backed Database::initialize stays schema v12 (R01 deferred). Exclusive-owner startup applies operational v14 canonical tables with zero candidate pair_% tables (STARTUP_V14 / RS63_DEFERRED_V12_THEN_V14). This qualifies the pinned fixture, not production.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -715,11 +726,10 @@
         "S54_SCOPED_HTTP"
       ],
       "open": [
-        "Candidate v13/v14 are not activated on normal startup",
-        "Operational readers still speak v12",
+        "Candidate CopySession v13/v14 remain fixture-only and unactivated",
         "A lossless down migration is not promised"
       ],
-      "evidence": "Copy-only sealed fixtures exercise v13/v14 crash/restart, forged/future schema refusal, null mapping display, typed readers, and scoped HTTP. STARTUP_V12 proves nonactivation. These are not production migrations.",
+      "evidence": "Copy-only sealed fixtures exercise candidate v13/v14 crash/restart, forged/future schema refusal, null mapping display, typed readers, and scoped HTTP. STARTUP_V14 proves ordinary initialize is operational v14 canonical_* with zero candidate pair_% tables; lone file-backed initialize stays deferred v12 until exclusive owner (RS63_DEFERRED_V12_THEN_V14). These are not production migrations.",
       "diagnostic_expected_baseline_failure": false
     },
     {
