@@ -157,6 +157,35 @@ async fn build_publish_fixture() -> PublishFixture {
     db.initialize().unwrap();
     let now = Utc::now();
     let parent_id = "parent".to_string();
+    // Constructor-created on-disk UUID (`svnadmin create` above), recorded before
+    // seeded last_svn_rev / applied mapping. Not a later live URL observation.
+    let constructor_uuid = {
+        let output = Command::new("svnlook")
+            .args(["uuid", svn_repo.to_str().unwrap()])
+            .output()
+            .expect("svnlook uuid of constructor-created repository");
+        assert!(
+            output.status.success(),
+            "svnlook uuid failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let uuid = String::from_utf8(output.stdout)
+            .expect("constructor-created SVN UUID is utf-8")
+            .trim()
+            .to_string();
+        assert!(
+            !uuid.is_empty(),
+            "constructor-created SVN UUID is empty for {}",
+            svn_repo.display()
+        );
+        uuid
+    };
+    reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+        &db,
+        &parent_id,
+        &constructor_uuid,
+    )
+    .unwrap_or_else(|error| panic!("record constructor-created SVN UUID for {parent_id}: {error}"));
     db.insert_repository(&Repository {
         id: parent_id.clone(),
         name: "Parent".into(),
@@ -1125,6 +1154,35 @@ async fn replay_pending_git_inspect_team_history_http_auth() {
     let db = Database::new(&db_path).unwrap();
     db.initialize().unwrap();
     let now = Utc::now();
+    // Constructor-created on-disk UUID (`svnadmin create` above), recorded before
+    // seeded last_svn_rev / applied mapping. Not a later live URL observation.
+    let constructor_uuid = {
+        let output = Command::new("svnlook")
+            .args(["uuid", svn_repo.to_str().unwrap()])
+            .output()
+            .expect("svnlook uuid of constructor-created repository");
+        assert!(
+            output.status.success(),
+            "svnlook uuid failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let uuid = String::from_utf8(output.stdout)
+            .expect("constructor-created SVN UUID is utf-8")
+            .trim()
+            .to_string();
+        assert!(
+            !uuid.is_empty(),
+            "constructor-created SVN UUID is empty for {}",
+            svn_repo.display()
+        );
+        uuid
+    };
+    reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+        &db,
+        CHILD_ID,
+        &constructor_uuid,
+    )
+    .unwrap_or_else(|error| panic!("record constructor-created SVN UUID for {CHILD_ID}: {error}"));
     db.insert_repository(&Repository {
         id: CHILD_ID.into(),
         name: "Child".into(),
@@ -1238,6 +1296,43 @@ async fn replay_pending_git_inspect_team_history_http_auth() {
     );
     let after = db.get_repository(CHILD_ID).unwrap().unwrap();
     assert_eq!(after.last_git_sha, tip);
+}
+
+fn svnlook_uuid(repo_dir: &Path) -> String {
+    let output = Command::new("svnlook")
+        .args(["uuid", repo_dir.to_str().unwrap()])
+        .output()
+        .expect("svnlook uuid");
+    assert!(
+        output.status.success(),
+        "svnlook uuid failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let uuid = String::from_utf8(output.stdout)
+        .expect("SVN UUID is utf-8")
+        .trim()
+        .to_string();
+    assert!(!uuid.is_empty());
+    uuid
+}
+
+fn overwrite_established_uuid(db: &Database, repo_id: &str, uuid: Option<&str>) {
+    let key =
+        reposync_core::db::lineage_checkpoints::independently_established_svn_uuid_kv_key(repo_id);
+    db.conn()
+        .execute(
+            "DELETE FROM kv_state WHERE key = ?1",
+            rusqlite::params![key],
+        )
+        .unwrap();
+    if let Some(uuid) = uuid {
+        db.conn()
+            .execute(
+                "INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)",
+                rusqlite::params![key, uuid, Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+    }
 }
 
 fn rs67_create_independent_target(fx: &PublishFixture, file: &str, bytes: &[u8]) {
@@ -1653,6 +1748,21 @@ async fn rs67_native_continuation_case(filtered: bool, include_parent: bool) {
         .get_repository(completed.child_repo_id.as_deref().unwrap())
         .unwrap()
         .unwrap();
+    let observed_uuid = svnlook_uuid(&fx.tmp.path().join("svn"));
+    let child_uuid = reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+        &fx.db.conn(),
+        &child.id,
+    )
+    .unwrap()
+    .expect("reviewed producer recorded child UUID before SyncEngine");
+    assert_eq!(child_uuid, observed_uuid);
+    assert_eq!(child_uuid, progress.plan.svn_uuid);
+    if let Some(copy) = progress.copy_evidence.as_ref() {
+        assert_eq!(copy.uuid, child_uuid);
+        assert_eq!(copy.target_path, progress.plan.target_path);
+    } else {
+        assert!(progress.plan.target_revision.is_some());
+    }
     assert!(child.enabled);
     assert_eq!(Some(child.last_svn_rev), progress.svn_revision);
     assert_eq!(
@@ -3259,4 +3369,423 @@ async fn rs67_recovery_inspects_consumed_svn_but_holds_next_step_for_stale_git()
         done
     );
     assert_eq!(target.info().await.unwrap().latest_rev, revision);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_reviewed_child_identity_refuses_foreign_parent_uuid_without_child_or_recopy() {
+    use reposync_core::late_pair_publish::reviewed::{self, Fault};
+    let _guard = replay_publish_67_guard().await;
+    assert!(svn_available());
+    let fx = build_publish_fixture().await;
+    let plan = rs67_prepare(&fx, false).await.unwrap();
+    let bridge = fx.tmp.path().join("repos/parent/git-repo");
+    let op = reposync_core::late_pair_publish::begin_reviewed_reconciliation(
+        reposync_core::late_pair::reconciliation::PrepareContext {
+            db: &fx.db,
+            parent: &fx.parent,
+            git_workdir: &bridge,
+            request: &fx.request,
+            admission: &fx.plan,
+            svn_password: "",
+            actor: "fixture-admin",
+            include_parent: false,
+        },
+        &plan.review_pin,
+        "foreign-parent-uuid",
+    )
+    .await
+    .unwrap();
+    reviewed::set_fault(&fx.parent_id, Fault::AfterCopy);
+    assert!(reviewed::run(
+        &fx.db,
+        &fx.config,
+        &fx.parent,
+        "",
+        &bridge,
+        &op.id,
+        "fixture-admin"
+    )
+    .await
+    .is_err());
+    let genuine = reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+        &fx.db.conn(),
+        &fx.parent_id,
+    )
+    .unwrap()
+    .unwrap();
+    overwrite_established_uuid(
+        &fx.db,
+        &fx.parent_id,
+        Some("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+    );
+    let before = {
+        let output = Command::new("svn")
+            .args(["log", "-q", "--", &fx.target_url])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let mappings: i64 = fx
+        .db
+        .conn()
+        .query_row("SELECT count(*) FROM sync_records", [], |r| r.get(0))
+        .unwrap();
+    let error = reviewed::run(
+        &fx.db,
+        &fx.config,
+        &fx.parent,
+        "",
+        &bridge,
+        &op.id,
+        "fixture-admin",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{error:#}")
+            .contains("parent established UUID contradicts reviewed child identity"),
+        "{error:#}"
+    );
+    let held = fx
+        .db
+        .get_late_pair_publish_operation(&fx.parent_id, &op.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.state, LatePairPublishState::ReconciliationHeld);
+    assert!(
+        held.child_repo_id.is_none() || {
+            fx.db
+                .get_repository(held.child_repo_id.as_deref().unwrap())
+                .unwrap()
+                .map(|child| !child.enabled)
+                .unwrap_or(true)
+        }
+    );
+    let after = {
+        let output = Command::new("svn")
+            .args(["log", "-q", "--", &fx.target_url])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(after, before, "native copy must not be reissued");
+    let mappings_after: i64 = fx
+        .db
+        .conn()
+        .query_row("SELECT count(*) FROM sync_records", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mappings_after, mappings);
+    overwrite_established_uuid(&fx.db, &fx.parent_id, Some(&genuine));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_reviewed_child_restart_refuses_missing_changed_foreign_uuid_enabled_and_reused_scope()
+{
+    use reposync_core::late_pair_publish::reviewed::{self, Fault};
+    let _guard = replay_publish_67_guard().await;
+    assert!(svn_available());
+    async fn interrupt_after_first_svn(
+        fx: &PublishFixture,
+        request: &str,
+    ) -> reposync_core::db::late_pair_publish_operations::LatePairPublishOperation {
+        let plan = rs67_prepare(fx, false).await.unwrap();
+        let bridge = fx.tmp.path().join("repos/parent/git-repo");
+        let op = reposync_core::late_pair_publish::begin_reviewed_reconciliation(
+            reposync_core::late_pair::reconciliation::PrepareContext {
+                db: &fx.db,
+                parent: &fx.parent,
+                git_workdir: &bridge,
+                request: &fx.request,
+                admission: &fx.plan,
+                svn_password: "",
+                actor: "fixture-admin",
+                include_parent: false,
+            },
+            &plan.review_pin,
+            request,
+        )
+        .await
+        .unwrap();
+        reviewed::set_fault(&fx.parent_id, Fault::AfterSvnCommit(1));
+        assert!(reviewed::run(
+            &fx.db,
+            &fx.config,
+            &fx.parent,
+            "",
+            &bridge,
+            &op.id,
+            "fixture-admin"
+        )
+        .await
+        .is_err());
+        fx.db
+            .get_late_pair_publish_operation(&fx.parent_id, &op.id)
+            .unwrap()
+            .unwrap()
+    }
+    async fn refuse(
+        fx: &PublishFixture,
+        op_id: &str,
+        needle: &str,
+    ) -> reposync_core::db::late_pair_publish_operations::LatePairPublishOperation {
+        let bridge = fx.tmp.path().join("repos/parent/git-repo");
+        let mappings: i64 = fx
+            .db
+            .conn()
+            .query_row("SELECT count(*) FROM sync_records", [], |r| r.get(0))
+            .unwrap();
+        let log_before = String::from_utf8(
+            Command::new("svn")
+                .args(["log", "-q", "--", &fx.target_url])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let error = reviewed::run(
+            &fx.db,
+            &fx.config,
+            &fx.parent,
+            "",
+            &bridge,
+            op_id,
+            "fixture-admin",
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(needle), "{error:#}");
+        let held = fx
+            .db
+            .get_late_pair_publish_operation(&fx.parent_id, op_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.state, LatePairPublishState::ReconciliationHeld);
+        if let Some(child_id) = held.child_repo_id.as_deref() {
+            let _child = fx.db.get_repository(child_id).unwrap().unwrap();
+            assert_ne!(held.state, LatePairPublishState::Completed);
+        }
+        let mappings_after: i64 = fx
+            .db
+            .conn()
+            .query_row("SELECT count(*) FROM sync_records", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mappings_after, mappings);
+        let log_after = String::from_utf8(
+            Command::new("svn")
+                .args(["log", "-q", "--", &fx.target_url])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert_eq!(log_after, log_before);
+        held
+    }
+
+    {
+        let fx = build_publish_fixture().await;
+        let held = interrupt_after_first_svn(&fx, "missing-uuid").await;
+        let child = held.child_repo_id.clone().unwrap();
+        let original = reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+            &fx.db.conn(),
+            &child,
+        )
+        .unwrap()
+        .unwrap();
+        overwrite_established_uuid(&fx.db, &child, None);
+        refuse(
+            &fx,
+            &held.id,
+            "disabled child restart has no independently established UUID",
+        )
+        .await;
+        assert!(!fx.db.get_repository(&child).unwrap().unwrap().enabled);
+        assert!(
+            reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+                &fx.db.conn(),
+                &child
+            )
+            .unwrap()
+            .is_none()
+        );
+        overwrite_established_uuid(&fx.db, &child, Some(&original));
+    }
+    {
+        let fx = build_publish_fixture().await;
+        let held = interrupt_after_first_svn(&fx, "foreign-uuid").await;
+        let child = held.child_repo_id.clone().unwrap();
+        let original = reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+            &fx.db.conn(),
+            &child,
+        )
+        .unwrap()
+        .unwrap();
+        overwrite_established_uuid(&fx.db, &child, Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
+        refuse(
+            &fx,
+            &held.id,
+            "disabled child restart UUID does not match this operation's reviewed identity",
+        )
+        .await;
+        assert!(!fx.db.get_repository(&child).unwrap().unwrap().enabled);
+        assert_eq!(
+            reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+                &fx.db.conn(),
+                &child
+            )
+            .unwrap()
+            .as_deref(),
+            Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        );
+        overwrite_established_uuid(&fx.db, &child, Some(&original));
+    }
+    {
+        let fx = build_publish_fixture().await;
+        let held = interrupt_after_first_svn(&fx, "enabled-child").await;
+        let child_id = held.child_repo_id.clone().unwrap();
+        fx.db
+            .conn()
+            .execute(
+                "UPDATE repositories SET enabled=1 WHERE id=?1",
+                rusqlite::params![child_id],
+            )
+            .unwrap();
+        refuse(
+            &fx,
+            &held.id,
+            "child registration was replaced or activated before completion",
+        )
+        .await;
+        assert!(fx.db.get_repository(&child_id).unwrap().unwrap().enabled);
+        assert_ne!(
+            fx.db
+                .get_late_pair_publish_operation(&fx.parent_id, &held.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            LatePairPublishState::Completed
+        );
+    }
+    {
+        let fx = build_publish_fixture().await;
+        let held = interrupt_after_first_svn(&fx, "reused-scope").await;
+        let child_id = held.child_repo_id.clone().unwrap();
+        let original_scope = held
+            .reconciliation
+            .as_ref()
+            .unwrap()
+            .child_scope_uuid
+            .clone()
+            .unwrap();
+        fx.db
+            .conn()
+            .execute(
+                "DELETE FROM repositories WHERE id=?1",
+                rusqlite::params![child_id],
+            )
+            .unwrap();
+        let mut replacement = fx.parent.clone();
+        replacement.id = child_id.clone();
+        replacement.name = format!("reused-child-{child_id}");
+        replacement.parent_id = Some(fx.parent_id.clone());
+        replacement.enabled = false;
+        replacement.sync_status = "reconciling".into();
+        replacement.git_branch = held.git_branch.clone();
+        replacement.svn_branch = held.svn_branch.clone();
+        fx.db.insert_repository(&replacement).unwrap();
+        let reused =
+            reposync_core::db::repo_scope_identity::repository_scope_uuid(&fx.db.conn(), &child_id)
+                .unwrap();
+        assert_ne!(reused, original_scope);
+        refuse(&fx, &held.id, "child registration incarnation changed").await;
+        assert!(!fx.db.get_repository(&child_id).unwrap().unwrap().enabled);
+        assert_eq!(
+            reposync_core::db::repo_scope_identity::repository_scope_uuid(&fx.db.conn(), &child_id)
+                .unwrap(),
+            reused
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs67_reviewed_child_identity_incomplete_handoff_stays_disabled_held_on_reopen() {
+    use reposync_core::late_pair_publish::reviewed::{self, Fault};
+    let _guard = replay_publish_67_guard().await;
+    assert!(svn_available());
+    let fx = build_publish_fixture().await;
+    let plan = rs67_prepare(&fx, false).await.unwrap();
+    let bridge = fx.tmp.path().join("repos/parent/git-repo");
+    let op = reposync_core::late_pair_publish::begin_reviewed_reconciliation(
+        reposync_core::late_pair::reconciliation::PrepareContext {
+            db: &fx.db,
+            parent: &fx.parent,
+            git_workdir: &bridge,
+            request: &fx.request,
+            admission: &fx.plan,
+            svn_password: "",
+            actor: "fixture-admin",
+            include_parent: false,
+        },
+        &plan.review_pin,
+        "incomplete-handoff",
+    )
+    .await
+    .unwrap();
+    reviewed::set_fault(&fx.parent_id, Fault::AfterSvnCommit(1));
+    assert!(reviewed::run(
+        &fx.db,
+        &fx.config,
+        &fx.parent,
+        "",
+        &bridge,
+        &op.id,
+        "fixture-admin"
+    )
+    .await
+    .is_err());
+    let held = fx
+        .db
+        .get_late_pair_publish_operation(&fx.parent_id, &op.id)
+        .unwrap()
+        .unwrap();
+    let child_id = held.child_repo_id.clone().unwrap();
+    let copy = held.reconciliation.as_ref().unwrap().copy_evidence.clone();
+    let receipts = held.reconciliation.as_ref().unwrap().receipts.clone();
+    overwrite_established_uuid(&fx.db, &child_id, None);
+    drop(fx.db);
+    let reopened = Database::new(fx.tmp.path().join("reposync.db")).unwrap();
+    let error = reviewed::run(
+        &reopened,
+        &fx.config,
+        &fx.parent,
+        "",
+        &bridge,
+        &op.id,
+        "fixture-admin",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{error:#}")
+            .contains("disabled child restart has no independently established UUID"),
+        "{error:#}"
+    );
+    let again = reopened
+        .get_late_pair_publish_operation(&fx.parent_id, &op.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.state, LatePairPublishState::ReconciliationHeld);
+    assert_ne!(again.state, LatePairPublishState::Completed);
+    let child = reopened.get_repository(&child_id).unwrap().unwrap();
+    assert!(!child.enabled);
+    assert_eq!(again.reconciliation.as_ref().unwrap().copy_evidence, copy);
+    assert_eq!(again.reconciliation.as_ref().unwrap().receipts, receipts);
+    assert!(
+        reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+            &reopened.conn(),
+            &child_id
+        )
+        .unwrap()
+        .is_none()
+    );
 }
