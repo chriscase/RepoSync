@@ -599,7 +599,11 @@ fn retained_legacy_baseline(conn: &Connection, repo_id: &str) -> Result<bool, Da
     Ok(records > 0)
 }
 
-fn independently_established_svn_uuid(
+pub fn independently_established_svn_uuid_kv_key(repo_id: &str) -> String {
+    format!("independently_established_svn_uuid:{repo_id}")
+}
+
+fn snapshot_pin_svn_uuid(
     conn: &Connection,
     repo_id: &str,
 ) -> Result<Option<String>, DatabaseError> {
@@ -633,6 +637,61 @@ fn independently_established_svn_uuid(
         .and_then(|uuid| uuid.as_str())
         .filter(|uuid| !uuid.is_empty())
         .map(str::to_string))
+}
+
+/// Independently established SVN UUID: import snapshot pin, or a producer that
+/// already observed live identity (completed history import / late-pair copy /
+/// fixture that created the SVN). Retained watermarks alone are not proof.
+pub fn independently_established_svn_uuid(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<Option<String>, DatabaseError> {
+    let pin = snapshot_pin_svn_uuid(conn, repo_id)?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [independently_established_svn_uuid_kv_key(repo_id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let recorded = raw
+        .map(|uuid| uuid.trim().to_string())
+        .filter(|uuid| !uuid.is_empty());
+    match (pin, recorded) {
+        (Some(pin), Some(recorded)) if pin != recorded => Err(DatabaseError::Other(format!(
+            "import snapshot pin UUID {pin} does not match recorded UUID {recorded}"
+        ))),
+        (Some(pin), _) => Ok(Some(pin)),
+        (None, Some(recorded)) => Ok(Some(recorded)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Record a live SVN UUID the producer already observed. Empty UUID is refused.
+/// A different existing snapshot pin or recorded UUID is refused.
+pub fn record_independently_established_svn_uuid(
+    db: &Database,
+    repo_id: &str,
+    uuid: &str,
+) -> Result<(), DatabaseError> {
+    let uuid = uuid.trim();
+    if uuid.is_empty() {
+        return Err(DatabaseError::Other(
+            "independently established SVN UUID is empty".into(),
+        ));
+    }
+    {
+        let conn = db.conn();
+        if let Some(existing) = independently_established_svn_uuid(&conn, repo_id)? {
+            if existing != uuid {
+                return Err(DatabaseError::Other(format!(
+                    "independently established SVN UUID {existing} does not match observed {uuid}"
+                )));
+            }
+            return Ok(());
+        }
+    }
+    db.set_state(&independently_established_svn_uuid_kv_key(repo_id), uuid)
 }
 
 fn git_baseline_from_repo(
@@ -1110,6 +1169,113 @@ mod tests {
             Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "svn_identity_unproved"
         ));
         assert!(load_canonical_lineage(&db, "pair").unwrap().is_none());
+    }
+
+    #[test]
+    fn retained_baseline_with_matching_recorded_uuid_pins() {
+        let db = setup();
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev = 5, last_git_sha = ?1 WHERE id = 'pair'",
+                ["c".repeat(40)],
+            )
+            .unwrap();
+        record_independently_established_svn_uuid(&db, "pair", "uuid-live").unwrap();
+        adopt_or_hold_live_svn_identity(&db, "pair", &live_identity("uuid-live")).unwrap();
+        let loaded = load_canonical_lineage(&db, "pair").unwrap().unwrap();
+        assert_eq!(loaded.svn_uuid, "uuid-live");
+    }
+
+    #[test]
+    fn retained_baseline_with_matching_snapshot_pin_pins() {
+        let db = setup();
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev = 4, last_git_sha = ?1 WHERE id = 'pair'",
+                ["d".repeat(40)],
+            )
+            .unwrap();
+        db.set_state("import_operation_v1:latest:pair", "op-pin")
+            .unwrap();
+        db.set_state(
+            "import_operation_v1:document:op-pin",
+            &serde_json::json!({
+                "snapshot_pin": {
+                    "svn_uuid": "uuid-pin",
+                    "canonical_url": "file:///repo",
+                    "operative_rev": 4,
+                    "peg_rev": 4,
+                    "requested": "HEAD"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        adopt_or_hold_live_svn_identity(&db, "pair", &live_identity("uuid-pin")).unwrap();
+        assert_eq!(
+            load_canonical_lineage(&db, "pair")
+                .unwrap()
+                .unwrap()
+                .svn_uuid,
+            "uuid-pin"
+        );
+    }
+
+    #[test]
+    fn retained_baseline_with_mismatched_recorded_uuid_holds_changed() {
+        let db = setup();
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev = 5, last_git_sha = ?1 WHERE id = 'pair'",
+                ["e".repeat(40)],
+            )
+            .unwrap();
+        record_independently_established_svn_uuid(&db, "pair", "uuid-proved").unwrap();
+        let err =
+            adopt_or_hold_live_svn_identity(&db, "pair", &live_identity("uuid-other")).unwrap_err();
+        match err {
+            SyncError::HistoryBlocked { reason, .. } => {
+                assert_eq!(reason, "svn_identity_changed")
+            }
+            other => panic!("expected HistoryBlocked, got {other:?}"),
+        }
+        assert!(load_canonical_lineage(&db, "pair").unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_recorded_uuid_is_refused() {
+        let db = setup();
+        assert!(record_independently_established_svn_uuid(&db, "pair", "  ").is_err());
+        assert!(independently_established_svn_uuid(&db.conn(), "pair")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn snapshot_pin_and_recorded_uuid_mismatch_is_refused() {
+        let db = setup();
+        db.set_state("import_operation_v1:latest:pair", "op-pin")
+            .unwrap();
+        db.set_state(
+            "import_operation_v1:document:op-pin",
+            &serde_json::json!({
+                "snapshot_pin": {
+                    "svn_uuid": "uuid-pin",
+                    "canonical_url": "file:///repo",
+                    "operative_rev": 1,
+                    "peg_rev": 1,
+                    "requested": "HEAD"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        db.set_state(
+            &independently_established_svn_uuid_kv_key("pair"),
+            "uuid-other",
+        )
+        .unwrap();
+        assert!(independently_established_svn_uuid(&db.conn(), "pair").is_err());
     }
 
     #[test]

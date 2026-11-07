@@ -2979,6 +2979,19 @@ pub async fn run_snapshot_import(
             pin.history_boundary()
         ));
     }
+    if pin.svn_uuid.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "snapshot pin did not report a repository UUID"
+        ));
+    }
+    if let Some(repo) = repo_id.as_deref() {
+        crate::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            db,
+            repo,
+            &pin.svn_uuid,
+        )
+        .context("failed to record independently established SVN UUID")?;
+    }
 
     let repo_path = {
         let git = git_client.lock().unwrap_or_else(|p| p.into_inner());
@@ -3337,6 +3350,19 @@ pub async fn run_full_import(
         }
         Err(e) => return Err(e).context("failed to get SVN info"),
     };
+    if svn_info.uuid.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "live SVN info did not report a repository UUID"
+        ));
+    }
+    if let Some(repo) = repo_id.as_deref() {
+        crate::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            db,
+            repo,
+            &svn_info.uuid,
+        )
+        .context("failed to record independently established SVN UUID")?;
+    }
     let head_rev = svn_info.latest_rev;
 
     {

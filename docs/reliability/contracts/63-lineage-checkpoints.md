@@ -57,11 +57,13 @@ equal final trees are hints, not lineage.
 
 Live SVN UUID and path incarnation are compared in `fetch_svn_changes` **before**
 the `head_rev <= last_rev` early return. Independently established
-initialization (no retained mappings/cursors, or an import snapshot pin whose
-UUID matches live) pins `canonical_lineage` and records the Git baseline/ref
+initialization (no retained mappings/cursors, an import snapshot pin whose UUID
+matches live, or a producer-recorded UUID from a completed history import,
+late-pair copy in the same SVN repository, or a fixture that observed the live
+repo it created) pins `canonical_lineage` and records the Git baseline/ref
 from the repository row. Legacy adoption with retained mappings and no proved
 UUID holds (`svn_identity_unproved`) rather than pinning a same-URL
-replacement. A later UUID or incarnation mismatch holds only that pair
+replacement. Retained `last_svn_rev` / `last_git_sha` alone is never proof. A later UUID or incarnation mismatch holds only that pair
 (`svn_identity_changed` / `reconciliation_required`) and does not silently
 sync a recreated repo at a low or equal revision under stale lineage.
 

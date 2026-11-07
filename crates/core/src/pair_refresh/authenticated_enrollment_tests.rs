@@ -216,6 +216,18 @@ impl Fixture {
             )
             .unwrap();
         }
+        let uuid = run(Command::new("svnlook").arg("uuid").arg(&svn_repository));
+        let uuid = uuid.trim();
+        assert!(
+            !uuid.is_empty(),
+            "fixture SVN UUID must be independently established from the live repository"
+        );
+        for id in ["parent", "child"] {
+            crate::db::lineage_checkpoints::record_independently_established_svn_uuid(
+                &db, id, uuid,
+            )
+            .unwrap();
+        }
         Self {
             db,
             _server: server,

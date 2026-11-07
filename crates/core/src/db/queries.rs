@@ -5103,7 +5103,7 @@ mod tests {
             db.conn()
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            13
+            i64::from(crate::db::schema::CURRENT_SCHEMA_VERSION)
         );
     }
 
