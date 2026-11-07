@@ -10,7 +10,7 @@ use reposync_core::db::import_operations::{
 use reposync_core::db::lineage_checkpoints::{
     adopt_or_hold_live_svn_identity, independently_established_svn_uuid, load_canonical_lineage,
     load_directional_checkpoint, pin_canonical_lineage, verify_or_pin_live_svn_identity,
-    CanonicalLineage, CheckpointDirection, LiveSvnIdentity,
+    CanonicalLineage, CheckpointDirection, LiveSvnIdentity, MappingOutcome,
 };
 use reposync_core::db::queries::CredentialOrigin;
 use reposync_core::db::repo_scope_identity::repository_scope_uuid;
@@ -460,13 +460,114 @@ fn origin_commit_count(bare: &Path) -> usize {
     walk.count()
 }
 
+const R01_OLD_INSTALL_GATE: &str = "R01_OLD_INSTALL_UPGRADE";
+const R01_OLD_CODE: &str = "87379741779a6259f7eeb52a68cc6f061174e5ef";
+const R01_GENERATOR_SOURCE: &str = "crates/web/tests/legacy_import_generator.rs";
+const R01_FIXTURE_CASE: &str = "candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade";
+
+fn require_svn_git() {
+    assert!(
+        svn_available() && git_available(),
+        "PR245-1-R1-V requires svn, svnadmin, svnlook, and git"
+    );
+}
+
+fn reopen_managed_db(data_dir: &Path) -> (Database, reposync_core::writer_fence::WriterFenceGuard) {
+    let db = Database::new(data_dir.join("state.db")).unwrap();
+    db.initialize().unwrap();
+    let fence = reposync_core::writer_fence::claim(&db, data_dir).unwrap();
+    (db, fence)
+}
+
+fn origin_tip(bare: &Path) -> String {
+    git2::Repository::open(bare)
+        .unwrap()
+        .refname_to_id("refs/heads/main")
+        .unwrap()
+        .to_string()
+}
+
+fn origin_blob(bare: &Path, sha: &str, path: &str) -> String {
+    let repo = git2::Repository::open(bare).unwrap();
+    let commit = repo.find_commit(git2::Oid::from_str(sha).unwrap()).unwrap();
+    let blob = repo
+        .find_blob(
+            commit
+                .tree()
+                .unwrap()
+                .get_path(Path::new(path))
+                .unwrap()
+                .id(),
+        )
+        .unwrap();
+    String::from_utf8(blob.content().to_vec()).unwrap()
+}
+
+fn import_cfg() -> reposync_core::import::ImportConfig {
+    reposync_core::import::ImportConfig {
+        committer_name: "Fixture".into(),
+        committer_email: "fixture@example.invalid".into(),
+        remote_name: "origin".into(),
+        branch: "main".into(),
+        push_token: None,
+        message_prefix: None,
+        trunk_path: String::new(),
+    }
+}
+
+fn import_state(repo_id: &str, op_id: &str) -> reposync_core::import::ImportRunState {
+    reposync_core::import::ImportRunState {
+        progress: std::sync::Arc::new(tokio::sync::RwLock::new(
+            reposync_core::import::ImportProgress::default(),
+        )),
+        ws_broadcast: None,
+        repo_id: Some(repo_id.into()),
+        operation_id: Some(op_id.into()),
+        cancel_signal: None,
+    }
+}
+
+fn assert_scope_schema(db: &Database) {
+    let conn = db.conn();
+    assert_eq!(version(&conn), CURRENT_SCHEMA_VERSION as i64);
+    assert_eq!(canonical_table_count(&conn), 3);
+    assert_eq!(pair_table_count(&conn), 0);
+}
+
+fn authorize_import_resume(db: &Database, repo_id: &str, op_id: &str) {
+    let mut held = db.get_import_operation(repo_id, op_id).unwrap().unwrap();
+    held.resume_authorized = true;
+    db.conn()
+        .execute(
+            "UPDATE kv_state SET value=?1 WHERE key=?2",
+            rusqlite::params![
+                serde_json::to_string(&held).unwrap(),
+                format!("import_operation_v1:document:{op_id}")
+            ],
+        )
+        .unwrap();
+    db.resume_import_operation(repo_id, op_id).unwrap();
+}
+
+fn unproved_hold_checkpoint(
+    db: &Database,
+    repo_id: &str,
+) -> reposync_core::db::lineage_checkpoints::CanonicalCheckpoint {
+    let scope = repository_scope_uuid(&db.conn(), repo_id).unwrap();
+    load_directional_checkpoint(
+        &db.conn(),
+        &scope,
+        PAIR_GENERATION,
+        CheckpointDirection::SvnToGit,
+    )
+    .unwrap()
+    .expect("unproved hold must persist a canonical checkpoint")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn predecessor_partial_full_import_holds_same_url_replacement_uuid() {
     let _serial = writer_fence_test_lock().lock().await;
-    if !svn_available() || !git_available() {
-        eprintln!("SKIP: svn/svnadmin/git not available");
-        return;
-    }
+    require_svn_git();
     let tmp = tempfile::tempdir().unwrap();
     let svn_path = tmp.path().join("svn_repo");
     assert!(Command::new("svnadmin")
@@ -636,24 +737,8 @@ async fn predecessor_partial_full_import_holds_same_url_replacement_uuid() {
         &identity,
         &db,
         &reposync_core::file_policy::FilePolicy::new(0, Vec::new()),
-        &reposync_core::import::ImportConfig {
-            committer_name: "Fixture".into(),
-            committer_email: "fixture@example.invalid".into(),
-            remote_name: "origin".into(),
-            branch: "main".into(),
-            push_token: None,
-            message_prefix: None,
-            trunk_path: String::new(),
-        },
-        reposync_core::import::ImportRunState {
-            progress: std::sync::Arc::new(tokio::sync::RwLock::new(
-                reposync_core::import::ImportProgress::default(),
-            )),
-            ws_broadcast: None,
-            repo_id: Some("legacy-import".into()),
-            operation_id: Some(op.id.clone()),
-            cancel_signal: None,
-        },
+        &import_cfg(),
+        import_state("legacy-import", &op.id),
     )
     .await
     .expect("identity hold is an import outcome, not a transport crash");
@@ -687,22 +772,58 @@ async fn predecessor_partial_full_import_holds_same_url_replacement_uuid() {
         .unwrap()
         .is_none());
     assert_eq!(origin_commit_count(&bare), 1);
+    let hold_checkpoint = unproved_hold_checkpoint(&db, "legacy-import");
+    assert_eq!(
+        hold_checkpoint.outcome,
+        MappingOutcome::UnknownReconciliationRequired
+    );
+    assert_eq!(
+        hold_checkpoint.reason.as_deref(),
+        Some("svn_identity_unproved")
+    );
+    assert_scope_schema(&db);
 
-    let mut held = db
-        .get_import_operation("legacy-import", &op.id)
+    let op_id = op.id.clone();
+    drop(_fence);
+    drop(db);
+
+    let (db, _fence) = reopen_managed_db(&data_dir);
+    assert_scope_schema(&db);
+    let reopened = db
+        .get_import_operation("legacy-import", &op_id)
         .unwrap()
         .unwrap();
-    held.resume_authorized = true;
-    db.conn()
-        .execute(
-            "UPDATE kv_state SET value=?1 WHERE key=?2",
-            rusqlite::params![
-                serde_json::to_string(&held).unwrap(),
-                format!("import_operation_v1:document:{}", op.id)
-            ],
-        )
-        .unwrap();
-    db.resume_import_operation("legacy-import", &op.id).unwrap();
+    assert_eq!(reopened.state, ImportOperationState::ReconciliationRequired);
+    assert!(import_operation_has_retained_effects(&reopened));
+    assert_eq!(reopened.last_confirmed_svn_rev, Some(1));
+    assert_eq!(
+        reopened.last_confirmed_git_sha.as_deref(),
+        Some(prefix_sha.as_str())
+    );
+    assert!(reopened.snapshot_pin.is_none());
+    assert!(
+        independently_established_svn_uuid(&db.conn(), "legacy-import")
+            .unwrap()
+            .is_none(),
+        "reopen must not mint replacement UUID authority"
+    );
+    assert!(load_canonical_lineage(&db, "legacy-import")
+        .unwrap()
+        .is_none());
+    let reopened_hold = unproved_hold_checkpoint(&db, "legacy-import");
+    assert_eq!(
+        reopened_hold.outcome,
+        MappingOutcome::UnknownReconciliationRequired
+    );
+    assert_eq!(
+        reopened_hold.reason.as_deref(),
+        Some("svn_identity_unproved")
+    );
+    assert_eq!(origin_tip(&bare), prefix_sha);
+    assert_eq!(origin_blob(&bare, &prefix_sha, "one.txt"), "one\n");
+    assert_eq!(origin_commit_count(&bare), 1);
+
+    authorize_import_resume(&db, "legacy-import", &op_id);
     let git_client = reposync_core::git::GitClient::new(&git_work).unwrap();
     let reopen = reposync_core::import::run_full_import(
         &reposync_core::svn::SvnClient::new(&svn_url, "", ""),
@@ -710,38 +831,28 @@ async fn predecessor_partial_full_import_holds_same_url_replacement_uuid() {
         &identity,
         &db,
         &reposync_core::file_policy::FilePolicy::new(0, Vec::new()),
-        &reposync_core::import::ImportConfig {
-            committer_name: "Fixture".into(),
-            committer_email: "fixture@example.invalid".into(),
-            remote_name: "origin".into(),
-            branch: "main".into(),
-            push_token: None,
-            message_prefix: None,
-            trunk_path: String::new(),
-        },
-        reposync_core::import::ImportRunState {
-            progress: std::sync::Arc::new(tokio::sync::RwLock::new(
-                reposync_core::import::ImportProgress::default(),
-            )),
-            ws_broadcast: None,
-            repo_id: Some("legacy-import".into()),
-            operation_id: Some(op.id.clone()),
-            cancel_signal: None,
-        },
+        &import_cfg(),
+        import_state("legacy-import", &op_id),
     )
     .await
     .unwrap();
-    assert!(matches!(
-        reopen,
-        reposync_core::import::ImportOutcome::ReconciliationRequired { ref reason, .. }
-            if reason.contains("svn_identity_unproved")
-    ));
+    match reopen {
+        reposync_core::import::ImportOutcome::ReconciliationRequired { commits, reason } => {
+            assert_eq!(commits, 0);
+            assert!(
+                reason.contains("svn_identity_unproved"),
+                "reopened replacement must remain refused, got {reason}"
+            );
+        }
+        other => panic!("expected replacement refusal after reopen, got {other:?}"),
+    }
     assert!(
         independently_established_svn_uuid(&db.conn(), "legacy-import")
             .unwrap()
             .is_none()
     );
     assert_eq!(origin_commit_count(&bare), 1);
+    assert_eq!(origin_tip(&bare), prefix_sha);
 
     let fresh_work = tmp.path().join("fresh_git");
     let fresh_bare = tmp.path().join("fresh.origin.git");
@@ -801,36 +912,41 @@ async fn predecessor_partial_full_import_holds_same_url_replacement_uuid() {
         &identity,
         &db,
         &reposync_core::file_policy::FilePolicy::new(0, Vec::new()),
-        &reposync_core::import::ImportConfig {
-            committer_name: "Fixture".into(),
-            committer_email: "fixture@example.invalid".into(),
-            remote_name: "origin".into(),
-            branch: "main".into(),
-            push_token: None,
-            message_prefix: None,
-            trunk_path: String::new(),
-        },
-        reposync_core::import::ImportRunState {
-            progress: std::sync::Arc::new(tokio::sync::RwLock::new(
-                reposync_core::import::ImportProgress::default(),
-            )),
-            ws_broadcast: None,
-            repo_id: Some("fresh-import".into()),
-            operation_id: Some(fresh_op.id.clone()),
-            cancel_signal: None,
-        },
+        &import_cfg(),
+        import_state("fresh-import", &fresh_op.id),
     )
     .await
     .unwrap();
-    assert!(
-        matches!(
-            fresh_outcome,
-            reposync_core::import::ImportOutcome::Completed { commits, .. } if commits >= 1
-        ) || matches!(
-            fresh_outcome,
-            reposync_core::import::ImportOutcome::ReconciliationRequired { commits, .. } if commits >= 1
-        ),
-        "fresh import should proceed, got {fresh_outcome:?}"
+    let reposync_core::import::ImportOutcome::Completed {
+        commits: fresh_commits,
+        svn_rev: fresh_rev,
+        git_sha: fresh_sha,
+    } = fresh_outcome
+    else {
+        panic!("fresh import must complete, got {fresh_outcome:?}");
+    };
+    assert_eq!(fresh_commits, 3);
+    assert_eq!(fresh_rev, 3);
+    db.complete_import_operation("fresh-import", &fresh_op.id, fresh_rev, &fresh_sha)
+        .unwrap();
+    let fresh_done = db
+        .get_import_operation("fresh-import", &fresh_op.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(fresh_done.state, ImportOperationState::Completed);
+    assert_eq!(fresh_done.last_confirmed_svn_rev, Some(3));
+    assert_eq!(
+        fresh_done.last_confirmed_git_sha.as_deref(),
+        Some(fresh_sha.as_str())
+    );
+    assert_eq!(origin_tip(&fresh_bare), fresh_sha);
+    assert_eq!(
+        origin_blob(&fresh_bare, &fresh_sha, "three.txt"),
+        "replacement-three\n"
+    );
+    assert_eq!(
+        db.get_repo_watermark("fresh-import").unwrap(),
+        (3, fresh_sha.clone())
     );
     assert_eq!(
         independently_established_svn_uuid(&db.conn(), "fresh-import")
@@ -838,15 +954,24 @@ async fn predecessor_partial_full_import_holds_same_url_replacement_uuid() {
             .as_deref(),
         Some(replacement_uuid.as_str())
     );
+    assert_eq!(origin_commit_count(&fresh_bare), 3);
 
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
             "case":"RS63_PREDECESSOR_IMPORT_PREFIX_HOLD",
+            "journal_construction":"current_apis",
+            "predecessor_binary_executed":false,
+            "old_install_gate":R01_OLD_INSTALL_GATE,
+            "old_code":R01_OLD_CODE,
+            "persisted_reopen":true,
             "original_uuid": original_uuid,
             "replacement_uuid": replacement_uuid,
             "recorded_legacy_uuid": independently_established_svn_uuid(&db.conn(), "legacy-import").unwrap(),
-            "origin_commits": origin_commit_count(&bare)
+            "origin_commits": origin_commit_count(&bare),
+            "fresh_import_completed":true,
+            "fresh_svn_rev":fresh_rev,
+            "fresh_git_sha":fresh_sha
         })
     );
 }
@@ -854,10 +979,7 @@ async fn predecessor_partial_full_import_holds_same_url_replacement_uuid() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn independently_proved_same_identity_resume_continues() {
     let _serial = writer_fence_test_lock().lock().await;
-    if !svn_available() || !git_available() {
-        eprintln!("SKIP: svn/svnadmin/git not available");
-        return;
-    }
+    require_svn_git();
     let tmp = tempfile::tempdir().unwrap();
     let svn_path = tmp.path().join("svn_repo");
     assert!(Command::new("svnadmin")
@@ -965,21 +1087,7 @@ async fn independently_proved_same_identity_resume_continues() {
         "worker stopped",
     )
     .unwrap();
-    let mut held = db
-        .get_import_operation("proved-import", &op.id)
-        .unwrap()
-        .unwrap();
-    held.resume_authorized = true;
-    db.conn()
-        .execute(
-            "UPDATE kv_state SET value=?1 WHERE key=?2",
-            rusqlite::params![
-                serde_json::to_string(&held).unwrap(),
-                format!("import_operation_v1:document:{}", op.id)
-            ],
-        )
-        .unwrap();
-    db.resume_import_operation("proved-import", &op.id).unwrap();
+    authorize_import_resume(&db, "proved-import", &op.id);
     let identity = reposync_core::identity::IdentityMapper::new(
         &reposync_core::config::IdentityConfig::default(),
     )
@@ -990,39 +1098,120 @@ async fn independently_proved_same_identity_resume_continues() {
         &identity,
         &db,
         &reposync_core::file_policy::FilePolicy::new(0, Vec::new()),
-        &reposync_core::import::ImportConfig {
-            committer_name: "Fixture".into(),
-            committer_email: "fixture@example.invalid".into(),
-            remote_name: "origin".into(),
-            branch: "main".into(),
-            push_token: None,
-            message_prefix: None,
-            trunk_path: String::new(),
-        },
-        reposync_core::import::ImportRunState {
-            progress: std::sync::Arc::new(tokio::sync::RwLock::new(
-                reposync_core::import::ImportProgress::default(),
-            )),
-            ws_broadcast: None,
-            repo_id: Some("proved-import".into()),
-            operation_id: Some(op.id.clone()),
-            cancel_signal: None,
-        },
+        &import_cfg(),
+        import_state("proved-import", &op.id),
     )
     .await
     .unwrap();
-    assert!(
-        !matches!(
-            outcome,
-            reposync_core::import::ImportOutcome::ReconciliationRequired { ref reason, .. }
-                if reason.contains("svn_identity_unproved")
-        ),
-        "matching proved identity must not hold unproved, got {outcome:?}"
+    let reposync_core::import::ImportOutcome::Completed {
+        commits,
+        svn_rev,
+        git_sha,
+    } = outcome
+    else {
+        panic!("matching proved identity must complete, got {outcome:?}");
+    };
+    assert_eq!(commits, 2);
+    assert_eq!(svn_rev, 2);
+    db.complete_import_operation("proved-import", &op.id, svn_rev, &git_sha)
+        .unwrap();
+    let finished = db
+        .get_import_operation("proved-import", &op.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(finished.state, ImportOperationState::Completed);
+    assert_eq!(finished.last_confirmed_svn_rev, Some(2));
+    assert_eq!(
+        finished.last_confirmed_git_sha.as_deref(),
+        Some(git_sha.as_str())
+    );
+    assert_eq!(origin_tip(&bare), git_sha);
+    assert_eq!(origin_blob(&bare, &git_sha, "two.txt"), "two\n");
+    assert_eq!(
+        db.get_repo_watermark("proved-import").unwrap(),
+        (2, git_sha.clone())
     );
     assert_eq!(
         independently_established_svn_uuid(&db.conn(), "proved-import")
             .unwrap()
             .as_deref(),
         Some(live_uuid.as_str())
+    );
+    let scope = repository_scope_uuid(&db.conn(), "proved-import").unwrap();
+    if let Some(checkpoint) = load_directional_checkpoint(
+        &db.conn(),
+        &scope,
+        PAIR_GENERATION,
+        CheckpointDirection::SvnToGit,
+    )
+    .unwrap()
+    {
+        assert_ne!(
+            checkpoint.reason.as_deref(),
+            Some("svn_identity_unproved"),
+            "successful resume must not leave an unproved identity hold"
+        );
+    }
+    assert_scope_schema(&db);
+
+    let op_id = op.id.clone();
+    drop(_fence);
+    drop(db);
+    let (db, _fence) = reopen_managed_db(&data_dir);
+    let reopened = db
+        .get_import_operation("proved-import", &op_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened.state, ImportOperationState::Completed);
+    assert_eq!(reopened.last_confirmed_svn_rev, Some(2));
+    assert_eq!(
+        reopened.last_confirmed_git_sha.as_deref(),
+        Some(git_sha.as_str())
+    );
+    assert_eq!(
+        db.get_repo_watermark("proved-import").unwrap(),
+        (2, git_sha.clone())
+    );
+    assert_eq!(origin_tip(&bare), git_sha);
+    assert_eq!(origin_blob(&bare, &git_sha, "two.txt"), "two\n");
+    assert_eq!(
+        independently_established_svn_uuid(&db.conn(), "proved-import")
+            .unwrap()
+            .as_deref(),
+        Some(live_uuid.as_str())
+    );
+    assert_scope_schema(&db);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS63_PROVED_IDENTITY_RESUME_COMPLETED",
+            "commits":commits,
+            "svn_rev":svn_rev,
+            "git_sha":git_sha,
+            "persisted_reopen":true,
+            "origin_commits":origin_commit_count(&bare)
+        })
+    );
+}
+
+#[test]
+fn predecessor_binary_old_install_gate_is_not_current_api_journal() {
+    let generator_admitted = std::env::var_os("REPOSYNC_OLD_GENERATOR").is_some();
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS63_PREDECESSOR_BINARY_GATE_NOT_ADMITTED",
+            "old_install_gate":R01_OLD_INSTALL_GATE,
+            "old_code":R01_OLD_CODE,
+            "fixture_production_path":R01_GENERATOR_SOURCE,
+            "fixture_case":R01_FIXTURE_CASE,
+            "ordinary_test":"canonical_lineage_63::predecessor_partial_full_import_holds_same_url_replacement_uuid",
+            "journal_construction":"current_apis",
+            "predecessor_binary_executed":false,
+            "old_generator_env_present":generator_admitted,
+            "reliability_fixture_feature":cfg!(feature = "reliability-fixture"),
+            "qualification":"NOT RUN",
+            "reason":"ordinary runtime does not admit R01_OLD_INSTALL_UPGRADE; current-API journals are not old-version upgrade evidence"
+        })
     );
 }
