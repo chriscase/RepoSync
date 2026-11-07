@@ -61,9 +61,13 @@ initialization (no retained mappings/cursors, an import snapshot pin whose UUID
 matches live, or a producer-recorded UUID from a completed history import,
 late-pair copy in the same SVN repository, or a fixture that observed the live
 repo it created) pins `canonical_lineage` and records the Git baseline/ref
-from the repository row. Legacy adoption with retained mappings and no proved
-UUID holds (`svn_identity_unproved`) rather than pinning a same-URL
-replacement. Retained `last_svn_rev` / `last_git_sha` alone is never proof. A later UUID or incarnation mismatch holds only that pair
+from the repository row. A live `svn.info` UUID is not independently established
+over a predecessor full-import journal or published Git prefix that lacks a
+historical UUID key or snapshot pin: resume holds (`svn_identity_unproved`)
+before recording replacement authority, skipping old revisions, or publishing.
+Legacy adoption with retained mappings and no proved UUID holds rather than
+pinning a same-URL replacement. Retained `last_svn_rev` / `last_git_sha` alone
+is never proof. A later UUID or incarnation mismatch holds only that pair
 (`svn_identity_changed` / `reconciliation_required`) and does not silently
 sync a recreated repo at a low or equal revision under stale lineage.
 

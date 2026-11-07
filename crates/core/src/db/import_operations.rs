@@ -359,6 +359,29 @@ pub fn resolve_repo_import_baseline(
     Ok(RepoImportBaseline::Pending)
 }
 
+/// True when this journal already has durable local or published effects.
+/// A live `svn.info` UUID must not become historical authority over them.
+pub fn import_operation_has_retained_effects(op: &ImportOperation) -> bool {
+    op.processed_revisions > 0
+        || op.local_commits > 0
+        || op.confirmed_batches > 0
+        || op.last_local_svn_rev.is_some_and(|rev| rev > 0)
+        || op.last_confirmed_svn_rev.is_some_and(|rev| rev > 0)
+        || op
+            .last_local_git_sha
+            .as_deref()
+            .is_some_and(|sha| !sha.is_empty())
+        || op
+            .last_confirmed_git_sha
+            .as_deref()
+            .is_some_and(|sha| !sha.is_empty())
+        || op
+            .intended_git_sha
+            .as_deref()
+            .is_some_and(|sha| !sha.is_empty())
+        || !op.pending_commit_maps.is_empty()
+}
+
 /// A partial import may resume only when the confirmed SVN/Git prefix matches
 /// the durable local tip and no publication intent remains outstanding.
 pub fn import_resume_checkpoint(op: &ImportOperation) -> Option<(i64, u64, u64)> {
@@ -1161,6 +1184,44 @@ mod tests {
     use super::*;
     use crate::db::watermark_recovery::recover_repo_watermark_from_global_migration;
     use rusqlite::params;
+
+    #[test]
+    fn retained_effects_require_local_or_published_prefix() {
+        let empty = ImportOperation {
+            version: 1,
+            id: "op".into(),
+            repo_id: "pair".into(),
+            operation_type: "full_import".into(),
+            initiator_id: "admin".into(),
+            request_id: "req".into(),
+            target_fingerprint: "fp".into(),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            state: ImportOperationState::Running,
+            cancel_requested: false,
+            processed_revisions: 0,
+            total_revisions: Some(3),
+            local_commits: 0,
+            confirmed_batches: 0,
+            last_local_svn_rev: None,
+            last_local_git_sha: None,
+            last_confirmed_svn_rev: None,
+            last_confirmed_git_sha: None,
+            intended_ref: None,
+            intended_git_sha: None,
+            outcome_detail: None,
+            resume_authorized: false,
+            snapshot_pin: None,
+            pending_commit_maps: Vec::new(),
+        };
+        assert!(!import_operation_has_retained_effects(&empty));
+        let mut prefix = empty.clone();
+        prefix.last_confirmed_svn_rev = Some(1);
+        prefix.last_confirmed_git_sha = Some("a".repeat(40));
+        prefix.processed_revisions = 1;
+        prefix.confirmed_batches = 1;
+        assert!(import_operation_has_retained_effects(&prefix));
+    }
 
     #[test]
     fn exact_identity_cancel_and_reopen_hold() {

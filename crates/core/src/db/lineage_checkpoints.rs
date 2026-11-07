@@ -694,6 +694,59 @@ pub fn record_independently_established_svn_uuid(
     db.set_state(&independently_established_svn_uuid_kv_key(repo_id), uuid)
 }
 
+/// Record a live UUID only as independently established initialization.
+/// Retained import effects or mappings without prior proof hold instead of
+/// minting today's observation as historical authority.
+pub fn record_live_svn_uuid_or_hold_unproved(
+    db: &Database,
+    repo_id: &str,
+    live: &LiveSvnIdentity,
+    retained_producer_effects: bool,
+) -> Result<(), SyncError> {
+    if live.uuid.trim().is_empty() {
+        return Err(blocked(
+            "svn_uuid_missing",
+            "live SVN info did not report a repository UUID",
+        ));
+    }
+    let (proved, retained_baseline) = {
+        let conn = db.conn();
+        (
+            independently_established_svn_uuid(&conn, repo_id).map_err(SyncError::DatabaseError)?,
+            retained_legacy_baseline(&conn, repo_id).map_err(SyncError::DatabaseError)?,
+        )
+    };
+    if let Some(expected) = proved {
+        if expected != live.uuid {
+            return hold_unproved_identity(
+                db,
+                repo_id,
+                live,
+                "svn_identity_changed",
+                format!(
+                    "live SVN uuid={} does not match independently established uuid={}",
+                    live.uuid, expected
+                ),
+            );
+        }
+        return Ok(());
+    }
+    if retained_producer_effects || retained_baseline {
+        return hold_unproved_identity(
+            db,
+            repo_id,
+            live,
+            "svn_identity_unproved",
+            format!(
+                "live SVN uuid={} url={} has no independently established identity for retained import effects or mappings/checkpoints",
+                live.uuid, live.url
+            ),
+        );
+    }
+    record_independently_established_svn_uuid(db, repo_id, &live.uuid)
+        .map_err(SyncError::DatabaseError)
+}
+
 fn git_baseline_from_repo(
     conn: &Connection,
     repo_id: &str,
@@ -1249,6 +1302,68 @@ mod tests {
         assert!(independently_established_svn_uuid(&db.conn(), "pair")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn retained_import_effects_without_uuid_hold_and_do_not_record_live() {
+        let db = setup();
+        let err = record_live_svn_uuid_or_hold_unproved(
+            &db,
+            "pair",
+            &live_identity("uuid-replacement"),
+            true,
+        )
+        .unwrap_err();
+        match err {
+            SyncError::HistoryBlocked { reason, .. } => {
+                assert_eq!(reason, "svn_identity_unproved")
+            }
+            other => panic!("expected HistoryBlocked, got {other:?}"),
+        }
+        assert!(independently_established_svn_uuid(&db.conn(), "pair")
+            .unwrap()
+            .is_none());
+        assert!(load_canonical_lineage(&db, "pair").unwrap().is_none());
+        let again = record_live_svn_uuid_or_hold_unproved(
+            &db,
+            "pair",
+            &live_identity("uuid-replacement"),
+            true,
+        );
+        assert!(matches!(
+            again,
+            Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "svn_identity_unproved"
+        ));
+        assert!(independently_established_svn_uuid(&db.conn(), "pair")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn fresh_import_without_retained_effects_records_live_uuid() {
+        let db = setup();
+        record_live_svn_uuid_or_hold_unproved(&db, "pair", &live_identity("uuid-fresh"), false)
+            .unwrap();
+        assert_eq!(
+            independently_established_svn_uuid(&db.conn(), "pair")
+                .unwrap()
+                .as_deref(),
+            Some("uuid-fresh")
+        );
+    }
+
+    #[test]
+    fn matching_recorded_uuid_allows_resume_with_retained_effects() {
+        let db = setup();
+        record_independently_established_svn_uuid(&db, "pair", "uuid-live").unwrap();
+        record_live_svn_uuid_or_hold_unproved(&db, "pair", &live_identity("uuid-live"), true)
+            .unwrap();
+        assert_eq!(
+            independently_established_svn_uuid(&db.conn(), "pair")
+                .unwrap()
+                .as_deref(),
+            Some("uuid-live")
+        );
     }
 
     #[test]
