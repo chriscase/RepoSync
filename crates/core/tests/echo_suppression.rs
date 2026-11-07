@@ -2,10 +2,18 @@
 
 use chrono::Utc;
 use reposync_core::db::git_push_operations::{git_push_target_fingerprint, GitPushIntent};
+use reposync_core::db::repo_scope_identity::{
+    attach_scope_uuid_to_receipt, new_scope_uuid, repository_scope_uuid,
+};
+use reposync_core::echo_receipt_scope::{
+    attach_generation_to_receipt, handled_git_no_target_state_key, handled_svn_no_target_state_key,
+    repo_echo_generation, repo_echo_generation_tx,
+};
 use reposync_core::echo_suppression::{
     classify_incoming_git_commit, classify_incoming_svn_revision, EchoDisposition, TeamEchoContext,
     SYNC_MARKER,
 };
+use reposync_core::errors::DatabaseError;
 use reposync_core::models::{SyncDirection, SyncRecord, SyncRecordStatus};
 use reposync_core::Database;
 
@@ -13,6 +21,76 @@ fn setup_db() -> Database {
     let db = Database::in_memory().unwrap();
     db.initialize().unwrap();
     db
+}
+
+fn ensure_test_repo(db: &Database, repo_id: &str) {
+    if db.get_repository(repo_id).unwrap().is_some() {
+        return;
+    }
+    let scope = new_scope_uuid();
+    db.conn()
+        .execute(
+            "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_at, updated_at, last_svn_rev, last_git_sha, sync_status, total_syncs, total_errors, consecutive_errors, scope_uuid)
+             VALUES (?1, ?1, 'file:///x', '', '', 'local', '', '', 'main', 'team', 5, 0, 0, 1, 't', 't', 0, '', 'idle', 0, 0, 0, ?2)",
+            rusqlite::params![repo_id, scope],
+        )
+        .unwrap();
+}
+
+fn write_git_no_target_receipt(db: &Database, repo_id: &str, git_sha: &str, receipt: &str) {
+    let scoped = {
+        let conn = db.conn();
+        let scope = repository_scope_uuid(&conn, repo_id).ok();
+        let generation = scope
+            .as_ref()
+            .map(|_| repo_echo_generation_tx(&conn, repo_id).unwrap());
+        (scope, generation)
+    };
+    if let (Some(scope), Some(generation)) = scoped {
+        if let Ok(mut record) = serde_json::from_str::<serde_json::Value>(receipt) {
+            attach_scope_uuid_to_receipt(&mut record, &scope);
+            attach_generation_to_receipt(&mut record, generation);
+            let key = handled_git_no_target_state_key(&scope, generation, git_sha);
+            db.set_state(&key, &record.to_string()).unwrap();
+            return;
+        }
+        let key = handled_git_no_target_state_key(&scope, generation, git_sha);
+        db.set_state(&key, receipt).unwrap();
+        return;
+    }
+    db.set_state(
+        &format!("handled_git_no_target_{}_{}", repo_id, git_sha),
+        receipt,
+    )
+    .unwrap();
+}
+
+fn write_svn_no_target_receipt(db: &Database, repo_id: &str, svn_rev: i64, receipt: &str) {
+    let scoped = {
+        let conn = db.conn();
+        let scope = repository_scope_uuid(&conn, repo_id).ok();
+        let generation = scope
+            .as_ref()
+            .map(|_| repo_echo_generation_tx(&conn, repo_id).unwrap());
+        (scope, generation)
+    };
+    if let (Some(scope), Some(generation)) = scoped {
+        if let Ok(mut record) = serde_json::from_str::<serde_json::Value>(receipt) {
+            attach_scope_uuid_to_receipt(&mut record, &scope);
+            attach_generation_to_receipt(&mut record, generation);
+            let key = handled_svn_no_target_state_key(&scope, generation, svn_rev);
+            db.set_state(&key, &record.to_string()).unwrap();
+            return;
+        }
+        let key = handled_svn_no_target_state_key(&scope, generation, svn_rev);
+        db.set_state(&key, receipt).unwrap();
+        return;
+    }
+    db.set_state(
+        &format!("handled_svn_no_target_{}_{}", repo_id, svn_rev),
+        receipt,
+    )
+    .unwrap();
 }
 
 fn insert_applied_record(
@@ -116,6 +194,17 @@ fn handled_no_target_receipt_suppresses_only_when_admission_scoped() {
         &receipt.to_string(),
     )
     .unwrap();
+    match classify_incoming_git_commit(&ctx(&db, "pair"), &sha, "no marker") {
+        Err(DatabaseError::NotFound { entity, id }) => {
+            assert_eq!(entity, "repository");
+            assert_eq!(id, "pair");
+        }
+        other => panic!("unregistered pair must fail closed, got {other:?}"),
+    }
+
+    ensure_test_repo(&db, "pair");
+    ensure_test_repo(&db, "other");
+    write_git_no_target_receipt(&db, "pair", &sha, &receipt.to_string());
     assert_eq!(
         classify_incoming_git_commit(&ctx(&db, "pair"), &sha, "no marker")
             .unwrap()
@@ -124,8 +213,10 @@ fn handled_no_target_receipt_suppresses_only_when_admission_scoped() {
     );
 
     let other_repo_sha = "5".repeat(40);
-    db.set_state(
-        &format!("handled_git_no_target_other_{other_repo_sha}"),
+    write_git_no_target_receipt(
+        &db,
+        "other",
+        &other_repo_sha,
         &serde_json::json!({
             "version": 1,
             "repo_id": "other",
@@ -134,8 +225,7 @@ fn handled_no_target_receipt_suppresses_only_when_admission_scoped() {
             "projection": projection,
         })
         .to_string(),
-    )
-    .unwrap();
+    );
     assert_eq!(
         classify_incoming_git_commit(&ctx(&db, "pair"), &other_repo_sha, "no marker")
             .unwrap()
@@ -144,21 +234,18 @@ fn handled_no_target_receipt_suppresses_only_when_admission_scoped() {
     );
 
     let malformed_sha = "6".repeat(40);
-    db.set_state(
-        &format!("handled_git_no_target_pair_{malformed_sha}"),
-        "not-json",
-    )
-    .unwrap();
-    assert_eq!(
-        classify_incoming_git_commit(&ctx(&db, "pair"), &malformed_sha, "no marker")
-            .unwrap()
-            .unwrap(),
-        EchoDisposition::ApplyGenuine
-    );
+    write_git_no_target_receipt(&db, "pair", &malformed_sha, "not-json");
+    match classify_incoming_git_commit(&ctx(&db, "pair"), &malformed_sha, "no marker") {
+        Err(DatabaseError::Other(message))
+            if message.contains("malformed scoped no-target receipt") => {}
+        other => panic!("malformed scoped Git receipt must fail closed, got {other:?}"),
+    }
 
     let weak_v3_sha = "7".repeat(40);
-    db.set_state(
-        &format!("handled_git_no_target_pair_{weak_v3_sha}"),
+    write_git_no_target_receipt(
+        &db,
+        "pair",
+        &weak_v3_sha,
         &serde_json::json!({
             "version": 3,
             "repo_id": "pair",
@@ -167,13 +254,57 @@ fn handled_no_target_receipt_suppresses_only_when_admission_scoped() {
             "projection": projection,
         })
         .to_string(),
-    )
-    .unwrap();
+    );
     assert_eq!(
         classify_incoming_git_commit(&ctx(&db, "pair"), &weak_v3_sha, "no marker")
             .unwrap()
             .unwrap(),
         EchoDisposition::ApplyGenuine
+    );
+
+    let scope = repository_scope_uuid(&db.conn(), "pair").unwrap();
+    let generation = repo_echo_generation(&db, "pair").unwrap();
+    let key = handled_git_no_target_state_key(&scope, generation, &sha);
+    db.set_state(
+        &key,
+        &serde_json::json!({
+            "version": 1,
+            "repo_id": "pair",
+            "git_sha": sha,
+            "outcome": "filtered",
+            "projection": projection,
+            "generation": generation,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        classify_incoming_git_commit(&ctx(&db, "pair"), &sha, "no marker")
+            .unwrap()
+            .unwrap(),
+        EchoDisposition::ApplyGenuine,
+        "field-less managed receipts must not suppress genuine work"
+    );
+    db.set_state(
+        &key,
+        &serde_json::json!({
+            "version": 1,
+            "repo_id": "pair",
+            "git_sha": sha,
+            "outcome": "filtered",
+            "projection": projection,
+            "generation": generation,
+            "scope_uuid": "00000000-0000-0000-0000-000000000000",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        classify_incoming_git_commit(&ctx(&db, "pair"), &sha, "no marker")
+            .unwrap()
+            .unwrap(),
+        EchoDisposition::ApplyGenuine,
+        "foreign-scope receipts must not suppress genuine work"
     );
 }
 
@@ -232,14 +363,27 @@ fn handled_svn_no_target_receipt_suppresses_only_when_admission_scoped() {
         &receipt.to_string(),
     )
     .unwrap();
+    match classify_incoming_svn_revision(&ctx(&db, "pair"), svn_rev, "no marker") {
+        Err(DatabaseError::NotFound { entity, id }) => {
+            assert_eq!(entity, "repository");
+            assert_eq!(id, "pair");
+        }
+        other => panic!("unregistered pair must fail closed, got {other:?}"),
+    }
+
+    ensure_test_repo(&db, "pair");
+    ensure_test_repo(&db, "other");
+    write_svn_no_target_receipt(&db, "pair", svn_rev, &receipt.to_string());
     assert_eq!(
         classify_incoming_svn_revision(&ctx(&db, "pair"), svn_rev, "no marker").unwrap(),
         EchoDisposition::SkipEcho
     );
 
     let other_rev = 9_i64;
-    db.set_state(
-        &format!("handled_svn_no_target_other_{other_rev}"),
+    write_svn_no_target_receipt(
+        &db,
+        "other",
+        other_rev,
         &serde_json::json!({
             "version": 1,
             "repo_id": "other",
@@ -248,27 +392,24 @@ fn handled_svn_no_target_receipt_suppresses_only_when_admission_scoped() {
             "projection": projection,
         })
         .to_string(),
-    )
-    .unwrap();
+    );
     assert_eq!(
         classify_incoming_svn_revision(&ctx(&db, "pair"), other_rev, "no marker").unwrap(),
         EchoDisposition::ApplyGenuine
     );
 
     let malformed_rev = 10_i64;
-    db.set_state(
-        &format!("handled_svn_no_target_pair_{malformed_rev}"),
-        "not-json",
-    )
-    .unwrap();
+    write_svn_no_target_receipt(&db, "pair", malformed_rev, "not-json");
     assert_eq!(
         classify_incoming_svn_revision(&ctx(&db, "pair"), malformed_rev, "no marker").unwrap(),
         EchoDisposition::ApplyGenuine
     );
 
     let weak_rev = 11_i64;
-    db.set_state(
-        &format!("handled_svn_no_target_pair_{weak_rev}"),
+    write_svn_no_target_receipt(
+        &db,
+        "pair",
+        weak_rev,
         &serde_json::json!({
             "version": 3,
             "repo_id": "pair",
@@ -277,11 +418,51 @@ fn handled_svn_no_target_receipt_suppresses_only_when_admission_scoped() {
             "projection": projection,
         })
         .to_string(),
-    )
-    .unwrap();
+    );
     assert_eq!(
         classify_incoming_svn_revision(&ctx(&db, "pair"), weak_rev, "no marker").unwrap(),
         EchoDisposition::ApplyGenuine
+    );
+
+    let scope = repository_scope_uuid(&db.conn(), "pair").unwrap();
+    let generation = repo_echo_generation(&db, "pair").unwrap();
+    let key = handled_svn_no_target_state_key(&scope, generation, svn_rev);
+    db.set_state(
+        &key,
+        &serde_json::json!({
+            "version": 1,
+            "repo_id": "pair",
+            "svn_revision": svn_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+            "generation": generation,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        classify_incoming_svn_revision(&ctx(&db, "pair"), svn_rev, "no marker").unwrap(),
+        EchoDisposition::ApplyGenuine,
+        "field-less managed receipts must not suppress genuine work"
+    );
+    db.set_state(
+        &key,
+        &serde_json::json!({
+            "version": 1,
+            "repo_id": "pair",
+            "svn_revision": svn_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+            "generation": generation,
+            "scope_uuid": "00000000-0000-0000-0000-000000000000",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        classify_incoming_svn_revision(&ctx(&db, "pair"), svn_rev, "no marker").unwrap(),
+        EchoDisposition::ApplyGenuine,
+        "foreign-scope receipts must not suppress genuine work"
     );
 }
 
