@@ -245,17 +245,92 @@ struct SvnApplyTestFault {
 
 const GIT_PROBE_MAX_OUTPUT: usize = 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbePipe {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+enum ProbePipeSetupError {
+    GetFlags(ProbePipe),
+    SetFlags(ProbePipe),
+    #[cfg(not(unix))]
+    NoInterruptibleBackend,
+}
+
+#[cfg(unix)]
+fn configure_probe_pipe_nonblocking(
+    fd: std::os::unix::io::RawFd,
+    pipe: ProbePipe,
+) -> Result<(), ProbePipeSetupError> {
+    #[cfg(test)]
+    if pr245_probe_cleanup_tests::fail_getfl(pipe) {
+        return Err(ProbePipeSetupError::GetFlags(pipe));
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(ProbePipeSetupError::GetFlags(pipe));
+    }
+    #[cfg(test)]
+    if pr245_probe_cleanup_tests::fail_setfl(pipe) {
+        return Err(ProbePipeSetupError::SetFlags(pipe));
+    }
+    let updated = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if updated < 0 {
+        return Err(ProbePipeSetupError::SetFlags(pipe));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn configure_probe_pipe_nonblocking(pipe: ProbePipe) -> Result<(), ProbePipeSetupError> {
+    let _ = pipe;
+    Err(ProbePipeSetupError::NoInterruptibleBackend)
+}
+
+fn reap_owned_probe_child(child: &mut std::process::Child) {
+    kill_git_probe_group(child);
+    let reap_deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < reap_deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn release_unready_probe(
+    error: ProbePipeSetupError,
+    child: &mut std::process::Child,
+    stdout: std::process::ChildStdout,
+    stderr: std::process::ChildStderr,
+) -> Option<std::process::Output> {
+    #[cfg(test)]
+    {
+        let running = matches!(child.try_wait(), Ok(None));
+        pr245_probe_cleanup_tests::note_child_running_before_reap(running);
+        pr245_probe_cleanup_tests::record_setup_error(error);
+    }
+    #[cfg(not(test))]
+    let _ = error;
+    drop(stdout);
+    drop(stderr);
+    reap_owned_probe_child(child);
+    None
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
 fn drain_limited(
-    mut pipe: impl Read + std::os::unix::io::AsRawFd,
+    mut pipe: impl Read,
     max: usize,
     stop: &AtomicBool,
+    #[cfg(test)] entered: Option<Arc<AtomicBool>>,
 ) -> (Vec<u8>, bool) {
-    let fd = pipe.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags >= 0 {
-        unsafe {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
+    #[cfg(test)]
+    if let Some(entered) = entered {
+        entered.store(true, Ordering::Relaxed);
     }
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -314,151 +389,217 @@ fn sync_git_command_output(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn().ok()?;
-    let stdout = child.stdout.take()?;
-    let stderr = child.stderr.take()?;
-    let stop_stdout = Arc::new(AtomicBool::new(false));
-    let stop_stderr = Arc::new(AtomicBool::new(false));
-    let (tx_out, rx_out) = mpsc::channel();
-    let (tx_err, rx_err) = mpsc::channel();
-    let stop_stdout_reader = Arc::clone(&stop_stdout);
-    let stop_stderr_reader = Arc::clone(&stop_stderr);
-    let stdout_reader = std::thread::spawn(move || {
-        let _ = tx_out.send(drain_limited(
-            stdout,
-            GIT_PROBE_MAX_OUTPUT,
-            &stop_stdout_reader,
-        ));
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let _ = tx_err.send(drain_limited(
-            stderr,
-            GIT_PROBE_MAX_OUTPUT,
-            &stop_stderr_reader,
-        ));
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if !remaining_until(deadline).is_zero() => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            _ => break None,
-        }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return None,
     };
-    let mut killed_group = false;
-    let reap_group = |child: &mut std::process::Child| {
-        kill_git_probe_group(child);
-        let reap_deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < reap_deadline {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    };
-    if status.is_none() {
-        reap_group(&mut child);
-        killed_group = true;
-    }
-    let mut stdout_drain = None;
-    let mut stderr_drain = None;
-    let pull = |stdout_drain: &mut Option<(Vec<u8>, bool)>,
-                stderr_drain: &mut Option<(Vec<u8>, bool)>| {
-        if stdout_drain.as_ref().is_none_or(|drain: &(Vec<u8>, bool)| !drain.1) {
-            if let Ok(value) = rx_out.try_recv() {
-                *stdout_drain = Some(value);
-            }
-        }
-        if stderr_drain.as_ref().is_none_or(|drain: &(Vec<u8>, bool)| !drain.1) {
-            if let Ok(value) = rx_err.try_recv() {
-                *stderr_drain = Some(value);
-            }
-        }
-    };
-    let collect_deadline = if Instant::now() < deadline {
-        deadline
-    } else {
-        Instant::now() + Duration::from_millis(200)
-    };
-    while Instant::now() < collect_deadline
-        && (stdout_drain.as_ref().is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
-            || stderr_drain.as_ref().is_none_or(|drain: &(Vec<u8>, bool)| !drain.1))
-    {
-        pull(&mut stdout_drain, &mut stderr_drain);
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let clean_eof = !killed_group
-        && stdout_drain.as_ref().is_some_and(|drain: &(Vec<u8>, bool)| drain.1)
-        && stderr_drain.as_ref().is_some_and(|drain: &(Vec<u8>, bool)| drain.1);
-    if !clean_eof && !killed_group {
-        reap_group(&mut child);
-        killed_group = true;
-        let after_kill = Instant::now() + Duration::from_millis(800);
-        while Instant::now() < after_kill
-            && (stdout_drain.as_ref().is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
-                || stderr_drain.as_ref().is_none_or(|drain: &(Vec<u8>, bool)| !drain.1))
-        {
-            pull(&mut stdout_drain, &mut stderr_drain);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    } else if killed_group {
-        let after_kill = Instant::now() + Duration::from_millis(800);
-        while Instant::now() < after_kill
-            && (stdout_drain.as_ref().is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
-                || stderr_drain.as_ref().is_none_or(|drain: &(Vec<u8>, bool)| !drain.1))
-        {
-            pull(&mut stdout_drain, &mut stderr_drain);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-    if stdout_drain.as_ref().is_none_or(|drain: &(Vec<u8>, bool)| !drain.1) {
-        stop_stdout.store(true, Ordering::Relaxed);
-    }
-    if stderr_drain.as_ref().is_none_or(|drain: &(Vec<u8>, bool)| !drain.1) {
-        stop_stderr.store(true, Ordering::Relaxed);
-    }
-    let join_reader = |handle: std::thread::JoinHandle<()>| -> bool {
-        let join_deadline = Instant::now() + Duration::from_millis(800);
-        while Instant::now() < join_deadline && !handle.is_finished() {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        if !handle.is_finished() {
-            return false;
-        }
-        handle.join().is_ok()
-    };
-    let stdout_joined = join_reader(stdout_reader);
-    let stderr_joined = join_reader(stderr_reader);
-    pull(&mut stdout_drain, &mut stderr_drain);
-    let stdout_eof = stdout_drain.as_ref().is_some_and(|drain: &(Vec<u8>, bool)| drain.1);
-    let stderr_eof = stderr_drain.as_ref().is_some_and(|drain: &(Vec<u8>, bool)| drain.1);
     #[cfg(test)]
-    pr245_probe_cleanup_tests::record_probe_drains(
-        stdout_eof,
-        stderr_eof,
-        stdout_joined,
-        stderr_joined,
-    );
-    if clean_eof && stdout_joined && stderr_joined {
-        let status = status.expect("clean probe completion has the leader status");
-        let (stdout, _) = stdout_drain.expect("clean stdout drain");
-        let (stderr, _) = stderr_drain.expect("clean stderr drain");
-        return Some(std::process::Output {
-            status,
+    pr245_probe_cleanup_tests::note_child_pid(child.id());
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (stdout, stderr) = match (stdout, stderr) {
+        (Some(stdout), Some(stderr)) => (stdout, stderr),
+        (stdout, stderr) => {
+            drop(stdout);
+            drop(stderr);
+            reap_owned_probe_child(&mut child);
+            return None;
+        }
+    };
+    #[cfg(not(unix))]
+    {
+        return release_unready_probe(
+            ProbePipeSetupError::NoInterruptibleBackend,
+            &mut child,
             stdout,
             stderr,
-        });
+        );
     }
-    let _ = (
-        killed_group,
-        stdout_eof,
-        stderr_eof,
-        stdout_joined,
-        stderr_joined,
-    );
-    None
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Err(error) = configure_probe_pipe_nonblocking(stdout.as_raw_fd(), ProbePipe::Stdout)
+        {
+            return release_unready_probe(error, &mut child, stdout, stderr);
+        }
+        if let Err(error) = configure_probe_pipe_nonblocking(stderr.as_raw_fd(), ProbePipe::Stderr)
+        {
+            return release_unready_probe(error, &mut child, stdout, stderr);
+        }
+        let stop_stdout = Arc::new(AtomicBool::new(false));
+        let stop_stderr = Arc::new(AtomicBool::new(false));
+        let (tx_out, rx_out) = mpsc::channel();
+        let (tx_err, rx_err) = mpsc::channel();
+        let stop_stdout_reader = Arc::clone(&stop_stdout);
+        let stop_stderr_reader = Arc::clone(&stop_stderr);
+        #[cfg(test)]
+        let stdout_entered = pr245_probe_cleanup_tests::drain_entered_flag(ProbePipe::Stdout);
+        #[cfg(test)]
+        let stderr_entered = pr245_probe_cleanup_tests::drain_entered_flag(ProbePipe::Stderr);
+        #[cfg(test)]
+        pr245_probe_cleanup_tests::mark_reader_started(ProbePipe::Stdout);
+        let stdout_reader = std::thread::spawn(move || {
+            let _ = tx_out.send(drain_limited(
+                stdout,
+                GIT_PROBE_MAX_OUTPUT,
+                &stop_stdout_reader,
+                #[cfg(test)]
+                stdout_entered,
+            ));
+        });
+        #[cfg(test)]
+        pr245_probe_cleanup_tests::mark_reader_started(ProbePipe::Stderr);
+        let stderr_reader = std::thread::spawn(move || {
+            let _ = tx_err.send(drain_limited(
+                stderr,
+                GIT_PROBE_MAX_OUTPUT,
+                &stop_stderr_reader,
+                #[cfg(test)]
+                stderr_entered,
+            ));
+        });
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if !remaining_until(deadline).is_zero() => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => break None,
+            }
+        };
+        let mut killed_group = false;
+        if status.is_none() {
+            reap_owned_probe_child(&mut child);
+            killed_group = true;
+        }
+        let mut stdout_drain = None;
+        let mut stderr_drain = None;
+        let pull = |stdout_drain: &mut Option<(Vec<u8>, bool)>,
+                    stderr_drain: &mut Option<(Vec<u8>, bool)>| {
+            if stdout_drain
+                .as_ref()
+                .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+            {
+                if let Ok(value) = rx_out.try_recv() {
+                    *stdout_drain = Some(value);
+                }
+            }
+            if stderr_drain
+                .as_ref()
+                .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+            {
+                if let Ok(value) = rx_err.try_recv() {
+                    *stderr_drain = Some(value);
+                }
+            }
+        };
+        let collect_deadline = if Instant::now() < deadline {
+            deadline
+        } else {
+            Instant::now() + Duration::from_millis(200)
+        };
+        while Instant::now() < collect_deadline
+            && (stdout_drain
+                .as_ref()
+                .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+                || stderr_drain
+                    .as_ref()
+                    .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1))
+        {
+            pull(&mut stdout_drain, &mut stderr_drain);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let clean_eof = !killed_group
+            && stdout_drain
+                .as_ref()
+                .is_some_and(|drain: &(Vec<u8>, bool)| drain.1)
+            && stderr_drain
+                .as_ref()
+                .is_some_and(|drain: &(Vec<u8>, bool)| drain.1);
+        if !clean_eof && !killed_group {
+            reap_owned_probe_child(&mut child);
+            killed_group = true;
+            let after_kill = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < after_kill
+                && (stdout_drain
+                    .as_ref()
+                    .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+                    || stderr_drain
+                        .as_ref()
+                        .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1))
+            {
+                pull(&mut stdout_drain, &mut stderr_drain);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        } else if killed_group {
+            let after_kill = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < after_kill
+                && (stdout_drain
+                    .as_ref()
+                    .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+                    || stderr_drain
+                        .as_ref()
+                        .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1))
+            {
+                pull(&mut stdout_drain, &mut stderr_drain);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        if stdout_drain
+            .as_ref()
+            .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+        {
+            stop_stdout.store(true, Ordering::Relaxed);
+        }
+        if stderr_drain
+            .as_ref()
+            .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+        {
+            stop_stderr.store(true, Ordering::Relaxed);
+        }
+        let join_reader = |handle: std::thread::JoinHandle<()>| -> bool {
+            let join_deadline = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < join_deadline && !handle.is_finished() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            handle.join().is_ok()
+        };
+        let stdout_joined = join_reader(stdout_reader);
+        let stderr_joined = join_reader(stderr_reader);
+        pull(&mut stdout_drain, &mut stderr_drain);
+        let stdout_eof = stdout_drain
+            .as_ref()
+            .is_some_and(|drain: &(Vec<u8>, bool)| drain.1);
+        let stderr_eof = stderr_drain
+            .as_ref()
+            .is_some_and(|drain: &(Vec<u8>, bool)| drain.1);
+        #[cfg(test)]
+        pr245_probe_cleanup_tests::record_probe_drains(
+            stdout_eof,
+            stderr_eof,
+            stdout_joined,
+            stderr_joined,
+        );
+        if clean_eof && stdout_joined && stderr_joined {
+            let status = status.expect("clean probe completion has the leader status");
+            let (stdout, _) = stdout_drain.expect("clean stdout drain");
+            let (stderr, _) = stderr_drain.expect("clean stderr drain");
+            return Some(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        let _ = (
+            killed_group,
+            stdout_eof,
+            stderr_eof,
+            stdout_joined,
+            stderr_joined,
+        );
+        None
+    }
 }
 impl SyncEngine {
     /// Create a new sync engine with all required dependencies.
@@ -7674,15 +7815,17 @@ repo = "test/test-repo"
 
 #[cfg(test)]
 mod pr245_probe_cleanup_tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::sync_git_command_output;
+    use super::{sync_git_command_output, ProbePipe, ProbePipeSetupError};
 
     thread_local! {
-        static PROBE_DRAIN_NOTE: std::cell::RefCell<Option<Arc<ProbeDrainNote>>> =
-            std::cell::RefCell::new(None);
+        static PROBE_DRAIN_NOTE: RefCell<Option<Arc<ProbeDrainNote>>> = RefCell::new(None);
+        static PROBE_SETUP_FAULT: Cell<Option<ProbeSetupFault>> = Cell::new(None);
+        static PROBE_SETUP_TRACE: RefCell<Option<Arc<ProbeSetupTrace>>> = RefCell::new(None);
     }
 
     pub(super) struct ProbeDrainNote {
@@ -7690,6 +7833,62 @@ mod pr245_probe_cleanup_tests {
         stderr_eof: AtomicBool,
         stdout_joined: AtomicBool,
         stderr_joined: AtomicBool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ProbeSetupFault {
+        GetFlags(ProbePipe),
+        SetFlags(ProbePipe),
+    }
+
+    struct ProbeSetupTrace {
+        gets: [AtomicUsize; 2],
+        sets: [AtomicUsize; 2],
+        drains: [Arc<AtomicBool>; 2],
+        readers: [AtomicBool; 2],
+        child_pid: AtomicI32,
+        running_before_reap: AtomicBool,
+        error_code: AtomicU8,
+    }
+
+    struct SetupFaultGuard {
+        trace: Arc<ProbeSetupTrace>,
+    }
+
+    impl Drop for SetupFaultGuard {
+        fn drop(&mut self) {
+            PROBE_SETUP_FAULT.with(|slot| slot.set(None));
+            PROBE_SETUP_TRACE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn pipe_index(pipe: ProbePipe) -> usize {
+        match pipe {
+            ProbePipe::Stdout => 0,
+            ProbePipe::Stderr => 1,
+        }
+    }
+
+    fn fresh_trace() -> Arc<ProbeSetupTrace> {
+        Arc::new(ProbeSetupTrace {
+            gets: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            sets: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            drains: [
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ],
+            readers: [AtomicBool::new(false), AtomicBool::new(false)],
+            child_pid: AtomicI32::new(0),
+            running_before_reap: AtomicBool::new(false),
+            error_code: AtomicU8::new(0),
+        })
+    }
+
+    fn arm_setup_fault(fault: ProbeSetupFault) -> SetupFaultGuard {
+        let trace = fresh_trace();
+        PROBE_SETUP_FAULT.with(|slot| slot.set(Some(fault)));
+        PROBE_SETUP_TRACE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&trace)));
+        SetupFaultGuard { trace }
     }
 
     pub(super) fn record_probe_drains(
@@ -7709,19 +7908,226 @@ mod pr245_probe_cleanup_tests {
         });
     }
 
-    fn terminated(pid: i32) -> bool {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn fail_getfl(pipe: ProbePipe) -> bool {
+        let index = pipe_index(pipe);
+        PROBE_SETUP_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow().as_ref() {
+                trace.gets[index].fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        PROBE_SETUP_FAULT.with(|slot| slot.get() == Some(ProbeSetupFault::GetFlags(pipe)))
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn fail_setfl(pipe: ProbePipe) -> bool {
+        let index = pipe_index(pipe);
+        PROBE_SETUP_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow().as_ref() {
+                trace.sets[index].fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        PROBE_SETUP_FAULT.with(|slot| slot.get() == Some(ProbeSetupFault::SetFlags(pipe)))
+    }
+
+    pub(super) fn note_child_pid(pid: u32) {
+        PROBE_SETUP_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow().as_ref() {
+                trace.child_pid.store(pid as i32, Ordering::Relaxed);
+            }
+        });
+    }
+
+    pub(super) fn note_child_running_before_reap(running: bool) {
+        PROBE_SETUP_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow().as_ref() {
+                trace.running_before_reap.store(running, Ordering::Relaxed);
+            }
+        });
+    }
+
+    pub(super) fn record_setup_error(error: ProbePipeSetupError) {
+        let code = match error {
+            ProbePipeSetupError::GetFlags(ProbePipe::Stdout) => 1,
+            ProbePipeSetupError::SetFlags(ProbePipe::Stdout) => 2,
+            ProbePipeSetupError::GetFlags(ProbePipe::Stderr) => 3,
+            ProbePipeSetupError::SetFlags(ProbePipe::Stderr) => 4,
+            #[cfg(not(unix))]
+            ProbePipeSetupError::NoInterruptibleBackend => 5,
+        };
+        PROBE_SETUP_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow().as_ref() {
+                trace.error_code.store(code, Ordering::Relaxed);
+            }
+        });
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn mark_reader_started(pipe: ProbePipe) {
+        let index = pipe_index(pipe);
+        PROBE_SETUP_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow().as_ref() {
+                trace.readers[index].store(true, Ordering::Relaxed);
+            }
+        });
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn drain_entered_flag(pipe: ProbePipe) -> Option<Arc<AtomicBool>> {
+        let index = pipe_index(pipe);
+        PROBE_SETUP_TRACE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|trace| Arc::clone(&trace.drains[index]))
+        })
+    }
+
+    #[cfg(unix)]
+    fn owned_unix_process_is_absent(pid: i32) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == 0 {
+            return false;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    #[cfg(unix)]
+    fn assert_setup_fault_refuses_before_read(
+        fault: ProbeSetupFault,
+        index: usize,
+        error_code: u8,
+        set_attempted: bool,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap()
+            .success());
+        let guard = arm_setup_fault(fault);
+        let started = Instant::now();
+        let result = sync_git_command_output(
+            tmp.path(),
+            &["-c", "alias.hold=!exec sleep 30", "hold"],
+            Duration::from_secs(5),
+            None,
+        );
+        assert!(
+            result.is_none(),
+            "setup failure must not return probe output"
+        );
+        let trace = &guard.trace;
+        assert_eq!(trace.error_code.load(Ordering::Relaxed), error_code);
+        assert_eq!(trace.gets[index].load(Ordering::Relaxed), 1);
+        assert_eq!(
+            trace.sets[index].load(Ordering::Relaxed),
+            usize::from(set_attempted)
+        );
+        if index == 1 {
+            assert_eq!(trace.gets[0].load(Ordering::Relaxed), 1);
+            assert_eq!(trace.sets[0].load(Ordering::Relaxed), 1);
+        } else {
+            assert_eq!(trace.gets[1].load(Ordering::Relaxed), 0);
+            assert_eq!(trace.sets[1].load(Ordering::Relaxed), 0);
+        }
+        assert!(!trace.readers[0].load(Ordering::Relaxed));
+        assert!(!trace.readers[1].load(Ordering::Relaxed));
+        assert!(!trace.drains[0].load(Ordering::Relaxed));
+        assert!(!trace.drains[1].load(Ordering::Relaxed));
+        assert!(
+            trace.running_before_reap.load(Ordering::Relaxed),
+            "owned child must still be running when setup fails"
+        );
+        let pid = trace.child_pid.load(Ordering::Relaxed);
+        assert!(pid > 0, "owned child pid must be recorded");
+        let observed = Instant::now();
+        let absent = loop {
+            if owned_unix_process_is_absent(pid) {
+                break true;
+            }
+            if observed.elapsed() >= Duration::from_millis(200) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            absent,
+            "owned child {pid} must be reaped after setup failure"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "setup failure returned in {:?}; cleanup must stay bounded",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_getfl_failure_on_stdout_refuses_without_a_reader() {
+        assert_setup_fault_refuses_before_read(
+            ProbeSetupFault::GetFlags(ProbePipe::Stdout),
+            0,
+            1,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_setfl_failure_on_stdout_refuses_without_a_reader() {
+        assert_setup_fault_refuses_before_read(
+            ProbeSetupFault::SetFlags(ProbePipe::Stdout),
+            0,
+            2,
+            true,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_getfl_failure_on_stderr_refuses_without_a_reader() {
+        assert_setup_fault_refuses_before_read(
+            ProbeSetupFault::GetFlags(ProbePipe::Stderr),
+            1,
+            3,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_setfl_failure_on_stderr_refuses_without_a_reader() {
+        assert_setup_fault_refuses_before_read(
+            ProbeSetupFault::SetFlags(ProbePipe::Stderr),
+            1,
+            4,
+            true,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_proc_state_is_exited(pid: i32) -> bool {
+        if pid <= 0 {
+            return false;
+        }
         match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Err(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
             Ok(text) => {
                 let state = text
                     .rsplit_once(')')
                     .and_then(|(_, rest)| rest.split_whitespace().next())
                     .unwrap_or("");
-                state == "Z"
+                matches!(state, "Z" | "X")
             }
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn leader_exited_descendant_retains(pipe: &str) {
         let tmp = tempfile::tempdir().unwrap();
         assert!(std::process::Command::new("git")
@@ -7754,7 +8160,10 @@ mod pr245_probe_cleanup_tests {
             None,
         );
         PROBE_DRAIN_NOTE.with(|slot| *slot.borrow_mut() = None);
-        assert!(result.is_none(), "{pipe} descendant must not become a successful probe");
+        assert!(
+            result.is_none(),
+            "{pipe} descendant must not become a successful probe"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "{pipe} probe returned in {:?}; cleanup must stay bounded",
@@ -7785,22 +8194,51 @@ mod pr245_probe_cleanup_tests {
             .trim()
             .parse()
             .unwrap();
-        assert_eq!(leader_pgid, hold_pgid, "{pipe} descendant must share the leader group");
-        assert!(leader_pgid > 0);
-        assert!(terminated(leader), "{pipe} leader {leader} must be gone");
-        assert!(terminated(hold), "{pipe} descendant {hold} must be terminated");
-        assert!(terminated(leader_pgid), "{pipe} group {leader_pgid} must be terminated");
-        assert!(note.stdout_eof.load(Ordering::Relaxed), "{pipe} stdout drain must reach EOF");
-        assert!(note.stderr_eof.load(Ordering::Relaxed), "{pipe} stderr drain must reach EOF");
-        assert!(note.stdout_joined.load(Ordering::Relaxed), "{pipe} stdout reader must join");
-        assert!(note.stderr_joined.load(Ordering::Relaxed), "{pipe} stderr reader must join");
+        assert_eq!(
+            leader_pgid, hold_pgid,
+            "{pipe} descendant must share the leader group"
+        );
+        assert!(leader > 0, "{pipe} leader pid must be recorded");
+        assert!(hold > 0, "{pipe} descendant pid must be recorded");
+        assert!(leader_pgid > 0, "{pipe} group id must be recorded");
+        assert!(hold_pgid > 0, "{pipe} descendant group id must be recorded");
+        assert!(
+            linux_proc_state_is_exited(leader),
+            "{pipe} leader {leader} must have exited"
+        );
+        assert!(
+            linux_proc_state_is_exited(hold),
+            "{pipe} descendant {hold} must have exited"
+        );
+        assert!(
+            linux_proc_state_is_exited(leader_pgid),
+            "{pipe} group {leader_pgid} must have exited"
+        );
+        assert!(
+            note.stdout_eof.load(Ordering::Relaxed),
+            "{pipe} stdout drain must reach EOF"
+        );
+        assert!(
+            note.stderr_eof.load(Ordering::Relaxed),
+            "{pipe} stderr drain must reach EOF"
+        );
+        assert!(
+            note.stdout_joined.load(Ordering::Relaxed),
+            "{pipe} stdout reader must join"
+        );
+        assert!(
+            note.stderr_joined.load(Ordering::Relaxed),
+            "{pipe} stderr reader must join"
+        );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn leader_exited_descendant_retains_stdout_is_terminated_and_drained() {
         leader_exited_descendant_retains("stdout");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn leader_exited_descendant_retains_stderr_is_terminated_and_drained() {
         leader_exited_descendant_retains("stderr");

@@ -200,11 +200,12 @@ impl HeldPair {
             .unwrap()
             .trim()
             .to_string();
-        assert!(!svn_uuid.is_empty(), "constructor-created SVN UUID is empty");
+        assert!(
+            !svn_uuid.is_empty(),
+            "constructor-created SVN UUID is empty"
+        );
         reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
-            &db,
-            repo_id,
-            &svn_uuid,
+            &db, repo_id, &svn_uuid,
         )
         .unwrap();
         let now = chrono::Utc::now().to_rfc3339();

@@ -1522,7 +1522,13 @@ async fn resume_preparation_failure_keeps_authorization_then_continues() {
     let uuid = uuid.trim();
     assert!(!uuid.is_empty());
     assert!(std::process::Command::new("git")
-        .args(["init", "--bare", "--initial-branch", "main", bare.to_str().unwrap()])
+        .args([
+            "init",
+            "--bare",
+            "--initial-branch",
+            "main",
+            bare.to_str().unwrap()
+        ])
         .status()
         .unwrap()
         .success());
@@ -1556,7 +1562,12 @@ async fn resume_preparation_failure_keeps_authorization_then_continues() {
     let prefix_tree = prefix_tree.trim().to_string();
     let bare_before = String::from_utf8(
         std::process::Command::new("git")
-            .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main"])
+            .args([
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "rev-parse",
+                "refs/heads/main",
+            ])
             .output()
             .unwrap()
             .stdout,
@@ -1706,7 +1717,12 @@ async fn resume_preparation_failure_keeps_authorization_then_continues() {
         "missing origin must fail credential remote lookup after the workdir exists: {refused_message}"
     );
     assert!(matches!(
-        state.db.get_import_operation(repo_id, &operation_id).unwrap().unwrap().state,
+        state
+            .db
+            .get_import_operation(repo_id, &operation_id)
+            .unwrap()
+            .unwrap()
+            .state,
         ImportOperationState::ReconciliationRequired
     ));
     let app = axum::Router::new()
@@ -1723,7 +1739,10 @@ async fn resume_preparation_failure_keeps_authorization_then_continues() {
         .send()
         .await
         .unwrap();
-    assert_eq!(http_refused.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        http_refused.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
     let held = state
         .db
         .get_import_operation(repo_id, &operation_id)
@@ -1739,7 +1758,12 @@ async fn resume_preparation_failure_keeps_authorization_then_continues() {
     assert!(state.import_handles.lock().await.is_empty());
     let bare_held = String::from_utf8(
         std::process::Command::new("git")
-            .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main"])
+            .args([
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "rev-parse",
+                "refs/heads/main",
+            ])
             .output()
             .unwrap()
             .stdout,
@@ -1758,7 +1782,10 @@ async fn resume_preparation_failure_keeps_authorization_then_continues() {
         .unwrap();
     let started_status = started.status();
     let started_body = started.text().await.unwrap();
-    assert!(started_status.is_success(), "{started_status} {started_body}");
+    assert!(
+        started_status.is_success(),
+        "{started_status} {started_body}"
+    );
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut finished = None;
     while tokio::time::Instant::now() < deadline {
@@ -1777,7 +1804,9 @@ async fn resume_preparation_failure_keeps_authorization_then_continues() {
             finished = Some(current);
             break;
         }
-        if current.state == ImportOperationState::ReconciliationRequired && !current.resume_authorized {
+        if current.state == ImportOperationState::ReconciliationRequired
+            && !current.resume_authorized
+        {
             finished = Some(current);
             break;
         }
@@ -1793,7 +1822,12 @@ async fn resume_preparation_failure_keeps_authorization_then_continues() {
     );
     let remote_tip = String::from_utf8(
         std::process::Command::new("git")
-            .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main"])
+            .args([
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "rev-parse",
+                "refs/heads/main",
+            ])
             .output()
             .unwrap()
             .stdout,
@@ -1802,13 +1836,23 @@ async fn resume_preparation_failure_keeps_authorization_then_continues() {
     let remote_tip = remote_tip.trim().to_string();
     assert_ne!(remote_tip, tip);
     let remote_file = std::process::Command::new("git")
-        .args(["--git-dir", bare.to_str().unwrap(), "show", "refs/heads/main:history.txt"])
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show",
+            "refs/heads/main:history.txt",
+        ])
         .output()
         .unwrap();
     assert_eq!(remote_file.stdout, b"two\n");
     let parent = String::from_utf8(
         std::process::Command::new("git")
-            .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main^"])
+            .args([
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "rev-parse",
+                "refs/heads/main^",
+            ])
             .output()
             .unwrap()
             .stdout,
@@ -1818,7 +1862,12 @@ async fn resume_preparation_failure_keeps_authorization_then_continues() {
     assert_eq!(
         String::from_utf8(
             std::process::Command::new("git")
-                .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", &format!("{tip}^{{tree}}")])
+                .args([
+                    "--git-dir",
+                    bare.to_str().unwrap(),
+                    "rev-parse",
+                    &format!("{tip}^{{tree}}")
+                ])
                 .output()
                 .unwrap()
                 .stdout,
@@ -1835,10 +1884,18 @@ async fn resume_preparation_failure_keeps_authorization_then_continues() {
         .unwrap()
         .unwrap();
     assert_eq!(again.state, ImportOperationState::Completed);
-    assert_eq!(again.last_confirmed_git_sha.as_deref(), Some(remote_tip.as_str()));
+    assert_eq!(
+        again.last_confirmed_git_sha.as_deref(),
+        Some(remote_tip.as_str())
+    );
     let reopened_remote = String::from_utf8(
         std::process::Command::new("git")
-            .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main"])
+            .args([
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "rev-parse",
+                "refs/heads/main",
+            ])
             .output()
             .unwrap()
             .stdout,
