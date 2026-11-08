@@ -5408,6 +5408,42 @@ async fn candidate_r17_repository_cursors_remain_scoped() {
     row.name = "other qualified pair".into();
     row.svn_url = other_svn.clone();
     row.git_repo = other_bare.to_string_lossy().to_string();
+    {
+        let other_svn_repo = other_root.join("svn_repo");
+        let svnlook_uuid = std::process::Command::new("svnlook")
+            .args([
+                "uuid",
+                other_svn_repo
+                    .to_str()
+                    .expect("R17 other svn_repo path is utf-8"),
+            ])
+            .output()
+            .expect("svnlook uuid of this R17 other-repo");
+        assert!(
+            svnlook_uuid.status.success(),
+            "svnlook uuid failed for {}: {}",
+            other_svn_repo.display(),
+            String::from_utf8_lossy(&svnlook_uuid.stderr)
+        );
+        let captured_uuid = String::from_utf8(svnlook_uuid.stdout)
+            .expect("R17 other-repo SVN UUID is utf-8")
+            .trim()
+            .to_string();
+        assert!(
+            !captured_uuid.is_empty(),
+            "R17 other-repo SVN UUID is empty for {}",
+            other_svn_repo.display()
+        );
+        assert_eq!(row.id, "other", "R17 seeded row.id must be other");
+        reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            &other_db,
+            &row.id,
+            &captured_uuid,
+        )
+        .unwrap_or_else(|error| {
+            panic!("record independently established SVN UUID for other: {error}")
+        });
+    }
     row.last_svn_rev = 1;
     row.last_git_sha = other_initial;
     row.total_syncs = 0;
