@@ -2473,29 +2473,6 @@ async fn resume_repo_import(
         ));
     }
 
-    let resumed = db
-        .resume_import_operation(&id, &operation_id)
-        .map_err(import_write_error)?;
-
-    {
-        let mut p = progress.write().await;
-        p.phase = ImportPhase::Importing;
-        p.started_at = Some(chrono::Utc::now().to_rfc3339());
-        p.completed_at = None;
-        p.cancel_requested = false;
-        p.cancel_signal
-            .store(false, std::sync::atomic::Ordering::Release);
-        p.total_revs = resumed.total_revisions.unwrap_or(0) as i64;
-        p.commits_created = resumed.local_commits;
-        p.batches_pushed = resumed.confirmed_batches;
-        p.current_rev = resumed.processed_revisions as i64;
-        // This Arc outlives the previous attempt. Drop its errors so a healthy
-        // resume is not labeled with that history, and so a new unpersisted
-        // failure is the first error for this attempt. Durable outcome detail
-        // is unchanged here.
-        p.errors.clear();
-    }
-
     let svn_import_url = reposync_core::svn::operand::configured_branch_url(
         &repo.svn_url,
         if repo.svn_branch.is_empty() {
@@ -2521,6 +2498,29 @@ async fn resume_repo_import(
     let identity_config = reposync_core::config::IdentityConfig::default();
     let identity_mapper = IdentityMapper::new(&identity_config)
         .map_err(|e| AppError::Internal(format!("failed to init identity mapper: {e}")))?;
+    let resumed = db
+        .resume_import_operation(&id, &operation_id)
+        .map_err(import_write_error)?;
+
+    {
+        let mut p = progress.write().await;
+        p.phase = ImportPhase::Importing;
+        p.started_at = Some(chrono::Utc::now().to_rfc3339());
+        p.completed_at = None;
+        p.cancel_requested = false;
+        p.cancel_signal
+            .store(false, std::sync::atomic::Ordering::Release);
+        p.total_revs = resumed.total_revisions.unwrap_or(0) as i64;
+        p.commits_created = resumed.local_commits;
+        p.batches_pushed = resumed.confirmed_batches;
+        p.current_rev = resumed.processed_revisions as i64;
+        // This Arc outlives the previous attempt. Drop its errors so a healthy
+        // resume is not labeled with that history, and so a new unpersisted
+        // failure is the first error for this attempt. Durable outcome detail
+        // is unchanged here.
+        p.errors.clear();
+    }
+
     let lfs_threshold_bytes = if repo.lfs_threshold_mb > 0 {
         (repo.lfs_threshold_mb as u64) * 1024 * 1024
     } else {

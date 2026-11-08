@@ -1462,3 +1462,387 @@ async fn resume_import_read_failure_keeps_resume_authorization() {
     assert_eq!(after.state, ImportOperationState::ReconciliationRequired);
     assert!(after.resume_authorized);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn resume_preparation_failure_keeps_authorization_then_continues() {
+    let repo_id = "import-resume-prepare";
+    let dir = tempfile::tempdir().unwrap();
+    let svn_repo = dir.path().join("svn-repo");
+    let bare = dir.path().join("origin.git");
+    let git_repo = dir.path().join("repos").join(repo_id).join("git-repo");
+    assert!(std::process::Command::new("svnadmin")
+        .args(["create", svn_repo.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let svn_root = format!("file://{}", svn_repo.display());
+    let seed = dir.path().join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    std::fs::write(seed.join("history.txt"), b"one\n").unwrap();
+    assert!(std::process::Command::new("svn")
+        .args([
+            "import",
+            seed.to_str().unwrap(),
+            &format!("{svn_root}/trunk"),
+            "-m",
+            "one",
+            "--username",
+            "fixture",
+            "--non-interactive",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let checkout = dir.path().join("wc");
+    assert!(std::process::Command::new("svn")
+        .args([
+            "checkout",
+            &format!("{svn_root}/trunk"),
+            checkout.to_str().unwrap(),
+            "--username",
+            "fixture",
+            "--non-interactive",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(checkout.join("history.txt"), b"two\n").unwrap();
+    assert!(std::process::Command::new("svn")
+        .args(["commit", "-m", "two", "--username", "fixture"])
+        .current_dir(&checkout)
+        .status()
+        .unwrap()
+        .success());
+    let uuid = std::process::Command::new("svnlook")
+        .args(["uuid", svn_repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(uuid.status.success());
+    let uuid = String::from_utf8(uuid.stdout).unwrap();
+    let uuid = uuid.trim();
+    assert!(!uuid.is_empty());
+    assert!(std::process::Command::new("git")
+        .args(["init", "--bare", "--initial-branch", "main", bare.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::create_dir_all(&git_repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&git_repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    git(&["init", "--initial-branch", "main"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    std::fs::write(git_repo.join("history.txt"), b"one\n").unwrap();
+    git(&["add", "history.txt"]);
+    git(&["commit", "-m", "checkpoint"]);
+    let origin = bare.to_str().unwrap().to_string();
+    git(&["remote", "add", "origin", &origin]);
+    git(&["push", "-u", "origin", "main"]);
+    let tip = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap();
+    let tip = tip.trim().to_string();
+    let prefix_tree = String::from_utf8(git(&["rev-parse", "HEAD^{tree}"]).stdout).unwrap();
+    let prefix_tree = prefix_tree.trim().to_string();
+    let bare_before = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(bare_before.trim(), tip);
+
+    let db_path = dir.path().join("reposync.db");
+    let db = Database::new(&db_path).unwrap();
+    db.initialize().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_repository(&Repository {
+        id: repo_id.into(),
+        name: repo_id.into(),
+        svn_url: svn_root.clone(),
+        svn_branch: "trunk".into(),
+        svn_username: "fixture".into(),
+        git_provider: "gitea".into(),
+        git_api_url: format!("file://{}", dir.path().display()),
+        git_repo: "local/history".into(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 30,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: false,
+        created_by: None,
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+        last_svn_rev: 0,
+        last_git_sha: String::new(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+        &db, repo_id, uuid,
+    )
+    .unwrap();
+    db.set_state(&format!("secret_svn_password_{repo_id}"), "fixture")
+        .unwrap();
+    db.set_state(&format!("secret_git_token_{repo_id}"), "dummy-token")
+        .unwrap();
+    let operation = db
+        .create_import_operation(repo_id, "admin", "resume-request", "fingerprint-fixed")
+        .unwrap();
+    let operation_id = operation.id.clone();
+    db.start_import_operation(repo_id, &operation_id).unwrap();
+    db.note_import_total(repo_id, &operation_id, 2).unwrap();
+    db.note_import_local(repo_id, &operation_id, 1, &tip, 1, 1)
+        .unwrap();
+    db.begin_import_publication(repo_id, &operation_id, "refs/heads/main", &tip)
+        .unwrap();
+    db.confirm_import_publication(repo_id, &operation_id, &tip)
+        .unwrap();
+    db.finish_import_operation(
+        repo_id,
+        &operation_id,
+        ImportOperationState::ReconciliationRequired,
+        "worker stopped before resume",
+    )
+    .unwrap();
+    let mut held = db
+        .get_import_operation(repo_id, &operation_id)
+        .unwrap()
+        .unwrap();
+    held.resume_authorized = true;
+    db.conn()
+        .execute(
+            "UPDATE kv_state SET value=?1 WHERE key=?2",
+            rusqlite::params![
+                serde_json::to_string(&held).unwrap(),
+                format!("import_operation_v1:document:{operation_id}")
+            ],
+        )
+        .unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[daemon]\ndata_dir = \"{}\"\n[svn]\nurl = \"{svn_root}\"\nusername = \"fixture\"\n[github]\nrepo = \"local/history\"\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+    let mut config = AppConfig::load_from_file(&config_path).unwrap();
+    config.web.admin_password = Some("secret".into());
+    let dummy = dir.path().join("dummy-git");
+    std::fs::create_dir_all(&dummy).unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&dummy)
+        .status()
+        .unwrap()
+        .success());
+    let engine = SyncEngine::new(
+        config.clone(),
+        Database::in_memory().unwrap(),
+        SvnClient::new(&svn_root, "fixture", ""),
+        GitClient::new(&dummy).unwrap(),
+        Arc::new(IdentityMapper::new(&reposync_core::config::IdentityConfig::default()).unwrap()),
+    );
+    let (trigger, _rx) = tokio::sync::mpsc::channel(1);
+    let (ws, _) = tokio::sync::broadcast::channel(1);
+    let state = Arc::new(AppState {
+        db,
+        sync_engine: Arc::new(engine),
+        config,
+        sync_trigger: trigger,
+        ws_broadcast: ws,
+        sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        import_progress: Arc::new(tokio::sync::RwLock::new(ImportProgress::default())),
+        config_path,
+        prev_net_snapshot: std::sync::Mutex::new(None),
+        repo_import_progress: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        login_attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
+        import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(crate::SchedulerServiceState::running()),
+    });
+    state.sessions.write().await.insert(
+        "token".into(),
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    );
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer token"),
+    );
+    git(&["remote", "remove", "origin"]);
+    let refused = super::resume_repo_import(
+        State(state.clone()),
+        headers.clone(),
+        Path((repo_id.into(), operation_id.clone())),
+    )
+    .await
+    .unwrap_err();
+    let refused_message = app_error_message(refused);
+    assert!(
+        refused_message.contains("failed to set git credentials"),
+        "missing origin must fail credential remote lookup after the workdir exists: {refused_message}"
+    );
+    assert!(matches!(
+        state.db.get_import_operation(repo_id, &operation_id).unwrap().unwrap().state,
+        ImportOperationState::ReconciliationRequired
+    ));
+    let app = axum::Router::new()
+        .merge(super::routes())
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let resume_url = format!("http://{addr}/api/repos/{repo_id}/import/{operation_id}/resume");
+    let http_refused = client
+        .post(&resume_url)
+        .bearer_auth("token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(http_refused.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    let held = state
+        .db
+        .get_import_operation(repo_id, &operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.state, ImportOperationState::ReconciliationRequired);
+    assert!(held.resume_authorized);
+    assert_eq!(held.last_confirmed_git_sha.as_deref(), Some(tip.as_str()));
+    assert_eq!(held.target_fingerprint, "fingerprint-fixed");
+    let progress = state.get_repo_import_progress(repo_id).await;
+    assert_ne!(progress.read().await.phase, ImportPhase::Importing);
+    assert_ne!(progress.read().await.phase, ImportPhase::Completed);
+    assert!(state.import_handles.lock().await.is_empty());
+    let bare_held = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(bare_held.trim(), tip);
+    let local_held = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap();
+    assert_eq!(local_held.trim(), tip);
+
+    git(&["remote", "add", "origin", &origin]);
+    let started = client
+        .post(&resume_url)
+        .bearer_auth("token")
+        .send()
+        .await
+        .unwrap();
+    let started_status = started.status();
+    let started_body = started.text().await.unwrap();
+    assert!(started_status.is_success(), "{started_status} {started_body}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut finished = None;
+    while tokio::time::Instant::now() < deadline {
+        let current = state
+            .db
+            .get_import_operation(repo_id, &operation_id)
+            .unwrap()
+            .unwrap();
+        if matches!(
+            current.state,
+            ImportOperationState::Completed
+                | ImportOperationState::Failed
+                | ImportOperationState::ReconciliationRequired
+        ) && current.state != ImportOperationState::ReconciliationRequired
+        {
+            finished = Some(current);
+            break;
+        }
+        if current.state == ImportOperationState::ReconciliationRequired && !current.resume_authorized {
+            finished = Some(current);
+            break;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let finished = finished.expect("resume did not reach a terminal operation");
+    assert_eq!(
+        finished.state,
+        ImportOperationState::Completed,
+        "{:?}",
+        finished.outcome_detail
+    );
+    let remote_tip = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let remote_tip = remote_tip.trim().to_string();
+    assert_ne!(remote_tip, tip);
+    let remote_file = std::process::Command::new("git")
+        .args(["--git-dir", bare.to_str().unwrap(), "show", "refs/heads/main:history.txt"])
+        .output()
+        .unwrap();
+    assert_eq!(remote_file.stdout, b"two\n");
+    let parent = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main^"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(parent.trim(), tip);
+    assert_eq!(
+        String::from_utf8(
+            std::process::Command::new("git")
+                .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", &format!("{tip}^{{tree}}")])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim(),
+        prefix_tree
+    );
+    drop(state);
+    server.abort();
+    let reopened = Database::new(&db_path).unwrap();
+    let again = reopened
+        .get_import_operation(repo_id, &operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.state, ImportOperationState::Completed);
+    assert_eq!(again.last_confirmed_git_sha.as_deref(), Some(remote_tip.as_str()));
+    let reopened_remote = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(reopened_remote.trim(), remote_tip);
+}
