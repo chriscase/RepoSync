@@ -1982,6 +1982,10 @@ END;"#
             .env("GIT_TERMINAL_PROMPT", "0")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE");
+        cmd.env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL");
         if let Some(dir) = dir {
             cmd.current_dir(dir);
         }
@@ -2003,6 +2007,10 @@ END;"#
             .env("GIT_TERMINAL_PROMPT", "0")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE");
+        cmd.env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL");
         if let Some(dir) = dir {
             cmd.current_dir(dir);
         }
