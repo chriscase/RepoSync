@@ -1231,6 +1231,52 @@ impl QualifiedPair {
         svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor");
         svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
         let baseline_svn_rev = svn_youngest(&svn_repo_root);
+        let captured_constructor_svn_identity = {
+            let repo_dir = svn_repo_root
+                .strip_prefix("file://")
+                .expect("constructor SVN root is a file:// repository");
+            let svnlook_uuid = Command::new("svnlook")
+                .args(["uuid", repo_dir])
+                .output()
+                .expect("svnlook uuid of this constructor-created repository");
+            assert!(
+                svnlook_uuid.status.success(),
+                "svnlook uuid failed for {repo_dir}: {}",
+                String::from_utf8_lossy(&svnlook_uuid.stderr)
+            );
+            let uuid = String::from_utf8(svnlook_uuid.stdout)
+                .expect("constructor-created SVN UUID is utf-8")
+                .trim()
+                .to_string();
+            assert!(
+                !uuid.is_empty(),
+                "constructor-created SVN UUID is empty for {repo_dir}"
+            );
+            let info = SvnClient::new(&svn_url, "", "")
+                .info()
+                .await
+                .expect("native svn info of this constructor-created branch");
+            assert_eq!(
+                info.uuid.trim(),
+                uuid.as_str(),
+                "svnlook UUID must match native svn info UUID for this constructor"
+            );
+            assert!(
+                !info.root_url.trim().is_empty() && !info.url.trim().is_empty(),
+                "native svn info did not report root/url for this constructor"
+            );
+            assert_eq!(
+                info.latest_rev, baseline_svn_rev,
+                "native svn info revision must match constructor baseline"
+            );
+            (
+                uuid,
+                svn_repo_root.clone(),
+                svn_branch.to_string(),
+                baseline_svn_rev,
+                svn_url.clone(),
+            )
+        };
         let bridge = tmp.path().join("bridge");
         let bare = tmp.path().join("origin.git");
         let use_standard_trunk = svn_branch == "trunk";
@@ -1285,6 +1331,42 @@ impl QualifiedPair {
             teams_webhook_url: None,
         })
         .unwrap();
+        {
+            let (uuid, root, branch, revision, url) = &captured_constructor_svn_identity;
+            assert_eq!(root, &svn_repo_root);
+            assert_eq!(branch.as_str(), svn_branch);
+            assert_eq!(*revision, baseline_svn_rev);
+            assert_eq!(url, &svn_url);
+            assert!(!repo_id.is_empty(), "constructor repo_id is empty");
+            let scope =
+                reposync_core::db::repo_scope_identity::repository_scope_uuid(&db.conn(), repo_id)
+                    .unwrap_or_else(|error| {
+                        panic!("constructor repo_id {repo_id} has no scope: {error}")
+                    });
+            assert!(
+                !scope.is_empty(),
+                "constructor scope UUID is empty for {repo_id}"
+            );
+            reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+                &db, repo_id, uuid,
+            )
+            .unwrap_or_else(|error| {
+                panic!("record constructor-created SVN UUID for {repo_id} scope {scope}: {error}")
+            });
+            let recorded =
+                reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+                    &db.conn(),
+                    repo_id,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("read back constructor-created SVN UUID for {repo_id}: {error}")
+                });
+            assert_eq!(
+                recorded.as_deref(),
+                Some(uuid.as_str()),
+                "constructor-recorded SVN UUID does not match captured identity for {repo_id}"
+            );
+        }
         let mut config = make_app_config(&svn_repo_root, tmp.path());
         if use_standard_trunk {
             config.svn.layout = reposync_core::config::SvnLayout::Standard;
