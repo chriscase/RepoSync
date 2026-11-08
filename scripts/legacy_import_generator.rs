@@ -26,6 +26,34 @@ async fn generate_legacy_import() {
     let install = root.join("install");
     std::fs::create_dir_all(&install).unwrap();
     run("svnadmin", &["create", source.to_str().unwrap()]);
+    let qualification_source = source.canonicalize().unwrap();
+    let qualification_creation_uuid = run("svnlook", &["uuid", qualification_source.to_str().unwrap()])
+        .trim()
+        .to_string();
+    assert_eq!(qualification_creation_uuid.len(), 36, "native creation UUID missing");
+    let qualification_creation_witness = serde_json::json!({
+        "witness_version": 1,
+        "attribution": "qualification-adapter",
+        "not_old_production_emission": true,
+        "observed_before_trunk_history_and_import": true,
+        "source_path": qualification_source,
+        "svn_uuid": qualification_creation_uuid,
+    });
+    let qualification_creation_witness_path = root.join("qualification-driver-creation-witness.json");
+    std::fs::write(
+        &qualification_creation_witness_path,
+        serde_json::to_vec(&qualification_creation_witness).unwrap(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut creation_perms = std::fs::metadata(&qualification_creation_witness_path)
+            .unwrap()
+            .permissions();
+        creation_perms.set_mode(0o444);
+        std::fs::set_permissions(&qualification_creation_witness_path, creation_perms).unwrap();
+    }
     run("svn", &["mkdir", &format!("{source_url}/trunk"), "-m", "Create trunk", "--non-interactive"]);
     let wc = root.join("source-wc");
     run("svn", &["checkout", &format!("{source_url}/trunk"), wc.to_str().unwrap(), "--non-interactive"]);
@@ -88,6 +116,66 @@ async fn generate_legacy_import() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap(); });
+    let qualification_pre_uuid = run("svnlook", &["uuid", source.to_str().unwrap()]).trim().to_string();
+    let qualification_creation_record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&qualification_creation_witness_path).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        qualification_pre_uuid,
+        qualification_creation_record["svn_uuid"].as_str().unwrap()
+    );
+    assert_eq!(qualification_pre_uuid, qualification_creation_uuid);
+    let qualification_source_now = source.canonicalize().unwrap();
+    assert_eq!(qualification_source_now, qualification_source);
+    let qualification_youngest = run("svnlook", &["youngest", source.to_str().unwrap()]).trim().to_string();
+    let qualification_trunk_url = format!("{source_url}/trunk");
+    let qualification_info_url = run("svn", &["info", "--show-item", "url", &qualification_trunk_url])
+        .trim()
+        .to_string();
+    assert_eq!(qualification_info_url, qualification_trunk_url);
+    let qualification_info_rev = run(
+        "svn",
+        &["info", "--show-item", "revision", &qualification_trunk_url],
+    )
+    .trim()
+    .to_string();
+    assert_eq!(qualification_info_rev, qualification_youngest);
+    let qualification_git_target = bare.canonicalize().unwrap();
+    let qualification_git_sha = run(
+        "git",
+        &["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main"],
+    )
+    .trim()
+    .to_string();
+    assert_eq!(qualification_git_sha.len(), 40);
+    let qualification_repo = state.db.get_repository("pair").unwrap().unwrap();
+    assert_eq!(qualification_repo.svn_branch, "trunk");
+    assert_eq!(qualification_repo.git_branch, "main");
+    assert_eq!(qualification_repo.svn_url, source_url);
+    let qualification_pre_effect = serde_json::json!({
+        "witness_version": 1,
+        "attribution": "qualification-adapter",
+        "not_old_production_emission": true,
+        "observed_before_old_import": true,
+        "source_path": qualification_source_now,
+        "source_url": source_url,
+        "trunk_url": qualification_trunk_url,
+        "native_svn_info_url": qualification_info_url,
+        "native_youngest_revision": qualification_youngest,
+        "native_info_revision": qualification_info_rev,
+        "svn_uuid": qualification_pre_uuid,
+        "creation_svn_uuid": qualification_creation_uuid,
+        "repo_id": "pair",
+        "git_target": qualification_git_target,
+        "git_ref": "refs/heads/main",
+        "git_sha_before_import": qualification_git_sha,
+    });
+    std::fs::write(
+        root.join("qualification-driver-pre-effect-witness.json"),
+        serde_json::to_vec(&qualification_pre_effect).unwrap(),
+    )
+    .unwrap();
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/api/repos/pair/import"))
         .header("authorization", "Bearer old-fixture-session")
@@ -121,8 +209,60 @@ async fn generate_legacy_import() {
         |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
     assert_eq!(persisted_progress, ("completed".to_string(), "[]".to_string()));
     assert_eq!(run("git", &["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main"]).trim(), repo.last_git_sha);
+    let qualification_completed_uuid = run("svnlook", &["uuid", source.to_str().unwrap()]).trim().to_string();
+    assert_eq!(qualification_completed_uuid, qualification_pre_uuid);
+    assert_eq!(qualification_completed_uuid, qualification_creation_uuid);
+    let qualification_completed_ref = run(
+        "git",
+        &["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main"],
+    )
+    .trim()
+    .to_string();
+    assert_eq!(qualification_completed_ref, repo.last_git_sha);
+    let qualification_completed_youngest = run("svnlook", &["youngest", source.to_str().unwrap()])
+        .trim()
+        .to_string();
+    assert_eq!(qualification_completed_youngest, repo.last_svn_rev.to_string());
+    let qualification_completion_witness = serde_json::json!({
+        "witness_version": 1,
+        "attribution": "qualification-adapter",
+        "not_old_production_emission": true,
+        "observed_before_old_import": true,
+        "unchanged_through_old_completion": true,
+        "creation_svn_uuid": qualification_creation_uuid,
+        "pre_effect_svn_uuid": qualification_pre_uuid,
+        "completed_svn_uuid": qualification_completed_uuid,
+        "source_path": source.canonicalize().unwrap(),
+        "source_url": source_url,
+        "trunk_url": format!("{source_url}/trunk"),
+        "native_youngest_revision": qualification_completed_youngest,
+        "repo_id": "pair",
+        "git_target": bare.canonicalize().unwrap(),
+        "git_ref": "refs/heads/main",
+        "completed_sha": repo.last_git_sha,
+        "completed_svn_rev": repo.last_svn_rev,
+        "pre_effect": qualification_pre_effect,
+    });
+    std::fs::write(
+        root.join("qualification-driver-completion-witness.json"),
+        serde_json::to_vec(&qualification_completion_witness).unwrap(),
+    )
+    .unwrap();
     eprintln!("OLD_FIXTURE_EVIDENCE {}", serde_json::json!({
         "generator_code": "87379741779a6259f7eeb52a68cc6f061174e5ef",
+        "qualification_driver_witness_version": 1,
+        "qualification_driver_attribution": "qualification-adapter",
+        "qualification_driver_not_old_production_emission": true,
+        "qualification_driver_pre_effect_svn_uuid": qualification_creation_uuid,
+        "qualification_driver_completed_svn_uuid": qualification_completed_uuid,
+        "qualification_driver_observed_before_old_import": true,
+        "qualification_driver_uuid_unchanged_through_completion": true,
+        "qualification_driver_source_path": qualification_completion_witness["source_path"],
+        "qualification_driver_trunk_url": qualification_completion_witness["trunk_url"],
+        "qualification_driver_repo_id": "pair",
+        "qualification_driver_git_ref": "refs/heads/main",
+        "qualification_driver_git_target": qualification_completion_witness["git_target"],
+        "qualification_driver_completed_sha": repo.last_git_sha,
         "svn_revision": repo.last_svn_rev, "imported_git": repo.last_git_sha,
         "kv": kv, "import_mapping": map_count, "outbound_mapping": outbound,
         "source": source_url, "install": install,

@@ -2558,6 +2558,548 @@ async fn candidate_r10_legacy_stale_copy_requires_mapped_transition() {
 #[cfg(feature = "reliability-fixture")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct MemberSeal {
+        kind: String,
+        mode: u32,
+        bytes: u64,
+        sha256: String,
+    }
+
+    fn unix_mode(meta: &std::fs::Metadata) -> u32 {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            meta.mode()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            panic!("R01 member modes require Unix metadata");
+        }
+    }
+
+    fn seal_tree(root: &Path) -> BTreeMap<String, MemberSeal> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, MemberSeal>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                assert!(
+                    !rel.is_empty()
+                        && !rel.starts_with('/')
+                        && Path::new(&rel)
+                            .components()
+                            .all(|component| matches!(component, std::path::Component::Normal(_))),
+                    "unsafe member {rel}"
+                );
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                let mode = unix_mode(&meta);
+                let file_type = meta.file_type();
+                if file_type.is_symlink() {
+                    let target = std::fs::read_link(&path).unwrap();
+                    let encoded = target.to_string_lossy();
+                    out.insert(
+                        rel,
+                        MemberSeal {
+                            kind: "symlink".into(),
+                            mode,
+                            bytes: encoded.len() as u64,
+                            sha256: hex::encode(sha2::Sha256::digest(encoded.as_bytes())),
+                        },
+                    );
+                } else if file_type.is_dir() {
+                    out.insert(
+                        rel.clone(),
+                        MemberSeal {
+                            kind: "dir".into(),
+                            mode,
+                            bytes: 0,
+                            sha256: hex::encode(sha2::Sha256::digest(b"")),
+                        },
+                    );
+                    walk(root, &path, out);
+                } else if file_type.is_file() {
+                    let bytes = std::fs::read(&path).unwrap();
+                    out.insert(
+                        rel,
+                        MemberSeal {
+                            kind: "file".into(),
+                            mode,
+                            bytes: bytes.len() as u64,
+                            sha256: hex::encode(sha2::Sha256::digest(&bytes)),
+                        },
+                    );
+                } else {
+                    panic!("unexpected fixture member {rel}");
+                }
+            }
+        }
+        let mut sealed = BTreeMap::new();
+        walk(root, root, &mut sealed);
+        assert!(!sealed.is_empty(), "sealed fixture tree is empty");
+        sealed
+    }
+
+    fn verify_tree(root: &Path, sealed: &BTreeMap<String, MemberSeal>) {
+        let actual = seal_tree(root);
+        assert_eq!(
+            &actual,
+            sealed,
+            "fixture tree drifted at {}",
+            root.display()
+        );
+    }
+
+    fn copy_owned_tree(from: &Path, to: &Path) {
+        assert!(from.is_dir(), "{}", from.display());
+        assert!(!to.exists(), "refusing to overwrite {}", to.display());
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let status = Command::new("cp")
+            .args(["-a", from.to_str().unwrap(), to.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "cp {} -> {}",
+            from.display(),
+            to.display()
+        );
+    }
+
+    fn svnlook_uuid(repo: &Path) -> String {
+        let output = Command::new("svnlook")
+            .args(["uuid", repo.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn svn_youngest(repo: &Path) -> String {
+        let output = Command::new("svnlook")
+            .args(["youngest", repo.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn svnlook_cat(repo: &Path, revision: &str) -> Vec<u8> {
+        let output = Command::new("svnlook")
+            .args([
+                "cat",
+                "-r",
+                revision,
+                repo.to_str().unwrap(),
+                "trunk/origin.txt",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn assert_no_uuid_authority(db: &Database) {
+        let key = reposync_core::db::lineage_checkpoints::independently_established_svn_uuid_kv_key(
+            "pair",
+        );
+        assert!(
+            db.get_state(&key).unwrap().is_none(),
+            "old DB already has an independently established SVN UUID key"
+        );
+        assert!(
+            db.get_state("import_operation_v1:latest:pair")
+                .unwrap()
+                .is_none(),
+            "old DB already has an import snapshot pin"
+        );
+        assert!(
+            reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+                &db.conn(),
+                "pair",
+            )
+            .unwrap()
+            .is_none(),
+            "old DB already has SVN UUID authority"
+        );
+    }
+
+    fn applied_maps(db: &Database) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND status = 'applied'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn resolved_canonical(db: &Database) -> i64 {
+        match db.conn().query_row(
+            "SELECT COUNT(*) FROM canonical_mapping_outcomes WHERE outcome = 'applied_and_verified'",
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(count) => count,
+            Err(error) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains("no such table"),
+                    "canonical outcome query failed: {text}"
+                );
+                0
+            }
+        }
+    }
+
+    fn creation_witness_is_immutable(path: &Path) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = std::fs::metadata(path)
+                .map_err(|error| error.to_string())?
+                .mode();
+            if mode & 0o222 != 0 {
+                return Err(format!("creation witness mode {mode:o} is writable"));
+            }
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err("creation witness immutability requires Unix metadata".into())
+        }
+    }
+
+    fn accept_pre_effect_witness(
+        evidence: &serde_json::Value,
+        old_root: &Path,
+        live_svn: &Path,
+        bare: &Path,
+        generator: &str,
+    ) -> Result<String, String> {
+        fn text<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|item| !item.is_empty())
+                .ok_or_else(|| format!("missing {key}"))
+        }
+        fn flag(value: &serde_json::Value, key: &str) -> Result<bool, String> {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| format!("missing {key}"))
+        }
+        let binary = std::fs::read(generator).map_err(|error| error.to_string())?;
+        if binary.is_empty() {
+            return Err("old generator binary is empty".into());
+        }
+        let adapter = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/legacy_import_generator.rs")
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let adapter_text = std::fs::read_to_string(&adapter).map_err(|error| error.to_string())?;
+        for marker in [
+            "qualification-adapter",
+            "qualification_driver_pre_effect_svn_uuid",
+            "not_old_production_emission",
+            "87379741779a6259f7eeb52a68cc6f061174e5ef",
+            "fn generate_legacy_import",
+        ] {
+            if !adapter_text.contains(marker) {
+                return Err(format!("adapter source missing {marker}"));
+            }
+        }
+        if text(evidence, "generator_code")? != "87379741779a6259f7eeb52a68cc6f061174e5ef" {
+            return Err("generator_code is not the pinned old production".into());
+        }
+        let version = evidence
+            .get("qualification_driver_witness_version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("missing qualification_driver_witness_version")?;
+        if version != 1 {
+            return Err("witness version is not the qualification-driver v1".into());
+        }
+        if text(evidence, "qualification_driver_attribution")? != "qualification-adapter" {
+            return Err("witness is not attributed to the qualification adapter".into());
+        }
+        if !flag(evidence, "qualification_driver_not_old_production_emission")? {
+            return Err("witness claims to be old production emission".into());
+        }
+        if !flag(evidence, "qualification_driver_observed_before_old_import")? {
+            return Err("witness was not observed before old import".into());
+        }
+        if !flag(
+            evidence,
+            "qualification_driver_uuid_unchanged_through_completion",
+        )? {
+            return Err("witness UUID changed through old completion".into());
+        }
+        let witnessed = text(evidence, "qualification_driver_pre_effect_svn_uuid")?;
+        if witnessed.len() != 36
+            || witnessed != text(evidence, "qualification_driver_completed_svn_uuid")?
+        {
+            return Err("pre-effect and completed witness UUIDs differ".into());
+        }
+        if text(evidence, "qualification_driver_repo_id")? != "pair" {
+            return Err("witness repo id is not the original pair".into());
+        }
+        if text(evidence, "qualification_driver_git_ref")? != "refs/heads/main" {
+            return Err("witness git ref is not refs/heads/main".into());
+        }
+        let completed_sha = text(evidence, "qualification_driver_completed_sha")?;
+        if completed_sha.len() != 40 || completed_sha != text(evidence, "imported_git")? {
+            return Err("witness completed SHA does not match imported git".into());
+        }
+        let live_path = live_svn.canonicalize().map_err(|error| error.to_string())?;
+        if Path::new(text(evidence, "qualification_driver_source_path")?) != live_path {
+            return Err("witness source path is not the live fixture SVN".into());
+        }
+        let trunk = format!("file://{}/trunk", live_svn.display());
+        if text(evidence, "qualification_driver_trunk_url")? != trunk {
+            return Err("witness trunk URL is not the live fixture trunk".into());
+        }
+        let bare_path = bare.canonicalize().map_err(|error| error.to_string())?;
+        if Path::new(text(evidence, "qualification_driver_git_target")?) != bare_path {
+            return Err("witness git target is not the old bare repository".into());
+        }
+        if git_output(bare, &["rev-parse", "refs/heads/main"]) != completed_sha {
+            return Err("bare ref does not match the witnessed completed SHA".into());
+        }
+        let creation = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(old_root.join("qualification-driver-creation-witness.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let pre_effect = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(old_root.join("qualification-driver-pre-effect-witness.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let completion = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(old_root.join("qualification-driver-completion-witness.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        creation_witness_is_immutable(
+            &old_root.join("qualification-driver-creation-witness.json"),
+        )?;
+        if text(&creation, "svn_uuid")? != witnessed
+            || text(&creation, "attribution")? != "qualification-adapter"
+            || !flag(&creation, "not_old_production_emission")?
+            || !flag(&creation, "observed_before_trunk_history_and_import")?
+        {
+            return Err("creation witness does not match the pre-effect UUID".into());
+        }
+        if text(&pre_effect, "svn_uuid")? != witnessed
+            || text(&pre_effect, "creation_svn_uuid")? != witnessed
+            || !flag(&pre_effect, "observed_before_old_import")?
+            || text(&pre_effect, "repo_id")? != "pair"
+            || text(&pre_effect, "git_ref")? != "refs/heads/main"
+            || text(&pre_effect, "trunk_url")? != trunk
+            || text(&pre_effect, "native_svn_info_url")? != trunk
+        {
+            return Err("pre-effect witness file does not match the receipt".into());
+        }
+        if text(&completion, "completed_svn_uuid")? != witnessed
+            || text(&completion, "pre_effect_svn_uuid")? != witnessed
+            || !flag(&completion, "unchanged_through_old_completion")?
+            || text(&completion, "completed_sha")? != completed_sha
+            || text(&completion, "repo_id")? != "pair"
+        {
+            return Err("completion witness does not connect the pre-effect observation".into());
+        }
+        let youngest = svn_youngest(live_svn);
+        if text(&pre_effect, "native_youngest_revision")? != youngest
+            || evidence
+                .get("svn_revision")
+                .and_then(serde_json::Value::as_i64)
+                != youngest.parse::<i64>().ok()
+        {
+            return Err("witness revision does not match native youngest".into());
+        }
+        let live_uuid = svnlook_uuid(live_svn);
+        if live_uuid != witnessed {
+            return Err(format!(
+                "present-day UUID {live_uuid} does not match pre-effect witness {witnessed}"
+            ));
+        }
+        Ok(witnessed.to_string())
+    }
+
+    fn stage_replacement_svn(tmp: &Path, live: &Path, origin: &[u8], youngest: &str) {
+        assert!(!live.exists(), "{}", live.display());
+        let created = Command::new("svnadmin")
+            .args(["create", live.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(created.success(), "replacement svnadmin create");
+        let url = format!("file://{}", live.display());
+        let mkdir = Command::new("svn")
+            .args([
+                "mkdir",
+                &format!("{url}/trunk"),
+                "-m",
+                "Create trunk",
+                "--non-interactive",
+            ])
+            .status()
+            .unwrap();
+        assert!(mkdir.success(), "replacement trunk");
+        let wc = tmp.join("replacement-wc");
+        if wc.exists() {
+            std::fs::remove_dir_all(&wc).unwrap();
+        }
+        let checkout = Command::new("svn")
+            .args([
+                "checkout",
+                &format!("{url}/trunk"),
+                wc.to_str().unwrap(),
+                "--non-interactive",
+            ])
+            .status()
+            .unwrap();
+        assert!(checkout.success(), "replacement checkout");
+        std::fs::write(wc.join("origin.txt"), origin).unwrap();
+        let add = Command::new("svn")
+            .args(["add", wc.join("origin.txt").to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(add.success(), "replacement add");
+        let commit = Command::new("svn")
+            .args([
+                "commit",
+                wc.to_str().unwrap(),
+                "-m",
+                "Old import source",
+                "--username",
+                "fixture",
+                "--non-interactive",
+            ])
+            .status()
+            .unwrap();
+        assert!(commit.success(), "replacement commit");
+        assert_eq!(svn_youngest(live), youngest);
+        assert_eq!(svnlook_cat(live, youngest), origin);
+        std::fs::remove_dir_all(&wc).unwrap();
+    }
+
+    struct HoldProbe<'a> {
+        install: &'a Path,
+        svn_url: &'a str,
+        svn_repo: &'a Path,
+        bare: &'a Path,
+        old_tip: &'a str,
+        reason: &'a str,
+        recorded: Option<&'a str>,
+        label: &'a str,
+    }
+
+    async fn probe_hold(probe: HoldProbe<'_>) {
+        let youngest = svn_youngest(probe.svn_repo);
+        let bridge = probe.install.join("repos/pair/git-repo");
+        let db_path = probe.install.join("reposync.db");
+        let db = Database::new(&db_path).unwrap();
+        db.initialize().unwrap();
+        match probe.recorded {
+            None => assert_no_uuid_authority(&db),
+            Some(uuid) => {
+                assert_ne!(svnlook_uuid(probe.svn_repo), uuid, "{}", probe.label);
+                assert_eq!(
+                    reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+                        &db.conn(),
+                        "pair",
+                    )
+                    .unwrap()
+                    .as_deref(),
+                    Some(uuid),
+                    "{}",
+                    probe.label
+                );
+            }
+        }
+        let watermark = db.get_repo_watermark("pair").unwrap();
+        let applied = applied_maps(&db);
+        let resolved = resolved_canonical(&db);
+        let git_sha = db.get_repository("pair").unwrap().unwrap().last_git_sha;
+        drop(db);
+        for pass in ["first", "reopen"] {
+            let mut config = make_app_config(probe.svn_url, probe.install);
+            config.svn.layout = reposync_core::config::SvnLayout::Custom;
+            let db = Database::new(&db_path).unwrap();
+            let mut engine = SyncEngine::new(
+                config,
+                db,
+                SvnClient::new(probe.svn_url, "", ""),
+                GitClient::new(&bridge).unwrap(),
+                Arc::new(make_identity_mapper()),
+            );
+            engine.set_repo_id("pair".into());
+            let outcome = engine.run_sync_cycle().await;
+            match outcome {
+                Err(SyncError::HistoryBlocked { reason, .. }) if reason == probe.reason => {}
+                other => panic!("{} {pass} hold: {other:?}", probe.label),
+            }
+            assert_eq!(
+                engine.db().get_repo_watermark("pair").unwrap(),
+                watermark,
+                "{} {pass} watermark",
+                probe.label
+            );
+            assert_eq!(applied_maps(engine.db()), applied, "{} {pass}", probe.label);
+            assert_eq!(
+                resolved_canonical(engine.db()),
+                resolved,
+                "{} {pass} resolved history",
+                probe.label
+            );
+            let recorded =
+                reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+                    &engine.db().conn(),
+                    "pair",
+                )
+                .unwrap();
+            assert_eq!(
+                recorded.as_deref(),
+                probe.recorded,
+                "{} {pass} uuid",
+                probe.label
+            );
+            drop(engine);
+        }
+        assert_eq!(svn_youngest(probe.svn_repo), youngest, "{}", probe.label);
+        assert_eq!(
+            git_output(probe.bare, &["rev-parse", "refs/heads/main"]),
+            probe.old_tip,
+            "{}",
+            probe.label
+        );
+        assert_eq!(get_head_sha(&bridge), git_sha, "{}", probe.label);
+    }
     let tmp = TempDir::new().unwrap();
     assert_fixture_owned(tmp.path());
     let old_root = tmp.path().join("old-install-generation");
@@ -2586,12 +3128,33 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         String::from_utf8_lossy(&generation.stdout),
         String::from_utf8_lossy(&generation.stderr)
     );
-    let old_generation = String::from_utf8_lossy(&generation.stderr)
+    let generation_stderr = String::from_utf8_lossy(&generation.stderr);
+    let evidence_lines: Vec<&str> = generation_stderr
         .lines()
-        .find_map(|line| line.strip_prefix("OLD_FIXTURE_EVIDENCE "))
-        .map(|text| serde_json::from_str::<serde_json::Value>(text).unwrap())
-        .expect("old generator did not report production import provenance");
+        .filter(|line| line.starts_with("OLD_FIXTURE_EVIDENCE "))
+        .collect();
+    assert_eq!(evidence_lines.len(), 1, "old generator receipt count");
+    let old_generation = serde_json::from_str::<serde_json::Value>(
+        evidence_lines[0]
+            .strip_prefix("OLD_FIXTURE_EVIDENCE ")
+            .unwrap(),
+    )
+    .unwrap();
     let original = old_root.join("install");
+    let live_svn = old_root.join("svn_repo");
+    let witnessed_uuid = accept_pre_effect_witness(
+        &old_generation,
+        &old_root,
+        &live_svn,
+        &old_root.join("old-origin.git"),
+        &generator,
+    )
+    .unwrap_or_else(|error| panic!("pre-effect witness refused: {error}"));
+    let install_seal = seal_tree(&original);
+    let old_master = tmp.path().join("old-state-master");
+    copy_owned_tree(&old_root, &old_master);
+    verify_tree(&old_master.join("install"), &install_seal);
+    assert_eq!(svnlook_uuid(&old_master.join("svn_repo")), witnessed_uuid);
     let installer_spec = std::env::var_os("REPOSYNC_INSTALL_UPDATE_SPEC");
     let candidate = if installer_spec.is_some() {
         tmp.path().join("installed-prefix/data")
@@ -2628,6 +3191,147 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         git_output(&bare, &["rev-parse", "refs/heads/main"]),
         old_tip
     );
+    verify_tree(&candidate, &install_seal);
+    verify_tree(&restored, &install_seal);
+    assert_eq!(svnlook_uuid(&live_svn), witnessed_uuid);
+    {
+        let phase = tmp.path().join("unproved-unchanged");
+        copy_owned_tree(&original, &phase);
+        verify_tree(&phase, &install_seal);
+        probe_hold(HoldProbe {
+            install: &phase,
+            svn_url: &svn_url,
+            svn_repo: &live_svn,
+            bare: &bare,
+            old_tip: &old_tip,
+            reason: "svn_identity_unproved",
+            recorded: None,
+            label: "unchanged",
+        })
+        .await;
+    }
+    {
+        let phase = tmp.path().join("witness-refusals");
+        copy_owned_tree(&original, &phase);
+        verify_tree(&phase, &install_seal);
+        let db = Database::new(phase.join("reposync.db")).unwrap();
+        db.initialize().unwrap();
+        assert_no_uuid_authority(&db);
+        let mut missing = old_generation.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| !key.starts_with("qualification_driver_"));
+        assert!(
+            accept_pre_effect_witness(&missing, &old_root, &live_svn, &bare, &generator).is_err(),
+            "missing witness was admitted"
+        );
+        let mut malformed = old_generation.clone();
+        malformed["qualification_driver_observed_before_old_import"] = serde_json::json!(false);
+        assert!(
+            accept_pre_effect_witness(&malformed, &old_root, &live_svn, &bare, &generator).is_err(),
+            "malformed witness was admitted"
+        );
+        malformed = old_generation.clone();
+        malformed["qualification_driver_pre_effect_svn_uuid"] = serde_json::json!("");
+        malformed["qualification_driver_completed_svn_uuid"] = serde_json::json!("");
+        assert!(
+            accept_pre_effect_witness(&malformed, &old_root, &live_svn, &bare, &generator).is_err(),
+            "empty witness was admitted"
+        );
+        malformed = old_generation.clone();
+        malformed["qualification_driver_witness_version"] = serde_json::json!(0);
+        assert!(
+            accept_pre_effect_witness(&malformed, &old_root, &live_svn, &bare, &generator).is_err(),
+            "wrong witness version was admitted"
+        );
+        let mut foreign = old_generation.clone();
+        foreign["qualification_driver_pre_effect_svn_uuid"] =
+            serde_json::json!("00000000-0000-0000-0000-000000000000");
+        foreign["qualification_driver_completed_svn_uuid"] =
+            serde_json::json!("00000000-0000-0000-0000-000000000000");
+        foreign["qualification_driver_source_path"] = serde_json::json!("/tmp/foreign-svn");
+        assert!(
+            accept_pre_effect_witness(&foreign, &old_root, &live_svn, &bare, &generator).is_err(),
+            "foreign witness was admitted"
+        );
+        assert_no_uuid_authority(&db);
+        drop(db);
+    }
+    {
+        let phase = tmp.path().join("conflict-admitted");
+        copy_owned_tree(&original, &phase);
+        verify_tree(&phase, &install_seal);
+        let db = Database::new(phase.join("reposync.db")).unwrap();
+        db.initialize().unwrap();
+        assert_no_uuid_authority(&db);
+        reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            &db,
+            "pair",
+            &witnessed_uuid,
+        )
+        .unwrap();
+        drop(db);
+        let youngest = svn_youngest(&live_svn);
+        let origin = svnlook_cat(&old_master.join("svn_repo"), &youngest);
+        let parked = tmp.path().join("parked-original-svn");
+        std::fs::rename(&live_svn, &parked).unwrap();
+        stage_replacement_svn(tmp.path(), &live_svn, &origin, &youngest);
+        let replacement_uuid = svnlook_uuid(&live_svn);
+        assert_ne!(replacement_uuid, witnessed_uuid);
+        probe_hold(HoldProbe {
+            install: &phase,
+            svn_url: &svn_url,
+            svn_repo: &live_svn,
+            bare: &bare,
+            old_tip: &old_tip,
+            reason: "svn_identity_changed",
+            recorded: Some(&witnessed_uuid),
+            label: "replacement-conflict",
+        })
+        .await;
+        let db = Database::new(phase.join("reposync.db")).unwrap();
+        let recorded = reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+            &db.conn(),
+            "pair",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recorded, witnessed_uuid);
+        assert_ne!(recorded, replacement_uuid);
+        drop(db);
+        let unproved = tmp.path().join("unproved-replacement");
+        copy_owned_tree(&original, &unproved);
+        verify_tree(&unproved, &install_seal);
+        probe_hold(HoldProbe {
+            install: &unproved,
+            svn_url: &svn_url,
+            svn_repo: &live_svn,
+            bare: &bare,
+            old_tip: &old_tip,
+            reason: "svn_identity_unproved",
+            recorded: None,
+            label: "replacement-unproved",
+        })
+        .await;
+        assert!(
+            accept_pre_effect_witness(&old_generation, &old_root, &live_svn, &bare, &generator)
+                .is_err(),
+            "replacement UUID was admitted as the pre-effect witness"
+        );
+        let db = Database::new(unproved.join("reposync.db")).unwrap();
+        assert_no_uuid_authority(&db);
+        drop(db);
+        assert!(live_svn.starts_with(tmp.path()));
+        std::fs::remove_dir_all(&live_svn).unwrap();
+        std::fs::rename(&parked, &live_svn).unwrap();
+        assert_eq!(svnlook_uuid(&live_svn), witnessed_uuid);
+        assert_eq!(svnlook_uuid(&old_master.join("svn_repo")), witnessed_uuid);
+        verify_tree(&original, &install_seal);
+        verify_tree(&old_master.join("install"), &install_seal);
+        verify_tree(&candidate, &install_seal);
+        verify_tree(&restored, &install_seal);
+    }
     // Opt-in installer qualification uses this SAME authentic old-state copy.
     // A supplied bad specification fails; it never falls back to library-only proof.
     let installer_receipt = installer_spec.as_ref().map(|spec| {
@@ -2663,6 +3367,7 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     });
     let mut config = make_app_config(&svn_url, &candidate);
     config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    verify_tree(&candidate, &install_seal);
     let db_path = candidate.join("reposync.db");
     let db = Database::new(&db_path).unwrap();
     let old_schema: i64 = db
@@ -2702,6 +3407,13 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         Arc::new(make_identity_mapper()),
     );
     engine.set_repo_id("pair".into());
+    assert_no_uuid_authority(engine.db());
+    reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+        engine.db(),
+        "pair",
+        &witnessed_uuid,
+    )
+    .unwrap();
     let idle = engine.run_sync_cycle().await.unwrap();
     assert_eq!((idle.svn_to_git_count, idle.git_to_svn_count), (0, 0));
     assert_eq!(get_head_sha(&bridge), old_tip);
@@ -2726,6 +3438,7 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     assert_eq!(baseline_receipt["svn_rev"], old_svn_rev);
     let restored_bridge = restored.join("repos/pair/git-repo");
     assert_eq!(get_head_sha(&restored_bridge), old_tip);
+    verify_tree(&restored, &install_seal);
     let restored_db = Database::new(restored.join("reposync.db")).unwrap();
     assert_eq!(
         restored_db.get_repo_watermark("pair").unwrap(),
@@ -2748,6 +3461,13 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         Arc::new(make_identity_mapper()),
     );
     restore_engine.set_repo_id("pair".into());
+    assert_no_uuid_authority(restore_engine.db());
+    reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+        restore_engine.db(),
+        "pair",
+        &witnessed_uuid,
+    )
+    .unwrap();
     let restore_idle = restore_engine.run_sync_cycle().await.unwrap();
     assert_eq!(
         (restore_idle.svn_to_git_count, restore_idle.git_to_svn_count),
@@ -2902,6 +3622,7 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         .unwrap()
         .trim()
         .to_string();
+    assert_eq!(svn_uuid, witnessed_uuid);
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
@@ -2922,6 +3643,18 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
             "final_git_tree":tree_hashes(&tracked_tree(&bridge)),
             "post_upgrade_install_manifest":final_install_manifest,
             "repository_mapping_rows":mapped_rows,
+            "explicit_fixture_witness_admission": true,
+            "witness_uuid": witnessed_uuid,
+            "witness_observed_before_old_import": true,
+            "present_day_uuid_matches_witness": true,
+            "unproved_unchanged_hold": "svn_identity_unproved",
+            "unproved_unchanged_reopen_hold": "svn_identity_unproved",
+            "unproved_replacement_hold": "svn_identity_unproved",
+            "replacement_conflict_hold": "svn_identity_changed",
+            "recorded_uuid_remained_pre_effect_witness": true,
+            "malformed_witness_refused": true,
+            "missing_witness_refused": true,
+            "foreign_witness_refused": true,
         })
     );
     // Publish the installer-tier receipt only after every retained engine,
