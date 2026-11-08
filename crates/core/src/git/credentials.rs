@@ -115,6 +115,9 @@ pub fn apply_git_credential_chain_state(
         git.clear_remote_credentials(remote_name)
     } else if let Some(tok) = state.value.as_deref() {
         git.ensure_remote_credentials(remote_name, Some(tok))
+    } else if state.is_read_failure() {
+        debug!("git credential chain read failed; preserving remote credentials");
+        Ok(())
     } else {
         git.clear_in_memory_http_auth(remote_name)
     }
@@ -134,7 +137,12 @@ pub fn apply_git_credential_chain_state_for_sync(
         git.clear_remote_credentials(remote_name)
     } else if let Some(tok) = state.value.as_deref() {
         git.ensure_remote_credentials_embedded(remote_name, Some(tok))
+    } else if state.is_read_failure() {
+        debug!("git credential chain read failed; preserving embedded remote");
+        Ok(())
     } else {
+        // Absent leaves the remote unchanged so a chain miss cannot strip
+        // URL-embedded tokens on the scheduler path.
         Ok(())
     }
 }
@@ -165,7 +173,12 @@ pub fn apply_managed_git_credentials(
     remote_name: &str,
 ) -> Result<(), GitError> {
     let state = db.resolve_credential_chain_state(repo_id, "secret_git_token");
-    if state.explicitly_revoked {
+    if state.is_read_failure() {
+        warn!(
+            repo_id,
+            "git token chain read failed; preserving remote URL"
+        );
+    } else if state.explicitly_revoked {
         debug!(
             repo_id,
             "explicit git token revocation via credential chain"
@@ -222,6 +235,40 @@ mod tests {
         apply_git_credential_chain_state(&git, "origin", &CredentialChainState::not_found())
             .unwrap();
 
+        assert_eq!(git_origin_url(&bridge), url);
+    }
+
+    #[test]
+    fn apply_read_failure_leaves_embedded_token() {
+        let tmp = TempDir::new().unwrap();
+        let bare = tmp.path().join("origin.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", bare.to_str().unwrap()])
+            .status()
+            .unwrap();
+        let bridge = tmp.path().join("bridge");
+        std::process::Command::new("git")
+            .args(["clone", bare.to_str().unwrap(), bridge.to_str().unwrap()])
+            .status()
+            .unwrap();
+        let embedded = "embedded-read-failure-token";
+        let url = format!("https://x-access-token:{embedded}@git.invalid/repo.git");
+        std::process::Command::new("git")
+            .args(["remote", "set-url", "origin", &url])
+            .current_dir(&bridge)
+            .status()
+            .unwrap();
+
+        let git = GitClient::new(&bridge).unwrap();
+        apply_git_credential_chain_state(&git, "origin", &CredentialChainState::read_failure())
+            .unwrap();
+        assert_eq!(git_origin_url(&bridge), url);
+        apply_git_credential_chain_state_for_sync(
+            &git,
+            "origin",
+            &CredentialChainState::read_failure(),
+        )
+        .unwrap();
         assert_eq!(git_origin_url(&bridge), url);
     }
 

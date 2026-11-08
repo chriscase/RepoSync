@@ -1231,6 +1231,52 @@ impl QualifiedPair {
         svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor");
         svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
         let baseline_svn_rev = svn_youngest(&svn_repo_root);
+        let captured_constructor_svn_identity = {
+            let repo_dir = svn_repo_root
+                .strip_prefix("file://")
+                .expect("constructor SVN root is a file:// repository");
+            let svnlook_uuid = Command::new("svnlook")
+                .args(["uuid", repo_dir])
+                .output()
+                .expect("svnlook uuid of this constructor-created repository");
+            assert!(
+                svnlook_uuid.status.success(),
+                "svnlook uuid failed for {repo_dir}: {}",
+                String::from_utf8_lossy(&svnlook_uuid.stderr)
+            );
+            let uuid = String::from_utf8(svnlook_uuid.stdout)
+                .expect("constructor-created SVN UUID is utf-8")
+                .trim()
+                .to_string();
+            assert!(
+                !uuid.is_empty(),
+                "constructor-created SVN UUID is empty for {repo_dir}"
+            );
+            let info = SvnClient::new(&svn_url, "", "")
+                .info()
+                .await
+                .expect("native svn info of this constructor-created branch");
+            assert_eq!(
+                info.uuid.trim(),
+                uuid.as_str(),
+                "svnlook UUID must match native svn info UUID for this constructor"
+            );
+            assert!(
+                !info.root_url.trim().is_empty() && !info.url.trim().is_empty(),
+                "native svn info did not report root/url for this constructor"
+            );
+            assert_eq!(
+                info.latest_rev, baseline_svn_rev,
+                "native svn info revision must match constructor baseline"
+            );
+            (
+                uuid,
+                svn_repo_root.clone(),
+                svn_branch.to_string(),
+                baseline_svn_rev,
+                svn_url.clone(),
+            )
+        };
         let bridge = tmp.path().join("bridge");
         let bare = tmp.path().join("origin.git");
         let use_standard_trunk = svn_branch == "trunk";
@@ -1285,6 +1331,42 @@ impl QualifiedPair {
             teams_webhook_url: None,
         })
         .unwrap();
+        {
+            let (uuid, root, branch, revision, url) = &captured_constructor_svn_identity;
+            assert_eq!(root, &svn_repo_root);
+            assert_eq!(branch.as_str(), svn_branch);
+            assert_eq!(*revision, baseline_svn_rev);
+            assert_eq!(url, &svn_url);
+            assert!(!repo_id.is_empty(), "constructor repo_id is empty");
+            let scope =
+                reposync_core::db::repo_scope_identity::repository_scope_uuid(&db.conn(), repo_id)
+                    .unwrap_or_else(|error| {
+                        panic!("constructor repo_id {repo_id} has no scope: {error}")
+                    });
+            assert!(
+                !scope.is_empty(),
+                "constructor scope UUID is empty for {repo_id}"
+            );
+            reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+                &db, repo_id, uuid,
+            )
+            .unwrap_or_else(|error| {
+                panic!("record constructor-created SVN UUID for {repo_id} scope {scope}: {error}")
+            });
+            let recorded =
+                reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+                    &db.conn(),
+                    repo_id,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("read back constructor-created SVN UUID for {repo_id}: {error}")
+                });
+            assert_eq!(
+                recorded.as_deref(),
+                Some(uuid.as_str()),
+                "constructor-recorded SVN UUID does not match captured identity for {repo_id}"
+            );
+        }
         let mut config = make_app_config(&svn_repo_root, tmp.path());
         if use_standard_trunk {
             config.svn.layout = reposync_core::config::SvnLayout::Standard;
@@ -2476,6 +2558,1094 @@ async fn candidate_r10_legacy_stale_copy_requires_mapped_transition() {
 #[cfg(feature = "reliability-fixture")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct MemberSeal {
+        kind: String,
+        mode: u32,
+        bytes: u64,
+        sha256: String,
+    }
+
+    fn unix_mode(meta: &std::fs::Metadata) -> u32 {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            meta.mode()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            panic!("R01 member modes require Unix metadata");
+        }
+    }
+
+    fn seal_tree(root: &Path) -> BTreeMap<String, MemberSeal> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, MemberSeal>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                assert!(
+                    !rel.is_empty()
+                        && !rel.starts_with('/')
+                        && Path::new(&rel)
+                            .components()
+                            .all(|component| matches!(component, std::path::Component::Normal(_))),
+                    "unsafe member {rel}"
+                );
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                let mode = unix_mode(&meta);
+                let file_type = meta.file_type();
+                if file_type.is_symlink() {
+                    let target = std::fs::read_link(&path).unwrap();
+                    let encoded = target.to_string_lossy();
+                    out.insert(
+                        rel,
+                        MemberSeal {
+                            kind: "symlink".into(),
+                            mode,
+                            bytes: encoded.len() as u64,
+                            sha256: hex::encode(sha2::Sha256::digest(encoded.as_bytes())),
+                        },
+                    );
+                } else if file_type.is_dir() {
+                    out.insert(
+                        rel.clone(),
+                        MemberSeal {
+                            kind: "dir".into(),
+                            mode,
+                            bytes: 0,
+                            sha256: hex::encode(sha2::Sha256::digest(b"")),
+                        },
+                    );
+                    walk(root, &path, out);
+                } else if file_type.is_file() {
+                    let bytes = std::fs::read(&path).unwrap();
+                    out.insert(
+                        rel,
+                        MemberSeal {
+                            kind: "file".into(),
+                            mode,
+                            bytes: bytes.len() as u64,
+                            sha256: hex::encode(sha2::Sha256::digest(&bytes)),
+                        },
+                    );
+                } else {
+                    panic!("unexpected fixture member {rel}");
+                }
+            }
+        }
+        let mut sealed = BTreeMap::new();
+        walk(root, root, &mut sealed);
+        assert!(!sealed.is_empty(), "sealed fixture tree is empty");
+        sealed
+    }
+
+    fn verify_tree(root: &Path, sealed: &BTreeMap<String, MemberSeal>) {
+        let actual = seal_tree(root);
+        assert_eq!(
+            &actual,
+            sealed,
+            "fixture tree drifted at {}",
+            root.display()
+        );
+    }
+
+    const R01_QUIESCENT_READ_ONLY_SHM_SHA256: &str =
+        "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb";
+    const R01_EMPTY_SHA256: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    struct R01SidecarProbe {
+        mode: u32,
+        shm: Vec<u8>,
+        wal: Vec<u8>,
+        evidence: serde_json::Value,
+    }
+
+    fn r01_sha256(bytes: &[u8]) -> String {
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    fn r01_regular_sidecar(path: &Path) -> (u32, Vec<u8>) {
+        let meta = std::fs::symlink_metadata(path).unwrap_or_else(|error| {
+            panic!(
+                "unsupported host: missing sqlite sidecar {}: {error}",
+                path.display()
+            )
+        });
+        assert!(
+            meta.file_type().is_file(),
+            "unsupported host: sqlite sidecar {} is not a regular file",
+            path.display()
+        );
+        let bytes = std::fs::read(path).unwrap_or_else(|error| {
+            panic!(
+                "unsupported host: unreadable sqlite sidecar {}: {error}",
+                path.display()
+            )
+        });
+        (unix_mode(&meta), bytes)
+    }
+
+    fn r01_openoptions_0644_mode() -> u32 {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("openoptions-0644");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&path)
+            .unwrap();
+        unix_mode(&std::fs::symlink_metadata(&path).unwrap())
+    }
+
+    fn r01_sqlite3_cli_agreement(
+        native_mode: u32,
+        shm_sha: &str,
+        wal_sha: &str,
+    ) -> serde_json::Value {
+        let version = match Command::new("sqlite3").arg("-version").output() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return serde_json::json!({
+                    "present": false,
+                    "agreement": null
+                });
+            }
+            Err(error) => panic!("unsupported host: sqlite3 could not start: {error}"),
+            Ok(output) if !output.status.success() => panic!(
+                "unsupported host: sqlite3 -version failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        };
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("reposync.db");
+        let setup = Command::new("sqlite3")
+            .arg(&db)
+            .arg(
+                "PRAGMA journal_mode=WAL; PRAGMA user_version=12; PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("unsupported host: sqlite3 setup failed to start: {error}")
+            });
+        assert!(
+            setup.status.success(),
+            "unsupported host: sqlite3 setup failed: {}",
+            String::from_utf8_lossy(&setup.stderr)
+        );
+        let opened = Command::new("sqlite3")
+            .arg(format!("file:{}?mode=ro", db.display()))
+            .arg("PRAGMA user_version;")
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("unsupported host: sqlite3 read-only open failed to start: {error}")
+            });
+        assert!(
+            opened.status.success(),
+            "unsupported host: sqlite3 read-only open failed: {}",
+            String::from_utf8_lossy(&opened.stderr)
+        );
+        let (shm_mode, shm) = r01_regular_sidecar(&dir.path().join("reposync.db-shm"));
+        let (wal_mode, wal) = r01_regular_sidecar(&dir.path().join("reposync.db-wal"));
+        assert_eq!(
+            (
+                shm_mode,
+                wal_mode,
+                r01_sha256(&shm).as_str(),
+                r01_sha256(&wal).as_str()
+            ),
+            (native_mode, native_mode, shm_sha, wal_sha),
+            "installed sqlite3 sidecar mode or image differs from in-process SQLite"
+        );
+        serde_json::json!({
+            "present": true,
+            "version": version,
+            "agreement": true
+        })
+    }
+
+    // The expected sidecar mode is the st_mode of regular files created by the
+    // in-process library when it read-only opens an owned WAL database. An
+    // OpenOptions 0644 file only records the process umask; it is not the authority.
+    fn r01_probe_native_sqlite_sidecars() -> R01SidecarProbe {
+        let dir = TempDir::new().expect("owned sqlite probe directory");
+        let db_path = dir.path().join("reposync.db");
+        let created = Database::new(&db_path).unwrap_or_else(|error| {
+            panic!("unsupported host: native database creation failed: {error}")
+        });
+        drop(created);
+        let shm_path = dir.path().join("reposync.db-shm");
+        let wal_path = dir.path().join("reposync.db-wal");
+        if shm_path.exists() != wal_path.exists() {
+            panic!("unsupported host: native sqlite left only one sidecar");
+        }
+        if !shm_path.exists() {
+            let opened = Database::open_existing_read_only(&db_path).unwrap_or_else(|error| {
+                panic!("unsupported host: native read-only open failed: {error}")
+            });
+            let journal: String = opened
+                .conn()
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap_or_else(|error| {
+                    panic!("unsupported host: native journal_mode failed: {error}")
+                });
+            assert!(
+                journal.eq_ignore_ascii_case("wal"),
+                "unsupported host: native probe journal is {journal}"
+            );
+            drop(opened);
+        }
+        let (shm_mode, shm) = r01_regular_sidecar(&shm_path);
+        let (wal_mode, wal) = r01_regular_sidecar(&wal_path);
+        assert_eq!(
+            shm_mode, wal_mode,
+            "native sqlite sidecars have different modes"
+        );
+        let shm_sha = r01_sha256(&shm);
+        let wal_sha = r01_sha256(&wal);
+        assert_eq!(
+            (shm.len(), shm_sha.as_str(), wal.len(), wal_sha.as_str()),
+            (
+                32_768,
+                R01_QUIESCENT_READ_ONLY_SHM_SHA256,
+                0,
+                R01_EMPTY_SHA256
+            ),
+            "unsupported host: native sqlite did not reproduce the quiescent sidecar image"
+        );
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        let mapped: Vec<&str> = maps
+            .lines()
+            .filter(|line| line.contains("libsqlite3"))
+            .collect();
+        let evidence = serde_json::json!({
+            "authority": "in-process read-only open of an owned WAL database",
+            "observed_mode": shm_mode,
+            "shm_bytes": shm.len(),
+            "shm_sha256": shm_sha,
+            "wal_bytes": wal.len(),
+            "wal_sha256": wal_sha,
+            "quiescent_image_reproduced": true,
+            "sqlite3_cli": r01_sqlite3_cli_agreement(shm_mode, &shm_sha, &wal_sha),
+            "process_libsqlite_maps": mapped,
+            "process_libsqlite_observed": !mapped.is_empty(),
+            "openoptions_0644_st_mode": r01_openoptions_0644_mode(),
+            "openoptions_0644_is_authority": false,
+            "cross_host_mode_constant": false
+        });
+        R01SidecarProbe {
+            mode: shm_mode,
+            shm,
+            wal,
+            evidence,
+        }
+    }
+
+    // Read-only inspection can leave an empty WAL and its untouched index after
+    // close. This admits only that pair on the candidate copy. verify_tree stays
+    // exact for every pristine master and negative copy.
+    fn verify_post_probe_tree(
+        root: &Path,
+        sealed: &BTreeMap<String, MemberSeal>,
+    ) -> serde_json::Value {
+        let mut actual = seal_tree(root);
+        let extras: Vec<&str> = actual
+            .keys()
+            .filter(|key| !sealed.contains_key(key.as_str()))
+            .map(|key| key.as_str())
+            .collect();
+        if extras.is_empty() {
+            assert_eq!(
+                &actual,
+                sealed,
+                "fixture tree drifted at {}",
+                root.display()
+            );
+            return serde_json::json!({
+                "phase": "after_qualifier_child_exit",
+                "additions": [],
+                "sidecar_mode_provenance": r01_probe_native_sqlite_sidecars().evidence
+            });
+        }
+        assert_eq!(
+            extras,
+            ["reposync.db-shm", "reposync.db-wal"],
+            "fixture tree gained unexpected members at {}",
+            root.display()
+        );
+        let probe = r01_probe_native_sqlite_sidecars();
+        let created_mode = probe.mode;
+        let shm = &actual["reposync.db-shm"];
+        let wal = &actual["reposync.db-wal"];
+        for (member, bytes, sha) in [
+            (shm, 32_768, R01_QUIESCENT_READ_ONLY_SHM_SHA256),
+            (wal, 0, R01_EMPTY_SHA256),
+        ] {
+            assert_eq!(member.kind, "file", "SQLite sidecar is not a regular file");
+            assert_eq!(
+                member.mode, created_mode,
+                "SQLite sidecar mode {:o} is not the file-creation mode {:o}",
+                member.mode, created_mode
+            );
+            assert_eq!(
+                (member.bytes, member.sha256.as_str()),
+                (bytes, sha),
+                "SQLite sidecar is not the quiescent read-only image"
+            );
+        }
+        let additions = serde_json::json!([
+            {
+                "path": "reposync.db-shm",
+                "kind": shm.kind,
+                "mode": shm.mode,
+                "bytes": shm.bytes,
+                "sha256": shm.sha256,
+            },
+            {
+                "path": "reposync.db-wal",
+                "kind": wal.kind,
+                "mode": wal.mode,
+                "bytes": wal.bytes,
+                "sha256": wal.sha256,
+            }
+        ]);
+        actual.remove("reposync.db-shm");
+        actual.remove("reposync.db-wal");
+        assert_eq!(
+            &actual,
+            sealed,
+            "fixture tree drifted at {}",
+            root.display()
+        );
+        serde_json::json!({
+            "phase": "after_qualifier_child_exit",
+            "probe_that_created_sidecars": "not identified",
+            "sidecar_mode_provenance": probe.evidence,
+            "additions": additions
+        })
+    }
+
+    fn r01_write_mode(path: &Path, bytes: &[u8], mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777)).unwrap();
+        assert_eq!(
+            unix_mode(&std::fs::symlink_metadata(path).unwrap()),
+            mode,
+            "owned file {} did not keep mode {mode:o}",
+            path.display()
+        );
+    }
+
+    fn r01_caught_refusal(check: impl FnOnce() + std::panic::UnwindSafe) -> String {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let refused = std::panic::catch_unwind(check);
+        std::panic::set_hook(previous);
+        let payload = match refused {
+            Err(payload) => payload,
+            Ok(()) => panic!("validator accepted a mutation it must refuse"),
+        };
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    fn r01_expect_post_probe_refusal(
+        label: &str,
+        expected: &str,
+        root: &Path,
+        sealed: &BTreeMap<String, MemberSeal>,
+    ) {
+        let root = root.to_path_buf();
+        let sealed = sealed.clone();
+        let message = r01_caught_refusal(std::panic::AssertUnwindSafe(|| {
+            verify_post_probe_tree(&root, &sealed);
+        }));
+        assert!(
+            message.contains(expected),
+            "{label} refused without `{expected}`: {message}"
+        );
+    }
+
+    fn r01_owned_original(mode: u32) -> (TempDir, BTreeMap<String, MemberSeal>) {
+        let dir = TempDir::new().unwrap();
+        r01_write_mode(&dir.path().join("reposync.db"), b"original-db", mode);
+        let sealed = seal_tree(dir.path());
+        (dir, sealed)
+    }
+
+    fn r01_add_quiescent_pair(dir: &Path, probe: &R01SidecarProbe) {
+        r01_write_mode(&dir.join("reposync.db-shm"), &probe.shm, probe.mode);
+        r01_write_mode(&dir.join("reposync.db-wal"), &probe.wal, probe.mode);
+    }
+
+    fn r01_prove_post_probe_tree_discriminates() -> serde_json::Value {
+        let probe = r01_probe_native_sqlite_sidecars();
+        let wrong_mode = if (probe.mode & 0o777) == 0o644 {
+            (probe.mode & !0o777) | 0o600
+        } else {
+            (probe.mode & !0o777) | 0o644
+        };
+        assert_ne!(
+            wrong_mode, probe.mode,
+            "could not choose a distinct sidecar mode"
+        );
+
+        let (plain, plain_seal) = r01_owned_original(probe.mode);
+        let accepted = verify_post_probe_tree(plain.path(), &plain_seal);
+        assert_eq!(accepted["additions"], serde_json::json!([]));
+        assert_eq!(accepted["phase"], "after_qualifier_child_exit");
+
+        let (good, good_seal) = r01_owned_original(probe.mode);
+        r01_add_quiescent_pair(good.path(), &probe);
+        let pair = verify_post_probe_tree(good.path(), &good_seal);
+        assert_eq!(pair["probe_that_created_sidecars"], "not identified");
+        assert_eq!(pair["additions"][0]["sha256"], probe.evidence["shm_sha256"]);
+        assert_eq!(pair["additions"][1]["sha256"], probe.evidence["wal_sha256"]);
+        assert_eq!(
+            pair["additions"][0]["mode"].as_u64(),
+            Some(u64::from(probe.mode))
+        );
+        assert_eq!(
+            pair["additions"][1]["mode"].as_u64(),
+            Some(u64::from(probe.mode))
+        );
+        let strict = r01_caught_refusal(std::panic::AssertUnwindSafe(|| {
+            verify_tree(good.path(), &good_seal);
+        }));
+        assert!(
+            strict.contains("fixture tree drifted"),
+            "strict verify_tree refused without the exact-tree failure: {strict}"
+        );
+
+        let (changed, changed_seal) = r01_owned_original(probe.mode);
+        r01_add_quiescent_pair(changed.path(), &probe);
+        r01_write_mode(
+            &changed.path().join("reposync.db"),
+            b"changed-original",
+            probe.mode,
+        );
+        r01_expect_post_probe_refusal(
+            "changed original bytes",
+            "fixture tree drifted",
+            changed.path(),
+            &changed_seal,
+        );
+
+        let (restyled, restyled_seal) = r01_owned_original(probe.mode);
+        r01_add_quiescent_pair(restyled.path(), &probe);
+        r01_write_mode(
+            &restyled.path().join("reposync.db"),
+            b"original-db",
+            wrong_mode,
+        );
+        r01_expect_post_probe_refusal(
+            "changed original mode",
+            "fixture tree drifted",
+            restyled.path(),
+            &restyled_seal,
+        );
+
+        let (extra, extra_seal) = r01_owned_original(probe.mode);
+        r01_write_mode(&extra.path().join("notes.txt"), b"unrelated", probe.mode);
+        r01_expect_post_probe_refusal(
+            "unrelated extra member",
+            "unexpected members",
+            extra.path(),
+            &extra_seal,
+        );
+
+        let (mixed, mixed_seal) = r01_owned_original(probe.mode);
+        r01_add_quiescent_pair(mixed.path(), &probe);
+        r01_write_mode(&mixed.path().join("notes.txt"), b"unrelated", probe.mode);
+        r01_expect_post_probe_refusal(
+            "admitted pair plus unrelated member",
+            "unexpected members",
+            mixed.path(),
+            &mixed_seal,
+        );
+
+        let (shm_only, shm_seal) = r01_owned_original(probe.mode);
+        r01_write_mode(
+            &shm_only.path().join("reposync.db-shm"),
+            &probe.shm,
+            probe.mode,
+        );
+        r01_expect_post_probe_refusal(
+            "shm without wal",
+            "unexpected members",
+            shm_only.path(),
+            &shm_seal,
+        );
+
+        let (wal_only, wal_seal) = r01_owned_original(probe.mode);
+        r01_write_mode(
+            &wal_only.path().join("reposync.db-wal"),
+            &probe.wal,
+            probe.mode,
+        );
+        r01_expect_post_probe_refusal(
+            "wal without shm",
+            "unexpected members",
+            wal_only.path(),
+            &wal_seal,
+        );
+
+        let (dirty, dirty_seal) = r01_owned_original(probe.mode);
+        r01_write_mode(
+            &dirty.path().join("reposync.db-shm"),
+            &probe.shm,
+            probe.mode,
+        );
+        r01_write_mode(
+            &dirty.path().join("reposync.db-wal"),
+            b"not-empty",
+            probe.mode,
+        );
+        r01_expect_post_probe_refusal(
+            "nonempty wal",
+            "not the quiescent",
+            dirty.path(),
+            &dirty_seal,
+        );
+
+        let (bad_shm, bad_shm_seal) = r01_owned_original(probe.mode);
+        r01_write_mode(
+            &bad_shm.path().join("reposync.db-shm"),
+            &vec![0x5a; 32_768],
+            probe.mode,
+        );
+        r01_write_mode(
+            &bad_shm.path().join("reposync.db-wal"),
+            &probe.wal,
+            probe.mode,
+        );
+        r01_expect_post_probe_refusal(
+            "wrong shm digest",
+            "not the quiescent",
+            bad_shm.path(),
+            &bad_shm_seal,
+        );
+
+        let (linked, linked_seal) = r01_owned_original(probe.mode);
+        std::os::unix::fs::symlink("reposync.db", linked.path().join("reposync.db-shm")).unwrap();
+        let target = std::fs::read_link(linked.path().join("reposync.db-shm")).unwrap();
+        assert!(
+            target.is_relative()
+                && !target
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir)),
+            "sidecar symlink must stay inside the owned root"
+        );
+        r01_write_mode(
+            &linked.path().join("reposync.db-wal"),
+            &probe.wal,
+            probe.mode,
+        );
+        r01_expect_post_probe_refusal(
+            "symlink sidecar",
+            "not a regular file",
+            linked.path(),
+            &linked_seal,
+        );
+
+        let (bad_mode, bad_mode_seal) = r01_owned_original(probe.mode);
+        r01_write_mode(
+            &bad_mode.path().join("reposync.db-shm"),
+            &probe.shm,
+            wrong_mode,
+        );
+        r01_write_mode(
+            &bad_mode.path().join("reposync.db-wal"),
+            &probe.wal,
+            wrong_mode,
+        );
+        r01_expect_post_probe_refusal(
+            "wrong sidecar mode",
+            "not the file-creation mode",
+            bad_mode.path(),
+            &bad_mode_seal,
+        );
+
+        serde_json::json!({
+            "accepted": ["no_additions", "quiescent_pair"],
+            "refused": [
+                "strict_verify_tree_sidecar",
+                "changed_original_bytes",
+                "changed_original_mode",
+                "unrelated_extra_member",
+                "admitted_pair_plus_unrelated_member",
+                "shm_without_wal",
+                "wal_without_shm",
+                "nonempty_wal",
+                "wrong_shm_digest",
+                "symlink_sidecar",
+                "wrong_sidecar_mode"
+            ],
+            "provenance": probe.evidence
+        })
+    }
+
+    fn copy_owned_tree(from: &Path, to: &Path) {
+        assert!(from.is_dir(), "{}", from.display());
+        assert!(!to.exists(), "refusing to overwrite {}", to.display());
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let status = Command::new("cp")
+            .args(["-a", from.to_str().unwrap(), to.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "cp {} -> {}",
+            from.display(),
+            to.display()
+        );
+    }
+
+    fn svnlook_uuid(repo: &Path) -> String {
+        let output = Command::new("svnlook")
+            .args(["uuid", repo.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn svn_youngest(repo: &Path) -> String {
+        let output = Command::new("svnlook")
+            .args(["youngest", repo.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn svnlook_cat(repo: &Path, revision: &str) -> Vec<u8> {
+        let output = Command::new("svnlook")
+            .args([
+                "cat",
+                "-r",
+                revision,
+                repo.to_str().unwrap(),
+                "trunk/origin.txt",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn assert_no_uuid_authority(db: &Database) {
+        let key = reposync_core::db::lineage_checkpoints::independently_established_svn_uuid_kv_key(
+            "pair",
+        );
+        assert!(
+            db.get_state(&key).unwrap().is_none(),
+            "old DB already has an independently established SVN UUID key"
+        );
+        assert!(
+            db.get_state("import_operation_v1:latest:pair")
+                .unwrap()
+                .is_none(),
+            "old DB already has an import snapshot pin"
+        );
+        assert!(
+            reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+                &db.conn(),
+                "pair",
+            )
+            .unwrap()
+            .is_none(),
+            "old DB already has SVN UUID authority"
+        );
+    }
+
+    fn applied_maps(db: &Database) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND status = 'applied'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn resolved_canonical(db: &Database) -> i64 {
+        match db.conn().query_row(
+            "SELECT COUNT(*) FROM canonical_mapping_outcomes WHERE outcome = 'applied_and_verified'",
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(count) => count,
+            Err(error) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains("no such table"),
+                    "canonical outcome query failed: {text}"
+                );
+                0
+            }
+        }
+    }
+
+    fn creation_witness_is_immutable(path: &Path) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = std::fs::metadata(path)
+                .map_err(|error| error.to_string())?
+                .mode();
+            if mode & 0o222 != 0 {
+                return Err(format!("creation witness mode {mode:o} is writable"));
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err("creation witness immutability requires Unix metadata".into())
+        }
+    }
+
+    fn accept_pre_effect_witness(
+        evidence: &serde_json::Value,
+        old_root: &Path,
+        live_svn: &Path,
+        bare: &Path,
+        generator: &str,
+    ) -> Result<String, String> {
+        fn text<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|item| !item.is_empty())
+                .ok_or_else(|| format!("missing {key}"))
+        }
+        fn flag(value: &serde_json::Value, key: &str) -> Result<bool, String> {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| format!("missing {key}"))
+        }
+        let binary = std::fs::read(generator).map_err(|error| error.to_string())?;
+        if binary.is_empty() {
+            return Err("old generator binary is empty".into());
+        }
+        let adapter = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/legacy_import_generator.rs")
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let adapter_text = std::fs::read_to_string(&adapter).map_err(|error| error.to_string())?;
+        for marker in [
+            "qualification-adapter",
+            "qualification_driver_pre_effect_svn_uuid",
+            "not_old_production_emission",
+            "87379741779a6259f7eeb52a68cc6f061174e5ef",
+            "fn generate_legacy_import",
+        ] {
+            if !adapter_text.contains(marker) {
+                return Err(format!("adapter source missing {marker}"));
+            }
+        }
+        if text(evidence, "generator_code")? != "87379741779a6259f7eeb52a68cc6f061174e5ef" {
+            return Err("generator_code is not the pinned old production".into());
+        }
+        let version = evidence
+            .get("qualification_driver_witness_version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("missing qualification_driver_witness_version")?;
+        if version != 1 {
+            return Err("witness version is not the qualification-driver v1".into());
+        }
+        if text(evidence, "qualification_driver_attribution")? != "qualification-adapter" {
+            return Err("witness is not attributed to the qualification adapter".into());
+        }
+        if !flag(evidence, "qualification_driver_not_old_production_emission")? {
+            return Err("witness claims to be old production emission".into());
+        }
+        if !flag(evidence, "qualification_driver_observed_before_old_import")? {
+            return Err("witness was not observed before old import".into());
+        }
+        if !flag(
+            evidence,
+            "qualification_driver_uuid_unchanged_through_completion",
+        )? {
+            return Err("witness UUID changed through old completion".into());
+        }
+        let witnessed = text(evidence, "qualification_driver_pre_effect_svn_uuid")?;
+        if witnessed.len() != 36
+            || witnessed != text(evidence, "qualification_driver_completed_svn_uuid")?
+        {
+            return Err("pre-effect and completed witness UUIDs differ".into());
+        }
+        if text(evidence, "qualification_driver_repo_id")? != "pair" {
+            return Err("witness repo id is not the original pair".into());
+        }
+        if text(evidence, "qualification_driver_git_ref")? != "refs/heads/main" {
+            return Err("witness git ref is not refs/heads/main".into());
+        }
+        let completed_sha = text(evidence, "qualification_driver_completed_sha")?;
+        if completed_sha.len() != 40 || completed_sha != text(evidence, "imported_git")? {
+            return Err("witness completed SHA does not match imported git".into());
+        }
+        let live_path = live_svn.canonicalize().map_err(|error| error.to_string())?;
+        if Path::new(text(evidence, "qualification_driver_source_path")?) != live_path {
+            return Err("witness source path is not the live fixture SVN".into());
+        }
+        let trunk = format!("file://{}/trunk", live_svn.display());
+        if text(evidence, "qualification_driver_trunk_url")? != trunk {
+            return Err("witness trunk URL is not the live fixture trunk".into());
+        }
+        let bare_path = bare.canonicalize().map_err(|error| error.to_string())?;
+        if Path::new(text(evidence, "qualification_driver_git_target")?) != bare_path {
+            return Err("witness git target is not the old bare repository".into());
+        }
+        if git_output(bare, &["rev-parse", "refs/heads/main"]) != completed_sha {
+            return Err("bare ref does not match the witnessed completed SHA".into());
+        }
+        let creation = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(old_root.join("qualification-driver-creation-witness.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let pre_effect = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(old_root.join("qualification-driver-pre-effect-witness.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let completion = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(old_root.join("qualification-driver-completion-witness.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        creation_witness_is_immutable(
+            &old_root.join("qualification-driver-creation-witness.json"),
+        )?;
+        if text(&creation, "svn_uuid")? != witnessed
+            || text(&creation, "attribution")? != "qualification-adapter"
+            || !flag(&creation, "not_old_production_emission")?
+            || !flag(&creation, "observed_before_trunk_history_and_import")?
+        {
+            return Err("creation witness does not match the pre-effect UUID".into());
+        }
+        if text(&pre_effect, "svn_uuid")? != witnessed
+            || text(&pre_effect, "creation_svn_uuid")? != witnessed
+            || !flag(&pre_effect, "observed_before_old_import")?
+            || text(&pre_effect, "repo_id")? != "pair"
+            || text(&pre_effect, "git_ref")? != "refs/heads/main"
+            || text(&pre_effect, "trunk_url")? != trunk
+            || text(&pre_effect, "native_svn_info_url")? != trunk
+        {
+            return Err("pre-effect witness file does not match the receipt".into());
+        }
+        if text(&completion, "completed_svn_uuid")? != witnessed
+            || text(&completion, "pre_effect_svn_uuid")? != witnessed
+            || !flag(&completion, "unchanged_through_old_completion")?
+            || text(&completion, "completed_sha")? != completed_sha
+            || text(&completion, "repo_id")? != "pair"
+        {
+            return Err("completion witness does not connect the pre-effect observation".into());
+        }
+        let youngest = svn_youngest(live_svn);
+        if text(&pre_effect, "native_youngest_revision")? != youngest
+            || evidence
+                .get("svn_revision")
+                .and_then(serde_json::Value::as_i64)
+                != youngest.parse::<i64>().ok()
+        {
+            return Err("witness revision does not match native youngest".into());
+        }
+        let live_uuid = svnlook_uuid(live_svn);
+        if live_uuid != witnessed {
+            return Err(format!(
+                "present-day UUID {live_uuid} does not match pre-effect witness {witnessed}"
+            ));
+        }
+        Ok(witnessed.to_string())
+    }
+
+    fn stage_replacement_svn(tmp: &Path, live: &Path, origin: &[u8], youngest: &str) {
+        assert!(!live.exists(), "{}", live.display());
+        let created = Command::new("svnadmin")
+            .args(["create", live.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(created.success(), "replacement svnadmin create");
+        let url = format!("file://{}", live.display());
+        let mkdir = Command::new("svn")
+            .args([
+                "mkdir",
+                &format!("{url}/trunk"),
+                "-m",
+                "Create trunk",
+                "--non-interactive",
+            ])
+            .status()
+            .unwrap();
+        assert!(mkdir.success(), "replacement trunk");
+        let wc = tmp.join("replacement-wc");
+        if wc.exists() {
+            std::fs::remove_dir_all(&wc).unwrap();
+        }
+        let checkout = Command::new("svn")
+            .args([
+                "checkout",
+                &format!("{url}/trunk"),
+                wc.to_str().unwrap(),
+                "--non-interactive",
+            ])
+            .status()
+            .unwrap();
+        assert!(checkout.success(), "replacement checkout");
+        std::fs::write(wc.join("origin.txt"), origin).unwrap();
+        let add = Command::new("svn")
+            .args(["add", wc.join("origin.txt").to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(add.success(), "replacement add");
+        let commit = Command::new("svn")
+            .args([
+                "commit",
+                wc.to_str().unwrap(),
+                "-m",
+                "Old import source",
+                "--username",
+                "fixture",
+                "--non-interactive",
+            ])
+            .status()
+            .unwrap();
+        assert!(commit.success(), "replacement commit");
+        assert_eq!(svn_youngest(live), youngest);
+        assert_eq!(svnlook_cat(live, youngest), origin);
+        std::fs::remove_dir_all(&wc).unwrap();
+    }
+
+    struct HoldProbe<'a> {
+        install: &'a Path,
+        svn_url: &'a str,
+        svn_repo: &'a Path,
+        bare: &'a Path,
+        old_tip: &'a str,
+        reason: &'a str,
+        recorded: Option<&'a str>,
+        label: &'a str,
+    }
+
+    async fn probe_hold(probe: HoldProbe<'_>) {
+        let youngest = svn_youngest(probe.svn_repo);
+        let bridge = probe.install.join("repos/pair/git-repo");
+        let db_path = probe.install.join("reposync.db");
+        let db = Database::new(&db_path).unwrap();
+        db.initialize().unwrap();
+        match probe.recorded {
+            None => assert_no_uuid_authority(&db),
+            Some(uuid) => {
+                assert_ne!(svnlook_uuid(probe.svn_repo), uuid, "{}", probe.label);
+                assert_eq!(
+                    reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+                        &db.conn(),
+                        "pair",
+                    )
+                    .unwrap()
+                    .as_deref(),
+                    Some(uuid),
+                    "{}",
+                    probe.label
+                );
+            }
+        }
+        let watermark = db.get_repo_watermark("pair").unwrap();
+        let applied = applied_maps(&db);
+        let resolved = resolved_canonical(&db);
+        let git_sha = db.get_repository("pair").unwrap().unwrap().last_git_sha;
+        drop(db);
+        for pass in ["first", "reopen"] {
+            let mut config = make_app_config(probe.svn_url, probe.install);
+            config.svn.layout = reposync_core::config::SvnLayout::Custom;
+            let db = Database::new(&db_path).unwrap();
+            let mut engine = SyncEngine::new(
+                config,
+                db,
+                SvnClient::new(probe.svn_url, "", ""),
+                GitClient::new(&bridge).unwrap(),
+                Arc::new(make_identity_mapper()),
+            );
+            engine.set_repo_id("pair".into());
+            let outcome = engine.run_sync_cycle().await;
+            match outcome {
+                Err(SyncError::HistoryBlocked { reason, .. }) if reason == probe.reason => {}
+                other => panic!("{} {pass} hold: {other:?}", probe.label),
+            }
+            assert_eq!(
+                engine.db().get_repo_watermark("pair").unwrap(),
+                watermark,
+                "{} {pass} watermark",
+                probe.label
+            );
+            assert_eq!(applied_maps(engine.db()), applied, "{} {pass}", probe.label);
+            assert_eq!(
+                resolved_canonical(engine.db()),
+                resolved,
+                "{} {pass} resolved history",
+                probe.label
+            );
+            let recorded =
+                reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+                    &engine.db().conn(),
+                    "pair",
+                )
+                .unwrap();
+            assert_eq!(
+                recorded.as_deref(),
+                probe.recorded,
+                "{} {pass} uuid",
+                probe.label
+            );
+            drop(engine);
+        }
+        assert_eq!(svn_youngest(probe.svn_repo), youngest, "{}", probe.label);
+        assert_eq!(
+            git_output(probe.bare, &["rev-parse", "refs/heads/main"]),
+            probe.old_tip,
+            "{}",
+            probe.label
+        );
+        assert_eq!(get_head_sha(&bridge), git_sha, "{}", probe.label);
+    }
+    let post_probe_controls = r01_prove_post_probe_tree_discriminates();
     let tmp = TempDir::new().unwrap();
     assert_fixture_owned(tmp.path());
     let old_root = tmp.path().join("old-install-generation");
@@ -2504,12 +3674,33 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         String::from_utf8_lossy(&generation.stdout),
         String::from_utf8_lossy(&generation.stderr)
     );
-    let old_generation = String::from_utf8_lossy(&generation.stderr)
+    let generation_stderr = String::from_utf8_lossy(&generation.stderr);
+    let evidence_lines: Vec<&str> = generation_stderr
         .lines()
-        .find_map(|line| line.strip_prefix("OLD_FIXTURE_EVIDENCE "))
-        .map(|text| serde_json::from_str::<serde_json::Value>(text).unwrap())
-        .expect("old generator did not report production import provenance");
+        .filter(|line| line.starts_with("OLD_FIXTURE_EVIDENCE "))
+        .collect();
+    assert_eq!(evidence_lines.len(), 1, "old generator receipt count");
+    let old_generation = serde_json::from_str::<serde_json::Value>(
+        evidence_lines[0]
+            .strip_prefix("OLD_FIXTURE_EVIDENCE ")
+            .unwrap(),
+    )
+    .unwrap();
     let original = old_root.join("install");
+    let live_svn = old_root.join("svn_repo");
+    let witnessed_uuid = accept_pre_effect_witness(
+        &old_generation,
+        &old_root,
+        &live_svn,
+        &old_root.join("old-origin.git"),
+        &generator,
+    )
+    .unwrap_or_else(|error| panic!("pre-effect witness refused: {error}"));
+    let install_seal = seal_tree(&original);
+    let old_master = tmp.path().join("old-state-master");
+    copy_owned_tree(&old_root, &old_master);
+    verify_tree(&old_master.join("install"), &install_seal);
+    assert_eq!(svnlook_uuid(&old_master.join("svn_repo")), witnessed_uuid);
     let installer_spec = std::env::var_os("REPOSYNC_INSTALL_UPDATE_SPEC");
     let candidate = if installer_spec.is_some() {
         tmp.path().join("installed-prefix/data")
@@ -2546,6 +3737,147 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         git_output(&bare, &["rev-parse", "refs/heads/main"]),
         old_tip
     );
+    verify_tree(&candidate, &install_seal);
+    verify_tree(&restored, &install_seal);
+    assert_eq!(svnlook_uuid(&live_svn), witnessed_uuid);
+    {
+        let phase = tmp.path().join("unproved-unchanged");
+        copy_owned_tree(&original, &phase);
+        verify_tree(&phase, &install_seal);
+        probe_hold(HoldProbe {
+            install: &phase,
+            svn_url: &svn_url,
+            svn_repo: &live_svn,
+            bare: &bare,
+            old_tip: &old_tip,
+            reason: "svn_identity_unproved",
+            recorded: None,
+            label: "unchanged",
+        })
+        .await;
+    }
+    {
+        let phase = tmp.path().join("witness-refusals");
+        copy_owned_tree(&original, &phase);
+        verify_tree(&phase, &install_seal);
+        let db = Database::new(phase.join("reposync.db")).unwrap();
+        db.initialize().unwrap();
+        assert_no_uuid_authority(&db);
+        let mut missing = old_generation.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| !key.starts_with("qualification_driver_"));
+        assert!(
+            accept_pre_effect_witness(&missing, &old_root, &live_svn, &bare, &generator).is_err(),
+            "missing witness was admitted"
+        );
+        let mut malformed = old_generation.clone();
+        malformed["qualification_driver_observed_before_old_import"] = serde_json::json!(false);
+        assert!(
+            accept_pre_effect_witness(&malformed, &old_root, &live_svn, &bare, &generator).is_err(),
+            "malformed witness was admitted"
+        );
+        malformed = old_generation.clone();
+        malformed["qualification_driver_pre_effect_svn_uuid"] = serde_json::json!("");
+        malformed["qualification_driver_completed_svn_uuid"] = serde_json::json!("");
+        assert!(
+            accept_pre_effect_witness(&malformed, &old_root, &live_svn, &bare, &generator).is_err(),
+            "empty witness was admitted"
+        );
+        malformed = old_generation.clone();
+        malformed["qualification_driver_witness_version"] = serde_json::json!(0);
+        assert!(
+            accept_pre_effect_witness(&malformed, &old_root, &live_svn, &bare, &generator).is_err(),
+            "wrong witness version was admitted"
+        );
+        let mut foreign = old_generation.clone();
+        foreign["qualification_driver_pre_effect_svn_uuid"] =
+            serde_json::json!("00000000-0000-0000-0000-000000000000");
+        foreign["qualification_driver_completed_svn_uuid"] =
+            serde_json::json!("00000000-0000-0000-0000-000000000000");
+        foreign["qualification_driver_source_path"] = serde_json::json!("/tmp/foreign-svn");
+        assert!(
+            accept_pre_effect_witness(&foreign, &old_root, &live_svn, &bare, &generator).is_err(),
+            "foreign witness was admitted"
+        );
+        assert_no_uuid_authority(&db);
+        drop(db);
+    }
+    {
+        let phase = tmp.path().join("conflict-admitted");
+        copy_owned_tree(&original, &phase);
+        verify_tree(&phase, &install_seal);
+        let db = Database::new(phase.join("reposync.db")).unwrap();
+        db.initialize().unwrap();
+        assert_no_uuid_authority(&db);
+        reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            &db,
+            "pair",
+            &witnessed_uuid,
+        )
+        .unwrap();
+        drop(db);
+        let youngest = svn_youngest(&live_svn);
+        let origin = svnlook_cat(&old_master.join("svn_repo"), &youngest);
+        let parked = tmp.path().join("parked-original-svn");
+        std::fs::rename(&live_svn, &parked).unwrap();
+        stage_replacement_svn(tmp.path(), &live_svn, &origin, &youngest);
+        let replacement_uuid = svnlook_uuid(&live_svn);
+        assert_ne!(replacement_uuid, witnessed_uuid);
+        probe_hold(HoldProbe {
+            install: &phase,
+            svn_url: &svn_url,
+            svn_repo: &live_svn,
+            bare: &bare,
+            old_tip: &old_tip,
+            reason: "svn_identity_changed",
+            recorded: Some(&witnessed_uuid),
+            label: "replacement-conflict",
+        })
+        .await;
+        let db = Database::new(phase.join("reposync.db")).unwrap();
+        let recorded = reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+            &db.conn(),
+            "pair",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recorded, witnessed_uuid);
+        assert_ne!(recorded, replacement_uuid);
+        drop(db);
+        let unproved = tmp.path().join("unproved-replacement");
+        copy_owned_tree(&original, &unproved);
+        verify_tree(&unproved, &install_seal);
+        probe_hold(HoldProbe {
+            install: &unproved,
+            svn_url: &svn_url,
+            svn_repo: &live_svn,
+            bare: &bare,
+            old_tip: &old_tip,
+            reason: "svn_identity_unproved",
+            recorded: None,
+            label: "replacement-unproved",
+        })
+        .await;
+        assert!(
+            accept_pre_effect_witness(&old_generation, &old_root, &live_svn, &bare, &generator)
+                .is_err(),
+            "replacement UUID was admitted as the pre-effect witness"
+        );
+        let db = Database::new(unproved.join("reposync.db")).unwrap();
+        assert_no_uuid_authority(&db);
+        drop(db);
+        assert!(live_svn.starts_with(tmp.path()));
+        std::fs::remove_dir_all(&live_svn).unwrap();
+        std::fs::rename(&parked, &live_svn).unwrap();
+        assert_eq!(svnlook_uuid(&live_svn), witnessed_uuid);
+        assert_eq!(svnlook_uuid(&old_master.join("svn_repo")), witnessed_uuid);
+        verify_tree(&original, &install_seal);
+        verify_tree(&old_master.join("install"), &install_seal);
+        verify_tree(&candidate, &install_seal);
+        verify_tree(&restored, &install_seal);
+    }
     // Opt-in installer qualification uses this SAME authentic old-state copy.
     // A supplied bad specification fails; it never falls back to library-only proof.
     let installer_receipt = installer_spec.as_ref().map(|spec| {
@@ -2581,6 +3913,17 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     });
     let mut config = make_app_config(&svn_url, &candidate);
     config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    // The qualifier child has exited: .output() reaped it before this compare.
+    // Its schema helper closes its own connection before the child returns.
+    let post_probe_baseline = if installer_receipt.is_some() {
+        verify_post_probe_tree(&candidate, &install_seal)
+    } else {
+        verify_tree(&candidate, &install_seal);
+        serde_json::json!({
+            "phase": "no_qualifier_child",
+            "additions": []
+        })
+    };
     let db_path = candidate.join("reposync.db");
     let db = Database::new(&db_path).unwrap();
     let old_schema: i64 = db
@@ -2620,6 +3963,13 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         Arc::new(make_identity_mapper()),
     );
     engine.set_repo_id("pair".into());
+    assert_no_uuid_authority(engine.db());
+    reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+        engine.db(),
+        "pair",
+        &witnessed_uuid,
+    )
+    .unwrap();
     let idle = engine.run_sync_cycle().await.unwrap();
     assert_eq!((idle.svn_to_git_count, idle.git_to_svn_count), (0, 0));
     assert_eq!(get_head_sha(&bridge), old_tip);
@@ -2644,6 +3994,7 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     assert_eq!(baseline_receipt["svn_rev"], old_svn_rev);
     let restored_bridge = restored.join("repos/pair/git-repo");
     assert_eq!(get_head_sha(&restored_bridge), old_tip);
+    verify_tree(&restored, &install_seal);
     let restored_db = Database::new(restored.join("reposync.db")).unwrap();
     assert_eq!(
         restored_db.get_repo_watermark("pair").unwrap(),
@@ -2666,6 +4017,13 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         Arc::new(make_identity_mapper()),
     );
     restore_engine.set_repo_id("pair".into());
+    assert_no_uuid_authority(restore_engine.db());
+    reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+        restore_engine.db(),
+        "pair",
+        &witnessed_uuid,
+    )
+    .unwrap();
     let restore_idle = restore_engine.run_sync_cycle().await.unwrap();
     assert_eq!(
         (restore_idle.svn_to_git_count, restore_idle.git_to_svn_count),
@@ -2820,28 +4178,41 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         .unwrap()
         .trim()
         .to_string();
-    eprintln!(
-        "RELIABILITY_EVIDENCE {}",
-        serde_json::json!({
-            "case":"R01_OLD_INSTALL_UPGRADE", "old_code":"87379741779a6259f7eeb52a68cc6f061174e5ef",
-            "old_generator_sha256":hex::encode(sha2::Sha256::digest(old_binary)),
-            "old_db_sha256":original_db_hash, "old_generation":old_generation,
-            "old_svn_rev":old_svn_rev, "old_git":old_tip, "svn_uuid":svn_uuid,
-            "schema_before":old_schema, "schema_after":new_schema,
-            "verified_baseline_receipt":baseline_receipt,
-            "old_tree":tree_hashes(&old_tree), "old_install_file_count":original_manifest.len(),
-            "old_install_manifest":original_manifest,
-            "prewrite_restore_verified":true, "restore_noop":true,
-            "configuration_and_synthetic_credentials_preserved":true,
-            "changed_projection_rejected_without_remote_write":true,
-            "svn_only_rev":svn_only_rev, "svn_emitted":emitted,
-            "restart_noop":true, "git_outgoing":outgoing_sha, "outgoing_mapping":outgoing_map,
-            "final_svn_rev":final_rev, "final_svn_tree":tree_hashes(&exported_tree(&final_export)),
-            "final_git_tree":tree_hashes(&tracked_tree(&bridge)),
-            "post_upgrade_install_manifest":final_install_manifest,
-            "repository_mapping_rows":mapped_rows,
-        })
-    );
+    assert_eq!(svn_uuid, witnessed_uuid);
+    let mut reliability_evidence = serde_json::json!({
+        "case":"R01_OLD_INSTALL_UPGRADE", "old_code":"87379741779a6259f7eeb52a68cc6f061174e5ef",
+        "old_generator_sha256":hex::encode(sha2::Sha256::digest(old_binary)),
+        "old_db_sha256":original_db_hash, "old_generation":old_generation,
+        "old_svn_rev":old_svn_rev, "old_git":old_tip, "svn_uuid":svn_uuid,
+        "schema_before":old_schema, "schema_after":new_schema,
+        "verified_baseline_receipt":baseline_receipt,
+        "old_tree":tree_hashes(&old_tree), "old_install_file_count":original_manifest.len(),
+        "old_install_manifest":original_manifest,
+        "prewrite_restore_verified":true, "restore_noop":true,
+        "configuration_and_synthetic_credentials_preserved":true,
+        "changed_projection_rejected_without_remote_write":true,
+        "svn_only_rev":svn_only_rev, "svn_emitted":emitted,
+        "restart_noop":true, "git_outgoing":outgoing_sha, "outgoing_mapping":outgoing_map,
+        "final_svn_rev":final_rev, "final_svn_tree":tree_hashes(&exported_tree(&final_export)),
+        "final_git_tree":tree_hashes(&tracked_tree(&bridge)),
+        "post_upgrade_install_manifest":final_install_manifest,
+        "repository_mapping_rows":mapped_rows,
+        "explicit_fixture_witness_admission": true,
+        "witness_uuid": witnessed_uuid,
+        "witness_observed_before_old_import": true,
+        "present_day_uuid_matches_witness": true,
+        "unproved_unchanged_hold": "svn_identity_unproved",
+        "unproved_unchanged_reopen_hold": "svn_identity_unproved",
+        "unproved_replacement_hold": "svn_identity_unproved",
+        "replacement_conflict_hold": "svn_identity_changed",
+        "recorded_uuid_remained_pre_effect_witness": true,
+        "malformed_witness_refused": true,
+        "missing_witness_refused": true,
+        "foreign_witness_refused": true,
+    });
+    reliability_evidence["post_probe_baseline"] = post_probe_baseline;
+    reliability_evidence["post_probe_controls"] = post_probe_controls;
+    eprintln!("RELIABILITY_EVIDENCE {}", reliability_evidence);
     // Publish the installer-tier receipt only after every retained engine,
     // preservation, bidirectional and reconstructed-no-op assertion succeeds.
     if let Some(receipt) = installer_receipt {
@@ -5326,6 +6697,42 @@ async fn candidate_r17_repository_cursors_remain_scoped() {
     row.name = "other qualified pair".into();
     row.svn_url = other_svn.clone();
     row.git_repo = other_bare.to_string_lossy().to_string();
+    {
+        let other_svn_repo = other_root.join("svn_repo");
+        let svnlook_uuid = std::process::Command::new("svnlook")
+            .args([
+                "uuid",
+                other_svn_repo
+                    .to_str()
+                    .expect("R17 other svn_repo path is utf-8"),
+            ])
+            .output()
+            .expect("svnlook uuid of this R17 other-repo");
+        assert!(
+            svnlook_uuid.status.success(),
+            "svnlook uuid failed for {}: {}",
+            other_svn_repo.display(),
+            String::from_utf8_lossy(&svnlook_uuid.stderr)
+        );
+        let captured_uuid = String::from_utf8(svnlook_uuid.stdout)
+            .expect("R17 other-repo SVN UUID is utf-8")
+            .trim()
+            .to_string();
+        assert!(
+            !captured_uuid.is_empty(),
+            "R17 other-repo SVN UUID is empty for {}",
+            other_svn_repo.display()
+        );
+        assert_eq!(row.id, "other", "R17 seeded row.id must be other");
+        reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            &other_db,
+            &row.id,
+            &captured_uuid,
+        )
+        .unwrap_or_else(|error| {
+            panic!("record independently established SVN UUID for other: {error}")
+        });
+    }
     row.last_svn_rev = 1;
     row.last_git_sha = other_initial;
     row.total_syncs = 0;

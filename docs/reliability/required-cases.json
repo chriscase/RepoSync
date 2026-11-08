@@ -340,6 +340,54 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "RS63_OPERATIONAL_V14_NO_PAIR_TABLES",
+      "binary": "canonical_lineage_63",
+      "test": "operational_v14_has_canonical_tables_not_pair_tables",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS63_DEFERRED_V12_THEN_V14",
+      "binary": "canonical_lineage_63",
+      "test": "lone_legacy_v12_stays_deferred_until_exclusive_owner_reaches_v14",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS63_CANONICAL_TYPED_OUTCOMES",
+      "binary": "reposync-core",
+      "test": "db::lineage_checkpoints::tests::typed_outcomes_do_not_overload_null_empty_or_missing",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS63_SVN_UUID_IDENTITY_HOLD",
+      "binary": "canonical_lineage_63",
+      "test": "live_svn_uuid_change_holds_pair_before_up_to_date_return",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS63_PATH_INCARNATION_HOLD",
+      "binary": "canonical_lineage_63",
+      "test": "recreated_path_incarnation_does_not_reuse_stale_lineage",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS63_RS11_REDACTION_AND_PARENT_ROTATION",
+      "binary": "canonical_lineage_63",
+      "test": "rs11_dummy_tokens_are_redacted_and_parent_rotation_preserves_child",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS63_GIT_PROBE_TIMEOUT_KILLS_CHILD",
+      "binary": "reposync-core",
+      "test": "sync_engine::tests::git_probe_timeout_kills_hung_child",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS63_FIELDLESS_GEN2_RECEIPT",
+      "binary": "reposync-core",
+      "test": "echo_receipt_scope::tests::fieldless_legacy_receipt_rejected_at_generation_two",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "ECHO_GENERATION_STALE_RECEIPT",
       "binary": "team_mode_e2e",
       "test": "candidate_echo_generation_stale_receipt_does_not_suppress_after_bump",
@@ -404,7 +452,7 @@
       "binary": "team_mode_e2e",
       "test": "candidate_echo_identity_svn_uuid_auto_bump_not_implemented",
       "tier": "candidate_regression",
-      "supporting_note": "documents NOT IMPLEMENTED automatic echo-generation bump on repositories.svn_url UUID swap without explicit reimport reset"
+      "supporting_note": "historical team_mode_e2e document: automatic echo-generation bump on svn_url swap remains unclaimed; operational UUID hold is RS63_SVN_UUID_IDENTITY_HOLD"
     },
     {
       "id": "ECHO_IDENTITY_PATH_RECREATION",
@@ -900,9 +948,9 @@
       "tier": "candidate_regression"
     },
     {
-      "id": "STARTUP_V12",
+      "id": "STARTUP_V14",
       "binary": "startup_schema",
-      "test": "ordinary_startup_stays_v13",
+      "test": "ordinary_startup_stays_v14",
       "tier": "candidate_regression"
     },
     {

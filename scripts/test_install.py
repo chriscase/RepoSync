@@ -263,6 +263,98 @@ class OfflineInstaller(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn("R12_PINNED_INSTALLER_UPDATE", result.stdout)
                 self.assert_old()
+        with self.subTest(observation="read_only_schema_closes_before_return"):
+            probe = self.area / "schema-close-success.db"
+            setup = sqlite3.connect(probe)
+            setup.execute("PRAGMA user_version=12")
+            setup.commit()
+            setup.close()
+            before_bytes = probe.read_bytes()
+            before_mode = stat.S_IMODE(probe.stat().st_mode)
+            opened = []
+
+            class ClosedConnection(sqlite3.Connection):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.close_calls = 0
+                    opened.append(self)
+
+                def close(self):
+                    super().close()
+                    self.close_calls += 1
+
+            original_connect = sqlite3.connect
+
+            def connect(database, *args, **kwargs):
+                kwargs["factory"] = ClosedConnection
+                return original_connect(database, *args, **kwargs)
+
+            sqlite3.connect = connect
+            try:
+                version = _read_schema_readonly_closed(probe)
+            finally:
+                sqlite3.connect = original_connect
+            self.assertEqual(version, 12)
+            self.assertEqual(len(opened), 1)
+            self.assertEqual(opened[0].close_calls, 1)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                opened[0].execute("PRAGMA user_version")
+            self.assertEqual(probe.read_bytes(), before_bytes)
+            self.assertEqual(stat.S_IMODE(probe.stat().st_mode), before_mode)
+            self.assertEqual(self.state(), self.before)
+            print(
+                "SCHEMA_CLOSE_OBSERVATION read_only_schema_closes_before_return",
+                flush=True,
+            )
+
+        with self.subTest(observation="read_only_schema_closes_before_sql_failure"):
+            probe = self.area / "schema-close-failure.db"
+            setup = sqlite3.connect(probe)
+            setup.execute("CREATE TABLE schema_probe(k TEXT)")
+            setup.commit()
+            setup.close()
+            before_bytes = probe.read_bytes()
+            before_mode = stat.S_IMODE(probe.stat().st_mode)
+            opened = []
+
+            class FailingConnection(sqlite3.Connection):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.close_calls = 0
+                    opened.append(self)
+
+                def execute(self, sql, *args, **kwargs):
+                    raise sqlite3.OperationalError("deterministic schema probe failure")
+
+                def close(self):
+                    super().close()
+                    self.close_calls += 1
+
+            original_connect = sqlite3.connect
+
+            def connect(database, *args, **kwargs):
+                kwargs["factory"] = FailingConnection
+                return original_connect(database, *args, **kwargs)
+
+            sqlite3.connect = connect
+            try:
+                with self.assertRaises(sqlite3.OperationalError) as caught:
+                    _read_schema_readonly_closed(probe)
+            finally:
+                sqlite3.connect = original_connect
+            self.assertEqual(str(caught.exception), "deterministic schema probe failure")
+            self.assertEqual(len(opened), 1)
+            self.assertEqual(opened[0].close_calls, 1)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                sqlite3.Connection.execute(opened[0], "SELECT 1")
+            self.assertEqual(probe.read_bytes(), before_bytes)
+            self.assertEqual(stat.S_IMODE(probe.stat().st_mode), before_mode)
+            self.assertEqual(self.state(), self.before)
+            print(
+                "SCHEMA_CLOSE_OBSERVATION read_only_schema_closes_before_sql_failure",
+                flush=True,
+            )
+
 
 
 def package_into(record, destination):
@@ -297,6 +389,17 @@ def tree_bytes(directory):
         else:
             offline.require(stat.S_ISDIR(info.st_mode), "unsupported fixture state node")
     return value
+
+
+def _read_schema_readonly_closed(path):
+    """Read PRAGMA user_version from an absolute database, then close that connection."""
+    path = Path(path)
+    offline.require(path.is_absolute(), "schema probe requires an absolute database path")
+    connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    try:
+        return connection.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        connection.close()
 
 
 def qualify_existing_update(root, spec_path):
@@ -351,8 +454,7 @@ def qualify_existing_update(root, spec_path):
         return result.stdout
 
     def schema():
-        with sqlite3.connect((root / "data/reposync.db").as_uri() + "?mode=ro", uri=True) as db:
-            return db.execute("PRAGMA user_version").fetchone()[0]
+        return _read_schema_readonly_closed(root / "data/reposync.db")
 
     run([root / "bin/reposync", "--config", config_path, "status"])
     old_schema = schema()

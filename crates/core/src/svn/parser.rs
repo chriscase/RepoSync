@@ -187,7 +187,6 @@ pub fn parse_svn_copy_history(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
     fn canonical_history_path(path: &str) -> bool {
         path == "/"
             || (path.starts_with('/')
-                && path.trim() == path
                 && !path.chars().any(char::is_control)
                 && path
                     .split('/')

@@ -1650,6 +1650,34 @@ mod cancellation_tests {
             .status()
             .unwrap()
             .success());
+        let svnlook_uuid = std::process::Command::new("svnlook")
+            .arg("uuid")
+            .arg(&repository)
+            .output()
+            .expect("svnlook uuid of this scheduler fixture repository");
+        assert!(
+            svnlook_uuid.status.success(),
+            "svnlook uuid failed for {}: {}",
+            repository.display(),
+            String::from_utf8_lossy(&svnlook_uuid.stderr)
+        );
+        let captured_uuid = String::from_utf8(svnlook_uuid.stdout)
+            .expect("scheduler fixture SVN UUID is utf-8")
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        assert!(
+            !captured_uuid.is_empty(),
+            "scheduler fixture SVN UUID is empty for {}",
+            repository.display()
+        );
+        reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            &scheduler.db,
+            id,
+            &captured_uuid,
+        )
+        .unwrap_or_else(|error| {
+            panic!("record independently established SVN UUID for {id}: {error}")
+        });
         let root_url = format!("file://{}", repository.display());
         let svn = SvnClient::new(&root_url, "fixture", "");
         let wc = tmp.path().join("wc");

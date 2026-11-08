@@ -269,6 +269,61 @@ pub mod reviewed {
         op: &mut LatePairPublishOperation,
     ) -> Result<Repository> {
         let plan = progress(op)?.plan.clone();
+        ensure!(
+            op.initiator_id == plan.actor
+                && op.parent_repo_id == plan.parent_id
+                && op.target_fingerprint == plan.review_pin
+                && !op.request_id.is_empty()
+                && !plan.svn_uuid.trim().is_empty()
+                && !plan.svn_root_url.is_empty()
+                && !plan.target_path.is_empty()
+                && !plan.source_path.is_empty(),
+            "reviewed plan is not bound to this operation, actor or parent"
+        );
+        check_parent(db, &plan)?;
+        let proved_uuid = {
+            let uuid = plan.svn_uuid.trim().to_string();
+            match (&plan.target_revision, progress(op)?.copy_evidence.as_ref()) {
+                (Some(target_rev), None) => {
+                    ensure!(
+                        *target_rev >= plan.baseline_svn_revision
+                            && progress(op)?
+                                .svn_revision
+                                .is_some_and(|rev| rev >= *target_rev),
+                        "existing-target revision is not the reviewed observation"
+                    );
+                    uuid
+                }
+                (None, Some(copy)) => {
+                    let initial = model::tree_digest(&plan.initial_target_tree)?;
+                    ensure!(
+                        copy.uuid.trim() == uuid
+                            && copy.source_path == plan.source_path
+                            && copy.source_revision == plan.baseline_svn_revision
+                            && copy.target_path == plan.target_path
+                            && copy.tree_digest == initial
+                            && copy.revision > plan.baseline_svn_revision
+                            && progress(op)?
+                                .svn_revision
+                                .is_some_and(|rev| rev >= copy.revision),
+                        "native copy proof contradicts the reviewed plan"
+                    );
+                    uuid
+                }
+                _ => bail!("missing native copy or existing-target identity proof"),
+            }
+        };
+        if let Some(parent_uuid) =
+            crate::db::lineage_checkpoints::independently_established_svn_uuid(
+                &db.conn(),
+                &parent.id,
+            )?
+        {
+            ensure!(
+                parent_uuid == proved_uuid,
+                "parent established UUID contradicts reviewed child identity"
+            );
+        }
         if op.child_repo_id.is_none() {
             let mut next = op.clone();
             next.child_repo_id = Some(crate::db::repo_scope_identity::new_human_repository_id());
@@ -297,6 +352,13 @@ pub mod reviewed {
                     && child.git_repo == parent.git_repo,
                 "child registration was replaced or activated before completion"
             );
+            let established =
+                crate::db::lineage_checkpoints::independently_established_svn_uuid(&db.conn(), id)?
+                    .context("disabled child restart has no independently established UUID")?;
+            ensure!(
+                established == proved_uuid,
+                "disabled child restart UUID does not match this operation's reviewed identity"
+            );
             return Ok(child);
         }
         let mut child = parent.clone();
@@ -318,6 +380,11 @@ pub mod reviewed {
         child.created_at = chrono::Utc::now().to_rfc3339();
         child.updated_at = child.created_at.clone();
         db.insert_repository(&child)?;
+        crate::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            db,
+            &child.id,
+            &proved_uuid,
+        )?;
         let scope = crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), &child.id)?;
         let mut next = op.clone();
         next.reconciliation.as_deref_mut().unwrap().child_scope_uuid = Some(scope);
@@ -1368,6 +1435,7 @@ fn apply_baseline_watermarks(
     child_id: &str,
     baseline_git_sha: &str,
     svn_rev: i64,
+    svn_uuid: Option<&str>,
 ) -> Result<(), LatePairPublishRefusal> {
     let now = chrono::Utc::now().to_rfc3339();
     crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
@@ -1422,6 +1490,16 @@ fn apply_baseline_watermarks(
             detail: format!("failed to record baseline provenance: {e}"),
             plan: None,
         })?;
+    if let Some(uuid) = svn_uuid.map(str::trim).filter(|uuid| !uuid.is_empty()) {
+        crate::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            db, child_id, uuid,
+        )
+        .map_err(|e| LatePairPublishRefusal {
+            reason: "watermark_failed".into(),
+            detail: format!("failed to record independently established SVN UUID: {e}"),
+            plan: None,
+        })?;
+    }
     Ok(())
 }
 
@@ -1895,7 +1973,27 @@ pub async fn publish_admitted_late_pair(
                     plan: Some(Box::new(plan.clone())),
                 })?;
         }
-        apply_baseline_watermarks(db, &effective_child_id, &baseline.git_sha, svn_head)?;
+        let child_uuid = if let Some(uuid) = probe
+            .uuid
+            .as_deref()
+            .map(str::trim)
+            .filter(|uuid| !uuid.is_empty())
+        {
+            Some(uuid.to_string())
+        } else {
+            crate::db::lineage_checkpoints::independently_established_svn_uuid(
+                &db.conn(),
+                &parent.id,
+            )
+            .map_err(db_err)?
+        };
+        apply_baseline_watermarks(
+            db,
+            &effective_child_id,
+            &baseline.git_sha,
+            svn_head,
+            child_uuid.as_deref(),
+        )?;
         op.child_repo_id = Some(effective_child_id.clone());
         if take_fail_replay_once(&parent.id) {
             stash_pending_publish_refusal(
@@ -2050,7 +2148,7 @@ pub async fn replay_pending_git_for_integration_test(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::queries::CredentialChainState;
+    use crate::db::queries::{CredentialChainState, CredentialOrigin};
 
     #[test]
     fn parent_git_clone_url_derives_from_api_not_credentials() {
@@ -2094,6 +2192,7 @@ mod tests {
         let state = CredentialChainState {
             value: Some(String::new()),
             explicitly_revoked: false,
+            origin: CredentialOrigin::Explicit,
         };
         let err = http_git_token_for_clone("https://github.com/o/r.git", &state).unwrap_err();
         assert_eq!(err.reason, "git_credentials_missing");
@@ -2104,6 +2203,7 @@ mod tests {
         let state = CredentialChainState {
             value: Some("ghp_secret".into()),
             explicitly_revoked: false,
+            origin: CredentialOrigin::Explicit,
         };
         assert_eq!(
             http_git_token_for_clone("https://github.com/o/r.git", &state).unwrap(),
@@ -2116,6 +2216,7 @@ mod tests {
         let state = CredentialChainState {
             value: None,
             explicitly_revoked: false,
+            origin: CredentialOrigin::Absent,
         };
         assert_eq!(
             http_git_token_for_clone("file:///tmp/repo.git", &state).unwrap(),

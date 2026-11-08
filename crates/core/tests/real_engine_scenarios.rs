@@ -15,6 +15,10 @@ use std::time::Instant;
 
 use reposync_core::config::{AppConfig, IdentityConfig};
 use reposync_core::db::import_operations::ImportOperationState;
+use reposync_core::db::lineage_checkpoints::{
+    independently_established_svn_uuid, independently_established_svn_uuid_kv_key,
+    record_independently_established_svn_uuid,
+};
 use reposync_core::db::Database;
 use reposync_core::errors::{SvnError, SyncError};
 use reposync_core::git::GitClient;
@@ -425,6 +429,37 @@ fn setup_db(path: &Path) -> Database {
     db
 }
 
+/// UUID of the synthetic repository this constructor just created (`svnadmin create`).
+/// Read from that on-disk repo, not from a later live URL observation.
+fn uuid_of_constructor_created_svn_repo(repo_dir: &Path) -> String {
+    let output = Command::new("svnlook")
+        .args(["uuid", repo_dir.to_str().unwrap()])
+        .output()
+        .expect("svnlook uuid of constructor-created repository");
+    assert!(
+        output.status.success(),
+        "svnlook uuid failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let uuid = String::from_utf8(output.stdout)
+        .expect("constructor-created SVN UUID is utf-8")
+        .trim()
+        .to_string();
+    assert!(
+        !uuid.is_empty(),
+        "constructor-created SVN UUID is empty for {}",
+        repo_dir.display()
+    );
+    uuid
+}
+
+fn establish_constructor_created_svn_identity(db: &Database, repo_id: &str, repo_dir: &Path) {
+    let uuid = uuid_of_constructor_created_svn_repo(repo_dir);
+    record_independently_established_svn_uuid(db, repo_id, &uuid).unwrap_or_else(|error| {
+        panic!("record constructor-created SVN UUID for {repo_id}: {error}")
+    });
+}
+
 fn scoped_inbound_git_checkpoint(db: &Database, repo_id: &str) -> Option<String> {
     reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)
         .ok()
@@ -743,6 +778,7 @@ impl DualRepoFixture {
                 teams_webhook_url: None,
             })
             .unwrap();
+            establish_constructor_created_svn_identity(&db, id, &repo_dir);
             repos.push(SvnserveRepo {
                 id: id.into(),
                 svn_url,
@@ -873,6 +909,7 @@ impl SingleRepoFixture {
             teams_webhook_url: None,
         })
         .unwrap();
+        establish_constructor_created_svn_identity(&db, id, &repo_dir);
         let repo = SvnserveRepo {
             id: id.into(),
             svn_url,
@@ -2301,6 +2338,8 @@ impl ParentChildChainFixture {
         };
         db.insert_repository(&parent_row).unwrap();
         db.insert_repository(&child_row).unwrap();
+        establish_constructor_created_svn_identity(&db, &parent_id, &repo_dir);
+        establish_constructor_created_svn_identity(&db, &child_id, &repo_dir);
         Self {
             tmp,
             _daemon: daemon,
@@ -2456,6 +2495,20 @@ async fn scenario_r17_svnserve_parent_child_concurrent_credential_reload() {
     beta_repo.svn_username = alpha.username.clone();
     beta_repo.teams_webhook_url = Some(beta_hook.into());
     db.update_repository(&beta_repo).unwrap();
+    // Seam: this case rebinds repo_beta onto alpha's constructor-created SVN
+    // after DualRepoFixture already established repo_beta's original UUID.
+    // Identity must follow the synthetic repository this scenario actually uses,
+    // not a later live URL observation and not repo_beta's unused original UUID.
+    let alpha_constructor_uuid = independently_established_svn_uuid(&db.conn(), "repo_alpha")
+        .unwrap()
+        .expect("DualRepoFixture established repo_alpha constructor UUID");
+    db.conn()
+        .execute(
+            "DELETE FROM kv_state WHERE key = ?1",
+            [independently_established_svn_uuid_kv_key("repo_beta")],
+        )
+        .unwrap();
+    record_independently_established_svn_uuid(&db, "repo_beta", &alpha_constructor_uuid).unwrap();
     db.conn()
         .execute(
             "DELETE FROM kv_state WHERE key = 'secret_svn_password_repo_beta'",

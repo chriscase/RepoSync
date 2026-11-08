@@ -187,6 +187,27 @@ impl HeldPair {
         let db_path = tmp.path().join("sync.db");
         let db = Database::new(&db_path).unwrap();
         db.initialize().unwrap();
+        let svn_uuid_output = Command::new("svnlook")
+            .args(["uuid", tmp.path().join("svn_repo").to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            svn_uuid_output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&svn_uuid_output.stderr)
+        );
+        let svn_uuid = String::from_utf8(svn_uuid_output.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            !svn_uuid.is_empty(),
+            "constructor-created SVN UUID is empty"
+        );
+        reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            &db, repo_id, &svn_uuid,
+        )
+        .unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         db.insert_repository(&Repository {
             id: repo_id.into(),

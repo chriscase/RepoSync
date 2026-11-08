@@ -116,12 +116,16 @@ impl SvnToGitSync {
         }
 
         // 1. Read the current watermark.
-        let watermark = self
+        let watermark = match self
             .db
             .get_watermark(WATERMARK_KEY)
             .context("failed to read SVN watermark from database")?
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0);
+        {
+            Some(value) => value.parse::<i64>().with_context(|| {
+                format!("personal SVN watermark {value:?} is not a revision; refusing retry")
+            })?,
+            None => 0,
+        };
 
         info!(watermark, "starting SVN-to-Git sync pass");
 

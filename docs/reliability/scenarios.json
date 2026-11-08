@@ -1,7 +1,7 @@
 {
   "reviewed_base": "87379741779a6259f7eeb52a68cc6f061174e5ef",
   "authored_against_main": "4f985a24d1fede55bde88b521800ae9e5db0f5a3",
-  "scope": "Current-main #62 rollup after merged PR #72/#74/#75/#77/#78/#79/#80/#81/#82 plus #69 update-pair preview. Named isolated subcases are mapped; issue-complete PASS is not claimed. Re-anchor and refresh execution remain NOT IMPLEMENTED. Copy-only v13/v14 and candidate inspection routes remain unactivated. Live acceptance is not authorized.",
+  "scope": "Current-main #62 rollup after merged PR #72/#74/#75/#77/#78/#79/#80/#81/#82 plus #69 update-pair preview and operational #63 v14 canonical lineage. Named isolated subcases are mapped; issue-complete PASS is not claimed. Re-anchor and refresh execution remain NOT IMPLEMENTED. Candidate CopySession pair_% tables remain unactivated. Live acceptance is not authorized.",
   "scenarios": [
     {
       "id": "R01",
@@ -168,7 +168,7 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "A pinned original importer at 8737974 writes an installation; the candidate opens a copy and continues an SVN-only poll without resetting cursors. Ordinary startup stays schema v12 with zero candidate tables. This qualifies the pinned fixture, not production.",
+      "evidence": "A pinned original importer at 8737974 writes an installation; the candidate opens a copy and continues an SVN-only poll without resetting cursors. Lone file-backed Database::initialize stays schema v12 (R01 deferred). Exclusive-owner startup applies operational v14 canonical tables with zero candidate pair_% tables (STARTUP_V14 / RS63_DEFERRED_V12_THEN_V14). This qualifies the pinned fixture, not production.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -176,7 +176,7 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "copy_only",
-      "evidence": "Copy-only sealed fixtures exercise v13/v14 crash/restart, forged/future schema refusal, null mapping display, typed readers, and scoped HTTP. STARTUP_V12 proves nonactivation. These are not production migrations.",
+      "evidence": "Copy-only sealed fixtures exercise candidate v13/v14 crash/restart, forged/future schema refusal, null mapping display, typed readers, and scoped HTTP. STARTUP_V14 proves ordinary initialize is operational v14 canonical_* with zero candidate pair_% tables; lone file-backed initialize stays deferred v12 until exclusive owner (RS63_DEFERRED_V12_THEN_V14). These are not production migrations.",
       "diagnostic_expected_baseline_failure": false
     },
     {
