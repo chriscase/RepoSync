@@ -2659,6 +2659,551 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         );
     }
 
+    const R01_QUIESCENT_READ_ONLY_SHM_SHA256: &str =
+        "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb";
+    const R01_EMPTY_SHA256: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    struct R01SidecarProbe {
+        mode: u32,
+        shm: Vec<u8>,
+        wal: Vec<u8>,
+        evidence: serde_json::Value,
+    }
+
+    fn r01_sha256(bytes: &[u8]) -> String {
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    fn r01_regular_sidecar(path: &Path) -> (u32, Vec<u8>) {
+        let meta = std::fs::symlink_metadata(path).unwrap_or_else(|error| {
+            panic!(
+                "unsupported host: missing sqlite sidecar {}: {error}",
+                path.display()
+            )
+        });
+        assert!(
+            meta.file_type().is_file(),
+            "unsupported host: sqlite sidecar {} is not a regular file",
+            path.display()
+        );
+        let bytes = std::fs::read(path).unwrap_or_else(|error| {
+            panic!(
+                "unsupported host: unreadable sqlite sidecar {}: {error}",
+                path.display()
+            )
+        });
+        (unix_mode(&meta), bytes)
+    }
+
+    fn r01_openoptions_0644_mode() -> u32 {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("openoptions-0644");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&path)
+            .unwrap();
+        unix_mode(&std::fs::symlink_metadata(&path).unwrap())
+    }
+
+    fn r01_sqlite3_cli_agreement(
+        native_mode: u32,
+        shm_sha: &str,
+        wal_sha: &str,
+    ) -> serde_json::Value {
+        let version = match Command::new("sqlite3").arg("-version").output() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return serde_json::json!({
+                    "present": false,
+                    "agreement": null
+                });
+            }
+            Err(error) => panic!("unsupported host: sqlite3 could not start: {error}"),
+            Ok(output) if !output.status.success() => panic!(
+                "unsupported host: sqlite3 -version failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        };
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("reposync.db");
+        let setup = Command::new("sqlite3")
+            .arg(&db)
+            .arg(
+                "PRAGMA journal_mode=WAL; PRAGMA user_version=12; PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("unsupported host: sqlite3 setup failed to start: {error}")
+            });
+        assert!(
+            setup.status.success(),
+            "unsupported host: sqlite3 setup failed: {}",
+            String::from_utf8_lossy(&setup.stderr)
+        );
+        let opened = Command::new("sqlite3")
+            .arg(format!("file:{}?mode=ro", db.display()))
+            .arg("PRAGMA user_version;")
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("unsupported host: sqlite3 read-only open failed to start: {error}")
+            });
+        assert!(
+            opened.status.success(),
+            "unsupported host: sqlite3 read-only open failed: {}",
+            String::from_utf8_lossy(&opened.stderr)
+        );
+        let (shm_mode, shm) = r01_regular_sidecar(&dir.path().join("reposync.db-shm"));
+        let (wal_mode, wal) = r01_regular_sidecar(&dir.path().join("reposync.db-wal"));
+        assert_eq!(
+            (
+                shm_mode,
+                wal_mode,
+                r01_sha256(&shm).as_str(),
+                r01_sha256(&wal).as_str()
+            ),
+            (native_mode, native_mode, shm_sha, wal_sha),
+            "installed sqlite3 sidecar mode or image differs from in-process SQLite"
+        );
+        serde_json::json!({
+            "present": true,
+            "version": version,
+            "agreement": true
+        })
+    }
+
+    // The expected sidecar mode is the st_mode of regular files created by the
+    // in-process library when it read-only opens an owned WAL database. An
+    // OpenOptions 0644 file only records the process umask; it is not the authority.
+    fn r01_probe_native_sqlite_sidecars() -> R01SidecarProbe {
+        let dir = TempDir::new().expect("owned sqlite probe directory");
+        let db_path = dir.path().join("reposync.db");
+        let created = Database::new(&db_path).unwrap_or_else(|error| {
+            panic!("unsupported host: native database creation failed: {error}")
+        });
+        drop(created);
+        let shm_path = dir.path().join("reposync.db-shm");
+        let wal_path = dir.path().join("reposync.db-wal");
+        if shm_path.exists() != wal_path.exists() {
+            panic!("unsupported host: native sqlite left only one sidecar");
+        }
+        if !shm_path.exists() {
+            let opened = Database::open_existing_read_only(&db_path).unwrap_or_else(|error| {
+                panic!("unsupported host: native read-only open failed: {error}")
+            });
+            let journal: String = opened
+                .conn()
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap_or_else(|error| {
+                    panic!("unsupported host: native journal_mode failed: {error}")
+                });
+            assert!(
+                journal.eq_ignore_ascii_case("wal"),
+                "unsupported host: native probe journal is {journal}"
+            );
+            drop(opened);
+        }
+        let (shm_mode, shm) = r01_regular_sidecar(&shm_path);
+        let (wal_mode, wal) = r01_regular_sidecar(&wal_path);
+        assert_eq!(
+            shm_mode, wal_mode,
+            "native sqlite sidecars have different modes"
+        );
+        let shm_sha = r01_sha256(&shm);
+        let wal_sha = r01_sha256(&wal);
+        assert_eq!(
+            (shm.len(), shm_sha.as_str(), wal.len(), wal_sha.as_str()),
+            (
+                32_768,
+                R01_QUIESCENT_READ_ONLY_SHM_SHA256,
+                0,
+                R01_EMPTY_SHA256
+            ),
+            "unsupported host: native sqlite did not reproduce the quiescent sidecar image"
+        );
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        let mapped: Vec<&str> = maps
+            .lines()
+            .filter(|line| line.contains("libsqlite3"))
+            .collect();
+        let evidence = serde_json::json!({
+            "authority": "in-process read-only open of an owned WAL database",
+            "observed_mode": shm_mode,
+            "shm_bytes": shm.len(),
+            "shm_sha256": shm_sha,
+            "wal_bytes": wal.len(),
+            "wal_sha256": wal_sha,
+            "quiescent_image_reproduced": true,
+            "sqlite3_cli": r01_sqlite3_cli_agreement(shm_mode, &shm_sha, &wal_sha),
+            "process_libsqlite_maps": mapped,
+            "process_libsqlite_observed": !mapped.is_empty(),
+            "openoptions_0644_st_mode": r01_openoptions_0644_mode(),
+            "openoptions_0644_is_authority": false,
+            "cross_host_mode_constant": false
+        });
+        R01SidecarProbe {
+            mode: shm_mode,
+            shm,
+            wal,
+            evidence,
+        }
+    }
+
+    // Read-only inspection can leave an empty WAL and its untouched index after
+    // close. This admits only that pair on the candidate copy. verify_tree stays
+    // exact for every pristine master and negative copy.
+    fn verify_post_probe_tree(
+        root: &Path,
+        sealed: &BTreeMap<String, MemberSeal>,
+    ) -> serde_json::Value {
+        let mut actual = seal_tree(root);
+        let extras: Vec<&str> = actual
+            .keys()
+            .filter(|key| !sealed.contains_key(key.as_str()))
+            .map(|key| key.as_str())
+            .collect();
+        if extras.is_empty() {
+            assert_eq!(
+                &actual,
+                sealed,
+                "fixture tree drifted at {}",
+                root.display()
+            );
+            return serde_json::json!({
+                "phase": "after_qualifier_child_exit",
+                "additions": [],
+                "sidecar_mode_provenance": r01_probe_native_sqlite_sidecars().evidence
+            });
+        }
+        assert_eq!(
+            extras,
+            ["reposync.db-shm", "reposync.db-wal"],
+            "fixture tree gained unexpected members at {}",
+            root.display()
+        );
+        let probe = r01_probe_native_sqlite_sidecars();
+        let created_mode = probe.mode;
+        let shm = &actual["reposync.db-shm"];
+        let wal = &actual["reposync.db-wal"];
+        for (member, bytes, sha) in [
+            (shm, 32_768, R01_QUIESCENT_READ_ONLY_SHM_SHA256),
+            (wal, 0, R01_EMPTY_SHA256),
+        ] {
+            assert_eq!(member.kind, "file", "SQLite sidecar is not a regular file");
+            assert_eq!(
+                member.mode, created_mode,
+                "SQLite sidecar mode {:o} is not the file-creation mode {:o}",
+                member.mode, created_mode
+            );
+            assert_eq!(
+                (member.bytes, member.sha256.as_str()),
+                (bytes, sha),
+                "SQLite sidecar is not the quiescent read-only image"
+            );
+        }
+        let additions = serde_json::json!([
+            {
+                "path": "reposync.db-shm",
+                "kind": shm.kind,
+                "mode": shm.mode,
+                "bytes": shm.bytes,
+                "sha256": shm.sha256,
+            },
+            {
+                "path": "reposync.db-wal",
+                "kind": wal.kind,
+                "mode": wal.mode,
+                "bytes": wal.bytes,
+                "sha256": wal.sha256,
+            }
+        ]);
+        actual.remove("reposync.db-shm");
+        actual.remove("reposync.db-wal");
+        assert_eq!(
+            &actual,
+            sealed,
+            "fixture tree drifted at {}",
+            root.display()
+        );
+        serde_json::json!({
+            "phase": "after_qualifier_child_exit",
+            "probe_that_created_sidecars": "not identified",
+            "sidecar_mode_provenance": probe.evidence,
+            "additions": additions
+        })
+    }
+
+    fn r01_write_mode(path: &Path, bytes: &[u8], mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777)).unwrap();
+        assert_eq!(
+            unix_mode(&std::fs::symlink_metadata(path).unwrap()),
+            mode,
+            "owned file {} did not keep mode {mode:o}",
+            path.display()
+        );
+    }
+
+    fn r01_caught_refusal(check: impl FnOnce() + std::panic::UnwindSafe) -> String {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let refused = std::panic::catch_unwind(check);
+        std::panic::set_hook(previous);
+        let payload = match refused {
+            Err(payload) => payload,
+            Ok(()) => panic!("validator accepted a mutation it must refuse"),
+        };
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    fn r01_expect_post_probe_refusal(
+        label: &str,
+        expected: &str,
+        root: &Path,
+        sealed: &BTreeMap<String, MemberSeal>,
+    ) {
+        let root = root.to_path_buf();
+        let sealed = sealed.clone();
+        let message = r01_caught_refusal(std::panic::AssertUnwindSafe(|| {
+            verify_post_probe_tree(&root, &sealed);
+        }));
+        assert!(
+            message.contains(expected),
+            "{label} refused without `{expected}`: {message}"
+        );
+    }
+
+    fn r01_owned_original(mode: u32) -> (TempDir, BTreeMap<String, MemberSeal>) {
+        let dir = TempDir::new().unwrap();
+        r01_write_mode(&dir.path().join("reposync.db"), b"original-db", mode);
+        let sealed = seal_tree(dir.path());
+        (dir, sealed)
+    }
+
+    fn r01_add_quiescent_pair(dir: &Path, probe: &R01SidecarProbe) {
+        r01_write_mode(&dir.join("reposync.db-shm"), &probe.shm, probe.mode);
+        r01_write_mode(&dir.join("reposync.db-wal"), &probe.wal, probe.mode);
+    }
+
+    fn r01_prove_post_probe_tree_discriminates() -> serde_json::Value {
+        let probe = r01_probe_native_sqlite_sidecars();
+        let wrong_mode = if (probe.mode & 0o777) == 0o644 {
+            (probe.mode & !0o777) | 0o600
+        } else {
+            (probe.mode & !0o777) | 0o644
+        };
+        assert_ne!(
+            wrong_mode, probe.mode,
+            "could not choose a distinct sidecar mode"
+        );
+
+        let (plain, plain_seal) = r01_owned_original(probe.mode);
+        let accepted = verify_post_probe_tree(plain.path(), &plain_seal);
+        assert_eq!(accepted["additions"], serde_json::json!([]));
+        assert_eq!(accepted["phase"], "after_qualifier_child_exit");
+
+        let (good, good_seal) = r01_owned_original(probe.mode);
+        r01_add_quiescent_pair(good.path(), &probe);
+        let pair = verify_post_probe_tree(good.path(), &good_seal);
+        assert_eq!(pair["probe_that_created_sidecars"], "not identified");
+        assert_eq!(pair["additions"][0]["sha256"], probe.evidence["shm_sha256"]);
+        assert_eq!(pair["additions"][1]["sha256"], probe.evidence["wal_sha256"]);
+        assert_eq!(
+            pair["additions"][0]["mode"].as_u64(),
+            Some(u64::from(probe.mode))
+        );
+        assert_eq!(
+            pair["additions"][1]["mode"].as_u64(),
+            Some(u64::from(probe.mode))
+        );
+        let strict = r01_caught_refusal(std::panic::AssertUnwindSafe(|| {
+            verify_tree(good.path(), &good_seal);
+        }));
+        assert!(
+            strict.contains("fixture tree drifted"),
+            "strict verify_tree refused without the exact-tree failure: {strict}"
+        );
+
+        let (changed, changed_seal) = r01_owned_original(probe.mode);
+        r01_add_quiescent_pair(changed.path(), &probe);
+        r01_write_mode(
+            &changed.path().join("reposync.db"),
+            b"changed-original",
+            probe.mode,
+        );
+        r01_expect_post_probe_refusal(
+            "changed original bytes",
+            "fixture tree drifted",
+            changed.path(),
+            &changed_seal,
+        );
+
+        let (restyled, restyled_seal) = r01_owned_original(probe.mode);
+        r01_add_quiescent_pair(restyled.path(), &probe);
+        r01_write_mode(
+            &restyled.path().join("reposync.db"),
+            b"original-db",
+            wrong_mode,
+        );
+        r01_expect_post_probe_refusal(
+            "changed original mode",
+            "fixture tree drifted",
+            restyled.path(),
+            &restyled_seal,
+        );
+
+        let (extra, extra_seal) = r01_owned_original(probe.mode);
+        r01_write_mode(&extra.path().join("notes.txt"), b"unrelated", probe.mode);
+        r01_expect_post_probe_refusal(
+            "unrelated extra member",
+            "unexpected members",
+            extra.path(),
+            &extra_seal,
+        );
+
+        let (mixed, mixed_seal) = r01_owned_original(probe.mode);
+        r01_add_quiescent_pair(mixed.path(), &probe);
+        r01_write_mode(&mixed.path().join("notes.txt"), b"unrelated", probe.mode);
+        r01_expect_post_probe_refusal(
+            "admitted pair plus unrelated member",
+            "unexpected members",
+            mixed.path(),
+            &mixed_seal,
+        );
+
+        let (shm_only, shm_seal) = r01_owned_original(probe.mode);
+        r01_write_mode(
+            &shm_only.path().join("reposync.db-shm"),
+            &probe.shm,
+            probe.mode,
+        );
+        r01_expect_post_probe_refusal(
+            "shm without wal",
+            "unexpected members",
+            shm_only.path(),
+            &shm_seal,
+        );
+
+        let (wal_only, wal_seal) = r01_owned_original(probe.mode);
+        r01_write_mode(
+            &wal_only.path().join("reposync.db-wal"),
+            &probe.wal,
+            probe.mode,
+        );
+        r01_expect_post_probe_refusal(
+            "wal without shm",
+            "unexpected members",
+            wal_only.path(),
+            &wal_seal,
+        );
+
+        let (dirty, dirty_seal) = r01_owned_original(probe.mode);
+        r01_write_mode(
+            &dirty.path().join("reposync.db-shm"),
+            &probe.shm,
+            probe.mode,
+        );
+        r01_write_mode(
+            &dirty.path().join("reposync.db-wal"),
+            b"not-empty",
+            probe.mode,
+        );
+        r01_expect_post_probe_refusal(
+            "nonempty wal",
+            "not the quiescent",
+            dirty.path(),
+            &dirty_seal,
+        );
+
+        let (bad_shm, bad_shm_seal) = r01_owned_original(probe.mode);
+        r01_write_mode(
+            &bad_shm.path().join("reposync.db-shm"),
+            &vec![0x5a; 32_768],
+            probe.mode,
+        );
+        r01_write_mode(
+            &bad_shm.path().join("reposync.db-wal"),
+            &probe.wal,
+            probe.mode,
+        );
+        r01_expect_post_probe_refusal(
+            "wrong shm digest",
+            "not the quiescent",
+            bad_shm.path(),
+            &bad_shm_seal,
+        );
+
+        let (linked, linked_seal) = r01_owned_original(probe.mode);
+        std::os::unix::fs::symlink("reposync.db", linked.path().join("reposync.db-shm")).unwrap();
+        let target = std::fs::read_link(linked.path().join("reposync.db-shm")).unwrap();
+        assert!(
+            target.is_relative()
+                && !target
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir)),
+            "sidecar symlink must stay inside the owned root"
+        );
+        r01_write_mode(
+            &linked.path().join("reposync.db-wal"),
+            &probe.wal,
+            probe.mode,
+        );
+        r01_expect_post_probe_refusal(
+            "symlink sidecar",
+            "not a regular file",
+            linked.path(),
+            &linked_seal,
+        );
+
+        let (bad_mode, bad_mode_seal) = r01_owned_original(probe.mode);
+        r01_write_mode(
+            &bad_mode.path().join("reposync.db-shm"),
+            &probe.shm,
+            wrong_mode,
+        );
+        r01_write_mode(
+            &bad_mode.path().join("reposync.db-wal"),
+            &probe.wal,
+            wrong_mode,
+        );
+        r01_expect_post_probe_refusal(
+            "wrong sidecar mode",
+            "not the file-creation mode",
+            bad_mode.path(),
+            &bad_mode_seal,
+        );
+
+        serde_json::json!({
+            "accepted": ["no_additions", "quiescent_pair"],
+            "refused": [
+                "strict_verify_tree_sidecar",
+                "changed_original_bytes",
+                "changed_original_mode",
+                "unrelated_extra_member",
+                "admitted_pair_plus_unrelated_member",
+                "shm_without_wal",
+                "wal_without_shm",
+                "nonempty_wal",
+                "wrong_shm_digest",
+                "symlink_sidecar",
+                "wrong_sidecar_mode"
+            ],
+            "provenance": probe.evidence
+        })
+    }
+
     fn copy_owned_tree(from: &Path, to: &Path) {
         assert!(from.is_dir(), "{}", from.display());
         assert!(!to.exists(), "refusing to overwrite {}", to.display());
@@ -2785,7 +3330,7 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
             if mode & 0o222 != 0 {
                 return Err(format!("creation witness mode {mode:o} is writable"));
             }
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(unix))]
         {
@@ -3100,6 +3645,7 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         );
         assert_eq!(get_head_sha(&bridge), git_sha, "{}", probe.label);
     }
+    let post_probe_controls = r01_prove_post_probe_tree_discriminates();
     let tmp = TempDir::new().unwrap();
     assert_fixture_owned(tmp.path());
     let old_root = tmp.path().join("old-install-generation");
@@ -3367,7 +3913,17 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     });
     let mut config = make_app_config(&svn_url, &candidate);
     config.svn.layout = reposync_core::config::SvnLayout::Custom;
-    verify_tree(&candidate, &install_seal);
+    // The qualifier child has exited: .output() reaped it before this compare.
+    // Its schema helper closes its own connection before the child returns.
+    let post_probe_baseline = if installer_receipt.is_some() {
+        verify_post_probe_tree(&candidate, &install_seal)
+    } else {
+        verify_tree(&candidate, &install_seal);
+        serde_json::json!({
+            "phase": "no_qualifier_child",
+            "additions": []
+        })
+    };
     let db_path = candidate.join("reposync.db");
     let db = Database::new(&db_path).unwrap();
     let old_schema: i64 = db
@@ -3623,40 +4179,40 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         .trim()
         .to_string();
     assert_eq!(svn_uuid, witnessed_uuid);
-    eprintln!(
-        "RELIABILITY_EVIDENCE {}",
-        serde_json::json!({
-            "case":"R01_OLD_INSTALL_UPGRADE", "old_code":"87379741779a6259f7eeb52a68cc6f061174e5ef",
-            "old_generator_sha256":hex::encode(sha2::Sha256::digest(old_binary)),
-            "old_db_sha256":original_db_hash, "old_generation":old_generation,
-            "old_svn_rev":old_svn_rev, "old_git":old_tip, "svn_uuid":svn_uuid,
-            "schema_before":old_schema, "schema_after":new_schema,
-            "verified_baseline_receipt":baseline_receipt,
-            "old_tree":tree_hashes(&old_tree), "old_install_file_count":original_manifest.len(),
-            "old_install_manifest":original_manifest,
-            "prewrite_restore_verified":true, "restore_noop":true,
-            "configuration_and_synthetic_credentials_preserved":true,
-            "changed_projection_rejected_without_remote_write":true,
-            "svn_only_rev":svn_only_rev, "svn_emitted":emitted,
-            "restart_noop":true, "git_outgoing":outgoing_sha, "outgoing_mapping":outgoing_map,
-            "final_svn_rev":final_rev, "final_svn_tree":tree_hashes(&exported_tree(&final_export)),
-            "final_git_tree":tree_hashes(&tracked_tree(&bridge)),
-            "post_upgrade_install_manifest":final_install_manifest,
-            "repository_mapping_rows":mapped_rows,
-            "explicit_fixture_witness_admission": true,
-            "witness_uuid": witnessed_uuid,
-            "witness_observed_before_old_import": true,
-            "present_day_uuid_matches_witness": true,
-            "unproved_unchanged_hold": "svn_identity_unproved",
-            "unproved_unchanged_reopen_hold": "svn_identity_unproved",
-            "unproved_replacement_hold": "svn_identity_unproved",
-            "replacement_conflict_hold": "svn_identity_changed",
-            "recorded_uuid_remained_pre_effect_witness": true,
-            "malformed_witness_refused": true,
-            "missing_witness_refused": true,
-            "foreign_witness_refused": true,
-        })
-    );
+    let mut reliability_evidence = serde_json::json!({
+        "case":"R01_OLD_INSTALL_UPGRADE", "old_code":"87379741779a6259f7eeb52a68cc6f061174e5ef",
+        "old_generator_sha256":hex::encode(sha2::Sha256::digest(old_binary)),
+        "old_db_sha256":original_db_hash, "old_generation":old_generation,
+        "old_svn_rev":old_svn_rev, "old_git":old_tip, "svn_uuid":svn_uuid,
+        "schema_before":old_schema, "schema_after":new_schema,
+        "verified_baseline_receipt":baseline_receipt,
+        "old_tree":tree_hashes(&old_tree), "old_install_file_count":original_manifest.len(),
+        "old_install_manifest":original_manifest,
+        "prewrite_restore_verified":true, "restore_noop":true,
+        "configuration_and_synthetic_credentials_preserved":true,
+        "changed_projection_rejected_without_remote_write":true,
+        "svn_only_rev":svn_only_rev, "svn_emitted":emitted,
+        "restart_noop":true, "git_outgoing":outgoing_sha, "outgoing_mapping":outgoing_map,
+        "final_svn_rev":final_rev, "final_svn_tree":tree_hashes(&exported_tree(&final_export)),
+        "final_git_tree":tree_hashes(&tracked_tree(&bridge)),
+        "post_upgrade_install_manifest":final_install_manifest,
+        "repository_mapping_rows":mapped_rows,
+        "explicit_fixture_witness_admission": true,
+        "witness_uuid": witnessed_uuid,
+        "witness_observed_before_old_import": true,
+        "present_day_uuid_matches_witness": true,
+        "unproved_unchanged_hold": "svn_identity_unproved",
+        "unproved_unchanged_reopen_hold": "svn_identity_unproved",
+        "unproved_replacement_hold": "svn_identity_unproved",
+        "replacement_conflict_hold": "svn_identity_changed",
+        "recorded_uuid_remained_pre_effect_witness": true,
+        "malformed_witness_refused": true,
+        "missing_witness_refused": true,
+        "foreign_witness_refused": true,
+    });
+    reliability_evidence["post_probe_baseline"] = post_probe_baseline;
+    reliability_evidence["post_probe_controls"] = post_probe_controls;
+    eprintln!("RELIABILITY_EVIDENCE {}", reliability_evidence);
     // Publish the installer-tier receipt only after every retained engine,
     // preservation, bidirectional and reconstructed-no-op assertion succeeds.
     if let Some(receipt) = installer_receipt {
