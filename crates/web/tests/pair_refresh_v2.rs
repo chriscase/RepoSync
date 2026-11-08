@@ -490,6 +490,19 @@ mod authenticated_review_http_journey {
             db.initialize().unwrap();
             let svn_repository = temp.path().join("svn-repository");
             run(Command::new("svnadmin").arg("create").arg(&svn_repository));
+            let observed_svn_uuid = run(Command::new("svnlook").arg("uuid").arg(&svn_repository));
+            let svn_uuid = observed_svn_uuid.trim_end_matches(['\r', '\n']);
+            assert!(!svn_uuid.is_empty(), "svnlook uuid was empty");
+            for id in ["parent", "child"] {
+                match reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+                    &db,
+                    id,
+                    svn_uuid,
+                ) {
+                    Ok(()) => {}
+                    Err(error) => panic!("independently established svn uuid: {error}"),
+                }
+            }
             let root = reqwest::Url::from_file_path(svn_repository.canonicalize().unwrap())
                 .unwrap()
                 .to_string();
