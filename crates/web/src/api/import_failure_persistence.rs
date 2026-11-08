@@ -1958,7 +1958,6 @@ mod pr245_original_http_acceptance {
         home: PathBuf,
         svn_repo: PathBuf,
         bare: PathBuf,
-        workdir: PathBuf,
         prefix: Option<String>,
         operation_id: Option<String>,
     }
@@ -2306,7 +2305,6 @@ mod pr245_original_http_acceptance {
             home,
             svn_repo,
             bare,
-            workdir,
             prefix,
             operation_id,
         }
