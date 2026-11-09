@@ -79,6 +79,36 @@ fn op(path: &str) -> String {
     format!("{path}@")
 }
 
+/// An engine and the real writer-fence guard held for it. Fields drop in
+/// order: the engine and its database first, then the guard, which releases
+/// the lease. Dropping this is a true close; the next open reclaims.
+struct OwnedEngine {
+    engine: SyncEngine,
+    _fence: writer_fence::WriterFenceGuard,
+}
+
+impl std::ops::Deref for OwnedEngine {
+    type Target = SyncEngine;
+    fn deref(&self) -> &SyncEngine {
+        &self.engine
+    }
+}
+
+/// The durable writer-fence lease, read through a fresh handle.
+fn fence_lease(db_path: &Path) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    Database::new(db_path)
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = 'writer_fence_v1:lease'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+}
+
 struct Fixture {
     tmp: TempDir,
     svn_url: String,
@@ -127,7 +157,9 @@ impl Fixture {
             bare: tmp.path().join("origin.git"),
             git_work: tmp.path().join("git_work"),
             data_dir: tmp.path().join("data"),
-            db_path: tmp.path().join("data").join("state.db"),
+            // The canonical name: WriterFenceGuard::drop releases its lease in
+            // `<data_dir>/reposync.db`. Any other name leaves the lease behind.
+            db_path: tmp.path().join("data").join("reposync.db"),
             developer: None,
             tmp,
         };
@@ -188,7 +220,7 @@ impl Fixture {
         std::fs::create_dir_all(&self.data_dir).unwrap();
         let db = Database::new(&self.db_path).unwrap();
         db.initialize().unwrap();
-        let _fence = writer_fence::claim(&db, &self.data_dir).unwrap();
+        let fence = writer_fence::claim(&db, &self.data_dir).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         let repo = Repository {
             id: REPO.into(),
@@ -269,13 +301,20 @@ impl Fixture {
         assert_eq!(svn_rev, selected);
         db.complete_import_operation(REPO, &op.id, svn_rev, &git_sha)
             .unwrap();
+        drop(db);
+        drop(fence);
+        assert_eq!(
+            fence_lease(&self.db_path),
+            None,
+            "the import's writer fence is really released"
+        );
     }
 
     /// A real reopen: a new database handle, startup holds, a new engine.
     /// Admit `allowed`/`blocked` on the repository row (JSON arrays, NULL
     /// when empty) and build the engine's rules from that row exactly as the
     /// daemon scheduler does. This is the production authority for policy.
-    fn engine(&self, allowed: &[&str], blocked: &[&str]) -> SyncEngine {
+    fn engine(&self, allowed: &[&str], blocked: &[&str]) -> OwnedEngine {
         self.admit_policy(allowed, blocked);
         self.engine_with_rules_from_row()
     }
@@ -293,8 +332,9 @@ impl Fixture {
             .unwrap();
     }
 
-    fn engine_with_rules_from_row(&self) -> SyncEngine {
-        let mut engine = self.engine_without_rules();
+    fn engine_with_rules_from_row(&self) -> OwnedEngine {
+        let mut owned = self.engine_without_rules();
+        let engine = &mut owned.engine;
         let row = engine.db().get_repository(REPO).unwrap().unwrap();
         let parse = |raw: Option<&str>| -> Vec<String> {
             raw.map(|raw| serde_json::from_str::<Vec<String>>(raw).unwrap())
@@ -305,17 +345,21 @@ impl Fixture {
         if !allowed.is_empty() || !blocked.is_empty() {
             engine.set_path_rules(allowed, blocked);
         }
-        engine
+        owned
     }
 
     /// An engine whose in-memory rules are NOT the admitted row policy.
-    fn engine_with_stale_rules(&self, allowed: &[&str]) -> SyncEngine {
-        let mut engine = self.engine_without_rules();
-        engine.set_path_rules(allowed.iter().map(|s| s.to_string()).collect(), Vec::new());
-        engine
+    fn engine_with_stale_rules(&self, allowed: &[&str]) -> OwnedEngine {
+        let mut owned = self.engine_without_rules();
+        owned
+            .engine
+            .set_path_rules(allowed.iter().map(|s| s.to_string()).collect(), Vec::new());
+        owned
     }
 
-    fn engine_without_rules(&self) -> SyncEngine {
+    /// A real open: a new database handle, a real writer-fence claim held for
+    /// this engine's whole life, startup holds, a new engine.
+    fn engine_without_rules(&self) -> OwnedEngine {
         let mut config: AppConfig = toml::from_str(&format!(
             "[daemon]\ndata_dir = \"{}\"\n[svn]\nurl = \"{}\"\nusername = \"\"\npassword_env = \"RS53_UNUSED\"\n[github]\nrepo = \"fixture/partial\"\ntoken_env = \"RS53_UNUSED\"\n",
             self.data_dir.display(),
@@ -327,6 +371,7 @@ impl Fixture {
         config.github.token = Some(String::new());
         let db = Database::new(&self.db_path).unwrap();
         db.initialize().unwrap();
+        let fence = writer_fence::claim(&db, &self.data_dir).unwrap();
         db.hold_interrupted_svn_commits().unwrap();
         db.hold_interrupted_git_pushes().unwrap();
         db.hold_interrupted_team_cycle_mappings().unwrap();
@@ -344,7 +389,10 @@ impl Fixture {
             ),
         );
         engine.set_repo_id(REPO.into());
-        engine
+        OwnedEngine {
+            engine,
+            _fence: fence,
+        }
     }
 
     fn git(&self, args: &[&str]) -> String {
@@ -599,8 +647,21 @@ async fn sc02_fully_excluded_revision_has_no_git_effect_and_reopen_repeat_is_qui
     assert_filtered_once(&engine, r2);
     assert_eq!(audit_count(&engine, "svn_to_git_filtered"), 1);
     let rows_before = rows(&engine);
+    assert!(
+        fence_lease(&fx.db_path).is_some(),
+        "the running engine holds the fence"
+    );
     drop(engine);
+    assert_eq!(
+        fence_lease(&fx.db_path),
+        None,
+        "closing the engine releases its fence before any reopen"
+    );
     let reopened = fx.engine(&["team-a/"], &[]);
+    assert!(
+        fence_lease(&fx.db_path).is_some(),
+        "the reopened engine reclaims the fence"
+    );
     for _ in 0..2 {
         let quiet = reopened.run_sync_cycle().await.unwrap();
         assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
@@ -1018,6 +1079,7 @@ async fn filtered_finalizer_write_fault_rolls_back_atomically_then_fresh_cycle_f
     {
         let reopened = Database::new(&fx.db_path).unwrap();
         reopened.initialize().unwrap();
+        let _recovery_fence = writer_fence::claim(&reopened, &fx.data_dir).unwrap();
         reopened.hold_interrupted_team_cycle_mappings().unwrap();
         assert!(reopened
             .active_team_cycle_mapping_operation(REPO)
@@ -1101,10 +1163,12 @@ async fn replaced_svn_repository_identity_cannot_mint_filtered_completion() {
         &["commit", "-m", "foreign r2", ".", "--non-interactive"],
     );
     let engine = fx.engine(&["team-a/"], &[]);
+    let refused = format!("{:?}", engine.run_sync_cycle().await.unwrap_err());
     assert!(
-        engine.run_sync_cycle().await.is_err(),
-        "changed SVN UUID is refused"
+        refused.contains("svn_identity_changed") || refused.contains("does not match pinned uuid"),
+        "changed SVN UUID is refused as an identity change: {refused}"
     );
+    assert!(!refused.contains("WriterFenced"), "{refused}");
     assert_eq!(filtered_row_count(&engine, 2), 0);
     assert!(latest_cycle_mapping(&engine).is_none());
     assert_eq!(svn_watermark(&engine), 1);
