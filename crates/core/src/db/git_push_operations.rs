@@ -1087,6 +1087,9 @@ mod tests {
 
     #[test]
     fn pr245_3_canonical_write_failure_is_atomic_after_reopen() {
+        let _writer_fence_test_lock = crate::writer_fence::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let fx = pr245_3_prepare();
         let (db, owner) =
             Database::open_with_exclusive_owner(&fx.data_dir).expect("owned file-backed database");
