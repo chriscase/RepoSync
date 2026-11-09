@@ -15,6 +15,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useParams, useNavigate, useLocation, Link } from 'react-router-dom';
 import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry, type LatePairPlan, type PairRefreshPlan, type SkipCommitContext } from '../api';
+import { CommitMapTargetCell } from '../components/CommitMapTargetCell';
 import {
   type BranchPairRemovalNotice as RemovalNotice,
   removeBranchPairForView,
@@ -1491,9 +1492,7 @@ function RepositoryDetailEditor() {
                 {cmEntries.map((cm: CommitMapEntry) => (
                   <tr key={cm.id} className="hover:bg-gray-700/50">
                     <td className="px-6 py-3 text-sm font-mono text-blue-400">r{cm.svn_rev}</td>
-                    <td className="px-6 py-3 text-sm font-mono text-purple-400 truncate max-w-[200px]">
-                      {cm.git_sha.substring(0, 12)}
-                    </td>
+                    <CommitMapTargetCell entry={cm} />
                     <td className="px-6 py-3">
                       <DirectionBadge direction={cm.direction} />
                     </td>

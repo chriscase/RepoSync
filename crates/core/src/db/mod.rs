@@ -10,6 +10,7 @@ pub mod import_operations;
 pub mod late_pair_publish_operations;
 pub mod lineage_checkpoints;
 pub mod managed_remove;
+pub mod nullable_commit_map;
 pub mod ordinary_writer_windows;
 mod pair_refresh_competing_journals;
 pub mod pair_refresh_credentials;

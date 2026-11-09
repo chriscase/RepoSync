@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use reposync_core::db::import_operations::{resolve_repo_import_baseline, RepoImportBaseline};
+use reposync_core::db::schema::CURRENT_SCHEMA_VERSION;
 use reposync_core::db::Database;
 use rusqlite::{params, Connection, OpenFlags};
 
@@ -93,14 +94,19 @@ fn owned_legacy_startup_upgrades_before_scheduler_baseline() {
     drop(direct);
 
     let (db, owner) = Database::open_with_exclusive_owner(root.path()).unwrap();
-    assert_eq!(version(&db.conn()), 14);
+    // Exclusive-owner startup takes a deferred legacy file to the current
+    // operational schema (v15 since #54, which keeps every v13/v14 change).
+    assert_eq!(version(&db.conn()), i64::from(CURRENT_SCHEMA_VERSION));
     assert_eq!(scope_columns(&db.conn()), 1);
     let first_scope = scope(&db, "legacy");
     assert!(!first_scope.is_empty());
     // The scheduler opens a separate connection after owned daemon startup;
     // it does not initialize or construct an engine before resolving this.
     let scheduler = Database::new(&path).unwrap();
-    assert_eq!(version(&scheduler.conn()), 14);
+    assert_eq!(
+        version(&scheduler.conn()),
+        i64::from(CURRENT_SCHEMA_VERSION)
+    );
     match resolve_repo_import_baseline(&scheduler, "legacy").unwrap() {
         RepoImportBaseline::Verified { svn_rev, git_sha } => {
             assert_eq!(svn_rev, 42);
@@ -133,7 +139,7 @@ fn disabled_and_paused_legacy_rows_allow_registration_before_engine() {
         let root = tempfile::tempdir().unwrap();
         let path = legacy_store(root.path(), enabled, status);
         let (db, owner) = Database::open_with_exclusive_owner(root.path()).unwrap();
-        assert_eq!(version(&db.conn()), 14);
+        assert_eq!(version(&db.conn()), i64::from(CURRENT_SCHEMA_VERSION));
         let registration = Database::new(&path).unwrap();
         let original_scope = scope(&db, "legacy");
         let original = db.get_repository("legacy").unwrap().unwrap();

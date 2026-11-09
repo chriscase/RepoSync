@@ -51,7 +51,10 @@ fn recovery_open_refuses_schema_or_journal_conversion_and_symlink_aliases() {
     db.ensure_repository_scope_schema_upgrade().unwrap();
     db.set_state("marker", "preserve").unwrap();
     let saved = state(&db);
-    for version in [12, 13, 15] {
+    // Every non-current version, older and future, is refused; the alias and
+    // journal checks below then run on the current schema.
+    let current = reposync_core::db::schema::CURRENT_SCHEMA_VERSION;
+    for version in [12, 13, current - 1, current + 1] {
         db.conn()
             .pragma_update(None, "user_version", version)
             .unwrap();
@@ -64,7 +67,9 @@ fn recovery_open_refuses_schema_or_journal_conversion_and_symlink_aliases() {
         );
         assert_eq!(state(&db), saved);
     }
-    db.conn().pragma_update(None, "user_version", 14).unwrap();
+    db.conn()
+        .pragma_update(None, "user_version", current)
+        .unwrap();
     let alias = temp.path().join("alias.db");
     std::os::unix::fs::symlink(&path, &alias).unwrap();
     assert!(Database::open_existing_for_pair_refresh_recovery(&alias).is_err());

@@ -40,12 +40,33 @@ pub struct HistoryQuery {
 pub struct CommitMapEntryView {
     pub id: i64,
     pub svn_rev: i64,
-    pub git_sha: String,
+    /// `null` for a no-target row (#54); see `target_state`.
+    pub git_sha: Option<String>,
+    /// `git_commit`, `filtered_no_target`, `no_target_unverified` or
+    /// `legacy_empty_value`. Only `filtered_no_target` is a proven no-target
+    /// row; the canonical outcome tables remain the authority.
+    pub target_state: &'static str,
     pub direction: String,
     pub synced_at: String,
     pub svn_author: String,
     pub git_author: String,
     pub repo_id: Option<String>,
+}
+
+impl From<reposync_core::db::nullable_commit_map::CommitMapRow> for CommitMapEntryView {
+    fn from(row: reposync_core::db::nullable_commit_map::CommitMapRow) -> Self {
+        Self {
+            id: row.id,
+            svn_rev: row.svn_rev,
+            git_sha: row.git_sha,
+            target_state: row.target.as_str(),
+            direction: row.direction,
+            synced_at: row.synced_at,
+            svn_author: row.svn_author,
+            git_author: row.git_author,
+            repo_id: row.repo_id,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -99,53 +120,15 @@ async fn list_commit_map(
 
     let db = &state.db;
 
-    // IMPORTANT: Do NOT hoist `db.conn()` above this `if`. The `else` branch
-    // calls `db.list_commit_map()` which internally acquires the same mutex.
-    // Holding a MutexGuard while calling a db.*() method is an instant deadlock
-    // (std::sync::Mutex is not re-entrant). This was the root cause of the
-    // "repo detail page freezes the entire server" bug — see module doc.
-    let views: Vec<CommitMapEntryView> =
-        if let Some(ref rid) = query.repo_id {
-            let conn = db.conn();
-            let mut stmt = conn.prepare(
-            "SELECT id, svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id
-             FROM commit_map WHERE repo_id = ?1 ORDER BY id DESC LIMIT ?2",
-        ).map_err(|e| AppError::Internal(format!("prepare: {}", e)))?;
-            let rows: Vec<CommitMapEntryView> = stmt
-                .query_map(rusqlite::params![rid, limit], |row| {
-                    Ok(CommitMapEntryView {
-                        id: row.get(0)?,
-                        svn_rev: row.get(1)?,
-                        git_sha: row.get(2)?,
-                        direction: row.get(3)?,
-                        synced_at: row.get(4)?,
-                        svn_author: row.get(5)?,
-                        git_author: row.get(6)?,
-                        repo_id: row.get(7)?,
-                    })
-                })
-                .map_err(|e| AppError::Internal(format!("query: {}", e)))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| AppError::Internal(format!("row: {}", e)))?;
-            rows
-        } else {
-            let entries = db
-                .list_commit_map(limit)
-                .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-            entries
-                .into_iter()
-                .map(|e| CommitMapEntryView {
-                    id: e.id,
-                    svn_rev: e.svn_rev,
-                    git_sha: e.git_sha,
-                    direction: e.direction,
-                    synced_at: e.synced_at,
-                    svn_author: e.svn_author,
-                    git_author: e.git_author,
-                    repo_id: e.repo_id,
-                })
-                .collect()
-        };
+    // `list_commit_map_rows` acquires and releases the connection itself; do
+    // not hold a `db.conn()` guard around it (std::sync::Mutex is not
+    // re-entrant; see the module doc).
+    let views: Vec<CommitMapEntryView> = db
+        .list_commit_map_rows(query.repo_id.as_deref(), limit)
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
+        .into_iter()
+        .map(CommitMapEntryView::from)
+        .collect();
 
     let total = views.len();
     Ok(Json(CommitMapResponse {
@@ -212,4 +195,62 @@ async fn list_sync_records(
 
     let total = entries.len();
     Ok(Json(SyncRecordResponse { entries, total }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reposync_core::db::nullable_commit_map::{CommitMapRow, CommitMapTarget};
+
+    fn row(git_sha: Option<&str>, target: CommitMapTarget) -> CommitMapRow {
+        CommitMapRow {
+            id: 9,
+            svn_rev: 7,
+            git_sha: git_sha.map(str::to_string),
+            target,
+            direction: "svn_to_git".into(),
+            synced_at: "2026-11-09T00:00:00Z".into(),
+            svn_author: "dev".into(),
+            git_author: String::new(),
+            repo_id: Some("pair".into()),
+        }
+    }
+
+    #[test]
+    fn no_target_rows_serialize_null_sha_with_explicit_state() {
+        for (sha, target, state) in [
+            (
+                None,
+                CommitMapTarget::FilteredNoTarget,
+                "filtered_no_target",
+            ),
+            (
+                None,
+                CommitMapTarget::NoTargetUnverified,
+                "no_target_unverified",
+            ),
+            (
+                Some(""),
+                CommitMapTarget::LegacyEmptyValue,
+                "legacy_empty_value",
+            ),
+        ] {
+            let json = serde_json::to_value(CommitMapEntryView::from(row(sha, target))).unwrap();
+            assert_eq!(json["target_state"], state);
+            match sha {
+                None => assert!(json["git_sha"].is_null(), "{json}"),
+                Some(value) => assert_eq!(json["git_sha"], value),
+            }
+        }
+        let sha = "a".repeat(40);
+        let json = serde_json::to_value(CommitMapEntryView::from(row(
+            Some(&sha),
+            CommitMapTarget::GitCommit,
+        )))
+        .unwrap();
+        assert_eq!(json["git_sha"], sha.as_str());
+        assert_eq!(json["target_state"], "git_commit");
+        assert_eq!(json["svn_rev"], 7);
+        assert_eq!(json["repo_id"], "pair");
+    }
 }

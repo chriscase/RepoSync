@@ -99,6 +99,9 @@ fn operational_v14_has_canonical_tables_not_pair_tables() {
     assert_eq!(version(&conn), CURRENT_SCHEMA_VERSION as i64);
     assert_eq!(canonical_table_count(&conn), 3);
     assert_eq!(pair_table_count(&conn), 0);
+    // The test name and case id are pinned in required-cases.json. Since #54
+    // the current operational schema (v15) keeps every v14 canonical table
+    // and makes commit_map.git_sha nullable.
     assert_eq!(
         conn.query_row(
             "SELECT [notnull] FROM pragma_table_info('commit_map') WHERE name='git_sha'",
@@ -106,7 +109,7 @@ fn operational_v14_has_canonical_tables_not_pair_tables() {
             |row| row.get::<_, i64>(0)
         )
         .unwrap(),
-        1
+        0
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
@@ -115,7 +118,7 @@ fn operational_v14_has_canonical_tables_not_pair_tables() {
             "user_version":CURRENT_SCHEMA_VERSION,
             "canonical_tables":3,
             "candidate_pair_tables":0,
-            "commit_map_git_sha_notnull":1
+            "commit_map_git_sha_notnull":0
         })
     );
 }
