@@ -667,7 +667,9 @@ fn put_sqlite_files(report: &mut ObservationReport, db_path: &Path) {
 ///
 /// Rows and cells are limited in SQL. SQLite may read whole stored cells and use
 /// its own page cache internally. A failed open or query is reported as a read
-/// failure; "(no rows)" means the query ran and returned none.
+/// failure; "(no rows)" means the query ran and returned none. If the deadline
+/// watchdog cannot start, no query runs and SQL diagnostics are reported
+/// unavailable.
 fn put_database_rows(
     report: &mut ObservationReport,
     db_path: &Path,
@@ -705,9 +707,22 @@ fn put_database_rows(
                 }
             })
     };
-    if watchdog.is_err() {
-        report.put("<deadline watchdog not started; the entrance's 5 s busy_timeout still bounds lock waits>\n");
-    }
+    // Without the watchdog nothing bounds SQL scanning (busy_timeout bounds
+    // only lock waits), so no query runs.
+    let watchdog = match watchdog {
+        Ok(watchdog) => watchdog,
+        Err(_) => {
+            report.put(
+                "<SQL diagnostics unavailable: deadline watchdog not started; no query run>\n",
+            );
+            drop(conn);
+            drop(db);
+            report.put("closed explicitly (handle dropped)\n");
+            report.put("sidecars after:\n");
+            put_sqlite_files(report, db_path);
+            return;
+        }
+    };
     let cell = |column: &str| {
         format!(
             "CASE typeof(\"{column}\") WHEN 'null' THEN 'NULL' \
@@ -837,9 +852,7 @@ fn put_database_rows(
         }
     }
     done.store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(watchdog) = watchdog {
-        let _ = watchdog.join();
-    }
+    let _ = watchdog.join();
     drop(conn);
     drop(db);
     report.put("closed explicitly (handle dropped)\n");
