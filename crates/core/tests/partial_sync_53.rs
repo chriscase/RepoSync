@@ -97,19 +97,36 @@ impl std::ops::Deref for OwnedEngine {
     }
 }
 
-/// The durable writer-fence lease, read through a fresh handle.
+/// The durable writer-fence lease, read through the product's read-only
+/// inspection entrance `Database::open_existing_read_only`, not `Database::new`
+/// (which creates, sets WAL, checkpoints with TRUNCATE and integrity-checks).
+/// That entrance never creates storage, disables checkpoint-on-close before any
+/// read and refuses empty or pending-rollback storage. The handle is closed
+/// explicitly by dropping it. SQLite may still create or touch the `-wal`/`-shm`
+/// sidecars.
+///
+/// `None` means the database was read and holds no lease row. A refused open or a
+/// failed read panics with its own message, so it is never reported as an absent
+/// lease.
 fn fence_lease(db_path: &Path) -> Option<String> {
     use rusqlite::OptionalExtension;
-    Database::new(db_path)
-        .unwrap()
+    let db = match Database::open_existing_read_only(db_path) {
+        Ok(db) => db,
+        Err(e) => panic!("writer-fence lease read failed (not an absent lease): open: {e}"),
+    };
+    let lease = db
         .conn()
         .query_row(
             "SELECT value FROM kv_state WHERE key = 'writer_fence_v1:lease'",
             [],
             |row| row.get(0),
         )
-        .optional()
-        .unwrap()
+        .optional();
+    drop(db);
+    match lease {
+        Ok(lease) => lease,
+        Err(e) => panic!("writer-fence lease read failed (not an absent lease): query: {e}"),
+    }
 }
 
 struct Fixture {
@@ -493,128 +510,488 @@ impl Fixture {
     }
 }
 
-/// Observation-only dump, printed only when a case is already failing.
-/// It reads Git, files and records; it never changes them.
+/// Observation-only dump, written only when a case is already failing.
 impl Drop for Fixture {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            eprintln!("{}", self.observations());
+            // Never `eprintln!`, which panics if the write fails. A panic here,
+            // during unwinding, could abort the process. The report goes straight
+            // to the process stderr, after the failing assertion the panic hook
+            // already printed, and a failed write is ignored.
+            let report = self.observations();
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), report.as_bytes());
         }
         std::env::remove_var("REPOSYNC_RS53_OBSERVE_DIR");
     }
 }
 
-impl Fixture {
-    /// Secondary, bounded, read-only evidence. It never panics (no unwrap on any
-    /// path), so it cannot mask the failing assertion, whose message the panic hook
-    /// has already printed. Each git command keeps its own stdout, stderr and exit.
-    fn observations(&self) -> String {
-        const FILE_CAP: usize = 64 * 1024;
-        const ROW_CAP: usize = 200;
-        const TOTAL_CAP: usize = 512 * 1024;
-        fn bounded(bytes: &[u8], cap: usize) -> String {
-            let shown = &bytes[..bytes.len().min(cap)];
-            let mut text = String::from_utf8_lossy(shown).into_owned();
-            if bytes.len() > cap {
-                text += &format!("\n<truncated: {} of {} bytes shown>\n", cap, bytes.len());
-            }
-            text
+/// The diagnostic report. Its whole allowance is allocated once, and every
+/// append is checked against what is left before it is made. Once one does not
+/// fit, the report is closed: that append and every later step are recorded as
+/// not run.
+struct ObservationReport {
+    text: String,
+    cap: usize,
+    closed: bool,
+    not_run: usize,
+}
+
+impl ObservationReport {
+    /// Space past `cap` for the closing labels only.
+    const LABEL_RESERVE: usize = 512;
+
+    fn new(cap: usize) -> Self {
+        Self {
+            text: String::with_capacity(cap + Self::LABEL_RESERVE),
+            cap,
+            closed: false,
+            not_run: 0,
         }
-        let git = |dir: &Path, args: &[&str]| -> String {
-            match Command::new("git").args(args).current_dir(dir).output() {
-                Ok(out) => format!(
-                    "exit={:?}\nstdout:\n{}stderr:\n{}",
-                    out.status.code(),
-                    bounded(&out.stdout, FILE_CAP),
-                    bounded(&out.stderr, FILE_CAP)
-                ),
-                Err(e) => format!("<git not run: {e}>\n"),
+    }
+
+    fn room(&self) -> usize {
+        self.cap.saturating_sub(self.text.len())
+    }
+
+    /// Whether a further step may run; if not, it is counted as not run.
+    fn admit(&mut self, deadline: std::time::Instant) -> bool {
+        if self.closed || std::time::Instant::now() >= deadline {
+            self.not_run += 1;
+            return false;
+        }
+        true
+    }
+
+    /// Appends `part` whole if it fits; otherwise closes the report.
+    fn put(&mut self, part: &str) {
+        if self.closed {
+            return;
+        }
+        if part.len() > self.room() {
+            self.closed = true;
+            self.not_run += 1;
+            return;
+        }
+        self.text.push_str(part);
+    }
+
+    /// Formats `value` straight into the report: each fragment is checked
+    /// before it is appended, so nothing is serialized outside the allowance.
+    fn put_display(&mut self, value: &dyn std::fmt::Display) {
+        let _ = std::fmt::Write::write_fmt(self, format_args!("{value}"));
+    }
+
+    /// Appends retained bytes shown as UTF-8, invalid sequences as U+FFFD, one
+    /// piece at a time, each checked first. A piece that does not fit is cut at
+    /// the allowance and the report is closed.
+    fn put_lossy(&mut self, bytes: &[u8]) {
+        for chunk in bytes.utf8_chunks() {
+            if self.closed {
+                return;
             }
-        };
-        let bare = self.bare.to_string_lossy().into_owned();
-        let mut out = String::from("=== RS53 OBSERVATION (secondary, read-only, bounded) ===\n");
-        let mut files: Vec<PathBuf> = std::fs::read_dir(self.tmp.path().join("observe"))
-            .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
-            .unwrap_or_default();
-        files.sort();
-        for file in files {
-            let bytes = std::fs::read(&file).unwrap_or_default();
-            out += &format!(
-                "--- producer {} ---\n{}\n",
-                file.display(),
-                bounded(&bytes, FILE_CAP)
+            let valid = chunk.valid();
+            let room = self.room();
+            if valid.len() > room {
+                let mut end = room;
+                while !valid.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.text.push_str(valid.get(..end).unwrap_or(""));
+                self.closed = true;
+                self.not_run += 1;
+                return;
+            }
+            self.text.push_str(valid);
+            if !chunk.invalid().is_empty() {
+                self.put("\u{FFFD}");
+            }
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if self.closed {
+            self.text.push_str(
+                "\n<report allowance spent: the last item was cut or not appended; later steps not run>\n",
             );
         }
-        out += "--- bare main: commit tree subject ---\n";
-        out += &git(
-            self.tmp.path(),
-            &["--git-dir", &bare, "log", "--format=%H %T %s", "main"],
+        if self.not_run > 0 {
+            self.text.push_str("<steps or appends not run: ");
+            let _ = std::fmt::Write::write_fmt(&mut self.text, format_args!("{}", self.not_run));
+            self.text.push_str(">\n");
+        }
+        self.text
+    }
+}
+
+impl std::fmt::Write for ObservationReport {
+    fn write_str(&mut self, part: &str) -> std::fmt::Result {
+        if self.closed || part.len() > self.room() {
+            self.put(part);
+            return Err(std::fmt::Error);
+        }
+        self.text.push_str(part);
+        Ok(())
+    }
+}
+
+/// Present or absent, and the size per metadata, of the database and its SQLite
+/// sidecars.
+fn put_sqlite_files(report: &mut ObservationReport, db_path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut name = db_path.as_os_str().to_owned();
+        name.push(suffix);
+        report.put("  reposync.db");
+        report.put(suffix);
+        match std::fs::symlink_metadata(&name) {
+            Ok(meta) => {
+                report.put(": present, metadata size ");
+                report.put_display(&meta.len());
+                report.put(" bytes\n");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => report.put(": absent\n"),
+            Err(_) => report.put(": <metadata read failed>\n"),
+        }
+    }
+}
+
+/// Bounded rows from the fixture database through the product's read-only
+/// inspection entrance `Database::open_existing_read_only`, not `Database::new`
+/// (which creates, sets WAL, checkpoints with TRUNCATE and integrity-checks).
+/// That entrance never creates storage, disables checkpoint-on-close before any
+/// read and refuses empty or pending-rollback storage. The handle is closed
+/// explicitly by dropping it.
+///
+/// SQLite may still create the `-wal` and `-shm` sidecars and write the
+/// wal-index in `-shm`; the sizes before and after are reported. No claim is
+/// made that the file is physically unchanged.
+///
+/// Rows and cells are limited in SQL. SQLite may read whole stored cells and use
+/// its own page cache internally. A failed open or query is reported as a read
+/// failure; "(no rows)" means the query ran and returned none.
+fn put_database_rows(
+    report: &mut ObservationReport,
+    db_path: &Path,
+    row_cap: usize,
+    cell_cap: usize,
+    deadline: std::time::Instant,
+) {
+    use std::time::{Duration, Instant};
+    report.put("sidecars before:\n");
+    put_sqlite_files(report, db_path);
+    let db = match Database::open_existing_read_only(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            report.put("<read failure: read-only inspection open refused or failed: ");
+            report.put_display(&e);
+            report.put(">\n");
+            return;
+        }
+    };
+    let conn = db.conn();
+    // The deadline also interrupts a running statement; joined before return.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = {
+        let done = done.clone();
+        let handle = conn.get_interrupt_handle();
+        std::thread::Builder::new()
+            .name("rs53-observe-db-deadline".into())
+            .spawn(move || {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if Instant::now() >= deadline {
+                        handle.interrupt();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+    };
+    if watchdog.is_err() {
+        report.put("<deadline watchdog not started; the entrance's 5 s busy_timeout still bounds lock waits>\n");
+    }
+    let cell = |column: &str| {
+        format!(
+            "CASE typeof(\"{column}\") WHEN 'null' THEN 'NULL' \
+             WHEN 'blob' THEN 'blob(' || length(\"{column}\") || '):' \
+             || hex(substr(\"{column}\", 1, {half})) \
+             ELSE substr(\"{column}\", 1, {cell_cap}) || CASE WHEN length(\"{column}\") > {cell_cap} \
+             THEN '<cell cut: ' || length(\"{column}\") || ' chars stored>' ELSE '' END END",
+            half = cell_cap / 2
+        )
+    };
+    // Fixed column lists: no runtime-derived identifiers.
+    let specs: [(&str, &[&str], &str); 6] = [
+        (
+            "repositories",
+            &["id", "last_svn_rev", "last_git_sha", "scope_uuid", "allowed_paths", "blocked_patterns"],
+            "",
+        ),
+        (
+            "sync_records",
+            &["id", "svn_rev", "git_sha", "direction", "status"],
+            "ORDER BY rowid",
+        ),
+        ("commit_map", &["svn_rev", "git_sha", "direction", "repo_id"], "ORDER BY id"),
+        (
+            "canonical_checkpoints",
+            &[
+                "scope_uuid", "generation", "direction", "handled_source_key", "outcome",
+                "target_git_sha", "target_svn_rev", "reason", "policy_snapshot", "updated_at",
+            ],
+            "",
+        ),
+        (
+            "canonical_mapping_outcomes",
+            &[
+                "id", "scope_uuid", "generation", "direction", "source_key", "outcome",
+                "target_git_sha", "target_svn_rev", "reason", "policy_snapshot", "created_at",
+            ],
+            "ORDER BY id",
+        ),
+        (
+            "kv_state",
+            &["key", "value"],
+            "WHERE key LIKE '%git%' OR key LIKE '%svn_rev%' OR key LIKE 'team_cycle_mapping%' ORDER BY key",
+        ),
+    ];
+    for (table, columns, tail) in specs {
+        if !report.admit(deadline) {
+            break;
+        }
+        let sql = format!(
+            "SELECT {} FROM \"{table}\" {tail} LIMIT {}",
+            columns
+                .iter()
+                .map(|c| cell(c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            row_cap + 1
         );
-        out += "--- bare main tree ---\n";
-        out += &git(
-            self.tmp.path(),
-            &["--git-dir", &bare, "ls-tree", "-r", "main"],
-        );
-        out += "--- bridge index ---\n";
-        out += &git(&self.git_work, &["ls-files", "-s"]);
-        out += "--- bridge worktree status ---\n";
-        out += &git(
-            &self.git_work,
-            &["status", "--porcelain=v1", "--untracked-files=all"],
-        );
-        match Database::new(&self.db_path) {
-            Ok(db) => {
-                let conn = db.conn();
-                for sql in [
-                    "SELECT id, last_svn_rev, last_git_sha, scope_uuid, allowed_paths, blocked_patterns FROM repositories",
-                    "SELECT id, svn_rev, git_sha, direction, status FROM sync_records ORDER BY rowid",
-                    "SELECT svn_rev, git_sha, direction, repo_id FROM commit_map ORDER BY id",
-                    "SELECT * FROM canonical_checkpoints",
-                    "SELECT * FROM canonical_mapping_outcomes",
-                    "SELECT key, value FROM kv_state WHERE key LIKE '%git%' OR key LIKE '%svn_rev%' OR key LIKE 'team_cycle_mapping%' ORDER BY key",
-                ] {
-                    out += &format!("--- {sql} ---\n");
-                    let mut stmt = match conn.prepare(sql) {
-                        Ok(stmt) => stmt,
-                        Err(e) => {
-                            out += &format!("<{e}>\n");
+        report.put("--- ");
+        report.put(table);
+        report.put(" (");
+        for (i, column) in columns.iter().enumerate() {
+            if i > 0 {
+                report.put(", ");
+            }
+            report.put(column);
+        }
+        report.put(") ");
+        report.put(tail);
+        report.put(" ---\n");
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                report.put("<read failure: prepare: ");
+                report.put_display(&e);
+                report.put(">\n");
+                continue;
+            }
+        };
+        let mut rows = match stmt.query([]) {
+            Ok(rows) => rows,
+            Err(e) => {
+                report.put("<read failure: query: ");
+                report.put_display(&e);
+                report.put(">\n");
+                continue;
+            }
+        };
+        let mut read = 0usize;
+        loop {
+            if read == row_cap {
+                match rows.next() {
+                    Ok(Some(_)) => report.put("<row cap: more rows exist; not read>\n"),
+                    Ok(None) => {}
+                    Err(_) => report.put("<read failure while probing for more rows>\n"),
+                }
+                break;
+            }
+            match rows.next() {
+                Ok(Some(row)) => {
+                    for i in 0..columns.len() {
+                        if i > 0 {
+                            report.put(" | ");
+                        }
+                        match row.get_ref(i) {
+                            Ok(rusqlite::types::ValueRef::Text(t)) => report.put_lossy(t),
+                            Ok(_) => report.put("<non-text cell>"),
+                            Err(_) => report.put("<cell read failure>"),
+                        }
+                    }
+                    report.put("\n");
+                    read += 1;
+                }
+                Ok(None) => {
+                    if read == 0 {
+                        report.put("(no rows)\n");
+                    }
+                    break;
+                }
+                Err(e) => {
+                    report.put("<read failure: row: ");
+                    report.put_display(&e);
+                    report.put(">\n");
+                    break;
+                }
+            }
+        }
+    }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(watchdog) = watchdog {
+        let _ = watchdog.join();
+    }
+    drop(conn);
+    drop(db);
+    report.put("closed explicitly (handle dropped)\n");
+    report.put("sidecars after:\n");
+    put_sqlite_files(report, db_path);
+}
+
+impl Fixture {
+    /// Secondary evidence, written only after the failing assertion's panic
+    /// message (the panic hook prints first). It starts no subprocess. Bounded
+    /// before allocation and before each append:
+    /// - producer files: the directory is iterated to `ENTRY_CAP` entries, no
+    ///   more enumerated; regular files only; each is read into one fixed buffer,
+    ///   at most the bytes still allowed;
+    /// - database rows and cells are limited in SQL (`put_database_rows`);
+    /// - the report has a fixed allowance; a step is not run once it or
+    ///   `DEADLINE` is spent.
+    ///
+    /// Git bare and bridge state would need a secondary subprocess, so it is
+    /// labelled unavailable. Nothing here panics: no unwrap or unchecked index.
+    fn observations(&self) -> String {
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+        const FILE_CAP: usize = 64 * 1024;
+        const ENTRY_CAP: usize = 64;
+        const ROW_CAP: usize = 200;
+        const CELL_CAP: usize = 2048;
+        const TOTAL_CAP: usize = 512 * 1024;
+        const DEADLINE: Duration = Duration::from_secs(30);
+        let deadline = Instant::now() + DEADLINE;
+        let mut report = ObservationReport::new(TOTAL_CAP);
+        let mut buf = vec![0u8; FILE_CAP];
+        report.put("=== RS53 OBSERVATION (secondary; labels state what is retained) ===\n");
+        report.put("thread: ");
+        report.put(std::thread::current().name().unwrap_or("<unnamed>"));
+        report.put("\nsource of this case: ");
+        report.put(&self.svn_url);
+        report.put("\n");
+        let observe = self.tmp.path().join("observe");
+        report.put("--- producer files (directory order; header names the writing source) ---\n");
+        match std::fs::read_dir(&observe) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                report.put("<observation directory absent: no producer capture reached it>\n")
+            }
+            Err(_) => report.put("<read failure: observation directory not listed>\n"),
+            Ok(mut entries) => {
+                let mut seen = 0usize;
+                loop {
+                    if seen == ENTRY_CAP {
+                        if entries.next().is_some() {
+                            report.put("<entry cap: more entries exist; not enumerated>\n");
+                        }
+                        break;
+                    }
+                    let Some(entry) = entries.next() else {
+                        break;
+                    };
+                    seen += 1;
+                    if !report.admit(deadline) {
+                        break;
+                    }
+                    let Ok(entry) = entry else {
+                        report.put("<read failure: directory entry>\n");
+                        continue;
+                    };
+                    report.put("--- ");
+                    report.put_lossy(entry.file_name().as_encoded_bytes());
+                    report.put(": ");
+                    let meta = match std::fs::symlink_metadata(entry.path()) {
+                        Ok(meta) if meta.file_type().is_file() => meta,
+                        Ok(_) => {
+                            report.put("not a regular file; not read\n");
+                            continue;
+                        }
+                        Err(_) => {
+                            report.put("<read failure: metadata>\n");
                             continue;
                         }
                     };
-                    let n = stmt.column_count();
-                    let rows = stmt.query_map([], |row| {
-                        Ok((0..n)
-                            .map(|i| match row.get_ref(i) {
-                                Ok(v) => format!("{v:?}"),
-                                Err(e) => format!("<{e}>"),
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" | "))
-                    });
-                    match rows {
-                        Ok(rows) => {
-                            for (i, row) in rows.enumerate() {
-                                if i == ROW_CAP {
-                                    out += "<truncated: row cap reached>\n";
-                                    break;
-                                }
-                                match row {
-                                    Ok(row) => out += &format!("{row}\n"),
-                                    Err(e) => out += &format!("<{e}>\n"),
-                                }
+                    // Room is kept for this file's label (its name is at most a few
+                    // hundred bytes), so the retained bytes can be shown.
+                    let allowance = FILE_CAP.min(report.room().saturating_sub(1024));
+                    let mut file = match std::fs::File::open(entry.path()) {
+                        Ok(file) => file,
+                        Err(_) => {
+                            report.put("<read failure: open>\n");
+                            continue;
+                        }
+                    };
+                    let mut kept = 0usize;
+                    let mut failed = false;
+                    while kept < allowance {
+                        let Some(window) = buf.get_mut(kept..allowance) else {
+                            break;
+                        };
+                        match file.read(window) {
+                            Ok(0) => break,
+                            Ok(n) => kept += n,
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(_) => {
+                                failed = true;
+                                break;
                             }
                         }
-                        Err(e) => out += &format!("<{e}>\n"),
                     }
+                    drop(file);
+                    let retained = buf.get(..kept).unwrap_or(&[]);
+                    report.put("metadata size ");
+                    report.put_display(&meta.len());
+                    report.put(" bytes; retained ");
+                    report.put_display(&kept);
+                    report.put(" bytes");
+                    if failed {
+                        report.put(" before a read failure");
+                    }
+                    if (kept as u64) < meta.len() {
+                        report.put(" (prefix only: not complete content, no hash)");
+                    }
+                    report.put("; ");
+                    let header = retained
+                        .split(|b| *b == b'\n')
+                        .next()
+                        .and_then(|line| line.strip_prefix(b"# rs53-observe source="));
+                    match header {
+                        Some(rest) => {
+                            let source = rest.split(|b| *b == b' ').next().unwrap_or(&[]);
+                            if source == self.svn_url.as_bytes() {
+                                report.put("written for this case's source");
+                            } else {
+                                report.put(
+                                    "header source differs from this case's source: not attributed",
+                                );
+                            }
+                        }
+                        None => report.put("no producer header retained: not attributed"),
+                    }
+                    report.put(" ---\n");
+                    report.put_lossy(retained);
+                    report.put("\n");
                 }
             }
-            Err(e) => out += &format!("<database not opened: {e}>\n"),
         }
-        if out.len() > TOTAL_CAP {
-            let text = bounded(out.as_bytes(), TOTAL_CAP);
-            return text;
+        report.put("--- Git bare and bridge state ---\n");
+        report.put(
+            "<unavailable: would need a secondary subprocess; no admitted finite capture facility>\n",
+        );
+        if report.admit(deadline) {
+            report
+                .put("--- database (read-only, no create, no checkpoint; not Database::new) ---\n");
+            put_database_rows(&mut report, &self.db_path, ROW_CAP, CELL_CAP, deadline);
         }
-        out
+        report.finish()
     }
 }
 

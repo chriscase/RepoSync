@@ -365,45 +365,175 @@ fn select_revision_sections(
 }
 
 /// Observation-only capture for native fixtures: debug builds only, and only when
-/// `REPOSYNC_RS53_OBSERVE_DIR` is set. It writes the raw `svn diff` the producer
-/// actually read, the changed-path log it validated against, and the plan it
-/// actually computed (selected patch, endpoints, counts, effect, or hold detail).
-/// It never recomputes or alters a plan, and write failures are ignored.
+/// `REPOSYNC_RS53_OBSERVE_DIR` is set. It records what the producer actually read
+/// and planned: a prefix of the raw `svn diff`, the changed-path log it validated
+/// against, and the plan it computed (selected patch prefix, endpoints, counts and
+/// effect, or the hold detail). It never recomputes or alters a plan, and write
+/// failures are ignored.
+///
+/// Each file has a fixed byte allowance, checked before every append. The patch
+/// and diff bodies are written as prefixes of text the producer already holds,
+/// with no copy. Every file starts with one header line naming the SVN source and
+/// how many bytes were kept, so a reader can tell a prefix from complete content
+/// and can tell which source wrote it (the variable is process-wide). A revision
+/// planned again in a later cycle keeps only its last plan's files.
 #[cfg(debug_assertions)]
-fn observe_plan_53(change: &SvnChangeSet, raw: &str, outcome: &Result<PlanState, String>) {
+fn observe_plan_53(
+    source: &str,
+    change: &SvnChangeSet,
+    raw: &str,
+    outcome: &Result<PlanState, String>,
+) {
+    use std::io::Write as _;
+    const BODY_CAP: usize = 64 * 1024;
+    const PLAN_CAP: usize = 16 * 1024;
+    const SOURCE_CAP: usize = 512;
+    /// The longest char-boundary prefix of `text` within `cap` bytes.
+    fn cut(text: &str, cap: usize) -> &str {
+        let mut end = text.len().min(cap);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.get(..end).unwrap_or("")
+    }
+    /// Plan text with a fixed allowance. An item is appended whole only if it
+    /// fits; after the first that does not, every later item is counted as
+    /// omitted. Only the final detail may be kept as a prefix.
+    struct Plan {
+        text: String,
+        omitted: usize,
+        cut: bool,
+    }
+    impl Plan {
+        fn put(&mut self, parts: &[&str]) {
+            let need = parts
+                .iter()
+                .map(|p| p.len())
+                .sum::<usize>()
+                .saturating_add(1);
+            if self.omitted > 0 || self.text.len().saturating_add(need) > PLAN_CAP {
+                self.omitted += 1;
+                return;
+            }
+            for part in parts {
+                self.text.push_str(part);
+            }
+            self.text.push('\n');
+        }
+        fn put_prefix(&mut self, label: &str, detail: &str) {
+            let room = PLAN_CAP.saturating_sub(self.text.len().saturating_add(label.len() + 1));
+            if self.omitted > 0 || room == 0 {
+                self.omitted += 1;
+                return;
+            }
+            let kept = cut(detail, room);
+            self.cut = kept.len() < detail.len();
+            self.text.push_str(label);
+            self.text.push_str(kept);
+            self.text.push('\n');
+        }
+    }
     let Some(dir) = std::env::var_os("REPOSYNC_RS53_OBSERVE_DIR") else {
         return;
     };
     let dir = std::path::PathBuf::from(dir);
     let rev = change.revision;
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join(format!("r{rev}.raw.diff")), raw);
-    let log: Vec<(&str, &str, Option<&str>)> = change
-        .changed_files
-        .iter()
-        .map(|f| (f.path.as_str(), f.action.as_str(), f.rename_from.as_deref()))
-        .collect();
-    let summary = match outcome {
+    let source = cut(source, SOURCE_CAP);
+    // Bounded by construction: the cut source, a fixed label and a few numbers.
+    let header = |kind: &str, kept: usize, total: usize, extent: &str| {
+        format!(
+            "# rs53-observe source={source} revision={rev} kind={kind} kept={kept} of {total} bytes ({extent})\n"
+        )
+    };
+    let write_prefix = |kind: &str, body: &str| {
+        let kept = body.len().min(BODY_CAP);
+        let Some(prefix) = body.as_bytes().get(..kept) else {
+            return;
+        };
+        let extent = if kept < body.len() {
+            "prefix only, not complete content"
+        } else {
+            "complete"
+        };
+        if let Ok(mut file) = std::fs::File::create(dir.join(format!("r{rev}.{kind}"))) {
+            let _ = file.write_all(header(kind, kept, body.len(), extent).as_bytes());
+            let _ = file.write_all(prefix);
+        }
+    };
+    write_prefix("raw.diff", raw);
+    let mut plan = Plan {
+        text: String::with_capacity(PLAN_CAP),
+        omitted: 0,
+        cut: false,
+    };
+    plan.put(&["log entries: ", &change.changed_files.len().to_string()]);
+    for f in &change.changed_files {
+        let from = f.rename_from.as_deref().unwrap_or("");
+        plan.put(&[
+            "log ",
+            f.action.as_str(),
+            " ",
+            f.path.as_str(),
+            " from=",
+            from,
+        ]);
+    }
+    match outcome {
         Ok(PlanState::Ready {
             effect,
             selected_patch,
             files,
             counts,
         }) => {
-            let _ = std::fs::write(dir.join(format!("r{rev}.selected.patch")), selected_patch);
-            let endpoints: Vec<(&str, &str, bool)> = files
-                .iter()
-                .map(|f| (f.path.as_str(), f.action.as_str(), f.is_binary))
-                .collect();
-            format!("effect={effect:?}\ncounts={counts:?}\nendpoints={endpoints:?}\n")
+            let effect = match effect {
+                SelectedEffect::Content => "Content",
+                SelectedEffect::Zero => "Zero",
+            };
+            plan.put(&["effect=", effect]);
+            plan.put(&[
+                "counts source=",
+                &counts.source.to_string(),
+                " included=",
+                &counts.included.to_string(),
+                " excluded=",
+                &counts.excluded.to_string(),
+            ]);
+            plan.put(&["endpoints: ", &files.len().to_string()]);
+            for f in files {
+                let kind = if f.is_binary { "binary" } else { "text" };
+                plan.put(&[
+                    "endpoint ",
+                    f.action.as_str(),
+                    " ",
+                    f.path.as_str(),
+                    " ",
+                    kind,
+                ]);
+            }
+            write_prefix("selected.patch", selected_patch);
         }
-        Ok(other) => format!("state={other:?}\n"),
-        Err(detail) => format!("held={detail}\n"),
+        Ok(PlanState::Held(detail)) => plan.put_prefix("state=Held detail=", detail),
+        Ok(PlanState::Pending) => plan.put(&["state=Pending"]),
+        Err(detail) => plan.put_prefix("held=", detail),
+    }
+    if !matches!(outcome, Ok(PlanState::Ready { .. })) {
+        // A revision re-planned in a later cycle keeps only its last plan: no
+        // selected patch from an earlier plan is left beside it.
+        let _ = std::fs::remove_file(dir.join(format!("r{rev}.selected.patch")));
+    }
+    let extent = match (plan.omitted, plan.cut) {
+        (0, false) => "complete".to_owned(),
+        (0, true) => "the detail is a prefix only, not complete content".to_owned(),
+        (n, _) => format!(
+            "{n} items not written, from the first that exceeded the {PLAN_CAP}-byte allowance"
+        ),
     };
-    let _ = std::fs::write(
-        dir.join(format!("r{rev}.plan.txt")),
-        format!("revision={rev}\nlog={log:?}\n{summary}"),
-    );
+    if let Ok(mut file) = std::fs::File::create(dir.join(format!("r{rev}.plan.txt"))) {
+        let len = plan.text.len();
+        let _ = file.write_all(header("plan.txt", len, len, &extent).as_bytes());
+        let _ = file.write_all(plan.text.as_bytes());
+    }
 }
 
 fn policy_identity(policy_snapshot: &str) -> String {
@@ -506,7 +636,7 @@ impl SyncEngine {
             .map_err(|e| format!("svn diff read failed: {e}"))?;
         let outcome = self.plan_from_diff_53(svn, change, &raw).await;
         #[cfg(debug_assertions)]
-        observe_plan_53(change, &raw, &outcome);
+        observe_plan_53(svn.url(), change, &raw, &outcome);
         outcome
     }
 
