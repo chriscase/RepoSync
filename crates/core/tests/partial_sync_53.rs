@@ -505,84 +505,114 @@ impl Drop for Fixture {
 }
 
 impl Fixture {
+    /// Secondary, bounded, read-only evidence. It never panics (no unwrap on any
+    /// path), so it cannot mask the failing assertion, whose message the panic hook
+    /// has already printed. Each git command keeps its own stdout, stderr and exit.
     fn observations(&self) -> String {
-        let quiet = |dir: &Path, args: &[&str]| -> String {
+        const FILE_CAP: usize = 64 * 1024;
+        const ROW_CAP: usize = 200;
+        const TOTAL_CAP: usize = 512 * 1024;
+        fn bounded(bytes: &[u8], cap: usize) -> String {
+            let shown = &bytes[..bytes.len().min(cap)];
+            let mut text = String::from_utf8_lossy(shown).into_owned();
+            if bytes.len() > cap {
+                text += &format!("\n<truncated: {} of {} bytes shown>\n", cap, bytes.len());
+            }
+            text
+        }
+        let git = |dir: &Path, args: &[&str]| -> String {
             match Command::new("git").args(args).current_dir(dir).output() {
                 Ok(out) => format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
+                    "exit={:?}\nstdout:\n{}stderr:\n{}",
+                    out.status.code(),
+                    bounded(&out.stdout, FILE_CAP),
+                    bounded(&out.stderr, FILE_CAP)
                 ),
-                Err(e) => format!("<git failed: {e}>"),
+                Err(e) => format!("<git not run: {e}>\n"),
             }
         };
-        let bare = self.bare.to_str().unwrap_or_default();
-        let mut out = String::from("=== RS53 OBSERVATION (read-only) ===\n");
-        let observe = self.tmp.path().join("observe");
-        let mut files: Vec<_> = std::fs::read_dir(&observe)
+        let bare = self.bare.to_string_lossy().into_owned();
+        let mut out = String::from("=== RS53 OBSERVATION (secondary, read-only, bounded) ===\n");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(self.tmp.path().join("observe"))
             .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
             .unwrap_or_default();
         files.sort();
         for file in files {
+            let bytes = std::fs::read(&file).unwrap_or_default();
             out += &format!(
                 "--- producer {} ---\n{}\n",
                 file.display(),
-                std::fs::read_to_string(&file).unwrap_or_default()
+                bounded(&bytes, FILE_CAP)
             );
         }
         out += "--- bare main: commit tree subject ---\n";
-        out += &quiet(
+        out += &git(
             self.tmp.path(),
-            &["--git-dir", bare, "log", "--format=%H %T %s", "main"],
+            &["--git-dir", &bare, "log", "--format=%H %T %s", "main"],
         );
         out += "--- bare main tree ---\n";
-        out += &quiet(
+        out += &git(
             self.tmp.path(),
-            &["--git-dir", bare, "ls-tree", "-r", "main"],
+            &["--git-dir", &bare, "ls-tree", "-r", "main"],
         );
         out += "--- bridge index ---\n";
-        out += &quiet(&self.git_work, &["ls-files", "-s"]);
+        out += &git(&self.git_work, &["ls-files", "-s"]);
         out += "--- bridge worktree status ---\n";
-        out += &quiet(
+        out += &git(
             &self.git_work,
             &["status", "--porcelain=v1", "--untracked-files=all"],
         );
-        if let Ok(db) = Database::new(&self.db_path) {
-            let conn = db.conn();
-            for sql in [
-                "SELECT id, last_svn_rev, last_git_sha, scope_uuid, allowed_paths, blocked_patterns FROM repositories",
-                "SELECT svn_rev, git_sha, direction, status FROM sync_records ORDER BY rowid",
-                "SELECT svn_rev, git_sha, direction, repo_id FROM commit_map ORDER BY id",
-                "SELECT * FROM canonical_checkpoints",
-                "SELECT * FROM canonical_mapping_outcomes",
-                "SELECT key, value FROM kv_state WHERE key LIKE '%git%' OR key LIKE '%svn_rev%' OR key LIKE 'team_cycle_mapping%' ORDER BY key",
-            ] {
-                out += &format!("--- {sql} ---\n");
-                match conn.prepare(sql) {
-                    Ok(mut stmt) => {
-                        let n = stmt.column_count();
-                        let rows = stmt.query_map([], |row| {
-                            Ok((0..n)
-                                .map(|i| match row.get_ref(i) {
-                                    Ok(v) => format!("{v:?}"),
-                                    Err(e) => format!("<{e}>"),
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" | "))
-                        });
-                        match rows {
-                            Ok(rows) => {
-                                for row in rows.flatten() {
-                                    out += &row;
-                                    out += "\n";
+        match Database::new(&self.db_path) {
+            Ok(db) => {
+                let conn = db.conn();
+                for sql in [
+                    "SELECT id, last_svn_rev, last_git_sha, scope_uuid, allowed_paths, blocked_patterns FROM repositories",
+                    "SELECT id, svn_rev, git_sha, direction, status FROM sync_records ORDER BY rowid",
+                    "SELECT svn_rev, git_sha, direction, repo_id FROM commit_map ORDER BY id",
+                    "SELECT * FROM canonical_checkpoints",
+                    "SELECT * FROM canonical_mapping_outcomes",
+                    "SELECT key, value FROM kv_state WHERE key LIKE '%git%' OR key LIKE '%svn_rev%' OR key LIKE 'team_cycle_mapping%' ORDER BY key",
+                ] {
+                    out += &format!("--- {sql} ---\n");
+                    let mut stmt = match conn.prepare(sql) {
+                        Ok(stmt) => stmt,
+                        Err(e) => {
+                            out += &format!("<{e}>\n");
+                            continue;
+                        }
+                    };
+                    let n = stmt.column_count();
+                    let rows = stmt.query_map([], |row| {
+                        Ok((0..n)
+                            .map(|i| match row.get_ref(i) {
+                                Ok(v) => format!("{v:?}"),
+                                Err(e) => format!("<{e}>"),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" | "))
+                    });
+                    match rows {
+                        Ok(rows) => {
+                            for (i, row) in rows.enumerate() {
+                                if i == ROW_CAP {
+                                    out += "<truncated: row cap reached>\n";
+                                    break;
+                                }
+                                match row {
+                                    Ok(row) => out += &format!("{row}\n"),
+                                    Err(e) => out += &format!("<{e}>\n"),
                                 }
                             }
-                            Err(e) => out += &format!("<{e}>\n"),
                         }
+                        Err(e) => out += &format!("<{e}>\n"),
                     }
-                    Err(e) => out += &format!("<{e}>\n"),
                 }
             }
+            Err(e) => out += &format!("<database not opened: {e}>\n"),
+        }
+        if out.len() > TOTAL_CAP {
+            let text = bounded(out.as_bytes(), TOTAL_CAP);
+            return text;
         }
         out
     }
@@ -619,8 +649,9 @@ fn scope_and_generation(engine: &SyncEngine) -> (String, i64) {
 /// The team publication record of `rev`, equal to `sha` everywhere: exactly one
 /// applied svn_to_git `sync_records` row; the canonical AppliedAndVerified outcome
 /// in the current scope/generation; the push journal's observed SHA and tree.
-/// Team mode writes no applied legacy `commit_map` row, and an applied revision
-/// has no NULL row either.
+/// The team publication finalizer (`git_push_operations::finalize_tx`) inserts no
+/// applied `commit_map` row; imports and other legacy paths do populate that table.
+/// An applied revision has no NULL row either.
 fn assert_team_applied(engine: &SyncEngine, fx: &Fixture, rev: i64, sha: &str) {
     let applied: Vec<String> = {
         let conn = engine.db().conn();
