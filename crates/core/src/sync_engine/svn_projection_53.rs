@@ -108,6 +108,17 @@ struct ContentFacts {
     added: bool,
     deleted: bool,
     binary: bool,
+    hunks: bool,
+}
+
+impl ContentFacts {
+    /// A content section changes Git content only with a hunk, a binary
+    /// marker, or an add/delete of the file. SVN prints a header-only
+    /// `Index:` section (no hunk) for a property-only change; that is not
+    /// file content.
+    fn has_git_effect(self) -> bool {
+        self.hunks || self.binary || self.added || self.deleted
+    }
 }
 
 fn content_facts(section: &DiffSection) -> Result<ContentFacts, String> {
@@ -116,6 +127,7 @@ fn content_facts(section: &DiffSection) -> Result<ContentFacts, String> {
     let new = format!("+++ {}\t(", section.path);
     for line in section.text.lines().skip(1) {
         if line.starts_with("@@") {
+            facts.hunks = true;
             break;
         }
         if line.starts_with("Cannot display: file marked as a binary type.") {
@@ -369,7 +381,12 @@ impl SyncEngine {
         let sections = split_svn_diff(&raw)?;
         let mut facts = Vec::with_capacity(sections.len());
         for section in &sections {
-            if is_root(&section.path) && section.kind == SectionKind::Content {
+            // The branch root has no Git file. A header-only root section
+            // (a root property change, e.g. merge metadata) is allowed.
+            if is_root(&section.path)
+                && section.kind == SectionKind::Content
+                && content_facts(section)?.has_git_effect()
+            {
                 return Err("svn diff shows file content for the branch root".into());
             }
             if !is_root(&section.path)
@@ -449,7 +466,7 @@ impl SyncEngine {
                 Some(f) if f.deleted => "D",
                 _ => "M",
             };
-            if let Some(f) = fact {
+            if let Some(f) = fact.filter(|f| f.has_git_effect()) {
                 selected_content = true;
                 files.retain(|file| file.path != section.path);
                 files.push(ChangedFile {
@@ -880,6 +897,31 @@ mod tests {
         )
         .unwrap();
         assert!(content_facts(&binary[0]).unwrap().binary);
+    }
+
+    #[test]
+    fn header_only_section_of_a_property_change_has_no_git_effect() {
+        let raw = "Index: team-a/a.txt\n===================================================================\n--- team-a/a.txt\t(revision 2)\n+++ team-a/a.txt\t(revision 3)\n\nProperty changes on: team-a/a.txt\n___________________________________________________________________\nAdded: custom:note\n## -0,0 +1 ##\n+value\n\\ No newline at end of property\n";
+        let sections = split_svn_diff(raw).unwrap();
+        assert_eq!(sections.len(), 2);
+        let facts = content_facts(&sections[0]).unwrap();
+        assert!(!facts.has_git_effect(), "{facts:?}");
+        assert_eq!(property_names(&sections[1]), vec!["custom:note"]);
+        let empty_add = split_svn_diff(
+            "Index: e.txt\n====\n--- e.txt\t(nonexistent)\n+++ e.txt\t(revision 2)\n",
+        )
+        .unwrap();
+        assert!(content_facts(&empty_add[0]).unwrap().has_git_effect());
+        let sections = split_svn_diff(MIXED).unwrap();
+        assert!(content_facts(&sections[1]).unwrap().has_git_effect());
+    }
+
+    #[test]
+    fn root_property_header_has_no_git_effect() {
+        let raw = "Index: .\n====\n--- .\t(revision 4)\n+++ .\t(revision 5)\n\nProperty changes on: .\n___\nModified: svn:mergeinfo\n";
+        let sections = split_svn_diff(raw).unwrap();
+        assert!(is_root(&sections[0].path) && is_root(&sections[1].path));
+        assert!(!content_facts(&sections[0]).unwrap().has_git_effect());
     }
 
     #[test]

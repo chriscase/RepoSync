@@ -57,8 +57,8 @@ Selected effect:
 
 | Selected evidence | Result |
 |---|---|
-| Any selected content section | **Content**: only the selected sections feed the unchanged apply/LFS/commit/push/observe/finalizer path |
-| No selected content; only plain property, empty-directory or root metadata changes | **Zero**: filtered finalization |
+| A selected content section with a hunk, a binary marker, or a file add/delete | **Content**: only the selected sections feed the unchanged apply/LFS/commit/push/observe/finalizer path |
+| No selected content; only plain property, empty-directory or root metadata changes (SVN's header-only `Index:` section for a property change carries no content) | **Zero**: filtered finalization |
 | No selected content, but a selected `svn:executable` / `svn:special` change | **Held**: Git meaning without a Git conversion |
 | Unparseable diff, uncovered section, missing evidence, read/export failure | **Held** |
 
