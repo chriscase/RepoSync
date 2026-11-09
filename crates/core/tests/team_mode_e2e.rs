@@ -9799,6 +9799,25 @@ async fn candidate_r10_policy_split_cursor_filtered_commit_rejected() {
         pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
         1
     );
+    // #53: engine path rules must equal the repository's admitted policy.
+    // Admit them on the actual repository row (allowed_paths JSON, blocked
+    // NULL) and read them back before the original setter.
+    {
+        let allowed: Vec<String> = vec!["allow/".into()];
+        let encoded = serde_json::to_string(&allowed).unwrap();
+        let db = pair.engine.db();
+        let updated = db
+            .conn()
+            .execute(
+                "UPDATE repositories SET allowed_paths = ?1, blocked_patterns = ?2 WHERE id = ?3",
+                rusqlite::params![encoded, None::<String>, pair.repo_id],
+            )
+            .unwrap();
+        assert_eq!(updated, 1, "exactly one repository row admits the policy");
+        let row = db.get_repository(&pair.repo_id).unwrap().unwrap();
+        assert_eq!(row.allowed_paths.as_deref(), Some(r#"["allow/"]"#));
+        assert_eq!(row.blocked_patterns, None);
+    }
     pair.engine.set_path_rules(vec!["allow/".into()], vec![]);
     let filtered = pair.developer_commit(
         "blocked.txt",
@@ -9812,7 +9831,7 @@ async fn candidate_r10_policy_split_cursor_filtered_commit_rejected() {
     );
     let svn_rev = svn_commit_file(
         &pair.wc,
-        "origin.txt",
+        "allow/incoming.txt",
         "SVN after filtered Git\n",
         "Incoming after filtered Git",
     );
@@ -12235,7 +12254,8 @@ async fn assert_git_rename_svn_divergence_stops_before_apply(
         .find(|c| c.file_path == conflict_path)
         .unwrap_or_else(|| {
             panic!(
-                "expected persisted conflict for {conflict_path}, got {:?}",
+                "expected persisted conflict for {conflict_path}, got {:?}; \
+                 sync cycle result: {sync_result:?}",
                 conflicts
                     .iter()
                     .map(|c| (&c.file_path, c.conflict_type.as_str()))
@@ -12286,6 +12306,25 @@ async fn candidate_rsc02_svn_delete_git_rename_in_scope_conflict_stops_before_ap
         pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
         1
     );
+    // #53: engine path rules must equal the repository's admitted policy.
+    // Admit them on the actual repository row (allowed_paths JSON, blocked
+    // NULL) and read them back before the original setter.
+    {
+        let allowed: Vec<String> = vec!["team".into()];
+        let encoded = serde_json::to_string(&allowed).unwrap();
+        let db = pair.engine.db();
+        let updated = db
+            .conn()
+            .execute(
+                "UPDATE repositories SET allowed_paths = ?1, blocked_patterns = ?2 WHERE id = ?3",
+                rusqlite::params![encoded, None::<String>, pair.repo_id],
+            )
+            .unwrap();
+        assert_eq!(updated, 1, "exactly one repository row admits the policy");
+        let row = db.get_repository(&pair.repo_id).unwrap().unwrap();
+        assert_eq!(row.allowed_paths.as_deref(), Some(r#"["team"]"#));
+        assert_eq!(row.blocked_patterns, None);
+    }
     pair.engine.set_path_rules(vec!["team".into()], Vec::new());
     let update = Command::new("svn")
         .args(["update", pair.wc.to_str().unwrap(), "--non-interactive"])
@@ -12308,6 +12347,25 @@ async fn candidate_rsc02_svn_rename_git_rename_conflict_stops_before_apply() {
         pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
         1
     );
+    // #53: engine path rules must equal the repository's admitted policy.
+    // Admit them on the actual repository row (allowed_paths JSON, blocked
+    // NULL) and read them back before the original setter.
+    {
+        let allowed: Vec<String> = vec!["team".into()];
+        let encoded = serde_json::to_string(&allowed).unwrap();
+        let db = pair.engine.db();
+        let updated = db
+            .conn()
+            .execute(
+                "UPDATE repositories SET allowed_paths = ?1, blocked_patterns = ?2 WHERE id = ?3",
+                rusqlite::params![encoded, None::<String>, pair.repo_id],
+            )
+            .unwrap();
+        assert_eq!(updated, 1, "exactly one repository row admits the policy");
+        let row = db.get_repository(&pair.repo_id).unwrap().unwrap();
+        assert_eq!(row.allowed_paths.as_deref(), Some(r#"["team"]"#));
+        assert_eq!(row.blocked_patterns, None);
+    }
     pair.engine.set_path_rules(vec!["team".into()], Vec::new());
     let update = Command::new("svn")
         .args(["update", pair.wc.to_str().unwrap(), "--non-interactive"])
@@ -14791,6 +14849,25 @@ async fn candidate_echo_generation_reset_split_cursor_not_ambiguous() {
         pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
         1
     );
+    // #53: engine path rules must equal the repository's admitted policy.
+    // Admit them on the actual repository row (allowed_paths JSON, blocked
+    // NULL) and read them back before the original setter.
+    {
+        let allowed: Vec<String> = vec!["allow/".into()];
+        let encoded = serde_json::to_string(&allowed).unwrap();
+        let db = pair.engine.db();
+        let updated = db
+            .conn()
+            .execute(
+                "UPDATE repositories SET allowed_paths = ?1, blocked_patterns = ?2 WHERE id = ?3",
+                rusqlite::params![encoded, None::<String>, pair.repo_id],
+            )
+            .unwrap();
+        assert_eq!(updated, 1, "exactly one repository row admits the policy");
+        let row = db.get_repository(&pair.repo_id).unwrap().unwrap();
+        assert_eq!(row.allowed_paths.as_deref(), Some(r#"["allow/"]"#));
+        assert_eq!(row.blocked_patterns, None);
+    }
     pair.engine.set_path_rules(vec!["allow/".into()], vec![]);
     let _filtered_gen1 = pair.developer_commit(
         "blocked.txt",
