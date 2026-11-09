@@ -1618,10 +1618,81 @@ pub(crate) fn pin_identity_difference(
     (observed.url != pinned_url).then(|| format!("url: {} != pinned {pinned_url}", observed.url))
 }
 
+/// Every retained snapshot claim of the repository, whatever commit it names:
+/// - each `snapshot-import:` origin row;
+/// - each snapshot-import journal of this repository that is completed or names
+///   any Git commit (local, confirmed or intended).
+///
+/// A snapshot journal that never named a commit and never completed claims no
+/// baseline. Malformed or unsupported journal documents are errors.
+fn retained_snapshot_claims_53(
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<Vec<String>, DatabaseError> {
+    use crate::db::import_operations::{ImportOperation, ImportOperationState};
+    let mut claims = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, git_sha FROM sync_records \
+             WHERE repo_id = ?1 AND substr(id, 1, 16) = 'snapshot-import:' ORDER BY id",
+        )?;
+        let rows = stmt.query_map([repo_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (id, sha) = row?;
+            claims.push(format!("origin {id} -> {sha:?}"));
+        }
+    }
+    let prefix = "import_operation_v1:document:";
+    let mut stmt = tx.prepare(
+        "SELECT key, value FROM kv_state WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key",
+    )?;
+    let rows = stmt.query_map([prefix], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (name, raw) = row?;
+        let op: ImportOperation = serde_json::from_str(&raw)
+            .map_err(|e| DatabaseError::Other(format!("invalid import operation {name}: {e}")))?;
+        if op.version != 1 {
+            return Err(DatabaseError::Other(format!(
+                "unsupported import operation version in {name}"
+            )));
+        }
+        let named: Vec<&str> = [
+            op.last_local_git_sha.as_deref(),
+            op.last_confirmed_git_sha.as_deref(),
+            op.intended_git_sha.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if op.repo_id == repo_id
+            && op.operation_type == "snapshot_import"
+            && (op.state == ImportOperationState::Completed || !named.is_empty())
+        {
+            claims.push(format!(
+                "journal {} ({:?}) -> {named:?}",
+                name.get(prefix.len()..).unwrap_or(""),
+                op.state
+            ));
+        }
+    }
+    Ok(claims)
+}
+
 /// Whether the next lineage pin is the first for the repository's current scope
 /// generation and, if so, what the records say about a snapshot origin of its
 /// Git baseline. One read transaction that is rolled back: it never writes and
-/// never mints a scope. `None`: not a first pin, or not snapshot-backed.
+/// never mints a scope.
+///
+/// `None` means not a first pin, or genuinely not snapshot-backed: there is no
+/// retained snapshot claim at all (the fresh or full-import path). Any retained
+/// claim makes absence of exact-baseline evidence a refusal, never fresh:
+/// - an empty baseline;
+/// - a baseline that no snapshot origin names, while other snapshot claims are
+///   retained.
 fn first_pin_snapshot_origin_53(
     db: &Database,
     repo_id: &str,
@@ -1650,21 +1721,19 @@ fn first_pin_snapshot_origin_53(
                 return Ok(None);
             }
         }
+        let claims = retained_snapshot_claims_53(&tx, repo_id)?;
         if baseline.is_empty() {
-            let retained: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sync_records WHERE repo_id = ?1 AND substr(id, 1, 16) = 'snapshot-import:')",
-                [repo_id],
-                |row| row.get(0),
-            )?;
-            return Ok(retained.then(|| {
-                SnapshotOriginEvidence::Refused(
-                    "snapshot-import origin records exist but the repository has no Git baseline"
-                        .into(),
-                )
+            return Ok((!claims.is_empty()).then(|| {
+                SnapshotOriginEvidence::Refused(format!(
+                    "the repository has no Git baseline but retains snapshot claims {claims:?}"
+                ))
             }));
         }
         match snapshot_origin_evidence(&tx, repo_id, &baseline)? {
-            SnapshotOriginEvidence::Absent => Ok(None),
+            SnapshotOriginEvidence::Absent if claims.is_empty() => Ok(None),
+            SnapshotOriginEvidence::Absent => Ok(Some(SnapshotOriginEvidence::Refused(format!(
+                "no snapshot origin names the Git baseline {baseline}, but the repository retains snapshot claims {claims:?}"
+            )))),
             other => Ok(Some(other)),
         }
     };
@@ -1872,5 +1941,250 @@ mod imported_origin_identity_tests {
                 .unwrap()
                 .starts_with("url")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // E3 first-pin controls: retained snapshot evidence that does not link the
+    // current Git baseline is never classified as fresh, and holds before any
+    // lineage row. Each refusal has a genuinely-no-snapshot control that pins.
+    // Rows are fabricated; this establishes classification, not provenance.
+    // -----------------------------------------------------------------------
+
+    const REPO: &str = "pair-e3";
+    const SCOPE: &str = "00000000-0000-4000-8000-0000000000e3";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const X: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    fn e3_db(dir: &std::path::Path, baseline: &str) -> Database {
+        let db = Database::new(dir.join("state.db")).unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid,last_svn_rev,last_git_sha)
+                 VALUES (?1,'pair','file:///svn/trunk','','','','r','main',1,'t','t',?2,?3,?4)",
+                params![REPO, SCOPE, if baseline.is_empty() { 0 } else { 2 }, baseline],
+            )
+            .unwrap();
+        db
+    }
+
+    fn journal(
+        op_id: &str,
+        operation_type: &str,
+        state: crate::db::import_operations::ImportOperationState,
+        sha: Option<&str>,
+    ) -> crate::db::import_operations::ImportOperation {
+        crate::db::import_operations::ImportOperation {
+            version: 1,
+            id: op_id.into(),
+            repo_id: REPO.into(),
+            operation_type: operation_type.into(),
+            initiator_id: "admin".into(),
+            request_id: "req".into(),
+            target_fingerprint: "fp".into(),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            state,
+            cancel_requested: false,
+            processed_revisions: 1,
+            total_revisions: Some(1),
+            local_commits: 1,
+            confirmed_batches: 1,
+            last_local_svn_rev: sha.map(|_| 2),
+            last_local_git_sha: sha.map(str::to_owned),
+            last_confirmed_svn_rev: sha.map(|_| 2),
+            last_confirmed_git_sha: sha.map(str::to_owned),
+            intended_ref: None,
+            intended_git_sha: None,
+            outcome_detail: None,
+            resume_authorized: false,
+            snapshot_pin: (operation_type == "snapshot_import").then(|| SnapshotPin {
+                svn_uuid: "uuid-1".into(),
+                canonical_url: "file:///svn/trunk".into(),
+                operative_rev: 2,
+                peg_rev: 2,
+                copy_from_path: None,
+                copy_from_rev: None,
+                requested: "2".into(),
+            }),
+            pending_commit_maps: Vec::new(),
+        }
+    }
+
+    fn put_journal(db: &Database, op: &crate::db::import_operations::ImportOperation) {
+        db.set_state(
+            &format!("import_operation_v1:document:{}", op.id),
+            &serde_json::to_string(op).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn put_origin(db: &Database, op_id: &str, sha: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+                 VALUES (?1, ?2, 2, ?3, 'svn_to_git', '', 'Verified SVN snapshot baseline', 't', 't', 'applied')",
+                params![format!("snapshot-import:{op_id}"), REPO, sha],
+            )
+            .unwrap();
+    }
+
+    fn lineage_count(db: &Database) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM canonical_lineage WHERE repo_id = ?1",
+                [REPO],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The SVN client is never read on these paths: a refusal holds before any
+    /// SVN read, and a genuinely-no-snapshot pair needs none.
+    fn unread_svn() -> SvnClient {
+        SvnClient::new("file:///rs53-e3-not-read", "", "")
+    }
+
+    fn trunk_identity() -> LiveSvnIdentity {
+        LiveSvnIdentity {
+            uuid: "uuid-1".into(),
+            root_url: "file:///svn".into(),
+            url: "file:///svn/trunk".into(),
+            branch_path: "trunk".into(),
+            incarnation_created_rev: 1,
+            copy_from_path: None,
+            copy_from_rev: None,
+        }
+    }
+
+    async fn assert_held_before_first_pin(db: &Database, needle: &str) {
+        use crate::db::import_operations::SnapshotOriginEvidence;
+        match first_pin_snapshot_origin_53(db, REPO).unwrap() {
+            Some(SnapshotOriginEvidence::Refused(detail)) => {
+                assert!(detail.contains(needle), "{needle:?} in {detail}")
+            }
+            other => panic!("incomplete retained snapshot evidence must refuse, got {other:?}"),
+        }
+        let held = guard_first_snapshot_pin_53(db, REPO, &unread_svn(), &trunk_identity())
+            .await
+            .unwrap_err();
+        match held {
+            SyncError::HistoryBlocked { reason, .. } => {
+                assert_eq!(reason, "svn_snapshot_origin_unproved")
+            }
+            other => panic!("expected the existing hold, got {other:?}"),
+        }
+        assert_eq!(lineage_count(db), 0, "no first lineage pin");
+    }
+
+    #[tokio::test]
+    async fn journal_only_snapshot_claim_with_an_empty_baseline_is_not_fresh_and_never_pins() {
+        use crate::db::import_operations::ImportOperationState;
+        // A completed snapshot journal survives while its origin row is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let db = e3_db(dir.path(), "");
+        put_journal(
+            &db,
+            &journal(
+                "op-orphan",
+                "snapshot_import",
+                ImportOperationState::Completed,
+                Some(B),
+            ),
+        );
+        assert_held_before_first_pin(&db, "no Git baseline").await;
+        assert_held_before_first_pin(&db, "op-orphan").await;
+        // Control: the genuinely fresh pair (no snapshot claim) still pins.
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh = e3_db(fresh_dir.path(), "");
+        assert!(first_pin_snapshot_origin_53(&fresh, REPO)
+            .unwrap()
+            .is_none());
+        guard_first_snapshot_pin_53(&fresh, REPO, &unread_svn(), &trunk_identity())
+            .await
+            .unwrap();
+        adopt_or_hold_live_svn_identity(&fresh, REPO, &trunk_identity()).unwrap();
+        assert_eq!(lineage_count(&fresh), 1, "the fresh path pins once");
+    }
+
+    #[tokio::test]
+    async fn retained_snapshot_origin_for_another_baseline_is_not_fresh_and_never_pins() {
+        use crate::db::import_operations::{
+            snapshot_origin_evidence, ImportOperationState, SnapshotOriginEvidence,
+        };
+        // The original snapshot published B; the current baseline is X.
+        let dir = tempfile::tempdir().unwrap();
+        let db = e3_db(dir.path(), X);
+        put_journal(
+            &db,
+            &journal(
+                "op-original",
+                "snapshot_import",
+                ImportOperationState::Completed,
+                Some(B),
+            ),
+        );
+        put_origin(&db, "op-original", B);
+        assert_eq!(
+            snapshot_origin_evidence(&db.conn(), REPO, X).unwrap(),
+            SnapshotOriginEvidence::Absent,
+            "exact-baseline evidence alone is absent for X"
+        );
+        assert_held_before_first_pin(&db, "no snapshot origin names the Git baseline").await;
+        // Control: a genuine full import of X, with only a snapshot attempt that
+        // never named a commit, is not snapshot-backed and pins.
+        let full_dir = tempfile::tempdir().unwrap();
+        let full = e3_db(full_dir.path(), X);
+        put_journal(
+            &full,
+            &journal(
+                "op-full",
+                "full_import",
+                ImportOperationState::Completed,
+                Some(X),
+            ),
+        );
+        put_journal(
+            &full,
+            &journal(
+                "op-abandoned",
+                "snapshot_import",
+                ImportOperationState::Cancelled,
+                None,
+            ),
+        );
+        record_independently_established_svn_uuid(&full, REPO, "uuid-1").unwrap();
+        assert!(first_pin_snapshot_origin_53(&full, REPO).unwrap().is_none());
+        guard_first_snapshot_pin_53(&full, REPO, &unread_svn(), &trunk_identity())
+            .await
+            .unwrap();
+        adopt_or_hold_live_svn_identity(&full, REPO, &trunk_identity()).unwrap();
+        assert_eq!(lineage_count(&full), 1, "the full-import path pins once");
+    }
+
+    #[tokio::test]
+    async fn incomplete_retained_claims_never_pass_and_malformed_journals_are_errors() {
+        use crate::db::import_operations::ImportOperationState;
+        // A snapshot journal that published locally but never completed, with no
+        // origin row, beside an unrelated baseline.
+        let dir = tempfile::tempdir().unwrap();
+        let db = e3_db(dir.path(), X);
+        put_journal(
+            &db,
+            &journal(
+                "op-local",
+                "snapshot_import",
+                ImportOperationState::ReconciliationRequired,
+                Some(B),
+            ),
+        );
+        assert_held_before_first_pin(&db, "op-local").await;
+        db.set_state("import_operation_v1:document:op-broken", "{not json")
+            .unwrap();
+        assert!(
+            first_pin_snapshot_origin_53(&db, REPO).is_err(),
+            "a malformed journal is an error, never fresh"
+        );
+        assert_eq!(lineage_count(&db), 0);
     }
 }
