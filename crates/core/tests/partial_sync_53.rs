@@ -1079,7 +1079,7 @@ async fn filtered_finalizer_write_fault_rolls_back_atomically_then_fresh_cycle_f
     {
         let reopened = Database::new(&fx.db_path).unwrap();
         reopened.initialize().unwrap();
-        let _recovery_fence = writer_fence::claim(&reopened, &fx.data_dir).unwrap();
+        let recovery_fence = writer_fence::claim(&reopened, &fx.data_dir).unwrap();
         reopened.hold_interrupted_team_cycle_mappings().unwrap();
         assert!(reopened
             .active_team_cycle_mapping_operation(REPO)
@@ -1089,7 +1089,15 @@ async fn filtered_finalizer_write_fault_rolls_back_atomically_then_fresh_cycle_f
             .conn()
             .execute_batch("DROP TRIGGER rs53_filtered_write_fault")
             .unwrap();
+        // Close the database first, then release the guard.
+        drop(reopened);
+        drop(recovery_fence);
     }
+    assert_eq!(
+        fence_lease(&fx.db_path),
+        None,
+        "the recovery reopen releases its fence before the next engine claims"
+    );
     let engine = fx.engine(&["team-a/"], &[]);
     let fresh = engine.run_sync_cycle().await.unwrap();
     assert_eq!(fresh.svn_to_git_count, 0);
