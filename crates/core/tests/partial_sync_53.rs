@@ -2312,3 +2312,221 @@ async fn recopying_the_imported_branch_from_the_same_source_holds_the_first_pin(
     assert_eq!(fx.svn_head(), 6);
     assert_first_pin_held(&fx, &imported, 4, "incarnation_created_rev: 3 != 6").await;
 }
+
+// ---------------------------------------------------------------------------
+// RS53-IMPORTED-ORIGIN-COVERAGE-EXTENSION-1: first-pin historical-unavailable
+// control. This is an INJECTED native subprocess-refusal control with a real
+// healthy SVN HEAD and the real first-pin entrypoint. It is not a real server
+// outage or authorization test, and it does not show that the refused
+// historical command reached the official binary (it never does). It uses the
+// existing `reliability-fixture` interposer of `SvnClient::svn_command`
+// unchanged.
+// ---------------------------------------------------------------------------
+
+/// Restores the previous values of the interposer variables when dropped.
+#[cfg(all(feature = "reliability-fixture", unix))]
+struct InterposerEnv {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+impl InterposerEnv {
+    fn install(root: &Path, script: &Path) -> Self {
+        let names = ["REPOSYNC_FIXTURE_ROOT", "REPOSYNC_IMPORT_SVN_BINARY"];
+        let saved = names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        std::env::set_var("REPOSYNC_FIXTURE_ROOT", root);
+        std::env::set_var("REPOSYNC_IMPORT_SVN_BINARY", script);
+        Self { saved }
+    }
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+impl Drop for InterposerEnv {
+    fn drop(&mut self) {
+        for (name, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+/// At most 64 KiB of the interposer's dispatch log.
+#[cfg(all(feature = "reliability-fixture", unix))]
+fn bounded_dispatch_log(path: &Path) -> String {
+    use std::io::Read;
+    let mut text = String::new();
+    if let Ok(file) = std::fs::File::open(path) {
+        let _ = file.take(64 * 1024).read_to_string(&mut text);
+    }
+    text
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn injected_refusal_of_the_historical_log_at_r_holds_the_real_first_pin_with_healthy_head() {
+    use reposync_core::db::lineage_checkpoints::verify_or_pin_live_svn_identity;
+    const SENTINEL: &str = "RS53-INJECTED-HISTORICAL-REFUSAL";
+    const REFUSED_STATUS: i32 = 97;
+    let _serial = serial().lock().await;
+    // 1. A genuine branch-path snapshot import at R = 2 (trunk created r1),
+    //    then a later revision H = 3 in the same incarnation.
+    let fx = Fixture::new_branch("trunk", false, BASELINE).await;
+    let snapshot_rev = 2;
+    let imported = fx.git_tip();
+    fx.write("team-a/later.txt", "same incarnation\n");
+    let head_rev = fx.commit("r3 in the same incarnation");
+    assert!(head_rev > snapshot_rev);
+    // The actual engine, database and writer fence stay alive; no cycle runs.
+    let engine = fx.engine(&["team-a/"], &[]);
+    assert!(lineage_rows(&engine).is_empty(), "no canonical lineage yet");
+    assert_eq!(svn_watermark(&engine), snapshot_rev);
+    let cursor = inbound_git_cursor(&engine);
+    assert_eq!(cursor.as_deref(), Some(imported.as_str()));
+    let records = sync_record_ids(&engine);
+    let mapped = rows(&engine);
+    let git = (fx.git_tip(), fx.git_commits());
+    // The configured fixture client with a genuine, false cancellation token
+    // (the interposer applies only to clients carrying one).
+    let svn = SvnClient::new(&fx.svn_url, "", "")
+        .with_cancel_signal(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    // 2. Before the fault: the official binary serves old-peg and HEAD reads.
+    svn.info_at_rev(snapshot_rev).await.unwrap();
+    assert!(!svn
+        .copy_history_at_rev(snapshot_rev)
+        .await
+        .unwrap()
+        .is_empty());
+    let before = svn.info().await.unwrap();
+    assert_eq!(before.latest_rev, head_rev);
+    assert!(!svn.copy_history_at_rev(head_rev).await.unwrap().is_empty());
+    // 3. A small script below a private canonical root refuses only the exact
+    //    dispatched argv of the historical log at R; every other argv execs
+    //    the absolute official SVN binary unchanged.
+    let official = run(fx.tmp.path(), "sh", &["-c", "command -v svn"]);
+    let official = std::fs::canonicalize(official.trim()).unwrap();
+    let root = fx.tmp.path().join("interposer-root");
+    std::fs::create_dir(&root).unwrap();
+    let root = std::fs::canonicalize(&root).unwrap();
+    let script = root.join("svn-refuse-historical.sh");
+    let dispatch_log = root.join("dispatch.log");
+    let target = reposync_core::svn::operand::literal_url(&fx.svn_url, Some(snapshot_rev)).unwrap();
+    let range = format!("{snapshot_rev}:1");
+    for value in [
+        &official.display().to_string(),
+        &dispatch_log.display().to_string(),
+        &target,
+    ] {
+        assert!(!value.contains('\''), "fixture paths are single-quote free");
+    }
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$#\" -eq 14 ] && [ \"$1\" = log ] && [ \"$2\" = --non-interactive ] \
+             && [ \"$3\" = --no-auth-cache ] && [ \"$4\" = --username ] && [ \"$5\" = '' ] \
+             && [ \"$6\" = --password ] && [ \"$7\" = '' ] && [ \"$8\" = --xml ] \
+             && [ \"$9\" = --verbose ] && [ \"${{10}}\" = --stop-on-copy ] && [ \"${{11}}\" = -r ] \
+             && [ \"${{12}}\" = '{range}' ] && [ \"${{13}}\" = -- ] && [ \"${{14}}\" = '{target}' ]; then\n\
+             printf 'REFUSED status={REFUSED_STATUS} argv=%s\\n' \"$*\" >> '{log}'\n\
+             printf '%s\\n' '{SENTINEL}' >&2\n\
+             exit {REFUSED_STATUS}\n\
+             fi\n\
+             printf 'DELEGATED argv=%s\\n' \"$*\" >> '{log}'\n\
+             exec '{official}' \"$@\"\n",
+            log = dispatch_log.display(),
+            official = official.display(),
+        ),
+    )
+    .unwrap();
+    let prior = (
+        std::env::var_os("REPOSYNC_FIXTURE_ROOT"),
+        std::env::var_os("REPOSYNC_IMPORT_SVN_BINARY"),
+    );
+    {
+        let _interposer = InterposerEnv::install(&root, &script);
+        // After installation, live HEAD info/history still delegate and succeed.
+        let live_info = svn.info().await.unwrap();
+        assert_eq!(live_info.latest_rev, head_rev);
+        assert!(!svn.copy_history_at_rev(head_rev).await.unwrap().is_empty());
+        let delegated = bounded_dispatch_log(&dispatch_log);
+        assert!(
+            delegated.lines().count() >= 2
+                && delegated.lines().all(|l| l.starts_with("DELEGATED ")),
+            "HEAD reads delegated to the official binary: {delegated}"
+        );
+        // 4. The real first-pin entrypoint, on the fixture's real database
+        //    under its retained fence, with genuine live info.
+        let held = verify_or_pin_live_svn_identity(engine.db(), REPO, &svn, &live_info)
+            .await
+            .unwrap_err();
+        let receipt = bounded_dispatch_log(&dispatch_log);
+        println!("RS53_INJECTED_REFUSAL_RECEIPT\n{receipt}");
+        // 5. The exact refused subprocess, the expected hold, and no effect.
+        match &held {
+            SyncError::HistoryBlocked { reason, detail } => {
+                assert_eq!(reason, "svn_incarnation_unproved", "{detail}");
+                assert!(detail.contains(SENTINEL), "{detail}");
+                assert!(
+                    detail.contains(&format!("exit {REFUSED_STATUS}")),
+                    "{detail}"
+                );
+                assert!(detail.contains(&format!("r{snapshot_rev}")), "{detail}");
+            }
+            other => panic!("expected the first-pin hold, got {other:?}"),
+        }
+        let refused: Vec<&str> = receipt
+            .lines()
+            .filter(|l| l.starts_with("REFUSED "))
+            .collect();
+        assert_eq!(
+            refused.len(),
+            1,
+            "exactly one subprocess refused: {receipt}"
+        );
+        assert!(
+            refused[0].contains(&format!("--stop-on-copy -r {range} -- {target}")),
+            "{receipt}"
+        );
+        assert!(
+            receipt
+                .lines()
+                .filter(|l| l.starts_with("DELEGATED "))
+                .any(|l| l.contains("info ") && l.contains(&target)),
+            "the historical info at R was delegated before the refused log: {receipt}"
+        );
+        assert!(
+            lineage_rows(&engine).is_empty(),
+            "no canonical lineage inserted"
+        );
+        assert_eq!(svn_watermark(&engine), snapshot_rev);
+        assert_eq!(inbound_git_cursor(&engine), cursor);
+        assert_eq!(sync_record_ids(&engine), records);
+        assert_eq!(rows(&engine), mapped);
+        assert_eq!((fx.git_tip(), fx.git_commits()), git);
+        assert_eq!(fx.svn_head(), head_rev);
+        // 6. `_interposer` restores the previous values here, before the
+        //    target-local serial guard is released at the end of the case.
+    }
+    assert_eq!(
+        (
+            std::env::var_os("REPOSYNC_FIXTURE_ROOT"),
+            std::env::var_os("REPOSYNC_IMPORT_SVN_BINARY"),
+        ),
+        prior,
+        "the interposer variables are restored"
+    );
+    // 7. Read-only old-peg reads succeed again once the fault is removed. The
+    //    durable hold is not cleared and the first pin is not retried.
+    svn.info_at_rev(snapshot_rev).await.unwrap();
+    assert!(!svn
+        .copy_history_at_rev(snapshot_rev)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(lineage_rows(&engine).is_empty());
+}

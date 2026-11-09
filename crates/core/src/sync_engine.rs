@@ -7881,6 +7881,414 @@ repo = "test/test-repo"
         assert_eq!(git_changes[0].path, "team/old.txt");
         assert!(matches!(git_changes[0].change_kind, ChangeKind::Deleted));
     }
+
+    // -----------------------------------------------------------------------
+    // RS53-IMPORTED-ORIGIN-COVERAGE-EXTENSION-1: witness-present reader cases.
+    // The witness is minted through the producer's own validators by the
+    // cfg(test) adapter; its two SVN observations are SYNTHETIC unit inputs,
+    // not native provenance. Each negative first proves the witness accepts,
+    // then varies only its named guard. No writer fence is claimed.
+    // -----------------------------------------------------------------------
+
+    struct WitnessReaderFixture {
+        engine: SyncEngine,
+        _git_dir: tempfile::TempDir,
+        imported: String,
+        emitted: String,
+    }
+
+    fn witness_svn_identity() -> crate::db::lineage_checkpoints::LiveSvnIdentity {
+        crate::db::lineage_checkpoints::LiveSvnIdentity {
+            uuid: "uuid-witness".into(),
+            root_url: "file:///svn".into(),
+            url: "file:///svn".into(),
+            branch_path: String::new(),
+            incarnation_created_rev: 1,
+            copy_from_path: None,
+            copy_from_rev: None,
+        }
+    }
+
+    /// Split inbound cursor B (a completed snapshot import at r1 pinned as the
+    /// lineage baseline) and emitted column X with an applied SVN-origin
+    /// record. `policy` admits `team-a/` on both the engine and the row;
+    /// `divergent` makes X not descend from B.
+    fn witness_reader_fixture(policy: bool, divergent: bool) -> WitnessReaderFixture {
+        use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
+        let (mut engine, git_dir) = team_echo_engine_with_git_dir("pair");
+        if policy {
+            engine.set_path_rules(vec!["team-a/".into()], Vec::new());
+        }
+        let repo_path = engine
+            .git_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .repo_path()
+            .to_path_buf();
+        let base = git_fixture_commit(&repo_path, "base.txt", "base\n", "base");
+        let imported = git_fixture_commit(&repo_path, "snapshot.txt", "snapshot\n", "snapshot B");
+        if divergent {
+            let switched = Command::new("git")
+                .args(["checkout", "-q", "-b", "emitted-elsewhere", &base])
+                .current_dir(&repo_path)
+                .status()
+                .unwrap();
+            assert!(switched.success());
+        }
+        let emitted = git_fixture_commit(&repo_path, "tip.txt", "tip\n", "svn emitted tip X");
+        let db = engine.db();
+        if policy {
+            db.conn()
+                .execute(
+                    "UPDATE repositories SET allowed_paths = '[\"team-a/\"]' WHERE id = 'pair'",
+                    [],
+                )
+                .unwrap();
+        }
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+                [&emitted],
+            )
+            .unwrap();
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(&db.conn(), "pair", &imported, "t")
+            .unwrap();
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), "pair").unwrap();
+        let generation = crate::db::nullable_commit_map::current_generation_read_only(
+            &db.conn(),
+            "pair",
+            &scope,
+        )
+        .unwrap();
+        let identity = witness_svn_identity();
+        crate::db::lineage_checkpoints::pin_canonical_lineage(
+            &db.conn(),
+            &crate::db::lineage_checkpoints::CanonicalLineage {
+                scope_uuid: scope,
+                generation,
+                repo_id: "pair".into(),
+                svn_uuid: identity.uuid.clone(),
+                svn_root_url: identity.root_url.clone(),
+                svn_url: identity.url.clone(),
+                svn_branch_path: identity.branch_path.clone(),
+                incarnation_created_rev: identity.incarnation_created_rev,
+                copy_from_path: None,
+                copy_from_rev: None,
+                git_baseline_sha: Some(imported.clone()),
+                git_ref: Some("main".into()),
+                projection_version: String::new(),
+                policy_hash: String::new(),
+            },
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+                 VALUES ('snapshot-import:op-witness', 'pair', 1, ?1, 'svn_to_git', '', 'Verified SVN snapshot baseline', 't', 't', 'applied')",
+                [&imported],
+            )
+            .unwrap();
+        let journal = crate::db::import_operations::ImportOperation {
+            version: 1,
+            id: "op-witness".into(),
+            repo_id: "pair".into(),
+            operation_type: "snapshot_import".into(),
+            initiator_id: "admin".into(),
+            request_id: "req".into(),
+            target_fingerprint: "fp".into(),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            state: crate::db::import_operations::ImportOperationState::Completed,
+            cancel_requested: false,
+            processed_revisions: 1,
+            total_revisions: Some(1),
+            local_commits: 1,
+            confirmed_batches: 1,
+            last_local_svn_rev: Some(1),
+            last_local_git_sha: Some(imported.clone()),
+            last_confirmed_svn_rev: Some(1),
+            last_confirmed_git_sha: Some(imported.clone()),
+            intended_ref: None,
+            intended_git_sha: None,
+            outcome_detail: None,
+            resume_authorized: false,
+            snapshot_pin: Some(crate::db::import_operations::SnapshotPin {
+                svn_uuid: identity.uuid.clone(),
+                canonical_url: identity.url.clone(),
+                operative_rev: 1,
+                peg_rev: 1,
+                copy_from_path: None,
+                copy_from_rev: None,
+                requested: "1".into(),
+            }),
+            pending_commit_maps: Vec::new(),
+        };
+        db.set_state(
+            "import_operation_v1:document:op-witness",
+            &serde_json::to_string(&journal).unwrap(),
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+        db.insert_sync_record(&SyncRecord {
+            id: "emitted-x".into(),
+            repo_id: Some("pair".into()),
+            svn_revision: Some(2),
+            git_hash: Some(emitted.clone()),
+            direction: SyncDirection::SvnToGit,
+            author: "dev".into(),
+            message: "emitted".into(),
+            timestamp: now,
+            synced_at: now,
+            status: SyncRecordStatus::Applied,
+        })
+        .unwrap();
+        WitnessReaderFixture {
+            engine,
+            _git_dir: git_dir,
+            imported,
+            emitted,
+        }
+    }
+
+    fn mint_witness<'a, 'db>(
+        engine: &'a SyncEngine,
+        window: &'a crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'db>,
+    ) -> svn_projection_53::ImportedOriginWitness53<'a, 'db> {
+        let observation = svn_projection_53::SyntheticSvnObservation53 {
+            historical_at_snapshot_rev: witness_svn_identity(),
+            live_at_head: witness_svn_identity(),
+        };
+        engine
+            .imported_origin_witness_from_synthetic_observation_53(window, &observation)
+            .unwrap()
+            .expect("the producer's validators accept the fixture's records")
+    }
+
+    fn assert_refused_by(result: Result<Option<String>, SyncError>, detail_needle: &str) {
+        match result {
+            Err(SyncError::HistoryBlocked { reason, detail }) => {
+                assert_eq!(reason, "ambiguous_checkpoint");
+                assert!(
+                    detail.contains(detail_needle),
+                    "{detail_needle:?} in {detail:?}"
+                );
+            }
+            other => panic!("expected the {detail_needle:?} guard refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn imported_origin_witness_reader_accepts_the_snapshot_cursor_only_through_the_witness_arm() {
+        let fx = witness_reader_fixture(true, false);
+        let window = fx
+            .engine
+            .db()
+            .begin_ordinary_writer_window(Some("pair"))
+            .unwrap();
+        let witness = mint_witness(&fx.engine, &window);
+        assert!(witness
+            .accepts(fx.engine.db(), "pair", &fx.imported, &fx.emitted)
+            .unwrap());
+        // Every competing handled-origin arm is false: rules are active (the
+        // old import arm is off), no applied Git→SVN record names B, B has no
+        // no-target receipt, and no reconciliation frontier exists.
+        let outbound: i64 = fx
+            .engine
+            .db()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_records WHERE git_sha = ?1 AND direction = 'git_to_svn'",
+                [&fx.imported],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbound, 0);
+        assert!(!fx
+            .engine
+            .checked_no_target_receipt("pair", &fx.imported)
+            .unwrap());
+        assert!(
+            !crate::db::late_pair_publish_operations::verified_reconciliation_frontier(
+                &fx.engine.db().conn(),
+                "pair",
+                &fx.imported,
+                &fx.engine.no_target_projection(),
+            )
+            .unwrap()
+        );
+        let before = checkpoint_authority_snapshot(&fx.engine);
+        assert_eq!(
+            fx.engine
+                .team_git_checkpoint_with(Some(&witness))
+                .unwrap()
+                .as_deref(),
+            Some(fx.imported.as_str()),
+            "the reader keeps B, never the emitted tip"
+        );
+        assert_eq!(
+            checkpoint_authority_snapshot(&fx.engine),
+            before,
+            "acceptance moves no cursor, mapping, receipt or row"
+        );
+        // The same records without the witness are refused: it is the only arm.
+        assert_refused_by(
+            fx.engine.team_git_checkpoint(),
+            "repository column and repository-scoped legacy cursor disagree",
+        );
+        assert_eq!(checkpoint_authority_snapshot(&fx.engine), before);
+    }
+
+    #[test]
+    fn imported_origin_witness_reader_still_refuses_an_emitted_column_not_descending_from_b() {
+        let fx = witness_reader_fixture(true, true);
+        let window = fx
+            .engine
+            .db()
+            .begin_ordinary_writer_window(Some("pair"))
+            .unwrap();
+        let witness = mint_witness(&fx.engine, &window);
+        assert!(witness
+            .accepts(fx.engine.db(), "pair", &fx.imported, &fx.emitted)
+            .unwrap());
+        let repo_path = fx
+            .engine
+            .git_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .repo_path()
+            .to_path_buf();
+        let ancestry = Command::new("git")
+            .args(["merge-base", "--is-ancestor", &fx.imported, &fx.emitted])
+            .current_dir(&repo_path)
+            .status()
+            .unwrap();
+        assert_eq!(
+            ancestry.code(),
+            Some(1),
+            "the varied guard: X does not descend from B"
+        );
+        let before = checkpoint_authority_snapshot(&fx.engine);
+        assert_refused_by(
+            fx.engine.team_git_checkpoint_with(Some(&witness)),
+            "repository column and repository-scoped legacy cursor disagree",
+        );
+        assert_eq!(checkpoint_authority_snapshot(&fx.engine), before);
+    }
+
+    #[test]
+    fn imported_origin_witness_reader_still_refuses_disagreeing_inbound_mirrors() {
+        let fx = witness_reader_fixture(true, false);
+        let window = fx
+            .engine
+            .db()
+            .begin_ordinary_writer_window(Some("pair"))
+            .unwrap();
+        let witness = mint_witness(&fx.engine, &window);
+        assert!(witness
+            .accepts(fx.engine.db(), "pair", &fx.imported, &fx.emitted)
+            .unwrap());
+        // The varied guard: an authoritative legacy inbound mirror that
+        // disagrees with the scoped cursor B.
+        fx.engine
+            .db()
+            .set_state(
+                crate::db::repo_scope_identity::LEGACY_REPO_ID_KV_READS_KEY,
+                "1",
+            )
+            .unwrap();
+        fx.engine
+            .db()
+            .set_state(&format!("last_git_sha_{}", "pair"), &fx.emitted)
+            .unwrap();
+        assert!(
+            crate::echo_receipt_scope::inbound_git_checkpoint_mirror_conflict(
+                fx.engine.db(),
+                "pair"
+            )
+            .unwrap()
+        );
+        let before = checkpoint_authority_snapshot(&fx.engine);
+        assert_refused_by(
+            fx.engine.team_git_checkpoint_with(Some(&witness)),
+            "repository inbound checkpoint mirrors disagree",
+        );
+        assert_eq!(checkpoint_authority_snapshot(&fx.engine), before);
+    }
+
+    #[test]
+    fn imported_origin_witness_reader_still_refuses_a_stale_verified_receipt_for_b() {
+        let fx = witness_reader_fixture(true, false);
+        let window = fx
+            .engine
+            .db()
+            .begin_ordinary_writer_window(Some("pair"))
+            .unwrap();
+        let witness = mint_witness(&fx.engine, &window);
+        assert!(witness
+            .accepts(fx.engine.db(), "pair", &fx.imported, &fx.emitted)
+            .unwrap());
+        // The varied guard: a verified no-target receipt for B from another
+        // generation than the current one.
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&fx.engine.db().conn(), "pair")
+                .unwrap();
+        let generation = crate::db::nullable_commit_map::current_generation_read_only(
+            &fx.engine.db().conn(),
+            "pair",
+            &scope,
+        )
+        .unwrap();
+        let receipt = serde_json::json!({
+            "version": 1,
+            "repo_id": "pair",
+            "git_sha": fx.imported,
+            "outcome": "filtered",
+            "projection": fx.engine.no_target_projection(),
+            "generation": generation + 1,
+        });
+        store_git_no_target_receipt_for_tests(&fx.engine, "pair", &fx.imported, receipt);
+        assert!(fx
+            .engine
+            .checkpoint_sha_has_stale_verified_no_target_receipt("pair", &fx.imported)
+            .unwrap());
+        let before = checkpoint_authority_snapshot(&fx.engine);
+        assert_refused_by(
+            fx.engine.team_git_checkpoint_with(Some(&witness)),
+            "stale no-target receipt conflicts with repository Git checkpoint",
+        );
+        assert_eq!(checkpoint_authority_snapshot(&fx.engine), before);
+    }
+
+    #[test]
+    fn imported_origin_witness_reader_under_empty_policy_keeps_the_no_witness_result() {
+        // A witness exists only under active rules, so a legitimate one is
+        // minted for an engine with rules (A) and presented to the empty-policy
+        // engine (B), whose reader must ignore it entirely.
+        let a = witness_reader_fixture(true, false);
+        let window = a
+            .engine
+            .db()
+            .begin_ordinary_writer_window(Some("pair"))
+            .unwrap();
+        let witness = mint_witness(&a.engine, &window);
+        assert!(witness
+            .accepts(a.engine.db(), "pair", &a.imported, &a.emitted)
+            .unwrap());
+        let b = witness_reader_fixture(false, false);
+        let before = checkpoint_authority_snapshot(&b.engine);
+        let without = b.engine.team_git_checkpoint();
+        let after_without = checkpoint_authority_snapshot(&b.engine);
+        let with = b.engine.team_git_checkpoint_with(Some(&witness));
+        assert_eq!(format!("{with:?}"), format!("{without:?}"));
+        assert_eq!(
+            with.unwrap().as_deref(),
+            Some(b.imported.as_str()),
+            "the original empty-policy import arm decides"
+        );
+        assert_eq!(checkpoint_authority_snapshot(&b.engine), after_without);
+        assert_eq!(after_without, before);
+    }
 }
 
 #[cfg(test)]

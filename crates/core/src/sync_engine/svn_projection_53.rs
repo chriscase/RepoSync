@@ -1350,18 +1350,7 @@ impl SyncEngine {
         &'a self,
         window: &'a OrdinaryWriterWindow<'db>,
     ) -> Result<Option<ImportedOriginWitness53<'a, 'db>>, SyncError> {
-        if self.allowed_paths.is_empty() && self.blocked_patterns.is_empty() {
-            return Ok(None);
-        }
-        let Some(repo_id) = self.effective_repo_id() else {
-            return Ok(None);
-        };
-        window
-            .require_engine_scope(&self.db, Some(repo_id))
-            .map_err(SyncError::DatabaseError)?;
-        let Some(records) =
-            read_witness_records(&self.db, repo_id).map_err(SyncError::DatabaseError)?
-        else {
+        let Some((repo_id, records)) = self.imported_origin_witness_records_53(window)? else {
             return Ok(None);
         };
         let svn = self
@@ -1376,9 +1365,53 @@ impl SyncEngine {
         let live = observe_live_svn_identity(&svn, &info)
             .await
             .map_err(SyncError::SvnError)?;
-        let difference = pin_identity_difference(&historical, &records.origin.pin)
-            .or_else(|| svn_identity_difference(&historical, &live))
-            .or_else(|| lineage_identity_difference(&historical, &records.lineage));
+        self.finish_imported_origin_witness_53(
+            window,
+            repo_id,
+            records,
+            &historical,
+            &live,
+            svn.url(),
+        )
+    }
+
+    /// The producer's preconditions and first record snapshot: active rules, a
+    /// managed repository, the window owning this engine scope, and witness
+    /// records that form a verified snapshot origin pinned as the baseline.
+    fn imported_origin_witness_records_53(
+        &self,
+        window: &OrdinaryWriterWindow<'_>,
+    ) -> Result<Option<(&str, WitnessRecords)>, SyncError> {
+        if self.allowed_paths.is_empty() && self.blocked_patterns.is_empty() {
+            return Ok(None);
+        }
+        let Some(repo_id) = self.effective_repo_id() else {
+            return Ok(None);
+        };
+        window
+            .require_engine_scope(&self.db, Some(repo_id))
+            .map_err(SyncError::DatabaseError)?;
+        let records = read_witness_records(&self.db, repo_id).map_err(SyncError::DatabaseError)?;
+        Ok(records.map(|records| (repo_id, records)))
+    }
+
+    /// The producer's validation after its SVN reads: the historical identity
+    /// must equal the pin, the live identity and the pinned lineage; the
+    /// configured SVN URL must be the registration's; the captured identity
+    /// (owner before and after one snapshot) and the records must be unchanged.
+    /// Only then is the witness minted, borrowing the actual database and window.
+    fn finish_imported_origin_witness_53<'a, 'db>(
+        &'a self,
+        window: &'a OrdinaryWriterWindow<'db>,
+        repo_id: &str,
+        records: WitnessRecords,
+        historical: &LiveSvnIdentity,
+        live: &LiveSvnIdentity,
+        configured_svn_url: &str,
+    ) -> Result<Option<ImportedOriginWitness53<'a, 'db>>, SyncError> {
+        let difference = pin_identity_difference(historical, &records.origin.pin)
+            .or_else(|| svn_identity_difference(historical, live))
+            .or_else(|| lineage_identity_difference(historical, &records.lineage));
         if let Some(difference) = difference {
             warn!(
                 repo_id,
@@ -1388,14 +1421,14 @@ impl SyncEngine {
             );
             return Ok(None);
         }
-        if svn.url().trim_end_matches('/') != records.svn_url.trim_end_matches('/') {
+        if configured_svn_url.trim_end_matches('/') != records.svn_url.trim_end_matches('/') {
             return Ok(None);
         }
         let identity = CapturedIdentity::capture(
             &self.db,
             window,
             repo_id,
-            &live,
+            live,
             &self.no_target_projection(),
         )
         .map_err(SyncError::DatabaseError)?;
@@ -1422,6 +1455,48 @@ impl SyncEngine {
             identity,
             records,
         }))
+    }
+}
+
+/// SYNTHETIC unit input (RS53-IMPORTED-ORIGIN-COVERAGE-EXTENSION-1): the
+/// historical (peg R) and live SVN identities a reader unit test states the
+/// producer observed. It is not an SVN observation and carries no native
+/// provenance; it exists only under `cfg(test)`.
+#[cfg(test)]
+pub(crate) struct SyntheticSvnObservation53 {
+    pub(crate) historical_at_snapshot_rev: LiveSvnIdentity,
+    pub(crate) live_at_head: LiveSvnIdentity,
+}
+
+#[cfg(test)]
+impl SyncEngine {
+    /// Test-only adapter for the witness consumer tests. It runs the
+    /// producer's own preconditions, record snapshot, identity/resource
+    /// validation, captured identity and final snapshot, with the two SVN reads
+    /// replaced by typed synthetic inputs. It borrows the actual database and
+    /// window and stores nothing. It has no production or debug counterpart.
+    pub(crate) fn imported_origin_witness_from_synthetic_observation_53<'a, 'db>(
+        &'a self,
+        window: &'a OrdinaryWriterWindow<'db>,
+        observation: &SyntheticSvnObservation53,
+    ) -> Result<Option<ImportedOriginWitness53<'a, 'db>>, SyncError> {
+        let Some((repo_id, records)) = self.imported_origin_witness_records_53(window)? else {
+            return Ok(None);
+        };
+        let configured = self
+            .svn_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .url()
+            .to_owned();
+        self.finish_imported_origin_witness_53(
+            window,
+            repo_id,
+            records,
+            &observation.historical_at_snapshot_rev,
+            &observation.live_at_head,
+            &configured,
+        )
     }
 }
 
