@@ -83,11 +83,17 @@ export interface AuthorMapping {
   github?: string;
 }
 
+/** Server classification of a commit-map row's Git side (#54). */
+export type CommitMapTargetState = 'git_commit' | 'filtered_no_target' | 'no_target_unverified' | 'legacy_empty_value';
+
 export interface CommitMapEntry {
   id: number;
   repo_id?: string;
   svn_rev: number;
-  git_sha: string;
+  /** `null` for a no-target row; read `target_state` for why. */
+  git_sha: string | null;
+  /** Absent only from servers older than #54. */
+  target_state?: CommitMapTargetState;
   direction: string;
   synced_at: string;
   svn_author: string;

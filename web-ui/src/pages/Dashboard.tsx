@@ -9,6 +9,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { UIForgeActivityStream } from '@appforgeapps/uiforge';
 import { api, type CommitMapEntry, type Repository } from '../api';
+import { CommitMapTargetCell } from '../components/CommitMapTargetCell';
 import { formatTimeAgo } from '../utils/time';
 import ImportProgressCard from '../components/ImportProgressCard';
 import ServerMonitor from '../components/ServerMonitor';
@@ -357,9 +358,7 @@ export default function Dashboard() {
                       <RepoBadge name={cm.repo_id ? repoNameMap.get(cm.repo_id) || 'Unknown' : repoName} />
                     </td>
                     <td className="px-6 py-3 text-sm font-mono text-blue-400">r{cm.svn_rev}</td>
-                    <td className="px-6 py-3 text-sm font-mono text-purple-400 truncate max-w-[200px]">
-                      {cm.git_sha.substring(0, 12)}
-                    </td>
+                    <CommitMapTargetCell entry={cm} />
                     <td className="px-6 py-3">
                       <DirectionBadge direction={cm.direction} />
                     </td>
