@@ -2508,7 +2508,10 @@ impl SyncEngine {
         }
 
         // 1. Fetch changes from both sides.
-        let svn_changes = self.fetch_svn_changes().await?;
+        // #53: keep the actual fetch, then prepare the projected file-level
+        // view and its plan batch before Git fetch/reset and conflict
+        // detection. Empty allowed and blocked rules keep the old behavior.
+        let (svn_changes, svn_projection) = self.prepare_svn_projection_53(writer_window).await?;
         let git_fetch = self.fetch_git_changes(&admission, &svn_changes).await?;
 
         stats.git_replay_has_more = git_fetch.has_more;
@@ -2638,8 +2641,13 @@ impl SyncEngine {
             None
         };
         let _ = self.persist_sync_state("applying");
-        self.sync_svn_to_git(&svn_changes, &mut stats.svn_to_git_count, writer_window)
-            .await?;
+        self.sync_svn_to_git(
+            &svn_changes,
+            svn_projection.as_ref(),
+            &mut stats.svn_to_git_count,
+            writer_window,
+        )
+        .await?;
 
         // Keep the durable mapped baseline distinct from the inbound cursor.
         // Convergence below additionally requires the captured old state and
@@ -2834,6 +2842,7 @@ impl SyncEngine {
     async fn sync_svn_to_git(
         &self,
         svn_changes: &[SvnChangeSet],
+        svn_projection: Option<&svn_projection_53::PreparedSvnBatch<'_, '_>>,
         applied: &mut usize,
         writer_window: &crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
     ) -> Result<(), SyncError> {
@@ -2876,21 +2885,37 @@ impl SyncEngine {
                 continue;
             }
 
+            // #53: consume the matching actual plan first. A zero-effect plan
+            // is finalized as filtered here (no Git commit, push or applied
+            // count); otherwise only its selected sections reach the
+            // unchanged apply path below. No batch keeps the old behavior.
+            let selected_patch = match svn_projection {
+                Some(batch) => match self.consume_svn_projection_plan_53(batch, change)? {
+                    Some(patch) => Some(patch),
+                    None => continue,
+                },
+                None => None,
+            };
+
             let git_identity = self
                 .identity_mapper
                 .svn_to_git(&change.author)
                 .map_err(SyncError::IdentityError)?;
 
-            // 1. Get the SVN diff for this revision.
+            // 1. Get the SVN diff for this revision (only its selected
+            // sections when a projection batch is active).
             let svn = self
                 .svn_client
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone();
-            let diff = svn
-                .diff_full(change.revision)
-                .await
-                .map_err(SyncError::SvnError)?;
+            let diff = match selected_patch {
+                Some(patch) => patch,
+                None => svn
+                    .diff_full(change.revision)
+                    .await
+                    .map_err(SyncError::SvnError)?,
+            };
 
             // Get the git repo path before locking, for apply_diff_to_path.
             let repo_path = {

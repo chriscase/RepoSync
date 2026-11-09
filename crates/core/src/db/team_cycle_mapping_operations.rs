@@ -879,10 +879,14 @@ fn finalize_svn_filtered_tx(
 }
 
 impl Database {
-    /// #53 typed begin for one filtered SVN revision. The owner check runs
-    /// outside SQLite; the captured identity is revalidated inside the same
-    /// transaction as the shared begin core.
-    pub(crate) fn begin_svn_filtered_mapping(
+    /// #53 typed filtered mapping for one SVN revision whose selected
+    /// Git-content effect the verified projection proved to be zero. The
+    /// owner check runs outside SQLite. Inside ONE journal transaction the
+    /// captured identity is revalidated, then the shared begin core and the
+    /// shared confirm core run, so a write failure rolls back the operation,
+    /// receipt, watermark, canonical outcome and NULL row together; recovery
+    /// is the next ordinary cycle's fresh observation, never a blind replay.
+    pub(crate) fn record_svn_filtered_mapping(
         &self,
         proof: &crate::sync_engine::svn_projection_53::VerifiedSvnProjection<'_, '_>,
         pre_write_svn_rev: i64,
@@ -895,7 +899,7 @@ impl Database {
         let request_id = format!("svn-r{}", proof.revision());
         self.transaction(|tx| {
             proof.revalidate_tx(tx)?;
-            begin_team_cycle_mapping_tx(
+            let op = begin_team_cycle_mapping_tx(
                 tx,
                 TeamCycleMappingIntent {
                     repo_id,
@@ -911,21 +915,8 @@ impl Database {
                     projection,
                     intended_target_proof: None,
                 },
-            )
-        })
-    }
-
-    /// #53 typed confirm: the shared confirm core with the verified
-    /// projection, in one transaction after the owner check.
-    pub(crate) fn confirm_svn_filtered_mapping(
-        &self,
-        proof: &crate::sync_engine::svn_projection_53::VerifiedSvnProjection<'_, '_>,
-        op_id: &str,
-    ) -> Result<TeamCycleMappingOperation, DatabaseError> {
-        proof.require_owner(self)?;
-        self.transaction(|tx| {
-            proof.revalidate_tx(tx)?;
-            confirm_team_cycle_mapping_tx(tx, proof.repo_id(), op_id, None, Some(proof))
+            )?;
+            confirm_team_cycle_mapping_tx(tx, repo_id, &op.id, None, Some(proof))
         })
     }
 }

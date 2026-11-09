@@ -1020,7 +1020,7 @@ mod insert_proven_no_target_row_tests {
     use crate::db::lineage_checkpoints::{record_mapping_outcome, MappingWrite};
 
     fn managed(dir: &std::path::Path) -> Database {
-        let db = Database::new(&dir.join("helper.db")).unwrap();
+        let db = Database::new(dir.join("helper.db")).unwrap();
         db.initialize().unwrap();
         db.conn()
             .execute(

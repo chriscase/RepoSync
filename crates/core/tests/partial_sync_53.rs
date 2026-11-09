@@ -1,0 +1,1072 @@
+//! #53 SVN→Git filtering with early #60 assertions, on real private SVN and
+//! Git repositories driven through the actual `SyncEngine` cycle.
+//!
+//! Each case starts from a fresh `svnadmin` repository (fresh UUID), commits
+//! an SVN-origin baseline, imports it through the pinned snapshot importer and
+//! completes that import, then runs ordinary engine cycles with path rules.
+//! "Reopen" drops the engine, database and writer fence and opens them again.
+//! These cases require `svn`, `svnadmin` and `git`; they fail, never skip,
+//! when the toolchain is missing.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+
+use tokio::sync::RwLock;
+
+use reposync_core::config::{AppConfig, IdentityConfig, SvnLayout};
+use reposync_core::db::import_operations::import_target_fingerprint;
+use reposync_core::db::nullable_commit_map::CommitMapTarget;
+use reposync_core::db::team_cycle_mapping_operations::{
+    TeamCycleMappingOutcome, TeamCycleMappingState,
+};
+use reposync_core::db::Database;
+use reposync_core::errors::SyncError;
+use reposync_core::file_policy::FilePolicy;
+use reposync_core::git::GitClient;
+use reposync_core::identity::mapper::IdentityMapper;
+use reposync_core::import::{ImportConfig, ImportOutcome, ImportProgress, ImportRunState};
+use reposync_core::models::Repository;
+use reposync_core::snapshot::{resolve_snapshot_pin, SnapshotRevision};
+use reposync_core::svn::SvnClient;
+use reposync_core::sync_engine::SyncEngine;
+use reposync_core::writer_fence;
+use tempfile::TempDir;
+
+const REPO: &str = "partial-53";
+
+/// This target serializes its own real-fence cases; nothing else shares it.
+fn serial() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &LOCK
+}
+
+fn require_toolchain() {
+    for tool in ["svn", "svnadmin", "git"] {
+        let found = Command::new(tool)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(found, "#53 native case requires `{tool}` on PATH");
+    }
+}
+
+fn run(dir: &Path, program: &str, args: &[&str]) -> String {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .env("LC_ALL", "C.UTF-8")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Partial fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Partial fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{program} {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// SVN CLI operand for a literal working-copy path (peg-escape any `@`).
+fn op(path: &str) -> String {
+    format!("{path}@")
+}
+
+struct Fixture {
+    tmp: TempDir,
+    svn_url: String,
+    wc: PathBuf,
+    bare: PathBuf,
+    git_work: PathBuf,
+    data_dir: PathBuf,
+    db_path: PathBuf,
+    developer: Option<PathBuf>,
+}
+
+impl Fixture {
+    /// Fresh SVN repository and baseline r1, imported and completed before
+    /// any mapping or watermark exists.
+    async fn new(baseline: &[(&str, &str)]) -> Self {
+        require_toolchain();
+        let tmp = TempDir::new().unwrap();
+        let repo_dir = tmp.path().join("svn_repo");
+        run(
+            tmp.path(),
+            "svnadmin",
+            &["create", repo_dir.to_str().unwrap()],
+        );
+        let hook = repo_dir.join("hooks/pre-revprop-change");
+        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let svn_url = format!("file://{}", repo_dir.display());
+        let wc = tmp.path().join("svn_wc");
+        run(
+            tmp.path(),
+            "svn",
+            &[
+                "checkout",
+                &svn_url,
+                wc.to_str().unwrap(),
+                "--non-interactive",
+            ],
+        );
+        let fixture_paths = Fixture {
+            svn_url: svn_url.clone(),
+            wc: wc.clone(),
+            bare: tmp.path().join("origin.git"),
+            git_work: tmp.path().join("git_work"),
+            data_dir: tmp.path().join("data"),
+            db_path: tmp.path().join("data").join("state.db"),
+            developer: None,
+            tmp,
+        };
+        for (path, bytes) in baseline {
+            fixture_paths.write(path, bytes);
+        }
+        let baseline_rev = fixture_paths.commit("baseline r1");
+        fixture_paths.import(baseline_rev).await;
+        fixture_paths
+    }
+
+    fn write(&self, path: &str, bytes: &str) {
+        let file = self.wc.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let existed = file.exists();
+        std::fs::write(&file, bytes).unwrap();
+        if !existed {
+            run(&self.wc, "svn", &["add", "--parents", "--force", &op(path)]);
+        }
+    }
+
+    fn svn(&self, args: &[&str]) {
+        run(&self.wc, "svn", args);
+    }
+
+    fn commit(&self, message: &str) -> i64 {
+        let out = run(
+            &self.wc,
+            "svn",
+            &["commit", "-m", message, ".", "--non-interactive"],
+        );
+        run(&self.wc, "svn", &["update", "--non-interactive"]);
+        out.lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("Committed revision ")
+                    .map(|rev| rev.trim_end_matches('.').parse::<i64>().unwrap())
+            })
+            .expect("committed revision")
+    }
+
+    async fn import(&self, selected: i64) {
+        git2::Repository::init_bare(&self.bare).unwrap();
+        let git_client = Arc::new(std::sync::Mutex::new(
+            GitClient::init(&self.git_work).unwrap(),
+        ));
+        run(&self.git_work, "git", &["checkout", "-B", "main"]);
+        run(
+            &self.git_work,
+            "git",
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("file://{}", self.bare.display()),
+            ],
+        );
+        std::fs::create_dir_all(&self.data_dir).unwrap();
+        let db = Database::new(&self.db_path).unwrap();
+        db.initialize().unwrap();
+        let _fence = writer_fence::claim(&db, &self.data_dir).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let repo = Repository {
+            id: REPO.into(),
+            name: "Partial".into(),
+            svn_url: self.svn_url.clone(),
+            svn_branch: String::new(),
+            svn_username: String::new(),
+            git_provider: "local".into(),
+            git_api_url: format!("file://{}", self.tmp.path().display()),
+            git_repo: "origin".into(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 0,
+            last_git_sha: String::new(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        };
+        db.insert_repository(&repo).unwrap();
+        let op = db
+            .create_import_operation(
+                REPO,
+                "fixture",
+                "partial-53",
+                &import_target_fingerprint(&repo, &self.git_work),
+            )
+            .unwrap();
+        let svn = SvnClient::new(&self.svn_url, "", "");
+        let pin = resolve_snapshot_pin(&svn, SnapshotRevision::Number(selected))
+            .await
+            .unwrap();
+        db.pin_snapshot_import(REPO, &op.id, pin.clone()).unwrap();
+        db.start_import_operation(REPO, &op.id).unwrap();
+        let outcome = reposync_core::import::run_snapshot_import(
+            &svn,
+            &git_client,
+            &db,
+            &FilePolicy::new(0, Vec::new()),
+            &ImportConfig {
+                committer_name: "Test User".into(),
+                committer_email: "test@example.com".into(),
+                remote_name: "origin".into(),
+                branch: "main".into(),
+                push_token: None,
+                message_prefix: None,
+                trunk_path: String::new(),
+            },
+            &pin,
+            ImportRunState {
+                progress: Arc::new(RwLock::new(ImportProgress::default())),
+                ws_broadcast: None,
+                repo_id: Some(REPO.into()),
+                operation_id: Some(op.id.clone()),
+                cancel_signal: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ImportOutcome::Completed {
+            svn_rev, git_sha, ..
+        } = outcome
+        else {
+            panic!("baseline import must complete: {outcome:?}");
+        };
+        assert_eq!(svn_rev, selected);
+        db.complete_import_operation(REPO, &op.id, svn_rev, &git_sha)
+            .unwrap();
+    }
+
+    /// A real reopen: a new database handle, startup holds, a new engine.
+    fn engine(&self, allowed: &[&str], blocked: &[&str]) -> SyncEngine {
+        let mut config: AppConfig = toml::from_str(&format!(
+            "[daemon]\ndata_dir = \"{}\"\n[svn]\nurl = \"{}\"\nusername = \"\"\npassword_env = \"RS53_UNUSED\"\n[github]\nrepo = \"fixture/partial\"\ntoken_env = \"RS53_UNUSED\"\n",
+            self.data_dir.display(),
+            self.svn_url
+        ))
+        .unwrap();
+        config.svn.layout = SvnLayout::Custom;
+        config.svn.password = Some(String::new());
+        config.github.token = Some(String::new());
+        let db = Database::new(&self.db_path).unwrap();
+        db.initialize().unwrap();
+        db.hold_interrupted_svn_commits().unwrap();
+        db.hold_interrupted_git_pushes().unwrap();
+        db.hold_interrupted_team_cycle_mappings().unwrap();
+        let mut engine = SyncEngine::new(
+            config,
+            db,
+            SvnClient::new(&self.svn_url, "", ""),
+            GitClient::new(&self.git_work).unwrap(),
+            Arc::new(
+                IdentityMapper::new(&IdentityConfig {
+                    email_domain: Some("example.invalid".into()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+        );
+        engine.set_repo_id(REPO.into());
+        engine.set_path_rules(
+            allowed.iter().map(|s| s.to_string()).collect(),
+            blocked.iter().map(|s| s.to_string()).collect(),
+        );
+        engine
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let mut full = vec!["--git-dir", self.bare.to_str().unwrap()];
+        full.extend_from_slice(args);
+        run(self.tmp.path(), "git", &full)
+    }
+
+    fn git_tip(&self) -> String {
+        self.git(&["rev-parse", "main"]).trim().to_owned()
+    }
+
+    fn git_commits(&self) -> usize {
+        self.git(&["rev-list", "--count", "main"])
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn git_file(&self, path: &str) -> Option<String> {
+        let listed = self.git(&["ls-tree", "-r", "--name-only", "-z", "main"]);
+        listed
+            .split('\0')
+            .any(|name| name == path)
+            .then(|| self.git(&["show", &format!("main:{path}")]))
+    }
+
+    fn git_paths(&self) -> Vec<String> {
+        let listed = self.git(&["ls-tree", "-r", "--name-only", "-z", "main"]);
+        listed
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn svn_head(&self) -> i64 {
+        let out = run(
+            &self.wc,
+            "svn",
+            &["info", "--show-item", "revision", &self.svn_url],
+        );
+        out.trim().parse().unwrap()
+    }
+
+    fn svn_file(&self, path: &str) -> Option<String> {
+        let output = Command::new("svn")
+            .args(["cat", &format!("{}/{}@HEAD", self.svn_url, path)])
+            .output()
+            .unwrap();
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8(output.stdout).unwrap())
+    }
+
+    /// A Git developer clone that pushes to the bare origin.
+    fn developer(&mut self) -> PathBuf {
+        if self.developer.is_none() {
+            let dir = self.tmp.path().join("developer");
+            run(
+                self.tmp.path(),
+                "git",
+                &[
+                    "clone",
+                    "-b",
+                    "main",
+                    self.bare.to_str().unwrap(),
+                    dir.to_str().unwrap(),
+                ],
+            );
+            self.developer = Some(dir);
+        }
+        self.developer.clone().unwrap()
+    }
+
+    fn git_push(&mut self, files: &[(&str, &str)], message: &str) -> String {
+        let dev = self.developer();
+        run(&dev, "git", &["pull", "--ff-only", "origin", "main"]);
+        for (path, bytes) in files {
+            let file = dev.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, bytes).unwrap();
+            run(&dev, "git", &["add", "--", path]);
+        }
+        run(&dev, "git", &["commit", "-m", message]);
+        run(&dev, "git", &["push", "origin", "main"]);
+        run(&dev, "git", &["rev-parse", "HEAD"]).trim().to_owned()
+    }
+}
+
+fn rows(engine: &SyncEngine) -> Vec<(i64, Option<String>, CommitMapTarget)> {
+    let mut listed: Vec<_> = engine
+        .db()
+        .list_commit_map_rows(Some(REPO), 1000)
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.svn_rev, row.git_sha, row.target))
+        .collect();
+    listed.sort_by_key(|row| row.0);
+    listed
+}
+
+fn filtered_row_count(engine: &SyncEngine, rev: i64) -> usize {
+    rows(engine)
+        .into_iter()
+        .filter(|(r, sha, target)| {
+            *r == rev && sha.is_none() && *target == CommitMapTarget::FilteredNoTarget
+        })
+        .count()
+}
+
+fn latest_cycle_mapping(
+    engine: &SyncEngine,
+) -> Option<reposync_core::db::team_cycle_mapping_operations::TeamCycleMappingOperation> {
+    let id = engine
+        .db()
+        .get_state(&format!("team_cycle_mapping_v1:latest:{REPO}"))
+        .unwrap()?;
+    engine
+        .db()
+        .get_team_cycle_mapping_operation(REPO, &id)
+        .unwrap()
+}
+
+fn audit_count(engine: &SyncEngine, action: &str) -> i64 {
+    engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE action = ?1 AND repo_id = ?2",
+            [action, REPO],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn svn_watermark(engine: &SyncEngine) -> i64 {
+    engine.db().get_repo_watermark(REPO).unwrap().0
+}
+
+fn inbound_git_cursor(engine: &SyncEngine) -> Option<String> {
+    reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(engine.db(), REPO).unwrap()
+}
+
+/// Assert that `rev` was finalized as filtered exactly once, atomically.
+fn assert_filtered_once(engine: &SyncEngine, rev: i64) {
+    assert_eq!(
+        filtered_row_count(engine, rev),
+        1,
+        "one proven NULL row for r{rev}"
+    );
+    let op = latest_cycle_mapping(engine).expect("filtered journal operation");
+    assert_eq!(op.outcome, TeamCycleMappingOutcome::SvnFiltered);
+    assert_eq!(op.state, TeamCycleMappingState::Completed);
+    assert_eq!(op.source_svn_rev, Some(rev));
+    assert!(op.source_git_sha.is_none());
+    assert!(engine
+        .db()
+        .active_team_cycle_mapping_operation(REPO)
+        .unwrap()
+        .is_none());
+    assert!(
+        reposync_core::echo_receipt_scope::read_svn_no_target_receipt(engine.db(), REPO, rev)
+            .unwrap()
+            .is_some(),
+        "scoped SVN no-target receipt for r{rev}"
+    );
+}
+
+const BASELINE: &[(&str, &str)] = &[
+    ("team-a/a.txt", "team-a baseline\n"),
+    ("team-a/old.txt", "team-a old\n"),
+    ("team-b/b.txt", "team-b baseline\n"),
+    ("team-b/c.txt", "team-b c\n"),
+    ("docs/readme.txt", "docs baseline\n"),
+];
+
+// ---------------------------------------------------------------------------
+// SC01-SC06
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc01_only_admitted_paths_and_bytes_enter_git_and_excluded_work_is_accounted() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let commits_before = fx.git_commits();
+    fx.write("team-a/a.txt", "team-a changed\n");
+    fx.write("team-a/new.txt", "team-a new\n");
+    let r2 = fx.commit("r2 admitted");
+    fx.write("team-b/b.txt", "team-b changed\n");
+    fx.write("docs/readme.txt", "docs changed\n");
+    let r3 = fx.commit("r3 excluded only");
+    let engine = fx.engine(&["team-a/"], &[]);
+    let stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        stats.svn_to_git_count, 1,
+        "only the admitted revision commits"
+    );
+    assert_eq!(fx.git_commits(), commits_before + 1);
+    assert_eq!(
+        fx.git_file("team-a/a.txt").as_deref(),
+        Some("team-a changed\n")
+    );
+    assert_eq!(
+        fx.git_file("team-a/new.txt").as_deref(),
+        Some("team-a new\n")
+    );
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("team-b baseline\n")
+    );
+    assert_eq!(
+        fx.git_file("docs/readme.txt").as_deref(),
+        Some("docs baseline\n")
+    );
+    assert!(fx
+        .git(&["log", "-1", "--format=%B", "main"])
+        .contains(&format!("synced from SVN r{r2}")));
+    assert_eq!(
+        svn_watermark(&engine),
+        r3,
+        "the scoped frontier accounts for r3"
+    );
+    assert_filtered_once(&engine, r3);
+    let mapped = rows(&engine);
+    assert!(mapped
+        .iter()
+        .any(|(rev, sha, _)| *rev == r2 && sha.as_deref() == Some(fx.git_tip().as_str())));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc02_fully_excluded_revision_has_no_git_effect_and_reopen_repeat_is_quiet() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let tip = fx.git_tip();
+    let refs = fx.git(&["for-each-ref"]);
+    fx.write("team-b/b.txt", "team-b only\n");
+    let r2 = fx.commit("r2 excluded");
+    let engine = fx.engine(&["team-a/"], &[]);
+    let cursor = inbound_git_cursor(&engine);
+    let stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 0);
+    assert_eq!(fx.git_tip(), tip, "no Git commit");
+    assert_eq!(fx.git(&["for-each-ref"]), refs, "no ref effect");
+    assert_eq!(svn_watermark(&engine), r2);
+    assert_eq!(
+        inbound_git_cursor(&engine),
+        cursor,
+        "inbound Git cursor unchanged"
+    );
+    assert_filtered_once(&engine, r2);
+    assert_eq!(audit_count(&engine, "svn_to_git_filtered"), 1);
+    let rows_before = rows(&engine);
+    drop(engine);
+    let reopened = fx.engine(&["team-a/"], &[]);
+    for _ in 0..2 {
+        let quiet = reopened.run_sync_cycle().await.unwrap();
+        assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
+    }
+    assert_eq!(
+        rows(&reopened),
+        rows_before,
+        "no extra rows after reopen/repeat"
+    );
+    assert_eq!(audit_count(&reopened, "svn_to_git_filtered"), 1);
+    assert_eq!(fx.git_tip(), tip);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc03_straddling_revision_applies_selected_bytes_and_deletes_only() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    fx.write("team-a/a.txt", "team-a straddle\n");
+    fx.svn(&["rm", &op("team-a/old.txt")]);
+    fx.write("team-b/b.txt", "team-b straddle\n");
+    fx.svn(&["rm", &op("team-b/c.txt")]);
+    let r2 = fx.commit("r2 straddles");
+    let engine = fx.engine(&["team-a/"], &[]);
+    let stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-a/a.txt").as_deref(),
+        Some("team-a straddle\n")
+    );
+    assert_eq!(
+        fx.git_file("team-a/old.txt"),
+        None,
+        "selected delete applied"
+    );
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("team-b baseline\n")
+    );
+    assert_eq!(
+        fx.git_file("team-b/c.txt").as_deref(),
+        Some("team-b c\n"),
+        "unrelated tree kept"
+    );
+    assert_eq!(
+        fx.git_file("docs/readme.txt").as_deref(),
+        Some("docs baseline\n")
+    );
+    let message = fx.git(&["log", "-1", "--format=%B", "main"]);
+    assert!(message.starts_with("r2 straddles"));
+    assert!(message.contains(&format!("synced from SVN r{r2}")));
+    assert_eq!(
+        filtered_row_count(&engine, r2),
+        0,
+        "a straddling revision is applied, not filtered"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc04_git_mixed_commit_reaches_svn_with_outside_paths_untouched() {
+    let _serial = serial().lock().await;
+    let mut fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    engine.run_sync_cycle().await.unwrap();
+    let head = fx.svn_head();
+    fx.git_push(
+        &[
+            ("team-a/from-git.txt", "from git admitted\n"),
+            ("team-b/from-git.txt", "from git outside\n"),
+        ],
+        "Git mixed commit",
+    );
+    let stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.git_to_svn_count, 1);
+    assert_eq!(fx.svn_head(), head + 1);
+    assert_eq!(
+        fx.svn_file("team-a/from-git.txt").as_deref(),
+        Some("from git admitted\n")
+    );
+    assert_eq!(
+        fx.svn_file("team-b/from-git.txt"),
+        None,
+        "outside path untouched in SVN"
+    );
+    assert_eq!(
+        fx.svn_file("team-b/b.txt").as_deref(),
+        Some("team-b baseline\n")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc05_git_excluded_only_commit_produces_no_svn_revision_and_repeats_quietly() {
+    let _serial = serial().lock().await;
+    let mut fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    engine.run_sync_cycle().await.unwrap();
+    let head = fx.svn_head();
+    let sha = fx.git_push(
+        &[("team-b/only.txt", "outside only\n")],
+        "Git excluded-only commit",
+    );
+    let stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.git_to_svn_count, 0);
+    assert_eq!(fx.svn_head(), head, "no SVN revision");
+    assert!(
+        reposync_core::echo_receipt_scope::read_git_no_target_receipt(engine.db(), REPO, &sha)
+            .unwrap()
+            .is_some(),
+        "existing Git no-target receipt"
+    );
+    let quiet = engine.run_sync_cycle().await.unwrap();
+    assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
+    assert_eq!(fx.svn_head(), head);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc06_svn_git_edit_svn_round_trip_keeps_exact_bytes_without_duplication() {
+    let _serial = serial().lock().await;
+    let mut fx = Fixture::new(BASELINE).await;
+    fx.write("team-a/round.txt", "from svn\n");
+    fx.write("team-b/noise.txt", "excluded noise\n");
+    let r2 = fx.commit("r2 svn origin");
+    let engine = fx.engine(&["team-a/"], &[]);
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-a/round.txt").as_deref(),
+        Some("from svn\n")
+    );
+    assert_eq!(fx.git_file("team-b/noise.txt"), None);
+    fx.git_push(&[("team-a/round.txt", "edited in git\n")], "Git edit");
+    assert_eq!(engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    let head = fx.svn_head();
+    assert_eq!(
+        fx.svn_file("team-a/round.txt").as_deref(),
+        Some("edited in git\n")
+    );
+    let tip = fx.git_tip();
+    let commits = fx.git_commits();
+    let mapped = rows(&engine);
+    assert!(mapped
+        .iter()
+        .any(|(rev, sha, _)| *rev == r2 && sha.is_some()));
+    drop(engine);
+    let reopened = fx.engine(&["team-a/"], &[]);
+    for _ in 0..2 {
+        let quiet = reopened.run_sync_cycle().await.unwrap();
+        assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
+    }
+    assert_eq!(
+        (fx.svn_head(), fx.git_tip(), fx.git_commits()),
+        (head, tip, commits)
+    );
+    assert_eq!(
+        rows(&reopened),
+        mapped,
+        "no duplicated mapping after reopen"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mandatory controls
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_policy_keeps_the_legacy_full_apply() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    fx.write("team-b/b.txt", "legacy full apply\n");
+    let r2 = fx.commit("r2 unfiltered");
+    let engine = fx.engine(&[], &[]);
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("legacy full apply\n")
+    );
+    assert_eq!(filtered_row_count(&engine, r2), 0);
+    assert_eq!(audit_count(&engine, "svn_to_git_filtered"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn component_matching_and_literal_names_are_mapped_exactly_once() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(&[
+        ("team/seed.txt", "seed\n"),
+        ("team-other/seed.txt", "seed\n"),
+    ])
+    .await;
+    fx.write("team/plain.txt", "plain\n");
+    fx.write("team/sp ace @-dash.txt", "literal\n");
+    fx.write("team/ünïcödé.txt", "unicode\n");
+    fx.write("team/%41.txt", "percent stays literal\n");
+    fx.write("team-other/y.txt", "sibling prefix\n");
+    fx.commit("r2 names");
+    let engine = fx.engine(&["team"], &[]);
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let paths = fx.git_paths();
+    for admitted in [
+        "team/plain.txt",
+        "team/sp ace @-dash.txt",
+        "team/ünïcödé.txt",
+        "team/%41.txt",
+    ] {
+        assert!(
+            paths.iter().any(|p| p == admitted),
+            "{admitted} in {paths:?}"
+        );
+    }
+    assert_eq!(
+        fx.git_file("team/%41.txt").as_deref(),
+        Some("percent stays literal\n")
+    );
+    assert!(!paths.iter().any(|p| p == "team/A.txt"), "no URL decoding");
+    assert!(
+        !paths.iter().any(|p| p == "team-other/y.txt"),
+        "component-aware match"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_rules_alone_project_with_the_same_namespace() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    fx.write("team-a/keep.txt", "kept\n");
+    fx.write("team-a/drop.log", "blocked\n");
+    fx.commit("r2 blocked pattern");
+    let engine = fx.engine(&[], &["*.log"]);
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(fx.git_file("team-a/keep.txt").as_deref(), Some("kept\n"));
+    assert_eq!(fx.git_file("team-a/drop.log"), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ancestor_directory_delete_removes_admitted_descendants_only() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(&[
+        ("team-a/sub/s.txt", "admitted descendant\n"),
+        ("team-a/keep.txt", "outside the admitted subtree\n"),
+        ("team-b/b.txt", "team-b baseline\n"),
+    ])
+    .await;
+    fx.svn(&["rm", &op("team-a")]);
+    fx.commit("r2 deletes the ancestor directory");
+    let engine = fx.engine(&["team-a/sub/"], &[]);
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-a/sub/s.txt"),
+        None,
+        "admitted descendant deleted"
+    );
+    assert_eq!(
+        fx.git_file("team-a/keep.txt").as_deref(),
+        Some("outside the admitted subtree\n"),
+        "excluded sibling under the same ancestor is never pruned"
+    );
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("team-b baseline\n")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copies_never_delete_sources_and_moves_across_the_boundary_are_endpoint_scoped() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    fx.svn(&["copy", &op("team-a/a.txt"), &op("team-b/copied.txt")]);
+    let r2 = fx.commit("r2 copy out of scope");
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 0);
+    assert_eq!(
+        fx.git_file("team-a/a.txt").as_deref(),
+        Some("team-a baseline\n"),
+        "copy source kept"
+    );
+    assert_eq!(fx.git_file("team-b/copied.txt"), None);
+    assert_filtered_once(&engine, r2);
+    fx.svn(&["move", &op("team-b/b.txt"), &op("team-a/moved-in.txt")]);
+    fx.commit("r3 move into scope");
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-a/moved-in.txt").as_deref(),
+        Some("team-b baseline\n")
+    );
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("team-b baseline\n"),
+        "excluded delete not applied"
+    );
+    fx.svn(&["move", &op("team-a/old.txt"), &op("team-b/moved-out.txt")]);
+    fx.commit("r4 move out of scope");
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-a/old.txt"),
+        None,
+        "admitted source endpoint deleted"
+    );
+    assert_eq!(
+        fx.git_file("team-b/moved-out.txt"),
+        None,
+        "blocked endpoint not added"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_directory_and_plain_property_are_filtered_but_git_meaning_property_holds() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    fx.svn(&["mkdir", &op("team-a/empty-dir")]);
+    let r2 = fx.commit("r2 empty directory");
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 0);
+    assert_filtered_once(&engine, r2);
+    fx.svn(&["propset", "custom:note", "value", &op("team-a/a.txt")]);
+    let r3 = fx.commit("r3 plain property");
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 0);
+    assert_filtered_once(&engine, r3);
+    let tip = fx.git_tip();
+    fx.svn(&["propset", "svn:executable", "*", &op("team-a/a.txt")]);
+    let r4 = fx.commit("r4 executable bit");
+    fx.write("team-a/after.txt", "later dependent work\n");
+    fx.commit("r5 later work");
+    let held = engine.run_sync_cycle().await.unwrap_err();
+    assert!(
+        matches!(&held, SyncError::HistoryBlocked { reason, .. } if reason == "svn_projection_held"),
+        "{held:?}"
+    );
+    assert_eq!(svn_watermark(&engine), r3, "r{r4} and later stay pending");
+    assert_eq!(
+        filtered_row_count(&engine, r4),
+        0,
+        "a hold never counts as filtering"
+    );
+    assert_eq!(fx.git_tip(), tip);
+    assert_eq!(fx.git_file("team-a/after.txt"), None);
+    assert_eq!(audit_count(&engine, "svn_to_git_projection_held"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_selected_patch_stops_at_the_frontier_and_never_counts_as_filtered() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    fx.write("team-a/a.txt", "selected bytes\n");
+    let r2 = fx.commit("r2 selected");
+    fx.write("team-b/b.txt", "excluded later\n");
+    let r3 = fx.commit("r3 excluded later");
+    let engine = fx.engine(&["team-a/"], &[]);
+    let tip = fx.git_tip();
+    // Debug fixture hook of the unchanged apply path: it replaces r2's patch
+    // bytes on this engine, so the real `git apply` subprocess fails.
+    engine.set_svn_apply_test_fault(r2, &fx.git_work);
+    let failed = engine.run_sync_cycle().await;
+    engine.clear_svn_apply_test_fault();
+    assert!(failed.is_err(), "{failed:?}");
+    assert_eq!(fx.git_tip(), tip);
+    assert!(svn_watermark(&engine) < r2, "r{r2} stays pending");
+    assert_eq!(filtered_row_count(&engine, r2), 0);
+    assert_eq!(
+        filtered_row_count(&engine, r3),
+        0,
+        "later revision stays pending"
+    );
+    let recovered = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(recovered.svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-a/a.txt").as_deref(),
+        Some("selected bytes\n")
+    );
+    assert_filtered_once(&engine, r3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filtered_finalizer_write_fault_rolls_back_atomically_then_fresh_cycle_finalizes_once() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    fx.write("team-b/b.txt", "excluded\n");
+    let r2 = fx.commit("r2 excluded");
+    let engine = fx.engine(&["team-a/"], &[]);
+    let receipts_before: i64 = engine
+        .db()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM kv_state", [], |row| row.get(0))
+        .unwrap();
+    engine
+        .db()
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER rs53_filtered_write_fault BEFORE INSERT ON commit_map \
+             WHEN NEW.git_sha IS NULL BEGIN SELECT RAISE(ABORT,'rs53 filtered write fault'); END;",
+        )
+        .unwrap();
+    let failed = engine.run_sync_cycle().await.unwrap_err();
+    assert!(
+        failed.to_string().contains("rs53 filtered write fault"),
+        "{failed}"
+    );
+    assert_eq!(svn_watermark(&engine), 1, "watermark rolled back");
+    assert!(
+        rows(&engine).iter().all(|(rev, _, _)| *rev != r2),
+        "no NULL row"
+    );
+    assert!(
+        latest_cycle_mapping(&engine).is_none(),
+        "no journal operation survives"
+    );
+    assert!(
+        reposync_core::echo_receipt_scope::read_svn_no_target_receipt(engine.db(), REPO, r2)
+            .unwrap()
+            .is_none()
+    );
+    let receipts_after: i64 = engine
+        .db()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM kv_state", [], |row| row.get(0))
+        .unwrap();
+    assert!(receipts_after >= receipts_before);
+    drop(engine);
+    {
+        let reopened = Database::new(&fx.db_path).unwrap();
+        reopened.initialize().unwrap();
+        reopened.hold_interrupted_team_cycle_mappings().unwrap();
+        assert!(reopened
+            .active_team_cycle_mapping_operation(REPO)
+            .unwrap()
+            .is_none());
+        reopened
+            .conn()
+            .execute_batch("DROP TRIGGER rs53_filtered_write_fault")
+            .unwrap();
+    }
+    let engine = fx.engine(&["team-a/"], &[]);
+    let fresh = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(fresh.svn_to_git_count, 0);
+    assert_filtered_once(&engine, r2);
+    let quiet = engine.run_sync_cycle().await.unwrap();
+    assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
+    assert_eq!(filtered_row_count(&engine, r2), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_scope_conflict_with_pending_git_work_stays_held() {
+    let _serial = serial().lock().await;
+    let mut fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    engine.run_sync_cycle().await.unwrap();
+    fx.git_push(
+        &[("team-a/a.txt", "git side\n")],
+        "Git edits the admitted file",
+    );
+    fx.write("team-a/a.txt", "svn side\n");
+    fx.commit("r2 svn edits the same admitted file");
+    let watermark = svn_watermark(&engine);
+    let held = engine.run_sync_cycle().await.unwrap_err();
+    assert!(
+        matches!(held, SyncError::UnresolvableConflict { .. }),
+        "{held:?}"
+    );
+    assert_eq!(svn_watermark(&engine), watermark);
+    assert_eq!(fx.svn_file("team-a/a.txt").as_deref(), Some("svn side\n"));
+    assert_eq!(fx.git_file("team-a/a.txt").as_deref(), Some("git side\n"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replaced_svn_repository_identity_cannot_mint_filtered_completion() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let repo_dir = fx.tmp.path().join("svn_repo");
+    std::fs::remove_dir_all(&repo_dir).unwrap();
+    run(
+        fx.tmp.path(),
+        "svnadmin",
+        &["create", repo_dir.to_str().unwrap()],
+    );
+    let other = fx.tmp.path().join("other_wc");
+    run(
+        fx.tmp.path(),
+        "svn",
+        &[
+            "checkout",
+            &fx.svn_url,
+            other.to_str().unwrap(),
+            "--non-interactive",
+        ],
+    );
+    std::fs::create_dir_all(other.join("team-b")).unwrap();
+    std::fs::write(other.join("team-b/b.txt"), "foreign\n").unwrap();
+    run(
+        &other,
+        "svn",
+        &["add", "--parents", "--force", "team-b/b.txt@"],
+    );
+    run(
+        &other,
+        "svn",
+        &["commit", "-m", "foreign r1", ".", "--non-interactive"],
+    );
+    std::fs::write(other.join("team-b/b.txt"), "foreign r2\n").unwrap();
+    run(
+        &other,
+        "svn",
+        &["commit", "-m", "foreign r2", ".", "--non-interactive"],
+    );
+    let engine = fx.engine(&["team-a/"], &[]);
+    assert!(
+        engine.run_sync_cycle().await.is_err(),
+        "changed SVN UUID is refused"
+    );
+    assert_eq!(filtered_row_count(&engine, 2), 0);
+    assert!(latest_cycle_mapping(&engine).is_none());
+    assert_eq!(svn_watermark(&engine), 1);
+}
