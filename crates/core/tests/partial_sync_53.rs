@@ -272,7 +272,50 @@ impl Fixture {
     }
 
     /// A real reopen: a new database handle, startup holds, a new engine.
+    /// Admit `allowed`/`blocked` on the repository row (JSON arrays, NULL
+    /// when empty) and build the engine's rules from that row exactly as the
+    /// daemon scheduler does. This is the production authority for policy.
     fn engine(&self, allowed: &[&str], blocked: &[&str]) -> SyncEngine {
+        self.admit_policy(allowed, blocked);
+        self.engine_with_rules_from_row()
+    }
+
+    fn admit_policy(&self, allowed: &[&str], blocked: &[&str]) {
+        let encode = |rules: &[&str]| -> Option<String> {
+            (!rules.is_empty()).then(|| serde_json::to_string(rules).unwrap())
+        };
+        let db = Database::new(&self.db_path).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE repositories SET allowed_paths = ?1, blocked_patterns = ?2 WHERE id = ?3",
+                rusqlite::params![encode(allowed), encode(blocked), REPO],
+            )
+            .unwrap();
+    }
+
+    fn engine_with_rules_from_row(&self) -> SyncEngine {
+        let mut engine = self.engine_without_rules();
+        let row = engine.db().get_repository(REPO).unwrap().unwrap();
+        let parse = |raw: Option<&str>| -> Vec<String> {
+            raw.map(|raw| serde_json::from_str::<Vec<String>>(raw).unwrap())
+                .unwrap_or_default()
+        };
+        let allowed = parse(row.allowed_paths.as_deref());
+        let blocked = parse(row.blocked_patterns.as_deref());
+        if !allowed.is_empty() || !blocked.is_empty() {
+            engine.set_path_rules(allowed, blocked);
+        }
+        engine
+    }
+
+    /// An engine whose in-memory rules are NOT the admitted row policy.
+    fn engine_with_stale_rules(&self, allowed: &[&str]) -> SyncEngine {
+        let mut engine = self.engine_without_rules();
+        engine.set_path_rules(allowed.iter().map(|s| s.to_string()).collect(), Vec::new());
+        engine
+    }
+
+    fn engine_without_rules(&self) -> SyncEngine {
         let mut config: AppConfig = toml::from_str(&format!(
             "[daemon]\ndata_dir = \"{}\"\n[svn]\nurl = \"{}\"\nusername = \"\"\npassword_env = \"RS53_UNUSED\"\n[github]\nrepo = \"fixture/partial\"\ntoken_env = \"RS53_UNUSED\"\n",
             self.data_dir.display(),
@@ -301,10 +344,6 @@ impl Fixture {
             ),
         );
         engine.set_repo_id(REPO.into());
-        engine.set_path_rules(
-            allowed.iter().map(|s| s.to_string()).collect(),
-            blocked.iter().map(|s| s.to_string()).collect(),
-        );
         engine
     }
 
@@ -1069,4 +1108,131 @@ async fn replaced_svn_repository_identity_cannot_mint_filtered_completion() {
     assert_eq!(filtered_row_count(&engine, 2), 0);
     assert!(latest_cycle_mapping(&engine).is_none());
     assert_eq!(svn_watermark(&engine), 1);
+}
+
+// ---------------------------------------------------------------------------
+// RS53-R1 / RS53-R2 regressions
+// ---------------------------------------------------------------------------
+
+/// The revision stays at the durable frontier: no Git effect, no watermark
+/// movement, no filtered row, later revisions pending, one held audit row.
+fn assert_held_at_frontier(
+    engine: &SyncEngine,
+    fx: &Fixture,
+    tip: &str,
+    held_rev: i64,
+    later_rev: i64,
+) {
+    assert_eq!(fx.git_tip(), tip, "no Git commit for the held revision");
+    assert_eq!(
+        fx.git_file("team-a/a.txt").as_deref(),
+        Some("team-a baseline\n"),
+        "selected content not applied"
+    );
+    assert_eq!(
+        fx.git_file("team-a/later.txt"),
+        None,
+        "later revision pending"
+    );
+    assert_eq!(svn_watermark(engine), held_rev - 1);
+    assert_eq!(filtered_row_count(engine, held_rev), 0);
+    assert_eq!(filtered_row_count(engine, later_rev), 0);
+    assert!(latest_cycle_mapping(engine).is_none());
+    assert_eq!(audit_count(engine, "svn_to_git_projection_held"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r1_selected_content_with_a_selected_executable_change_on_another_file_holds() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    let tip = fx.git_tip();
+    fx.write("team-a/a.txt", "selected content\n");
+    fx.svn(&["propset", "svn:executable", "*", &op("team-a/old.txt")]);
+    let held = fx.commit("r2 content plus a mode-only change");
+    fx.write("team-a/later.txt", "later dependent work\n");
+    let later = fx.commit("r3 later work");
+    let error = engine.run_sync_cycle().await.unwrap_err();
+    assert!(
+        matches!(&error, SyncError::HistoryBlocked { reason, detail }
+            if reason == "svn_projection_held" && detail.contains("svn:executable")),
+        "{error:?}"
+    );
+    assert_held_at_frontier(&engine, &fx, &tip, held, later);
+    let again = engine.run_sync_cycle().await.unwrap_err();
+    assert!(
+        matches!(again, SyncError::HistoryBlocked { .. }),
+        "the hold persists: {again:?}"
+    );
+    assert_eq!(fx.git_tip(), tip);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r1_selected_content_with_a_selected_symlink_holds() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    let tip = fx.git_tip();
+    fx.write("team-a/a.txt", "selected content\n");
+    std::os::unix::fs::symlink("a.txt", fx.wc.join("team-a/link")).unwrap();
+    fx.svn(&["add", &op("team-a/link")]);
+    let held = fx.commit("r2 content plus a symlink");
+    fx.write("team-a/later.txt", "later dependent work\n");
+    let later = fx.commit("r3 later work");
+    let error = engine.run_sync_cycle().await.unwrap_err();
+    assert!(
+        matches!(&error, SyncError::HistoryBlocked { reason, detail }
+            if reason == "svn_projection_held" && detail.contains("svn:special")),
+        "{error:?}"
+    );
+    assert_held_at_frontier(&engine, &fx, &tip, held, later);
+    assert_eq!(fx.git_file("team-a/link"), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_engine_policy_that_is_not_the_admitted_policy_is_refused_before_any_effect() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    fx.admit_policy(&["team-a/"], &[]);
+    let engine = fx.engine_with_stale_rules(&["team-b/"]);
+    let tip = fx.git_tip();
+    fx.write("team-a/a.txt", "would be excluded under the stale rules\n");
+    let r2 = fx.commit("r2");
+    let error = engine.run_sync_cycle().await.unwrap_err();
+    assert!(error.to_string().contains("admitted policy"), "{error}");
+    assert_eq!(fx.git_tip(), tip);
+    assert_eq!(svn_watermark(&engine), 1);
+    assert_eq!(filtered_row_count(&engine, r2), 0);
+    assert!(latest_cycle_mapping(&engine).is_none());
+    assert_eq!(audit_count(&engine, "svn_to_git_filtered"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_admitted_policy_change_refuses_the_stale_engine_and_a_fresh_engine_follows_it() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let stale = fx.engine(&["team-a/"], &[]);
+    fx.write("team-b/b.txt", "excluded under team-a\n");
+    let r2 = fx.commit("r2 team-b");
+    assert_eq!(stale.run_sync_cycle().await.unwrap().svn_to_git_count, 0);
+    assert_filtered_once(&stale, r2);
+    let tip = fx.git_tip();
+    // The operator admits a different policy; this engine still holds the old one.
+    fx.admit_policy(&["team-b/"], &[]);
+    fx.write("team-b/b.txt", "admitted under team-b\n");
+    let r3 = fx.commit("r3 team-b");
+    let error = stale.run_sync_cycle().await.unwrap_err();
+    assert!(error.to_string().contains("admitted policy"), "{error}");
+    assert_eq!(fx.git_tip(), tip);
+    assert_eq!(svn_watermark(&stale), r2);
+    assert_eq!(filtered_row_count(&stale, r3), 0);
+    drop(stale);
+    let fresh = fx.engine_with_rules_from_row();
+    assert_eq!(fresh.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("admitted under team-b\n")
+    );
+    assert_eq!(svn_watermark(&fresh), r3);
 }

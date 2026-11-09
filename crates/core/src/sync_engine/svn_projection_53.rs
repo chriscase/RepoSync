@@ -277,6 +277,93 @@ impl<'a, 'db> PreparedSvnBatch<'a, 'db> {
     }
 }
 
+/// Classify one revision's validated diff sections under the policy.
+///
+/// Any selected change to a property with Git meaning (`svn:executable`,
+/// `svn:special`: mode or symlink) is refused, whatever other selected
+/// content the revision has. The unchanged apply path has no conversion for
+/// it, so applying the rest would lose selected semantics while advancing the
+/// revision. Otherwise selected content gives `Content` (only the selected
+/// sections are applied), and its absence gives `Zero`.
+fn select_revision_sections(
+    sections: &[DiffSection],
+    facts: &[Option<ContentFacts>],
+    allowed: &[String],
+    blocked: &[String],
+) -> Result<PlanState, String> {
+    let mut source: Vec<&str> = Vec::new();
+    let mut files: Vec<ChangedFile> = Vec::new();
+    let mut selected_patch = String::new();
+    let mut selected_content = false;
+    let mut git_meaning: Vec<String> = Vec::new();
+    for (section, fact) in sections.iter().zip(facts) {
+        if is_root(&section.path) {
+            continue;
+        }
+        if !source.contains(&section.path.as_str()) {
+            source.push(&section.path);
+        }
+        if !path_is_projected(&section.path, allowed, blocked) {
+            continue;
+        }
+        if section.kind == SectionKind::Property {
+            for name in property_names(section) {
+                if GIT_MEANING_PROPERTIES.contains(&name) {
+                    git_meaning.push(format!("{name} on '{}'", section.path));
+                }
+            }
+        }
+        selected_patch.push_str(&section.text);
+        let action = match fact {
+            Some(f) if f.added => "A",
+            Some(f) if f.deleted => "D",
+            _ => "M",
+        };
+        if let Some(f) = fact.filter(|f| f.has_git_effect()) {
+            selected_content = true;
+            files.retain(|file| file.path != section.path);
+            files.push(ChangedFile {
+                path: section.path.clone(),
+                action: action.into(),
+                content: None,
+                is_binary: f.binary,
+                rename_from: None,
+            });
+        } else if !files.iter().any(|file| file.path == section.path) {
+            files.push(ChangedFile {
+                path: section.path.clone(),
+                action: "M".into(),
+                content: None,
+                is_binary: false,
+                rename_from: None,
+            });
+        }
+    }
+    if !git_meaning.is_empty() {
+        return Err(format!(
+            "selected property change with Git meaning has no Git conversion: {}",
+            git_meaning.join(", ")
+        ));
+    }
+    let included = files.len();
+    let counts = ProjectionCounts {
+        source: source.len(),
+        included,
+        excluded: source.len().saturating_sub(included),
+    };
+    let effect = if selected_content {
+        SelectedEffect::Content
+    } else {
+        SelectedEffect::Zero
+    };
+    Ok(PlanState::Ready {
+        effect,
+        selected_patch,
+        files,
+        counts,
+    })
+}
+
 fn policy_identity(policy_snapshot: &str) -> String {
     hex::encode(Sha256::digest(policy_snapshot.as_bytes()))[..16].to_owned()
 }
@@ -445,76 +532,7 @@ impl SyncEngine {
                 }
             }
         }
-        let mut source: Vec<&str> = Vec::new();
-        let mut files: Vec<ChangedFile> = Vec::new();
-        let mut selected_patch = String::new();
-        let mut selected_content = false;
-        let mut git_meaning: Vec<String> = Vec::new();
-        for (section, fact) in sections.iter().zip(&facts) {
-            if is_root(&section.path) {
-                continue;
-            }
-            if !source.contains(&section.path.as_str()) {
-                source.push(&section.path);
-            }
-            if !path_is_projected(&section.path, allowed, blocked) {
-                continue;
-            }
-            selected_patch.push_str(&section.text);
-            let action = match fact {
-                Some(f) if f.added => "A",
-                Some(f) if f.deleted => "D",
-                _ => "M",
-            };
-            if let Some(f) = fact.filter(|f| f.has_git_effect()) {
-                selected_content = true;
-                files.retain(|file| file.path != section.path);
-                files.push(ChangedFile {
-                    path: section.path.clone(),
-                    action: action.into(),
-                    content: None,
-                    is_binary: f.binary,
-                    rename_from: None,
-                });
-            } else {
-                for name in property_names(section) {
-                    if GIT_MEANING_PROPERTIES.contains(&name) {
-                        git_meaning.push(format!("{name} on '{}'", section.path));
-                    }
-                }
-                if !files.iter().any(|file| file.path == section.path) {
-                    files.push(ChangedFile {
-                        path: section.path.clone(),
-                        action: "M".into(),
-                        content: None,
-                        is_binary: false,
-                        rename_from: None,
-                    });
-                }
-            }
-        }
-        let included = files.len();
-        let counts = ProjectionCounts {
-            source: source.len(),
-            included,
-            excluded: source.len().saturating_sub(included),
-        };
-        let effect = if selected_content {
-            SelectedEffect::Content
-        } else if !git_meaning.is_empty() {
-            return Err(format!(
-                "selected property change with Git meaning has no Git conversion: {}",
-                git_meaning.join(", ")
-            ));
-        } else {
-            SelectedEffect::Zero
-        };
-        Ok(PlanState::Ready {
-            effect,
-            selected_patch,
-            files,
-            counts,
-        })
+        select_revision_sections(&sections, &facts, allowed, blocked)
     }
 
     /// Export one node at a pinned revision into an owned temporary
@@ -729,6 +747,38 @@ fn read_scope_snapshot(
     Ok((scope, generation, writer_epoch))
 }
 
+/// The repository's admitted path policy, read from its registration row
+/// exactly as the scheduler builds the engine's rules (each column is a JSON
+/// array of strings; NULL is empty; anything else is refused), rendered in the
+/// same shape as the engine's policy snapshot (`no_target_projection`). This
+/// is the authority both capture and revalidation compare against; no second
+/// policy store exists.
+fn read_admitted_policy_tx(tx: &Connection, repo_id: &str) -> Result<String, DatabaseError> {
+    let row: Option<(Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT allowed_paths, blocked_patterns FROM repositories WHERE id = ?1",
+            [repo_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((allowed, blocked)) = row else {
+        return Err(refused("repository registration is missing"));
+    };
+    let parse = |raw: Option<String>, setting: &str| -> Result<Vec<String>, DatabaseError> {
+        match raw {
+            None => Ok(Vec::new()),
+            Some(raw) => serde_json::from_str::<Vec<String>>(&raw).map_err(|_| {
+                refused(format!(
+                    "repository {setting} is not a JSON array of strings"
+                ))
+            }),
+        }
+    };
+    let allowed = parse(allowed, "allowed_paths")?;
+    let blocked = parse(blocked, "blocked_patterns")?;
+    Ok(serde_json::json!({"allowed_paths": allowed, "blocked_patterns": blocked}).to_string())
+}
+
 impl CapturedIdentity {
     /// Capture outside any SQLite reservation, except one read-only snapshot.
     /// `require_engine_scope` runs before and after the snapshot, so the
@@ -741,12 +791,18 @@ impl CapturedIdentity {
         policy_snapshot: &str,
     ) -> Result<Self, DatabaseError> {
         window.require_engine_scope(db, Some(repo_id))?;
-        let (scope_uuid, generation, writer_epoch, lineage) = db.transaction(|tx| {
+        let (scope_uuid, generation, writer_epoch, lineage, admitted) = db.transaction(|tx| {
             let (scope, generation, epoch) = read_scope_snapshot(tx, repo_id)?;
             let lineage = load_canonical_lineage_tx(tx, &scope, generation)?;
-            Ok((scope, generation, epoch, lineage))
+            let admitted = read_admitted_policy_tx(tx, repo_id)?;
+            Ok((scope, generation, epoch, lineage, admitted))
         })?;
         window.require_engine_scope(db, Some(repo_id))?;
+        if admitted != policy_snapshot {
+            return Err(refused(
+                "engine path policy differs from the repository's admitted policy",
+            ));
+        }
         let Some(lineage) = lineage else {
             return Err(refused(
                 "no canonical SVN lineage is pinned for the current scope generation",
@@ -775,7 +831,8 @@ impl CapturedIdentity {
         })
     }
 
-    /// Compare every captured field with the current database state inside
+    /// Compare every captured field (epoch, scope, generation, admitted path
+    /// policy, canonical SVN lineage) with the current database state inside
     /// the caller's journal transaction.
     fn revalidate_tx(&self, tx: &Connection) -> Result<(), DatabaseError> {
         let (scope, generation, epoch) = read_scope_snapshot(tx, &self.repo_id)?;
@@ -787,6 +844,11 @@ impl CapturedIdentity {
         }
         if generation != self.generation {
             return Err(refused("scope generation changed since the projection"));
+        }
+        if read_admitted_policy_tx(tx, &self.repo_id)? != self.policy_snapshot {
+            return Err(refused(
+                "repository admitted path policy changed since the projection",
+            ));
         }
         let lineage = load_canonical_lineage_tx(tx, &scope, generation)?
             .ok_or_else(|| refused("canonical SVN lineage disappeared"))?;
@@ -955,5 +1017,387 @@ mod tests {
             exported_files(dir.path()).unwrap(),
             vec!["a/b/c.txt".to_string(), "top @ -x.txt".to_string()]
         );
+    }
+
+    // -- RS53-R1: Git-meaning properties hold regardless of other content --
+
+    fn classify(raw: &str, allowed: &[&str]) -> Result<PlanState, String> {
+        let sections = split_svn_diff(raw).unwrap();
+        let facts: Vec<_> = sections
+            .iter()
+            .map(|s| match s.kind {
+                SectionKind::Content => Some(content_facts(s).unwrap()),
+                SectionKind::Property => None,
+            })
+            .collect();
+        let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+        select_revision_sections(&sections, &facts, &allowed, &[])
+    }
+
+    const CONTENT_A: &str = "Index: team-a/a.txt\n====\n--- team-a/a.txt\t(revision 1)\n+++ team-a/a.txt\t(revision 2)\n@@ -1 +1 @@\n-old\n+new\n";
+
+    #[test]
+    fn selected_executable_on_another_file_holds_despite_selected_content() {
+        let raw = format!(
+            "{CONTENT_A}Index: team-a/tool.sh\n====\n--- team-a/tool.sh\t(revision 1)\n+++ team-a/tool.sh\t(revision 2)\n\nProperty changes on: team-a/tool.sh\n___\nAdded: svn:executable\n## -0,0 +1 ##\n+*\n"
+        );
+        let held = classify(&raw, &["team-a/"]).unwrap_err();
+        assert!(
+            held.contains("svn:executable on 'team-a/tool.sh'"),
+            "{held}"
+        );
+        // The same Git-meaning change outside the selection does not hold.
+        assert!(matches!(
+            classify(
+                &raw.replace("team-a/tool.sh", "team-b/tool.sh"),
+                &["team-a/"]
+            ),
+            Ok(PlanState::Ready {
+                effect: SelectedEffect::Content,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn selected_symlink_property_holds_even_when_its_own_content_is_selected() {
+        let raw = format!(
+            "{CONTENT_A}Index: team-a/link\n====\n--- team-a/link\t(nonexistent)\n+++ team-a/link\t(revision 2)\n@@ -0,0 +1 @@\n+link a.txt\n\\ No newline at end of file\n\nProperty changes on: team-a/link\n___\nAdded: svn:special\n## -0,0 +1 ##\n+*\n"
+        );
+        let held = classify(&raw, &["team-a/"]).unwrap_err();
+        assert!(held.contains("svn:special on 'team-a/link'"), "{held}");
+        assert!(matches!(
+            classify(CONTENT_A, &["team-a/"]),
+            Ok(PlanState::Ready {
+                effect: SelectedEffect::Content,
+                ..
+            })
+        ));
+    }
+
+    // -- RS53-R2: policy/scope/generation/lineage/owner drift refuses -------
+
+    use crate::db::lineage_checkpoints::{pin_canonical_lineage, CanonicalLineage};
+    use crate::db::repo_scope_identity::repo_echo_generation_kv_key;
+
+    /// Window documents require a canonical UUID scope.
+    const SCOPE: &str = "00000000-0000-4000-8000-000000000053";
+
+    fn owned_pair_db(dir: &Path) -> Database {
+        let db = Database::new(dir.join("state.db")).unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid,allowed_paths,last_svn_rev,last_git_sha)
+                 VALUES ('pair','pair','file:///repo','','','','r','main',1,'t','t',?1,'[\"team-a/\"]',1,?2)",
+                rusqlite::params![SCOPE, "a".repeat(40)],
+            )
+            .unwrap();
+        let generation = {
+            let conn = db.conn();
+            current_generation_read_only(&conn, "pair", SCOPE).unwrap()
+        };
+        pin_canonical_lineage(
+            &db.conn(),
+            &CanonicalLineage {
+                scope_uuid: SCOPE.into(),
+                generation,
+                repo_id: "pair".into(),
+                svn_uuid: "uuid-53".into(),
+                svn_root_url: "file:///repo".into(),
+                svn_url: "file:///repo".into(),
+                svn_branch_path: String::new(),
+                incarnation_created_rev: 1,
+                copy_from_path: None,
+                copy_from_rev: None,
+                git_baseline_sha: None,
+                git_ref: None,
+                projection_version: String::new(),
+                policy_hash: String::new(),
+            },
+        )
+        .unwrap();
+        db
+    }
+
+    fn live() -> LiveSvnIdentity {
+        LiveSvnIdentity {
+            uuid: "uuid-53".into(),
+            root_url: "file:///repo".into(),
+            url: "file:///repo".into(),
+            branch_path: String::new(),
+            incarnation_created_rev: 1,
+            copy_from_path: None,
+            copy_from_rev: None,
+        }
+    }
+
+    fn engine_policy(allowed: &[&str]) -> String {
+        serde_json::json!({"allowed_paths": allowed, "blocked_patterns": Vec::<String>::new()})
+            .to_string()
+    }
+
+    fn revalidates(db: &Database, identity: &CapturedIdentity) -> Result<(), DatabaseError> {
+        db.transaction(|tx| identity.revalidate_tx(tx))
+    }
+
+    #[test]
+    fn capture_refuses_an_engine_policy_that_is_not_the_admitted_policy() {
+        let _lock = crate::writer_fence::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db = owned_pair_db(dir.path());
+        let window = db.begin_ordinary_writer_window(Some("pair")).unwrap();
+        let ok =
+            CapturedIdentity::capture(&db, &window, "pair", &live(), &engine_policy(&["team-a/"]));
+        assert!(ok.is_ok(), "{ok:?}");
+        let stale =
+            CapturedIdentity::capture(&db, &window, "pair", &live(), &engine_policy(&["team-b/"]))
+                .unwrap_err();
+        assert!(
+            stale
+                .to_string()
+                .contains("differs from the repository's admitted policy"),
+            "{stale}"
+        );
+    }
+
+    #[test]
+    fn revalidation_refuses_policy_scope_generation_and_lineage_drift() {
+        let _lock = crate::writer_fence::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db = owned_pair_db(dir.path());
+        let window = db.begin_ordinary_writer_window(Some("pair")).unwrap();
+        let identity =
+            CapturedIdentity::capture(&db, &window, "pair", &live(), &engine_policy(&["team-a/"]))
+                .unwrap();
+        revalidates(&db, &identity).unwrap();
+        let generation = identity.generation;
+        let drifts: [(&str, String, String, &str); 5] = [
+            (
+                "policy",
+                "UPDATE repositories SET allowed_paths='[\"team-b/\"]' WHERE id='pair'".into(),
+                "UPDATE repositories SET allowed_paths='[\"team-a/\"]' WHERE id='pair'".into(),
+                "admitted path policy changed",
+            ),
+            (
+                "malformed policy",
+                "UPDATE repositories SET allowed_paths='team-a/' WHERE id='pair'".into(),
+                "UPDATE repositories SET allowed_paths='[\"team-a/\"]' WHERE id='pair'".into(),
+                "not a JSON array of strings",
+            ),
+            (
+                "scope",
+                "UPDATE repositories SET scope_uuid='00000000-0000-4000-8000-0000000000aa' WHERE id='pair'".into(),
+                format!("UPDATE repositories SET scope_uuid='{SCOPE}' WHERE id='pair'"),
+                "repository scope changed",
+            ),
+            (
+                "generation",
+                format!(
+                    "INSERT INTO kv_state(key,value,updated_at) VALUES('{}','{}','t') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    repo_echo_generation_kv_key(SCOPE),
+                    generation + 1
+                ),
+                format!(
+                    "UPDATE kv_state SET value='{}' WHERE key='{}'",
+                    generation,
+                    repo_echo_generation_kv_key(SCOPE)
+                ),
+                "scope generation changed",
+            ),
+            (
+                "lineage",
+                format!("UPDATE canonical_lineage SET svn_uuid='uuid-other' WHERE scope_uuid='{SCOPE}'"),
+                format!("UPDATE canonical_lineage SET svn_uuid='uuid-53' WHERE scope_uuid='{SCOPE}'"),
+                "canonical SVN lineage changed",
+            ),
+        ];
+        for (name, drift, undo, needle) in drifts {
+            db.conn().execute_batch(&drift).unwrap();
+            let error = revalidates(&db, &identity).unwrap_err();
+            assert!(error.to_string().contains(needle), "{name}: {error}");
+            db.conn().execute_batch(&undo).unwrap();
+            revalidates(&db, &identity).unwrap_or_else(|e| panic!("{name} undo: {e}"));
+        }
+    }
+
+    #[test]
+    fn owner_checks_refuse_another_database_epoch_drift_and_an_expired_owner() {
+        let _lock = crate::writer_fence::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db = owned_pair_db(dir.path());
+        let _fence = crate::writer_fence::claim(&db, dir.path()).unwrap();
+        let window = db.begin_ordinary_writer_window(Some("pair")).unwrap();
+        let identity =
+            CapturedIdentity::capture(&db, &window, "pair", &live(), &engine_policy(&["team-a/"]))
+                .unwrap();
+        assert!(
+            identity.writer_epoch.is_some(),
+            "the claimed lease epoch is captured"
+        );
+        let proof = VerifiedSvnProjection {
+            db: &db,
+            window: &window,
+            identity,
+            revision: 2,
+            svn_author: "alice".into(),
+            counts: ProjectionCounts::default(),
+        };
+        proof.require_owner(&db).unwrap();
+        // Another database with identical bytes is not the owned resource.
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = owned_pair_db(other_dir.path());
+        let error = proof.require_owner(&other).unwrap_err();
+        assert!(
+            error.to_string().contains("not the projection's database"),
+            "{error}"
+        );
+        // A takeover moves the lease epoch under the live window.
+        let lease: String = db
+            .conn()
+            .query_row(
+                "SELECT value FROM kv_state WHERE key='writer_fence_v1:lease'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut moved: serde_json::Value = serde_json::from_str(&lease).unwrap();
+        moved["epoch"] = serde_json::json!(moved["epoch"].as_u64().unwrap() + 1);
+        db.conn()
+            .execute(
+                "UPDATE kv_state SET value=?1 WHERE key='writer_fence_v1:lease'",
+                [moved.to_string()],
+            )
+            .unwrap();
+        assert!(
+            proof.require_owner(&db).is_err(),
+            "epoch drift refuses the owner"
+        );
+        assert!(
+            db.transaction(|tx| proof.revalidate_tx(tx)).is_err(),
+            "epoch drift refuses revalidation"
+        );
+        db.conn()
+            .execute(
+                "UPDATE kv_state SET value=?1 WHERE key='writer_fence_v1:lease'",
+                [lease],
+            )
+            .unwrap();
+        proof.require_owner(&db).unwrap();
+        // Expired owner: the window's durable ownership document is gone (as
+        // after startup recovery cleared it) while the capability is held.
+        let documents: Vec<(String, String)> = {
+            let conn = db.conn();
+            let mut query = conn
+                .prepare(
+                    "SELECT key, value FROM kv_state \
+                     WHERE key LIKE 'pair_refresh_writer_window_v1:document:%'",
+                )
+                .unwrap();
+            let rows = query
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(documents.len(), 1, "exactly the live window's document");
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key = ?1", [&documents[0].0])
+            .unwrap();
+        assert!(proof.require_owner(&db).is_err(), "expired owner refuses");
+        assert!(
+            db.record_svn_filtered_mapping(&proof, 1, &"a".repeat(40))
+                .is_err(),
+            "no filtered record without the live owner"
+        );
+        db.conn()
+            .execute(
+                "INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,'t')",
+                [&documents[0].0, &documents[0].1],
+            )
+            .unwrap();
+        proof.require_owner(&db).unwrap();
+    }
+
+    #[test]
+    fn filtered_record_refuses_drift_with_no_effect_then_commits_once() {
+        let _lock = crate::writer_fence::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db = owned_pair_db(dir.path());
+        let window = db.begin_ordinary_writer_window(Some("pair")).unwrap();
+        let identity =
+            CapturedIdentity::capture(&db, &window, "pair", &live(), &engine_policy(&["team-a/"]))
+                .unwrap();
+        let proof = VerifiedSvnProjection {
+            db: &db,
+            window: &window,
+            identity,
+            revision: 2,
+            svn_author: "alice".into(),
+            counts: ProjectionCounts::default(),
+        };
+        let pre_git = "a".repeat(40);
+        let null_rows = |db: &Database| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM commit_map WHERE git_sha IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        db.conn()
+            .execute_batch("UPDATE repositories SET allowed_paths='[\"team-b/\"]' WHERE id='pair'")
+            .unwrap();
+        let error = db
+            .record_svn_filtered_mapping(&proof, 1, &pre_git)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("admitted path policy changed"),
+            "{error}"
+        );
+        assert_eq!(null_rows(&db), 0);
+        assert_eq!(db.get_repo_watermark("pair").unwrap().0, 1);
+        assert!(db
+            .get_state("team_cycle_mapping_v1:latest:pair")
+            .unwrap()
+            .is_none());
+        assert!(
+            crate::echo_receipt_scope::read_svn_no_target_receipt(&db, "pair", 2)
+                .unwrap()
+                .is_none()
+        );
+        db.conn()
+            .execute_batch("UPDATE repositories SET allowed_paths='[\"team-a/\"]' WHERE id='pair'")
+            .unwrap();
+        let op = db.record_svn_filtered_mapping(&proof, 1, &pre_git).unwrap();
+        assert_eq!(
+            op.outcome,
+            crate::db::team_cycle_mapping_operations::TeamCycleMappingOutcome::SvnFiltered
+        );
+        assert_eq!(
+            op.state,
+            crate::db::team_cycle_mapping_operations::TeamCycleMappingState::Completed
+        );
+        assert_eq!(null_rows(&db), 1);
+        assert_eq!(db.get_repo_watermark("pair").unwrap().0, 2);
+        let listed = db.list_commit_map_rows(Some("pair"), 10).unwrap();
+        assert_eq!(
+            listed[0].target,
+            crate::db::nullable_commit_map::CommitMapTarget::FilteredNoTarget
+        );
+        assert!(db
+            .active_team_cycle_mapping_operation("pair")
+            .unwrap()
+            .is_none());
     }
 }

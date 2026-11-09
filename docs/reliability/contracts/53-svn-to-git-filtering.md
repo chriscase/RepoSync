@@ -31,9 +31,14 @@ managed repository scope exists, it then:
 
 1. Observes the live SVN identity (`observe_live_svn_identity`). It calls the
    real `OrdinaryWriterWindow::require_engine_scope` before and after one
-   read-only snapshot of scope, generation, writer epoch and pinned canonical
-   lineage, outside any write reservation. A live/pinned lineage mismatch
-   refuses.
+   read-only snapshot of scope, generation, writer epoch, pinned canonical
+   lineage and the repository's **admitted path policy**, outside any write
+   reservation. A live/pinned lineage mismatch refuses.
+   * The admitted policy is the registration row's `allowed_paths` /
+     `blocked_patterns`, parsed exactly as the daemon scheduler parses them
+     (JSON string arrays, NULL = empty, anything else refused). The engine's
+     rules must equal it, or preparation refuses. There is no second policy
+     store.
 2. Plans every fetched revision in order from its actual `svn diff`:
    * The diff is split into node sections. Any text outside a section, or a
      `---`/`+++` header naming another path, holds the revision.
@@ -59,7 +64,7 @@ Selected effect:
 |---|---|
 | A selected content section with a hunk, a binary marker, or a file add/delete | **Content**: only the selected sections feed the unchanged apply/LFS/commit/push/observe/finalizer path |
 | No selected content; only plain property, empty-directory or root metadata changes (SVN's header-only `Index:` section for a property change carries no content) | **Zero**: filtered finalization |
-| No selected content, but a selected `svn:executable` / `svn:special` change | **Held**: Git meaning without a Git conversion |
+| Any selected `svn:executable` / `svn:special` add, change or delete, **regardless of other selected content** | **Held**: mode/symlink meaning has no conversion in the apply path, and applying the rest would lose it |
 | Unparseable diff, uncovered section, missing evidence, read/export failure | **Held** |
 
 A held revision stops the cycle at that revision with `HistoryBlocked`
@@ -82,7 +87,9 @@ A zero-effect plan mints a crate-private `VerifiedSvnProjection`. It:
 `Database::record_svn_filtered_mapping` checks the owner outside SQLite. Then,
 in ONE journal transaction, it:
 
-1. revalidates epoch, scope, generation, pinned lineage and policy;
+1. revalidates epoch, scope, generation, pinned lineage, and the admitted
+   path policy, re-read from the repository row (so a policy changed after
+   preparation is refused, not compared with itself);
 2. runs the shared begin core (`SvnFiltered`);
 3. runs the shared confirm core, whose filtered tail writes:
    * the scoped v1 `no_git_content` SVN receipt and SVN watermark (the
@@ -131,11 +138,25 @@ no URL and no credential, and report no applied commit count.
 | `filtered_finalizer_write_fault_…` | Real file-backed SQLite write fault in the filtered finalizer, drop and reopen, atomic rollback, fresh-cycle finalization once |
 | `in_scope_conflict_…` | Pending Git plus in-scope conflict stays held (#73 handling unchanged) |
 | `replaced_svn_repository_identity_…` | Changed SVN UUID cannot mint filtered completion |
+| `r1_selected_content_with_a_selected_executable_change_on_another_file_holds` | RS53-R1: selected content plus a mode-only change on another selected file holds at the durable frontier; later revision pending |
+| `r1_selected_content_with_a_selected_symlink_holds` | RS53-R1: selected content plus a selected symlink (`svn:special`) holds at the durable frontier |
+| `r2_engine_policy_that_is_not_the_admitted_policy_is_refused_before_any_effect` | RS53-R2: engine rules differing from the admitted row policy refuse before any effect |
+| `r2_admitted_policy_change_refuses_the_stale_engine_and_a_fresh_engine_follows_it` | RS53-R2: an admitted-policy change refuses the stale engine with no effect; a fresh engine built from the row follows it |
 
 Unit tests cover the diff splitter, header/property/binary facts, selection
 reach and pinned-export walking (`sync_engine::svn_projection_53::tests`); the
 generic refusals and forged journal JSON (`team_cycle_mapping_operations::svn_filtered_tests`);
 and the NULL-row helper (`nullable_commit_map::insert_proven_no_target_row_tests`).
+The module tests also run the drift controls on a real file-backed database
+with a real writer window:
+* the mixed-content Git-meaning holds (RS53-R1);
+* engine/admitted policy mismatch at capture;
+* policy, malformed-policy, scope, generation and canonical-lineage drift after
+  capture;
+* another database, lease-epoch drift and an expired owner refusing the owner
+  check;
+* `record_svn_filtered_mapping` refusing drift with zero effects and then
+  committing once (RS53-R2).
 
 ## Not established here
 
@@ -143,5 +164,3 @@ and the NULL-row helper (`nullable_commit_map::insert_proven_no_target_row_tests
 * Installed-version compatibility: the company installation's binary/build
   digest, OS/arch, schema/mode and sanitized config/policy/journal shape are
   not established. Historic 873/54 fixtures do not substitute.
-* `svn:executable` / `svn:special` changes alongside selected content follow
-  the unchanged apply path, which does not convert SVN properties.
