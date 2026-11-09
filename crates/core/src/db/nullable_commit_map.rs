@@ -111,15 +111,136 @@ fn columns(conn: &Connection) -> Result<Vec<ColumnInfo>, DatabaseError> {
     Ok(rows)
 }
 
-fn index_columns(conn: &Connection, index: &str) -> Result<Vec<String>, DatabaseError> {
-    let mut stmt = conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
-    let rows = stmt
-        .query_map([index], |row| row.get::<_, Option<String>>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows
-        .into_iter()
-        .map(|name| name.unwrap_or_default())
-        .collect())
+/// Collapse whitespace outside single-quoted literals and drop it next to
+/// `(`, `)` and `,`. Case, quoting and literal contents are kept, so any
+/// `CHECK`, `COLLATE`, `UNIQUE`, `REFERENCES` or value difference stays
+/// significant; only formatting differences between historical binaries are
+/// ignored.
+fn normalize_sql(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut pending_space = false;
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if pending_space && !out.is_empty() && !out.ends_with(['(', ',']) {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.push(ch);
+            while let Some(inner) = chars.next() {
+                out.push(inner);
+                if inner == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        out.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space
+            && !out.is_empty()
+            && !matches!(ch, '(' | ')' | ',')
+            && !out.ends_with(['(', ','])
+        {
+            out.push(' ');
+        }
+        pending_space = false;
+        out.push(ch);
+    }
+    out
+}
+
+/// Normalized stored SQL of the operational v14 `commit_map` table, built by
+/// the registry itself in an empty replica. The registry's commit_map DDL has
+/// had a single form (v1 table plus the v6 `repo_id` column) in its history.
+fn expected_v14_table_sql() -> &'static str {
+    static EXPECTED: OnceLock<String> = OnceLock::new();
+    EXPECTED.get_or_init(|| {
+        let replica = Connection::open_in_memory().expect("in-memory replica");
+        super::schema::run_migrations_up_to(&replica, 14).expect("v14 replica");
+        let sql: String = replica
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='commit_map'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v14 replica commit_map");
+        normalize_sql(&sql)
+    })
+}
+
+/// Reason the indexes on `commit_map` cannot be carried through the rebuild,
+/// or `None`. Registry indexes must keep their exact semantics; any index that
+/// backs a constraint (no stored SQL to recreate) is refused.
+fn unsupported_index_semantics(conn: &Connection) -> Result<Option<String>, DatabaseError> {
+    let indexes: Vec<(String, i64, String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT name, \"unique\", origin, partial FROM pragma_index_list('commit_map') ORDER BY name",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (name, unique, origin, partial) in &indexes {
+        if origin != "c" {
+            return Ok(Some(format!(
+                "index {name} backs a table constraint (origin {origin}) and cannot be rebuilt"
+            )));
+        }
+        if let Some((_, wanted)) = REGISTRY_INDEXES
+            .iter()
+            .find(|(registry, _)| registry.eq_ignore_ascii_case(name))
+        {
+            if *unique != 0 || *partial != 0 {
+                return Ok(Some(format!(
+                    "registry index {name} is unique or partial, unlike operational v14"
+                )));
+            }
+            let keys: Vec<(Option<String>, i64, Option<String>)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT name, \"desc\", coll FROM pragma_index_xinfo(?1) WHERE key = 1 ORDER BY seqno",
+                )?;
+                let rows = stmt
+                    .query_map([name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let same = keys.len() == wanted.len()
+                && keys
+                    .iter()
+                    .zip(wanted.iter())
+                    .all(|((column, desc, coll), want)| {
+                        column.as_deref() == Some(*want)
+                            && *desc == 0
+                            && coll
+                                .as_deref()
+                                .is_some_and(|c| c.eq_ignore_ascii_case("BINARY"))
+                    });
+            if !same {
+                return Ok(Some(format!(
+                    "registry index {name} covers {keys:?}, unlike operational v14"
+                )));
+            }
+        }
+    }
+    for (registry, _) in REGISTRY_INDEXES {
+        if !indexes
+            .iter()
+            .any(|(name, ..)| name.eq_ignore_ascii_case(registry))
+        {
+            return Ok(Some(format!("registry index {registry} is missing")));
+        }
+    }
+    Ok(None)
 }
 
 /// Stored `sqlite_schema.sql` text for the table and its four registry indexes
@@ -143,7 +264,7 @@ fn stored_registry_schema(conn: &Connection) -> Result<BTreeMap<String, String>,
     let mut out = BTreeMap::new();
     let table: Option<String> = conn
         .query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='commit_map'",
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND lower(name)='commit_map'",
             [],
             |row| row.get(0),
         )
@@ -154,7 +275,7 @@ fn stored_registry_schema(conn: &Connection) -> Result<BTreeMap<String, String>,
     for (name, _) in REGISTRY_INDEXES {
         let sql: Option<String> = conn
             .query_row(
-                "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?1 AND tbl_name='commit_map'",
+                "SELECT sql FROM sqlite_schema WHERE type='index' AND lower(name)=lower(?1) AND lower(tbl_name)='commit_map'",
                 [name],
                 |row| row.get(0),
             )
@@ -175,7 +296,7 @@ enum Shape {
 
 fn classify_shape(conn: &Connection) -> Result<Shape, DatabaseError> {
     let present: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='commit_map')",
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND lower(name)='commit_map')",
         [],
         |row| row.get(0),
     )?;
@@ -196,13 +317,29 @@ fn classify_shape(conn: &Connection) -> Result<Shape, DatabaseError> {
             "commit_map columns differ from operational v14: {actual:?}"
         )));
     }
-    for (name, wanted) in REGISTRY_INDEXES {
-        let actual = index_columns(conn, name)?;
-        if actual != wanted {
-            return Ok(Shape::Unsupported(format!(
-                "registry index {name} is missing or covers {actual:?}"
-            )));
-        }
+    let table_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND lower(name)='commit_map'",
+        [],
+        |row| row.get(0),
+    )?;
+    if normalize_sql(&table_sql) != expected_v14_table_sql() {
+        return Ok(Shape::Unsupported(
+            "commit_map table definition (constraints, collations or clauses) differs from operational v14"
+                .into(),
+        ));
+    }
+    let own_foreign_keys: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('commit_map'))",
+        [],
+        |row| row.get(0),
+    )?;
+    if own_foreign_keys {
+        return Ok(Shape::Unsupported(
+            "commit_map declares a foreign key, unlike operational v14".into(),
+        ));
+    }
+    if let Some(reason) = unsupported_index_semantics(conn)? {
+        return Ok(Shape::Unsupported(reason));
     }
     Ok(Shape::OperationalV14)
 }
@@ -213,7 +350,7 @@ fn external_dependents(conn: &Connection) -> Result<Vec<(String, String, String)
     let mut stmt = conn.prepare(
         "SELECT type, name, sql FROM sqlite_schema
          WHERE type IN ('view', 'trigger')
-           AND tbl_name <> 'commit_map'
+           AND lower(tbl_name) <> 'commit_map'
            AND instr(lower(sql), 'commit_map') > 0
          ORDER BY type, name",
     )?;
@@ -227,7 +364,7 @@ fn external_dependents(conn: &Connection) -> Result<Vec<(String, String, String)
 fn refuse_foreign_keys(conn: &Connection) -> Result<(), DatabaseError> {
     let tables: Vec<String> = {
         let mut stmt = conn.prepare(
-            "SELECT name FROM sqlite_schema WHERE type='table' AND name <> 'commit_map' ORDER BY name",
+            "SELECT name FROM sqlite_schema WHERE type='table' AND lower(name) <> 'commit_map' ORDER BY name",
         )?;
         let rows = stmt
             .query_map([], |row| row.get(0))?
@@ -236,7 +373,9 @@ fn refuse_foreign_keys(conn: &Connection) -> Result<(), DatabaseError> {
     };
     for table in tables {
         let refers: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list(?1) WHERE \"table\" = 'commit_map')",
+            // SQLite identifiers are case-insensitive: REFERENCES COMMIT_MAP(id)
+            // targets this table too.
+            "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list(?1) WHERE lower(\"table\") = 'commit_map')",
             [&table],
             |row| row.get(0),
         )?;
@@ -320,7 +459,7 @@ fn extra_objects(conn: &Connection) -> Result<Vec<(String, String, String)>, Dat
     let registry: Vec<&str> = REGISTRY_INDEXES.iter().map(|(name, _)| *name).collect();
     let mut stmt = conn.prepare(
         "SELECT type, name, sql FROM sqlite_schema
-         WHERE tbl_name = 'commit_map' AND type IN ('index', 'trigger') AND sql IS NOT NULL
+         WHERE lower(tbl_name) = 'commit_map' AND type IN ('index', 'trigger') AND sql IS NOT NULL
          ORDER BY type, name",
     )?;
     let rows = stmt
@@ -334,7 +473,9 @@ fn extra_objects(conn: &Connection) -> Result<Vec<(String, String, String)>, Dat
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows
         .into_iter()
-        .filter(|(kind, name, _)| !(kind == "index" && registry.contains(&name.as_str())))
+        .filter(|(kind, name, _)| {
+            !(kind == "index" && registry.iter().any(|r| r.eq_ignore_ascii_case(name)))
+        })
         .collect())
 }
 

@@ -362,6 +362,250 @@ fn views_and_foreign_triggers_that_query_commit_map_survive_and_still_work() {
 }
 
 #[test]
+fn mixed_case_cascading_foreign_key_child_is_refused_before_any_write() {
+    // RS54-R1: identifiers are case-insensitive, so these children reference
+    // commit_map. DROP TABLE would cascade-delete their rows.
+    for target in ["COMMIT_MAP", "\"Commit_Map\""] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = v14_file(dir.path());
+        let (digest, others) = {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE operator_child (
+                   id INTEGER PRIMARY KEY,
+                   map_id INTEGER REFERENCES {target}(id) ON DELETE CASCADE
+                 );
+                 INSERT INTO operator_child VALUES (1, 2), (2, 40);"
+            ))
+            .unwrap();
+            let reported: String = conn
+                .query_row(
+                    "SELECT \"table\" FROM pragma_foreign_key_list('operator_child')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_ne!(
+                reported, "commit_map",
+                "the hazard needs a non-lowercase target"
+            );
+            (
+                commit_map_row_digest(&conn).unwrap(),
+                everything_else(&conn),
+            )
+        };
+        {
+            let db = Database::new(&path).unwrap();
+            expect_migration_failed(db.initialize(), "foreign key");
+        }
+        // Genuine reopen of the file: parent, child and version are unchanged.
+        assert_untouched_v14(&path, &digest, &others);
+        let conn = Connection::open(&path).unwrap();
+        let children: Vec<(i64, i64)> = conn
+            .prepare("SELECT id, map_id FROM operator_child ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(children, vec![(1, 2), (2, 40)], "{target}");
+    }
+}
+
+const FIXTURE_V12: &str = include_str!("../../../daemon/tests/fixtures/schema-v12.sql");
+const FIXTURE_COMMIT_MAP_TAIL: &str = "git_author  TEXT    NOT NULL DEFAULT ''\n        );";
+
+/// Build a file at the frozen genuine v12 fixture, with its `commit_map` DDL
+/// optionally edited, plus rows. Returns the path.
+fn fixture_v12_file(dir: &Path, edit: Option<(&str, &str)>) -> PathBuf {
+    let mut sql = FIXTURE_V12.to_string();
+    if let Some((old, new)) = edit {
+        assert_eq!(sql.matches(old).count(), 1, "fixture edit anchor {old:?}");
+        sql = sql.replacen(old, new, 1);
+    }
+    let path = dir.join("reposync.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(&sql).unwrap();
+    assert_eq!(user_version(&conn), 12);
+    conn.execute_batch(
+        "INSERT INTO users (id, username, display_name, email, password_hash, created_at, updated_at)
+           VALUES ('u1', 'u1', 'U', 'u@x', 'h', 't', 't');
+         INSERT INTO commit_map (id, svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id) VALUES
+           (5, 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'svn_to_git', 't', 'u1', 'u1', NULL),
+           (9, 2, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'git_to_svn', 't', 'u1', 'u1', NULL);",
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn genuine_v12_fixture_and_formatting_only_variants_upgrade_to_v15() {
+    for edit in [
+        None,
+        Some((
+            FIXTURE_COMMIT_MAP_TAIL,
+            "git_author TEXT NOT NULL DEFAULT ''\n\n\t);",
+        )),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_v12_file(dir.path(), edit);
+        let digest = commit_map_row_digest(&Connection::open(&path).unwrap()).unwrap();
+        let db = Database::new(&path).unwrap();
+        db.initialize().unwrap();
+        assert_eq!(user_version(&db.conn()), 15, "{edit:?}");
+        assert_eq!(git_sha_not_null(&db.conn()), 0);
+        assert_eq!(commit_map_row_digest(&db.conn()).unwrap(), digest);
+    }
+}
+
+#[test]
+fn unsupported_commit_map_table_constraints_are_refused_before_any_rebuild_write() {
+    // RS54-R2: semantics pragma_table_info cannot see. The registry's v13 and
+    // v14 commit normally; v15 must refuse with commit_map untouched.
+    let cases: [(&str, &str); 4] = [
+        (
+            "git_author  TEXT    NOT NULL DEFAULT '',\n            UNIQUE (svn_rev, direction)\n        );",
+            "constraint",
+        ),
+        (
+            "git_author  TEXT    NOT NULL DEFAULT '' COLLATE NOCASE\n        );",
+            "differs from operational v14",
+        ),
+        (
+            "git_author  TEXT    NOT NULL DEFAULT '',\n            CHECK (length(git_sha) > 0)\n        );",
+            "differs from operational v14",
+        ),
+        (
+            "git_author  TEXT    NOT NULL DEFAULT '' REFERENCES users(id)\n        );",
+            "differs from operational v14",
+        ),
+    ];
+    for (tail, needle) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_v12_file(dir.path(), Some((FIXTURE_COMMIT_MAP_TAIL, tail)));
+        let (digest, table_sql, indexes) = {
+            let conn = Connection::open(&path).unwrap();
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE name='commit_map'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let indexes: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_index_list('commit_map')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (commit_map_row_digest(&conn).unwrap(), sql, indexes)
+        };
+        {
+            let db = Database::new(&path).unwrap();
+            expect_migration_failed(db.initialize(), needle);
+        }
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&conn), 14, "{tail}");
+        assert_eq!(git_sha_not_null(&conn), 1);
+        assert_eq!(commit_map_row_digest(&conn).unwrap(), digest);
+        assert_eq!(staging_tables(&conn), 0);
+        let after: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='commit_map'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, table_sql, "the original definition is kept");
+        let after_indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('commit_map')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_indexes, indexes, "constraint autoindexes are kept");
+    }
+}
+
+#[test]
+fn altered_registry_index_semantics_are_refused_before_any_write() {
+    let cases: [(&str, &str); 4] = [
+        (
+            "DROP INDEX idx_commit_map_svn_rev; CREATE UNIQUE INDEX idx_commit_map_svn_rev ON commit_map(svn_rev);",
+            "unique or partial",
+        ),
+        (
+            "DROP INDEX idx_commit_map_svn_rev; CREATE INDEX idx_commit_map_svn_rev ON commit_map(svn_rev DESC);",
+            "covers",
+        ),
+        (
+            "DROP INDEX idx_commit_map_git_sha; CREATE INDEX idx_commit_map_git_sha ON commit_map(git_sha COLLATE NOCASE);",
+            "covers",
+        ),
+        (
+            "DROP INDEX idx_commit_map_repo_svn; CREATE INDEX idx_commit_map_repo_svn ON commit_map(repo_id, svn_rev) WHERE repo_id IS NOT NULL;",
+            "unique or partial",
+        ),
+    ];
+    for (mutation, needle) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = v14_file(dir.path());
+        let (digest, others, index_sql) = {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(mutation).unwrap();
+            let sql: Vec<String> = conn
+                .prepare("SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name='commit_map' ORDER BY name")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            (
+                commit_map_row_digest(&conn).unwrap(),
+                everything_else(&conn),
+                sql,
+            )
+        };
+        {
+            let db = Database::new(&path).unwrap();
+            expect_migration_failed(db.initialize(), needle);
+        }
+        assert_untouched_v14(&path, &digest, &others);
+        let conn = Connection::open(&path).unwrap();
+        let after: Vec<String> = conn
+            .prepare("SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name='commit_map' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(after, index_sql, "{mutation}");
+    }
+}
+
+#[test]
+fn sql_normalization_ignores_only_formatting() {
+    assert_eq!(
+        normalize_sql("CREATE TABLE t (\n  a  TEXT NOT NULL DEFAULT '' ,\n b INTEGER\n)"),
+        normalize_sql("CREATE TABLE t(a TEXT NOT NULL DEFAULT '',b INTEGER)")
+    );
+    // Literal contents, case and added clauses stay significant.
+    assert_ne!(
+        normalize_sql("CHECK (d IN ('a', 'b'))"),
+        normalize_sql("CHECK (d IN ('A', 'b'))")
+    );
+    assert_ne!(normalize_sql("DEFAULT ' '"), normalize_sql("DEFAULT '  '"));
+    assert_ne!(
+        normalize_sql("a TEXT"),
+        normalize_sql("a TEXT COLLATE NOCASE")
+    );
+    assert_ne!(normalize_sql("a text"), normalize_sql("a TEXT"));
+}
+
+#[test]
 fn injected_failure_at_every_stage_rolls_back_then_retry_succeeds() {
     for stage in [
         "before_create",

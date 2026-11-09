@@ -46,8 +46,20 @@ NULL, the empty string and a missing row are never aliases of one another.
   single migration transaction. On any error nothing is kept.
 - Preconditions, checked inside that transaction before any write:
   - exact operational v14 columns (`PRAGMA table_info`) with `git_sha NOT NULL`;
-  - the four registry indexes are present with their registry columns;
-  - no foreign key in another table refers to `commit_map`.
+  - the stored `commit_map` definition equals the registry's own v14 definition
+    after formatting-only normalization (whitespace outside literals). Case,
+    literals and every clause stay significant, so a table-level `UNIQUE`,
+    `CHECK`, `COLLATE`, `REFERENCES` or other clause that `table_info` cannot
+    show is refused. The registry's `commit_map` DDL has had a single form in its
+    history, and the frozen v12 fixture matches it;
+  - each of the four registry indexes keeps its exact semantics: not unique,
+    not partial, created by `CREATE INDEX`, the registry key columns in order,
+    ascending, `BINARY` collation. Any index that backs a constraint (it has no
+    stored SQL and could not be recreated) is refused;
+  - no foreign key in another table refers to `commit_map`. Table names are
+    compared case-insensitively, as SQLite resolves them, so
+    `REFERENCES COMMIT_MAP(id) ON DELETE CASCADE` is refused too; dropping the
+    table under it would delete the child rows.
 
   Anything else is refused with `MigrationFailed { version: 15 }` and leaves the
   database at v14, byte-for-byte as far as SQLite is concerned.
