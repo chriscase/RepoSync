@@ -257,7 +257,31 @@ impl Database {
     }
 
     /// Insert a commit-map entry optionally scoped to a managed repository.
+    ///
+    /// Equivalent to [`Database::insert_commit_map_with_target`] with
+    /// `Some(git_sha)`. An empty `git_sha` is refused.
     pub fn insert_commit_map_with_repo(
+        &self,
+        svn_rev: i64,
+        git_sha: &str,
+        direction: &str,
+        svn_author: &str,
+        git_author: &str,
+        repo_id: Option<&str>,
+    ) -> Result<i64, DatabaseError> {
+        self.insert_commit_map_with_target(
+            svn_rev,
+            Some(git_sha),
+            direction,
+            svn_author,
+            git_author,
+            repo_id,
+        )
+    }
+
+    /// Applied-row writer behind `insert_commit_map_with_target(Some(sha))`.
+    /// `git_sha` is non-empty here.
+    pub(super) fn insert_commit_map_applied(
         &self,
         svn_rev: i64,
         git_sha: &str,
@@ -327,9 +351,16 @@ impl Database {
     }
 
     /// Look up a Git SHA by SVN revision.
+    ///
+    /// Returns the earliest row's SHA that is not NULL (the order the previous
+    /// `svn_rev` index scan produced). `None` means no row or only no-target
+    /// rows; callers that must tell those apart use
+    /// [`Database::list_commit_map_rows`] or [`Database::is_svn_rev_synced`].
     pub fn get_git_sha_for_svn_rev(&self, svn_rev: i64) -> Result<Option<String>, DatabaseError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT git_sha FROM commit_map WHERE svn_rev = ?1 LIMIT 1")?;
+        let mut stmt = conn.prepare(
+            "SELECT git_sha FROM commit_map WHERE svn_rev = ?1 AND git_sha IS NOT NULL ORDER BY id LIMIT 1",
+        )?;
         let mut rows = stmt.query_map(params![svn_rev], |row| row.get(0))?;
         match rows.next() {
             Some(Ok(sha)) => Ok(Some(sha)),
@@ -350,12 +381,14 @@ impl Database {
         }
     }
 
-    /// Return the most recent N commit-map entries ordered by synced_at desc.
+    /// Return the most recent N commit-map entries that have a Git SHA, newest
+    /// first. No-target rows (NULL `git_sha`) are not listed here; use
+    /// [`Database::list_commit_map_rows`] to see every row and its target.
     pub fn list_commit_map(&self, limit: u32) -> Result<Vec<CommitMapEntry>, DatabaseError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id
-             FROM commit_map ORDER BY id DESC LIMIT ?1",
+             FROM commit_map WHERE git_sha IS NOT NULL ORDER BY id DESC LIMIT ?1",
         )?;
         let entries = stmt
             .query_map(params![limit], |row| {
@@ -375,14 +408,22 @@ impl Database {
     }
 
     /// Check whether a given SVN revision has already been synced.
+    ///
+    /// True for a row with a Git SHA, or for a no-target row proven by a
+    /// canonical `intentionally_filtered_no_target` outcome. An unverified
+    /// NULL row does not count. This is a legacy compatibility predicate, not
+    /// canonical admission authority.
     pub fn is_svn_rev_synced(&self, svn_rev: i64) -> Result<bool, DatabaseError> {
         let conn = self.conn();
         let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM commit_map WHERE svn_rev = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM commit_map WHERE svn_rev = ?1 AND git_sha IS NOT NULL)",
             params![svn_rev],
             |row| row.get(0),
         )?;
-        Ok(exists)
+        if exists {
+            return Ok(true);
+        }
+        super::nullable_commit_map::any_proven_no_target_row(&conn, svn_rev, None)
     }
 
     /// Check whether a given Git SHA has already been synced.
@@ -2066,10 +2107,16 @@ impl Database {
     }
 
     /// Get the last SVN revision from the commit map or sync records.
+    ///
+    /// Only rows with a Git SHA count, so a no-target row never advances this
+    /// legacy fallback.
     pub fn get_last_svn_revision(&self) -> Result<Option<i64>, DatabaseError> {
         let conn = self.conn();
-        let result: Result<Option<i64>, _> =
-            conn.query_row("SELECT MAX(svn_rev) FROM commit_map", [], |row| row.get(0));
+        let result: Result<Option<i64>, _> = conn.query_row(
+            "SELECT MAX(svn_rev) FROM commit_map WHERE git_sha IS NOT NULL",
+            [],
+            |row| row.get(0),
+        );
         match result {
             Ok(Some(rev)) => Ok(Some(rev)),
             Ok(None) => {
@@ -2086,9 +2133,14 @@ impl Database {
     }
 
     /// Get the last Git hash from the commit map or sync records.
+    ///
+    /// The newest row with a Git SHA wins; no-target rows are skipped. When no
+    /// row has a SHA, the `sync_records` fallback applies, as for an empty map.
     pub fn get_last_git_hash(&self) -> Result<Option<String>, DatabaseError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT git_sha FROM commit_map ORDER BY id DESC LIMIT 1")?;
+        let mut stmt = conn.prepare(
+            "SELECT git_sha FROM commit_map WHERE git_sha IS NOT NULL ORDER BY id DESC LIMIT 1",
+        )?;
         let mut rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         match rows.next() {
             Some(Ok(sha)) => Ok(Some(sha)),

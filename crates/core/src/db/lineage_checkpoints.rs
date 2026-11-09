@@ -1,8 +1,9 @@
 //! Operational canonical lineage identity and typed directional checkpoints (#63).
 //!
 //! These tables are independent of the fixture-only candidate `pair_lineages`
-//! / `pair_frontiers` / `pair_outcomes` registry. `commit_map.git_sha` stays
-//! NOT NULL so this story does not compete with #54's nullable rebuild.
+//! / `pair_frontiers` / `pair_outcomes` registry. Operational v15 (#54) makes
+//! `commit_map.git_sha` nullable; a NULL row is only a projection of an
+//! `intentionally_filtered_no_target` outcome recorded here, never authority.
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};

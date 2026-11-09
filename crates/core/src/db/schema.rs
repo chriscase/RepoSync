@@ -394,12 +394,19 @@ static MIGRATIONS: &[(u32, &str, &str)] = &[
             ON canonical_mapping_outcomes (scope_uuid, generation, direction);
         "#,
     ),
+    (
+        15,
+        "nullable commit_map.git_sha for proven no-target SVN revisions (#54)",
+        // The verified table rebuild runs in `nullable_commit_map::migrate_v15`
+        // inside this migration's transaction (see `apply_migration_body`).
+        "-- commit_map rebuild: nullable_commit_map::migrate_v15",
+    ),
 ];
 
 /// Operational schema version for ordinary startup. Candidate CopySession
 /// `pair_lineages` / `pair_frontiers` / `pair_outcomes` SQL is not registered
 /// here and must not be applied by [`run_migrations`].
-pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+pub const CURRENT_SCHEMA_VERSION: u32 = 15;
 
 /// Bootstrap verified empty storage inside the startup owner's transaction.
 pub(crate) fn initialize_empty_startup_in_transaction(
@@ -524,7 +531,8 @@ fn repositories_table_has_scope_uuid_column(conn: &Connection) -> Result<bool, D
 }
 
 /// Apply deferred v13 scope identity and any later operational migrations
-/// (currently v14 canonical lineage) when startup deferred them for a legacy install.
+/// (currently v14 canonical lineage and v15 nullable `commit_map.git_sha`)
+/// when startup deferred them for a legacy install.
 pub fn ensure_v13_migration(conn: &Connection) -> Result<(), DatabaseError> {
     if get_schema_version(conn)? >= CURRENT_SCHEMA_VERSION {
         return Ok(());
@@ -599,6 +607,15 @@ fn apply_migration_body(conn: &Connection, version: u32, sql: &str) -> Result<()
                 version,
                 detail: e.to_string(),
             }
+        })?;
+    }
+    if version == super::nullable_commit_map::NULLABLE_COMMIT_MAP_VERSION {
+        super::nullable_commit_map::migrate_v15(conn).map_err(|e| match e {
+            DatabaseError::MigrationFailed { .. } => e,
+            other => DatabaseError::MigrationFailed {
+                version,
+                detail: other.to_string(),
+            },
         })?;
     }
     set_schema_version(conn, version).map_err(|e| DatabaseError::MigrationFailed {

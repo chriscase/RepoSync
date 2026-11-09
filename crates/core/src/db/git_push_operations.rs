@@ -305,10 +305,13 @@ fn personal_finalize_tx(
             ],
         )?;
     }
+    // A no-target (NULL) row for this revision must not suppress the applied
+    // SHA: published evidence is always recorded.
     let exists: bool = tx.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM commit_map
             WHERE svn_rev = ?1 AND direction = 'svn_to_git' AND repo_id = ?2
+              AND git_sha IS NOT NULL
         )",
         params![svn_rev, op.repo_id],
         |row| row.get(0),
@@ -1045,6 +1048,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(personal_rows, 1);
+    }
+
+    #[test]
+    fn personal_confirm_records_the_applied_sha_even_after_a_no_target_row() {
+        // #54: an earlier NULL-target row for the same revision must not stop
+        // the published SHA from being recorded.
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+                 VALUES (3, NULL, 'svn_to_git', 't', '', '', 'pair')",
+                [],
+            )
+            .unwrap();
+        let op = db.begin_svn_to_git_push(sample_intent()).unwrap();
+        let done = db
+            .confirm_personal_svn_to_git_push(
+                "pair",
+                &op.id,
+                "dddddddddddddddddddddddddddddddddddddddd",
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "svn_rev",
+                "Dev <dev@example.com>",
+            )
+            .unwrap();
+        assert_eq!(done.state, GitPushOperationState::Completed);
+        let count = |sql: &str| -> i64 { db.conn().query_row(sql, [], |row| row.get(0)).unwrap() };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM commit_map WHERE svn_rev=3 AND repo_id='pair' AND git_sha='dddddddddddddddddddddddddddddddddddddddd'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM commit_map WHERE svn_rev=3 AND repo_id='pair' AND git_sha IS NULL"),
+            1,
+            "the earlier row is history and is kept"
+        );
+        assert_eq!(
+            db.get_git_sha_for_svn_rev(3).unwrap().as_deref(),
+            Some("dddddddddddddddddddddddddddddddddddddddd")
+        );
     }
 
     #[test]

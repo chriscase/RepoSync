@@ -70,6 +70,7 @@ fn has_explicit_personal_commit_map_svn_to_git(
                 WHERE svn_rev = ?1
                   AND direction = 'svn_to_git'
                   AND repo_id = ?2
+                  AND git_sha IS NOT NULL
             )",
             params![svn_rev, read_ids[0]],
             |row| row.get(0),
@@ -81,12 +82,17 @@ fn has_explicit_personal_commit_map_svn_to_git(
                 WHERE svn_rev = ?1
                   AND direction = 'svn_to_git'
                   AND repo_id IN (?2, ?3)
+                  AND git_sha IS NOT NULL
             )",
             params![svn_rev, read_ids[0], read_ids[1]],
             |row| row.get(0),
         )?
     };
-    Ok(exists)
+    if exists {
+        return Ok(true);
+    }
+    // A NULL-target row counts only when canonical no-target proof exists.
+    super::nullable_commit_map::any_proven_no_target_row(conn, svn_rev, Some(read_ids))
 }
 
 fn null_commit_map_svn_to_git_has_personal_evidence(
@@ -99,6 +105,7 @@ fn null_commit_map_svn_to_git_has_personal_evidence(
             WHERE cm.svn_rev = ?1
               AND cm.direction = 'svn_to_git'
               AND cm.repo_id IS NULL
+              AND cm.git_sha IS NOT NULL
               AND EXISTS (
                   SELECT 1 FROM sync_records sr
                   WHERE sr.svn_rev = cm.svn_rev

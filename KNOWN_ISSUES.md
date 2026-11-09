@@ -73,3 +73,16 @@
 ### H5. Identity mapping per-repo
 - Currently uses global identity config
 - Each repo should be able to have its own email_domain and mapping file
+
+## Documented States
+
+### NULL `commit_map.git_sha` (#54)
+- Since operational schema v15, `commit_map.git_sha` may be NULL. NULL means
+  "this SVN revision produced no Git commit", and only when it is proven by a
+  canonical `intentionally_filtered_no_target` outcome for the same repository
+  scope and current generation. Unproven NULL rows are inert: they are not
+  "synced" and they never advance a watermark or checkpoint.
+- Nothing in the default configuration (empty `allowed_paths`) writes NULL
+  rows. The SVN→Git path filter that would produce them is separate #52 work.
+- The Repository Detail and Dashboard mapping tables label these rows instead of
+  showing a SHA. Contract: [docs/reliability/contracts/54-nullable-commit-map.md](docs/reliability/contracts/54-nullable-commit-map.md).
