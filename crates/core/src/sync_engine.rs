@@ -8244,3 +8244,6 @@ mod pr245_probe_cleanup_tests {
         leader_exited_descendant_retains("stderr");
     }
 }
+
+#[path = "sync_engine/svn_projection_53.rs"]
+pub(crate) mod svn_projection_53;

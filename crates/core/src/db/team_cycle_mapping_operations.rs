@@ -45,6 +45,10 @@ pub enum TeamCycleMappingDirection {
 #[serde(rename_all = "snake_case")]
 pub enum TeamCycleMappingOutcome {
     SvnNoTargetContent,
+    /// #53: an SVN revision whose selected Git-content effect is zero under
+    /// the active path policy. Only a verified SVN projection can begin or
+    /// finalize it; the generic journal API refuses this outcome.
+    SvnFiltered,
     GitFiltered,
     GitEmptyCommit,
     GitNoSvnDelta,
@@ -253,6 +257,7 @@ fn finalize_tx(
     tx: &Connection,
     mut op: TeamCycleMappingOperation,
     observed_proof: Option<serde_json::Value>,
+    filtered: Option<&crate::sync_engine::svn_projection_53::VerifiedSvnProjection<'_, '_>>,
 ) -> Result<TeamCycleMappingOperation, DatabaseError> {
     if op.intended_target_proof.is_some() && observed_proof != op.intended_target_proof {
         return Err(DatabaseError::Other(
@@ -260,6 +265,9 @@ fn finalize_tx(
         ));
     }
     match (&op.direction, &op.outcome) {
+        (TeamCycleMappingDirection::SvnToGit, TeamCycleMappingOutcome::SvnFiltered) => {
+            finalize_svn_filtered_tx(tx, &op, filtered)?;
+        }
         (TeamCycleMappingDirection::SvnToGit, TeamCycleMappingOutcome::SvnNoTargetContent) => {
             let svn_rev = op.source_svn_rev.ok_or_else(|| {
                 DatabaseError::Other("svn no-target mapping lacks source rev".into())
@@ -446,51 +454,12 @@ impl Database {
         &self,
         intent: TeamCycleMappingIntent<'_>,
     ) -> Result<TeamCycleMappingOperation, DatabaseError> {
-        self.transaction(|tx| {
-            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
-                tx,
-                intent.repo_id,
-            )?;
-            let active = key("active", intent.repo_id);
-            if read_value(tx, &active)?.is_some() {
-                return Err(DatabaseError::Other(
-                    "repository has an active or held team cycle mapping".into(),
-                ));
-            }
-            if super::managed_remove::new_work_blocked(tx, intent.repo_id)? {
-                return Err(DatabaseError::Other(
-                    "repository removal blocks a new team cycle mapping".into(),
-                ));
-            }
-            let now = Utc::now().to_rfc3339();
-            let op = TeamCycleMappingOperation {
-                version: 1,
-                id: Uuid::new_v4().to_string(),
-                repo_id: intent.repo_id.into(),
-                operation_type: "team_cycle_mapping".into(),
-                initiator_id: intent.initiator_id.into(),
-                request_id: intent.request_id.into(),
-                target_fingerprint: intent.target_fingerprint.into(),
-                created_at: now.clone(),
-                updated_at: now,
-                state: TeamCycleMappingState::Running,
-                direction: intent.direction,
-                outcome: intent.outcome,
-                source_svn_rev: intent.source_svn_rev,
-                source_git_sha: intent.source_git_sha.map(str::to_owned),
-                pre_write_svn_rev: intent.pre_write_svn_rev,
-                pre_write_git_sha: intent.pre_write_git_sha.into(),
-                projection: intent.projection.into(),
-                intended_target_proof: intent.intended_target_proof.cloned(),
-                observed_target_proof: None,
-                resume_authorized: false,
-                outcome_detail: None,
-            };
-            write_op(tx, &op)?;
-            write_value(tx, &active, &op.id)?;
-            write_value(tx, &key("latest", intent.repo_id), &op.id)?;
-            Ok(op)
-        })
+        if intent.outcome == TeamCycleMappingOutcome::SvnFiltered {
+            return Err(DatabaseError::Other(
+                "a filtered SVN team cycle mapping requires a verified SVN projection".into(),
+            ));
+        }
+        self.transaction(|tx| begin_team_cycle_mapping_tx(tx, intent))
     }
 
     pub fn hold_team_cycle_mapping_reconciliation(
@@ -523,21 +492,7 @@ impl Database {
         observed_proof: Option<serde_json::Value>,
     ) -> Result<TeamCycleMappingOperation, DatabaseError> {
         self.transaction(|tx| {
-            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
-            if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
-                return Err(DatabaseError::Other(
-                    "stale or inactive team cycle mapping operation".into(),
-                ));
-            }
-            let op = parse(&read_value(tx, &key("document", op_id))?.ok_or_else(|| {
-                DatabaseError::Other("missing team cycle mapping document".into())
-            })?)?;
-            if op.repo_id != repo_id || op.state != TeamCycleMappingState::Running {
-                return Err(DatabaseError::Other(
-                    "team cycle mapping is not running".into(),
-                ));
-            }
-            finalize_tx(tx, op, observed_proof)
+            confirm_team_cycle_mapping_tx(tx, repo_id, op_id, observed_proof, None)
         })
     }
 
@@ -753,5 +708,367 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(receipt["outcome"], "filtered");
+    }
+}
+
+/// Canonical reason recorded for a #53 filtered SVN revision. It is distinct
+/// from the legacy `no_git_content` reason of metadata-only revisions.
+pub(crate) const SVN_FILTERED_REASON: &str = "svn_filtered_no_git_content";
+
+/// The one shared begin core: the original `begin_team_cycle_mapping`
+/// transaction body, moved here unchanged. Both the generic API and the typed
+/// filtered begin run it inside their own transaction.
+// Kept byte-for-byte as moved from the original method (dedented only),
+// so the moved body can be compared exactly with its preimage.
+#[rustfmt::skip]
+fn begin_team_cycle_mapping_tx(
+    tx: &Connection,
+    intent: TeamCycleMappingIntent<'_>,
+) -> Result<TeamCycleMappingOperation, DatabaseError> {
+    super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+        tx,
+        intent.repo_id,
+    )?;
+    let active = key("active", intent.repo_id);
+    if read_value(tx, &active)?.is_some() {
+        return Err(DatabaseError::Other(
+            "repository has an active or held team cycle mapping".into(),
+        ));
+    }
+    if super::managed_remove::new_work_blocked(tx, intent.repo_id)? {
+        return Err(DatabaseError::Other(
+            "repository removal blocks a new team cycle mapping".into(),
+        ));
+    }
+    let now = Utc::now().to_rfc3339();
+    let op = TeamCycleMappingOperation {
+        version: 1,
+        id: Uuid::new_v4().to_string(),
+        repo_id: intent.repo_id.into(),
+        operation_type: "team_cycle_mapping".into(),
+        initiator_id: intent.initiator_id.into(),
+        request_id: intent.request_id.into(),
+        target_fingerprint: intent.target_fingerprint.into(),
+        created_at: now.clone(),
+        updated_at: now,
+        state: TeamCycleMappingState::Running,
+        direction: intent.direction,
+        outcome: intent.outcome,
+        source_svn_rev: intent.source_svn_rev,
+        source_git_sha: intent.source_git_sha.map(str::to_owned),
+        pre_write_svn_rev: intent.pre_write_svn_rev,
+        pre_write_git_sha: intent.pre_write_git_sha.into(),
+        projection: intent.projection.into(),
+        intended_target_proof: intent.intended_target_proof.cloned(),
+        observed_target_proof: None,
+        resume_authorized: false,
+        outcome_detail: None,
+    };
+    write_op(tx, &op)?;
+    write_value(tx, &active, &op.id)?;
+    write_value(tx, &key("latest", intent.repo_id), &op.id)?;
+    Ok(op)
+}
+
+/// The one shared confirm core: the original `confirm_team_cycle_mapping`
+/// guards and finalization, moved here unchanged except that the optional
+/// verified projection reaches `finalize_tx`.
+// Kept byte-for-byte as moved from the original method (dedented only),
+// so the moved body can be compared exactly with its preimage.
+#[rustfmt::skip]
+fn confirm_team_cycle_mapping_tx(
+    tx: &Connection,
+    repo_id: &str,
+    op_id: &str,
+    observed_proof: Option<serde_json::Value>,
+    filtered: Option<&crate::sync_engine::svn_projection_53::VerifiedSvnProjection<'_, '_>>,
+) -> Result<TeamCycleMappingOperation, DatabaseError> {
+    super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+    if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
+        return Err(DatabaseError::Other(
+            "stale or inactive team cycle mapping operation".into(),
+        ));
+    }
+    let op = parse(&read_value(tx, &key("document", op_id))?.ok_or_else(|| {
+        DatabaseError::Other("missing team cycle mapping document".into())
+    })?)?;
+    if op.repo_id != repo_id || op.state != TeamCycleMappingState::Running {
+        return Err(DatabaseError::Other(
+            "team cycle mapping is not running".into(),
+        ));
+    }
+    finalize_tx(tx, op, observed_proof, filtered)
+}
+
+/// Filtered SVN→Git tail of `finalize_tx`. In the caller's single journal
+/// transaction it writes, together: the scoped SVN no-target receipt and
+/// watermark, the canonical `intentionally_filtered_no_target` outcome and
+/// checkpoint (policy, reason, no targets), and the proven NULL `commit_map`
+/// projection. `finalize_tx` then completes the operation. It never moves
+/// the inbound Git cursor, never records a Git SHA and reports no remote
+/// effect. Any failure rolls the whole transaction back.
+fn finalize_svn_filtered_tx(
+    tx: &Connection,
+    op: &TeamCycleMappingOperation,
+    filtered: Option<&crate::sync_engine::svn_projection_53::VerifiedSvnProjection<'_, '_>>,
+) -> Result<(), DatabaseError> {
+    let Some(proof) = filtered else {
+        return Err(DatabaseError::Other(
+            "a filtered SVN team cycle mapping can only be finalized with a verified SVN projection"
+                .into(),
+        ));
+    };
+    let svn_rev = op
+        .source_svn_rev
+        .ok_or_else(|| DatabaseError::Other("svn filtered mapping lacks source rev".into()))?;
+    if op.repo_id != proof.repo_id()
+        || svn_rev != proof.revision()
+        || op.projection != proof.policy_snapshot()
+    {
+        return Err(DatabaseError::Other(
+            "svn filtered mapping does not match its verified SVN projection".into(),
+        ));
+    }
+    if op.source_git_sha.is_some() || op.intended_target_proof.is_some() {
+        return Err(DatabaseError::Other(
+            "svn filtered mapping must not carry a Git source or target proof".into(),
+        ));
+    }
+    if svn_rev <= op.pre_write_svn_rev {
+        return Err(DatabaseError::Other(
+            "observed SVN revision is not after the pre-write revision".into(),
+        ));
+    }
+    proof.revalidate_tx(tx)?;
+    // The projection proved that this revision has no Git content under the
+    // active policy, so the existing scoped v1 `no_git_content` receipt holds.
+    let receipt = serde_json::json!({
+        "version": 1,
+        "repo_id": op.repo_id,
+        "svn_revision": svn_rev,
+        "outcome": "no_git_content",
+        "projection": op.projection,
+    });
+    advance_svn_with_receipt_tx(tx, &op.repo_id, svn_rev, receipt)?;
+    // The receipt path resolves the current generation; refuse if that moved.
+    proof.revalidate_tx(tx)?;
+    let source_key = super::lineage_checkpoints::svn_source_key(svn_rev);
+    super::lineage_checkpoints::persist_directional_checkpoint_tx(
+        tx,
+        proof.scope_uuid(),
+        proof.generation(),
+        super::lineage_checkpoints::MappingWrite {
+            direction: super::lineage_checkpoints::CheckpointDirection::SvnToGit,
+            source_key: &source_key,
+            outcome: super::lineage_checkpoints::MappingOutcome::IntentionallyFilteredNoTarget,
+            target_git_sha: None,
+            target_svn_rev: None,
+            reason: Some(SVN_FILTERED_REASON),
+            policy_snapshot: Some(op.projection.as_str()),
+        },
+    )?;
+    super::nullable_commit_map::insert_proven_no_target_row_tx(
+        tx,
+        svn_rev,
+        "svn_to_git",
+        proof.svn_author(),
+        "",
+        &op.repo_id,
+    )?;
+    Ok(())
+}
+
+impl Database {
+    /// #53 typed begin for one filtered SVN revision. The owner check runs
+    /// outside SQLite; the captured identity is revalidated inside the same
+    /// transaction as the shared begin core.
+    pub(crate) fn begin_svn_filtered_mapping(
+        &self,
+        proof: &crate::sync_engine::svn_projection_53::VerifiedSvnProjection<'_, '_>,
+        pre_write_svn_rev: i64,
+        pre_write_git_sha: &str,
+    ) -> Result<TeamCycleMappingOperation, DatabaseError> {
+        proof.require_owner(self)?;
+        let repo_id = proof.repo_id();
+        let projection = proof.policy_snapshot();
+        let fingerprint = team_cycle_mapping_fingerprint(repo_id, projection);
+        let request_id = format!("svn-r{}", proof.revision());
+        self.transaction(|tx| {
+            proof.revalidate_tx(tx)?;
+            begin_team_cycle_mapping_tx(
+                tx,
+                TeamCycleMappingIntent {
+                    repo_id,
+                    initiator_id: "team_worker",
+                    request_id: &request_id,
+                    target_fingerprint: &fingerprint,
+                    direction: TeamCycleMappingDirection::SvnToGit,
+                    outcome: TeamCycleMappingOutcome::SvnFiltered,
+                    source_svn_rev: Some(proof.revision()),
+                    source_git_sha: None,
+                    pre_write_svn_rev,
+                    pre_write_git_sha,
+                    projection,
+                    intended_target_proof: None,
+                },
+            )
+        })
+    }
+
+    /// #53 typed confirm: the shared confirm core with the verified
+    /// projection, in one transaction after the owner check.
+    pub(crate) fn confirm_svn_filtered_mapping(
+        &self,
+        proof: &crate::sync_engine::svn_projection_53::VerifiedSvnProjection<'_, '_>,
+        op_id: &str,
+    ) -> Result<TeamCycleMappingOperation, DatabaseError> {
+        proof.require_owner(self)?;
+        self.transaction(|tx| {
+            proof.revalidate_tx(tx)?;
+            confirm_team_cycle_mapping_tx(tx, proof.repo_id(), op_id, None, Some(proof))
+        })
+    }
+}
+
+#[cfg(test)]
+mod svn_filtered_tests {
+    use super::*;
+
+    fn pair_db() -> Database {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_api_url, git_repo, git_branch, enabled, created_at, updated_at, last_svn_rev, last_git_sha)
+                 VALUES ('pair', 'pair', 'file:///svn', '', 'alice', 'file:///git', 'pair', 'main', 1, 't', 't', 1, ?1)",
+                ["a".repeat(40)],
+            )
+            .unwrap();
+        db
+    }
+
+    fn filtered_intent<'a>(fingerprint: &'a str, pre_git: &'a str) -> TeamCycleMappingIntent<'a> {
+        TeamCycleMappingIntent {
+            repo_id: "pair",
+            initiator_id: "team_worker",
+            request_id: "svn-r2",
+            target_fingerprint: fingerprint,
+            direction: TeamCycleMappingDirection::SvnToGit,
+            outcome: TeamCycleMappingOutcome::SvnFiltered,
+            source_svn_rev: Some(2),
+            source_git_sha: None,
+            pre_write_svn_rev: 1,
+            pre_write_git_sha: pre_git,
+            projection: "unfiltered",
+            intended_target_proof: None,
+        }
+    }
+
+    fn no_effects(db: &Database) {
+        let (svn_rev, _) = db.get_repo_watermark("pair").unwrap();
+        assert_eq!(svn_rev, 1, "no SVN watermark movement");
+        assert_eq!(db.get_state("last_svn_rev_pair").unwrap(), None);
+        assert!(
+            crate::echo_receipt_scope::read_svn_no_target_receipt(db, "pair", 2)
+                .unwrap()
+                .is_none()
+        );
+        let rows: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM commit_map", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "no commit_map row");
+        let outcomes: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM canonical_mapping_outcomes",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outcomes, 0, "no canonical outcome");
+    }
+
+    #[test]
+    fn generic_begin_refuses_svn_filtered_without_projection() {
+        let db = pair_db();
+        let fingerprint = team_cycle_mapping_fingerprint("pair", "unfiltered");
+        let pre_git = "a".repeat(40);
+        let error = db
+            .begin_team_cycle_mapping(filtered_intent(&fingerprint, &pre_git))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires a verified SVN projection"));
+        assert!(db
+            .active_team_cycle_mapping_operation("pair")
+            .unwrap()
+            .is_none());
+        no_effects(&db);
+    }
+
+    #[test]
+    fn forged_svn_filtered_journal_json_cannot_be_confirmed_generically() {
+        let db = pair_db();
+        let now = Utc::now().to_rfc3339();
+        let forged = TeamCycleMappingOperation {
+            version: 1,
+            id: "forged-op".into(),
+            repo_id: "pair".into(),
+            operation_type: "team_cycle_mapping".into(),
+            initiator_id: "team_worker".into(),
+            request_id: "svn-r2".into(),
+            target_fingerprint: team_cycle_mapping_fingerprint("pair", "unfiltered"),
+            created_at: now.clone(),
+            updated_at: now,
+            state: TeamCycleMappingState::Running,
+            direction: TeamCycleMappingDirection::SvnToGit,
+            outcome: TeamCycleMappingOutcome::SvnFiltered,
+            source_svn_rev: Some(2),
+            source_git_sha: None,
+            pre_write_svn_rev: 1,
+            pre_write_git_sha: "a".repeat(40),
+            projection: "unfiltered".into(),
+            intended_target_proof: None,
+            observed_target_proof: None,
+            resume_authorized: false,
+            outcome_detail: None,
+        };
+        db.transaction(|tx| {
+            write_op(tx, &forged)?;
+            write_value(tx, &key("active", "pair"), &forged.id)
+        })
+        .unwrap();
+        let error = db
+            .confirm_team_cycle_mapping("pair", "forged-op", None)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("can only be finalized with a verified SVN projection"));
+        let still = db
+            .get_team_cycle_mapping_operation("pair", "forged-op")
+            .unwrap()
+            .unwrap();
+        assert_eq!(still.state, TeamCycleMappingState::Running);
+        no_effects(&db);
+    }
+
+    #[test]
+    fn svn_filtered_outcome_keeps_existing_serialized_names() {
+        for (outcome, name) in [
+            (
+                TeamCycleMappingOutcome::SvnNoTargetContent,
+                "svn_no_target_content",
+            ),
+            (TeamCycleMappingOutcome::GitFiltered, "git_filtered"),
+            (TeamCycleMappingOutcome::GitEmptyCommit, "git_empty_commit"),
+            (TeamCycleMappingOutcome::GitNoSvnDelta, "git_no_svn_delta"),
+            (TeamCycleMappingOutcome::SvnFiltered, "svn_filtered"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(&outcome).unwrap(),
+                serde_json::Value::String(name.into())
+            );
+        }
     }
 }
