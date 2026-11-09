@@ -158,6 +158,85 @@ with a real writer window:
 * `record_svn_filtered_mapping` refusing drift with zero effects and then
   committing once (RS53-R2).
 
+## Imported origin and its historical incarnation (RS53-IMPORTED-ORIGIN-HISTORICAL-INCARNATION-1)
+
+A snapshot import publishes commit B from SVN revision R. That provenance is
+stored as one `snapshot-import:<op_id>` origin row, written by
+`complete_import_tx`, and the import's journal document. Neither records the
+incarnation of the imported path. The incarnation is therefore observed
+genuinely at peg R, never inferred from stored fields. `SnapshotPin` gains no
+fields, and its optional copy fields stay revision-local data.
+
+* **Shared decoder** (`import_operations::snapshot_origin_evidence`). It is
+  read-only and takes the caller's connection, repository and B. It returns:
+  * `Absent` when nothing names B;
+  * `Refused(detail)` when a claim exists but a link is missing or contradicts
+    another. Required links: exactly one applied `svn_to_git` origin row; its
+    op id equal to the journal key, the journal id and the repository; a
+    supported version; Completed `snapshot_import`; one-revision counters;
+    local and confirmed revision and commit equal to R and B; no intent or
+    pending maps; operative = peg = R;
+  * `Verified(record)` otherwise, with a digest of the journal text.
+
+  Malformed documents and SQLite errors are errors, never absence.
+* **Historical observer** (`lineage_checkpoints::observe_historical_svn_identity_at`).
+  It reads `svn info URL@R` and the stop-on-copy history at peg R through the
+  configured client. Path identity and incarnation extraction are the live
+  observer's. Empty, out-of-range or non-descending history is refused. The
+  identity compares UUID, root, URL, branch path, creation revision and the
+  path-specific creation copy pair. Revision-number ordering or equality is
+  never used as proof.
+* **First pin (E3, `verify_or_pin_live_svn_identity`; public signature
+  unchanged).** Before the first canonical lineage row of the current scope
+  generation is pinned for a snapshot-backed Git baseline:
+  * the live UUID and URL must equal the pin's;
+  * the identity observed now at R must equal the live identity;
+  * the records must be unchanged after the SVN reads.
+
+  A refused origin, an unobservable history or any difference uses the existing
+  hold (`hold_unproved_identity`) before any lineage row is written. Existing
+  rows are never rewritten. No SQLite reservation is held across the SVN reads.
+  Record reads are one rolled-back read transaction that never mints a scope.
+* **Reader witness (E2).** Under an active policy, before history admission,
+  the engine prepares `ImportedOriginWitness53` under the actual ordinary
+  writer window:
+  * Bound records, read in one snapshot: the reader's split cursor copies, scope
+    and generation (with the documented `current_generation_read_only` branch
+    that resolved it), writer epoch, admitted policy, the repository's SVN URL
+    and Git branch, the verified origin of the inbound cursor B, and the full
+    current lineage, whose baseline is B and whose Git ref is the repository
+    branch.
+  * After the SVN reads (historical at R and live), the identity must equal the
+    pin, the live identity and the pinned lineage. Then the captured identity
+    (owner before and after one snapshot) and the records must be unchanged.
+  * The witness has private fields, no serde and no scalar or JSON constructor,
+    and it borrows the actual database and window.
+  * `team_git_checkpoint_with` adds one last alternative to the handled-cursor
+    proof: `witness.accepts`, which checks the same database, the reader's own
+    cursor copies, the live owner outside SQLite, and one fresh snapshot with
+    the captured identity and every record unchanged.
+  * The no-argument `team_git_checkpoint()` and `inspect_team_history()` are
+    the original readers with no witness.
+  * The emitted-column proof, ancestry, mirror, missing-object and
+    stale-receipt refusals all still apply. The reader returns B, never the
+    emitted tip, so all Git work after B stays eligible for projection and
+    replay.
+
+Coverage:
+* Native, authored and **not run** (no Subversion on the authoring host):
+  * `imported_branch_first_pins_its_incarnation_and_round_trips_with_pending_git`
+    (branch path, C < R; first pin and the filtered round trip with pending Git);
+  * `deleting_and_recreating_the_imported_uncopied_branch_holds_the_first_pin`
+    (N1);
+  * `recopying_the_imported_branch_from_the_same_source_holds_the_first_pin`
+    (N2).
+* Unit:
+  * `import_operations::snapshot_origin_tests` (decoder links and refusals);
+  * `lineage_checkpoints::imported_origin_identity_tests` (identity
+    comparisons);
+  * `sync_engine::svn_projection_53::tests`: witness record links, generation
+    branch, and consumption drift and owner refusals.
+
 ## Not established here
 
 * Whole #60: Docker Compose, rewriting and Personal scenarios remain open.

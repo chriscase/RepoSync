@@ -878,6 +878,10 @@ pub async fn verify_or_pin_live_svn_identity(
     let live = observe_live_svn_identity(svn, info)
         .await
         .map_err(SyncError::SvnError)?;
+    // #53 (E3): before the first canonical lineage pin of a snapshot-backed
+    // baseline, the incarnation that snapshot read at its revision must be the
+    // live one. Unknown or different evidence holds before any row is written.
+    guard_first_snapshot_pin_53(db, repo_id, svn, &live).await?;
     adopt_or_hold_live_svn_identity(db, repo_id, &live)
 }
 
@@ -1479,5 +1483,394 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #53 imported-origin historical incarnation
+// (RS53-IMPORTED-ORIGIN-HISTORICAL-INCARNATION-1, L1)
+// ---------------------------------------------------------------------------
+
+/// The SVN identity of the configured target as it was at explicit peg revision
+/// `rev`, observed now through the configured client (`svn info URL@rev` and the
+/// stop-on-copy history at that peg). Path identity and incarnation extraction
+/// are the live observer's, unchanged. History that is empty, outside
+/// `1..=rev` or not strictly descending is refused, never guessed.
+pub(crate) async fn observe_historical_svn_identity_at(
+    svn: &SvnClient,
+    rev: i64,
+) -> Result<LiveSvnIdentity, SvnError> {
+    let info = svn.info_at_rev(rev).await?;
+    if info.uuid.trim().is_empty() {
+        return Err(SvnError::LineageRefused {
+            reason: "svn_uuid_missing".into(),
+            detail: format!("SVN info at r{rev} did not report a repository UUID"),
+        });
+    }
+    let identity = svn_path_identity(&info.root_url, &info.url)?;
+    let history = svn.copy_history_at_rev(rev).await?;
+    let descending = history
+        .windows(2)
+        .all(|pair| pair[0].revision > pair[1].revision);
+    let in_range = history
+        .iter()
+        .all(|entry| (1..=rev).contains(&entry.revision));
+    if history.is_empty() || !descending || !in_range {
+        return Err(SvnError::LineageRefused {
+            reason: "svn_incarnation_unproved".into(),
+            detail: format!(
+                "stop-on-copy history at r{rev} is empty or not a descending log within r1..r{rev}; refusing to guess the incarnation"
+            ),
+        });
+    }
+    let (created, copy_from_path, copy_from_rev) =
+        incarnation_from_history(&history, &identity.branch_path);
+    Ok(LiveSvnIdentity {
+        uuid: info.uuid.clone(),
+        root_url: identity.root_url,
+        url: info.url.trim_end_matches('/').to_string(),
+        branch_path: identity.branch_path,
+        incarnation_created_rev: created,
+        copy_from_path,
+        copy_from_rev,
+    })
+}
+
+/// The first field in which two observed identities differ, if any: UUID,
+/// root, target URL, branch path, incarnation creation revision and the
+/// path-specific creation copy pair.
+pub(crate) fn svn_identity_difference(
+    historical: &LiveSvnIdentity,
+    other: &LiveSvnIdentity,
+) -> Option<String> {
+    let differs =
+        |field: &str, a: String, b: String| (a != b).then(|| format!("{field}: {a} != {b}"));
+    differs("uuid", historical.uuid.clone(), other.uuid.clone())
+        .or_else(|| {
+            differs(
+                "root_url",
+                historical.root_url.clone(),
+                other.root_url.clone(),
+            )
+        })
+        .or_else(|| differs("url", historical.url.clone(), other.url.clone()))
+        .or_else(|| {
+            differs(
+                "branch_path",
+                historical.branch_path.clone(),
+                other.branch_path.clone(),
+            )
+        })
+        .or_else(|| {
+            differs(
+                "incarnation_created_rev",
+                historical.incarnation_created_rev.to_string(),
+                other.incarnation_created_rev.to_string(),
+            )
+        })
+        .or_else(|| {
+            differs(
+                "copy_from",
+                format!(
+                    "{:?}@{:?}",
+                    historical.copy_from_path, historical.copy_from_rev
+                ),
+                format!("{:?}@{:?}", other.copy_from_path, other.copy_from_rev),
+            )
+        })
+}
+
+/// The first field in which a historical observation differs from a pinned
+/// canonical lineage, if any (the same fields as `svn_identity_difference`).
+pub(crate) fn lineage_identity_difference(
+    historical: &LiveSvnIdentity,
+    lineage: &CanonicalLineage,
+) -> Option<String> {
+    svn_identity_difference(
+        historical,
+        &LiveSvnIdentity {
+            uuid: lineage.svn_uuid.clone(),
+            root_url: lineage.svn_root_url.clone(),
+            url: lineage.svn_url.clone(),
+            branch_path: lineage.svn_branch_path.clone(),
+            incarnation_created_rev: lineage.incarnation_created_rev,
+            copy_from_path: lineage.copy_from_path.clone(),
+            copy_from_rev: lineage.copy_from_rev,
+        },
+    )
+}
+
+/// The snapshot pin records the repository UUID and URL the snapshot read at
+/// its revision; an observed identity must carry the same. The pin's optional
+/// copy fields are revision-local data (possibly absent after an old read
+/// failure) and are neither compared nor treated as path-creation authority.
+pub(crate) fn pin_identity_difference(
+    observed: &LiveSvnIdentity,
+    pin: &crate::db::import_operations::SnapshotPin,
+) -> Option<String> {
+    if observed.uuid != pin.svn_uuid {
+        return Some(format!(
+            "uuid: {} != pinned {}",
+            observed.uuid, pin.svn_uuid
+        ));
+    }
+    let pinned_url = pin.canonical_url.trim_end_matches('/');
+    (observed.url != pinned_url).then(|| format!("url: {} != pinned {pinned_url}", observed.url))
+}
+
+/// Whether the next lineage pin is the first for the repository's current scope
+/// generation and, if so, what the records say about a snapshot origin of its
+/// Git baseline. One read transaction that is rolled back: it never writes and
+/// never mints a scope. `None`: not a first pin, or not snapshot-backed.
+fn first_pin_snapshot_origin_53(
+    db: &Database,
+    repo_id: &str,
+) -> Result<Option<crate::db::import_operations::SnapshotOriginEvidence>, DatabaseError> {
+    use crate::db::import_operations::{snapshot_origin_evidence, SnapshotOriginEvidence};
+    let conn = db.conn();
+    let tx = conn.unchecked_transaction()?;
+    let read = || -> Result<Option<SnapshotOriginEvidence>, DatabaseError> {
+        if !tables_ready(&tx)? {
+            return Ok(None);
+        }
+        let row: Option<(Option<String>, String)> = tx
+            .query_row(
+                "SELECT scope_uuid, last_git_sha FROM repositories WHERE id = ?1",
+                [repo_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((scope, baseline)) = row else {
+            return Ok(None);
+        };
+        if let Some(scope) = scope.filter(|scope| !scope.is_empty()) {
+            let generation =
+                crate::db::nullable_commit_map::current_generation_read_only(&tx, repo_id, &scope)?;
+            if load_canonical_lineage_tx(&tx, &scope, generation)?.is_some() {
+                return Ok(None);
+            }
+        }
+        if baseline.is_empty() {
+            let retained: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_records WHERE repo_id = ?1 AND substr(id, 1, 16) = 'snapshot-import:')",
+                [repo_id],
+                |row| row.get(0),
+            )?;
+            return Ok(retained.then(|| {
+                SnapshotOriginEvidence::Refused(
+                    "snapshot-import origin records exist but the repository has no Git baseline"
+                        .into(),
+                )
+            }));
+        }
+        match snapshot_origin_evidence(&tx, repo_id, &baseline)? {
+            SnapshotOriginEvidence::Absent => Ok(None),
+            other => Ok(Some(other)),
+        }
+    };
+    let result = read();
+    drop(tx);
+    result
+}
+
+/// E3: before the first canonical lineage pin of a snapshot-backed baseline,
+/// the live identity must be the snapshot's: the pin's UUID and URL, then the
+/// identity observed now at peg R (incarnation creation revision and creation
+/// copy pair included). A refused origin, an unobservable history, any
+/// difference, or records that change across the SVN reads hold through the
+/// existing hold path before any lineage row is written. No SQLite reservation
+/// is held across the SVN reads. Existing lineage rows are never touched here.
+async fn guard_first_snapshot_pin_53(
+    db: &Database,
+    repo_id: &str,
+    svn: &SvnClient,
+    live: &LiveSvnIdentity,
+) -> Result<(), SyncError> {
+    use crate::db::import_operations::SnapshotOriginEvidence;
+    let Some(origin) =
+        first_pin_snapshot_origin_53(db, repo_id).map_err(SyncError::DatabaseError)?
+    else {
+        return Ok(());
+    };
+    let record = match origin {
+        SnapshotOriginEvidence::Verified(record) => record,
+        SnapshotOriginEvidence::Refused(detail) => {
+            return hold_unproved_identity(
+                db,
+                repo_id,
+                live,
+                "svn_snapshot_origin_unproved",
+                detail,
+            )
+        }
+        SnapshotOriginEvidence::Absent => return Ok(()),
+    };
+    if let Some(difference) = pin_identity_difference(live, &record.pin) {
+        return hold_unproved_identity(
+            db,
+            repo_id,
+            live,
+            "svn_identity_changed",
+            format!("live SVN identity differs from the snapshot pin: {difference}"),
+        );
+    }
+    let historical = match observe_historical_svn_identity_at(svn, record.svn_rev).await {
+        Ok(historical) => historical,
+        Err(error) => {
+            return hold_unproved_identity(
+                db,
+                repo_id,
+                live,
+                "svn_incarnation_unproved",
+                format!(
+                    "SVN identity at snapshot r{} could not be observed: {error}",
+                    record.svn_rev
+                ),
+            )
+        }
+    };
+    if let Some(difference) = pin_identity_difference(&historical, &record.pin)
+        .or_else(|| svn_identity_difference(&historical, live))
+    {
+        return hold_unproved_identity(
+            db,
+            repo_id,
+            live,
+            "svn_identity_changed",
+            format!(
+                "SVN identity at snapshot r{} differs from the live identity: {difference}",
+                record.svn_rev
+            ),
+        );
+    }
+    match first_pin_snapshot_origin_53(db, repo_id).map_err(SyncError::DatabaseError)? {
+        Some(SnapshotOriginEvidence::Verified(again)) if again == record => Ok(()),
+        _ => hold_unproved_identity(
+            db,
+            repo_id,
+            live,
+            "svn_snapshot_origin_unproved",
+            "snapshot origin records changed while its historical identity was observed".into(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod imported_origin_identity_tests {
+    //! Pure comparison coverage for the E3 first-pin guard and the E2 witness.
+    //! SVN observation itself is native (`tests/partial_sync_53.rs`).
+    use super::*;
+    use crate::db::import_operations::SnapshotPin;
+
+    fn identity(created: i64, copy: Option<(&str, i64)>) -> LiveSvnIdentity {
+        LiveSvnIdentity {
+            uuid: "uuid-1".into(),
+            root_url: "file:///svn".into(),
+            url: "file:///svn/trunk".into(),
+            branch_path: "trunk".into(),
+            incarnation_created_rev: created,
+            copy_from_path: copy.map(|(path, _)| path.to_owned()),
+            copy_from_rev: copy.map(|(_, rev)| rev),
+        }
+    }
+
+    fn pin(uuid: &str, url: &str) -> SnapshotPin {
+        SnapshotPin {
+            svn_uuid: uuid.into(),
+            canonical_url: url.into(),
+            operative_rev: 2,
+            peg_rev: 2,
+            copy_from_path: Some("/elsewhere".into()),
+            copy_from_rev: Some(1),
+            requested: "HEAD".into(),
+        }
+    }
+
+    #[test]
+    fn same_uuid_and_url_with_another_uncopied_incarnation_is_a_difference() {
+        let difference = svn_identity_difference(&identity(1, None), &identity(4, None));
+        assert_eq!(
+            difference.as_deref(),
+            Some("incarnation_created_rev: 1 != 4")
+        );
+        assert_eq!(
+            svn_identity_difference(&identity(1, None), &identity(1, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn recopy_from_the_same_source_differs_in_creation_revision() {
+        let before = identity(3, Some(("/trunk", 2)));
+        let after = identity(6, Some(("/trunk", 2)));
+        assert!(svn_identity_difference(&before, &after)
+            .unwrap()
+            .starts_with("incarnation_created_rev"));
+        let other_source = identity(3, Some(("/branches/x", 2)));
+        assert!(svn_identity_difference(&before, &other_source)
+            .unwrap()
+            .starts_with("copy_from"));
+    }
+
+    #[test]
+    fn every_identity_field_is_compared_with_a_pinned_lineage() {
+        let historical = identity(1, None);
+        let mut lineage = CanonicalLineage {
+            scope_uuid: "scope".into(),
+            generation: 1,
+            repo_id: "repo".into(),
+            svn_uuid: "uuid-1".into(),
+            svn_root_url: "file:///svn".into(),
+            svn_url: "file:///svn/trunk".into(),
+            svn_branch_path: "trunk".into(),
+            incarnation_created_rev: 1,
+            copy_from_path: None,
+            copy_from_rev: None,
+            git_baseline_sha: Some("b".repeat(40)),
+            git_ref: Some("main".into()),
+            projection_version: String::new(),
+            policy_hash: String::new(),
+        };
+        assert_eq!(lineage_identity_difference(&historical, &lineage), None);
+        type LineageEdit = Box<dyn Fn(&mut CanonicalLineage)>;
+        let edits: Vec<LineageEdit> = vec![
+            Box::new(|l| l.svn_uuid = "uuid-2".into()),
+            Box::new(|l| l.svn_root_url = "file:///other".into()),
+            Box::new(|l| l.svn_url = "file:///svn/branches/b".into()),
+            Box::new(|l| l.svn_branch_path = "branches/b".into()),
+            Box::new(|l| l.incarnation_created_rev = 4),
+            Box::new(|l| l.copy_from_path = Some("/trunk".into())),
+            Box::new(|l| l.copy_from_rev = Some(2)),
+        ];
+        for edit in edits {
+            let mut changed = lineage.clone();
+            edit(&mut changed);
+            assert!(lineage_identity_difference(&historical, &changed).is_some());
+        }
+        lineage.git_baseline_sha = None;
+        assert_eq!(
+            lineage_identity_difference(&historical, &lineage),
+            None,
+            "baseline and policy fields are not identity fields"
+        );
+    }
+
+    #[test]
+    fn the_pin_contributes_uuid_and_url_only_and_never_its_copy_fields() {
+        let observed = identity(1, None);
+        assert_eq!(
+            pin_identity_difference(&observed, &pin("uuid-1", "file:///svn/trunk/")),
+            None
+        );
+        assert!(
+            pin_identity_difference(&observed, &pin("uuid-2", "file:///svn/trunk"))
+                .unwrap()
+                .starts_with("uuid")
+        );
+        assert!(
+            pin_identity_difference(&observed, &pin("uuid-1", "file:///svn/other"))
+                .unwrap()
+                .starts_with("url")
+        );
     }
 }

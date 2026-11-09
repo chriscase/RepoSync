@@ -34,7 +34,8 @@ use tracing::{info, warn};
 
 use super::{ChangedFile, SvnChangeSet, SyncEngine};
 use crate::db::lineage_checkpoints::{
-    load_canonical_lineage_tx, observe_live_svn_identity, LiveSvnIdentity,
+    lineage_identity_difference, load_canonical_lineage_tx, observe_historical_svn_identity_at,
+    observe_live_svn_identity, pin_identity_difference, svn_identity_difference, LiveSvnIdentity,
 };
 use crate::db::nullable_commit_map::current_generation_read_only;
 use crate::db::ordinary_writer_windows::OrdinaryWriterWindow;
@@ -1099,6 +1100,331 @@ impl<'a, 'db> VerifiedSvnProjection<'a, 'db> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Imported-origin witness (RS53-IMPORTED-ORIGIN-HISTORICAL-INCARNATION-1, E2)
+// ---------------------------------------------------------------------------
+
+fn witness_refused(detail: impl Into<String>) -> DatabaseError {
+    DatabaseError::Other(format!(
+        "imported-origin witness refused: {}",
+        detail.into()
+    ))
+}
+
+/// Which documented branch of `current_generation_read_only` resolved the
+/// generation. Recorded, not re-derived as a fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationSource {
+    Scoped,
+    LegacySingleRepository,
+    PairDefault,
+}
+
+/// Classify, in the caller's snapshot, which branch of
+/// `current_generation_read_only` applies (same keys, same order), and refuse a
+/// classification that disagrees with the value it returned.
+fn generation_source_tx(
+    tx: &Connection,
+    repo_id: &str,
+    scope: &str,
+    generation: i64,
+) -> Result<GenerationSource, DatabaseError> {
+    use crate::db::personal_scope::PERSONAL_SCOPE_KEY;
+    use crate::db::repo_scope_identity::{
+        legacy_repo_echo_generation_kv_key, repo_echo_generation_kv_key,
+        LEGACY_REPO_ID_KV_READS_KEY,
+    };
+    let kv = |key: &str| -> Result<Option<String>, DatabaseError> {
+        Ok(tx
+            .query_row("SELECT value FROM kv_state WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    };
+    let token = if repo_id == PERSONAL_SCOPE_KEY {
+        repo_id
+    } else {
+        scope
+    };
+    if kv(&repo_echo_generation_kv_key(token))?.is_some() {
+        return Ok(GenerationSource::Scoped);
+    }
+    let repositories: i64 =
+        tx.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+    if repositories <= 1
+        && kv(LEGACY_REPO_ID_KV_READS_KEY)?.as_deref() == Some("1")
+        && kv(&legacy_repo_echo_generation_kv_key(repo_id))?.is_some()
+    {
+        return Ok(GenerationSource::LegacySingleRepository);
+    }
+    if generation != crate::pair_refresh::PAIR_GENERATION {
+        return Err(witness_refused(
+            "generation classification disagrees with the current generation",
+        ));
+    }
+    Ok(GenerationSource::PairDefault)
+}
+
+/// Everything a witness binds, read in one snapshot: the reader's cursor copies,
+/// the scope and current generation (and which branch resolved it), the writer
+/// epoch, the admitted policy, the repository's SVN and Git resource, the
+/// verified snapshot origin of the inbound cursor, and the full current lineage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WitnessRecords {
+    column: String,
+    inbound: String,
+    scope_uuid: String,
+    generation: i64,
+    generation_source: GenerationSource,
+    writer_epoch: Option<u64>,
+    admitted_policy: String,
+    svn_url: String,
+    git_branch: String,
+    origin: crate::db::import_operations::SnapshotOriginRecord,
+    lineage: crate::db::lineage_checkpoints::CanonicalLineage,
+}
+
+/// `None` when the reader would not consult a witness (no split cursor), or the
+/// records do not form one verified snapshot origin that is the current
+/// lineage's Git baseline. Never writes; never mints a scope.
+fn witness_records_tx(
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<Option<WitnessRecords>, DatabaseError> {
+    use crate::db::import_operations::{snapshot_origin_evidence, SnapshotOriginEvidence};
+    let row: Option<(Option<String>, String, String, String)> = tx
+        .query_row(
+            "SELECT scope_uuid, last_git_sha, svn_url, git_branch FROM repositories WHERE id = ?1",
+            [repo_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((Some(stored_scope), column, svn_url, git_branch)) = row else {
+        return Ok(None);
+    };
+    if stored_scope.is_empty() || column.is_empty() {
+        return Ok(None);
+    }
+    let (scope_uuid, generation, writer_epoch) = read_scope_snapshot(tx, repo_id)?;
+    let Some(inbound) =
+        crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv_tx(tx, repo_id)?
+    else {
+        return Ok(None);
+    };
+    if inbound == column || !crate::history_inspect::is_full_git_oid(&inbound) {
+        return Ok(None);
+    }
+    let SnapshotOriginEvidence::Verified(origin) = snapshot_origin_evidence(tx, repo_id, &inbound)?
+    else {
+        return Ok(None);
+    };
+    let Some(lineage) = load_canonical_lineage_tx(tx, &scope_uuid, generation)? else {
+        return Ok(None);
+    };
+    let branch = (!git_branch.is_empty()).then_some(git_branch.as_str());
+    if lineage.repo_id != repo_id
+        || lineage.git_baseline_sha.as_deref() != Some(inbound.as_str())
+        || lineage.git_ref.as_deref() != branch
+    {
+        return Ok(None);
+    }
+    let generation_source = generation_source_tx(tx, repo_id, &scope_uuid, generation)?;
+    let admitted_policy = read_admitted_policy_tx(tx, repo_id)?;
+    Ok(Some(WitnessRecords {
+        column,
+        inbound,
+        scope_uuid,
+        generation,
+        generation_source,
+        writer_epoch,
+        admitted_policy,
+        svn_url,
+        git_branch,
+        origin: *origin,
+        lineage,
+    }))
+}
+
+/// One snapshot of the witness records in a read transaction that is rolled
+/// back, never committed.
+fn read_witness_records(
+    db: &Database,
+    repo_id: &str,
+) -> Result<Option<WitnessRecords>, DatabaseError> {
+    let conn = db.conn();
+    let tx = conn.unchecked_transaction()?;
+    let records = witness_records_tx(&tx, repo_id);
+    drop(tx);
+    records
+}
+
+/// Sealed, current-cycle witness that the inbound Git cursor B is this
+/// repository's completed snapshot import, and that the SVN identity that
+/// snapshot read at its revision R, observed in this cycle at peg R through the
+/// configured client, is both the live identity and the incarnation pinned in
+/// the current scope generation's lineage, whose Git baseline is B.
+///
+/// Its fields are private. It does not implement `Serialize`/`Deserialize` and
+/// has no scalar, JSON or flag constructor: only
+/// `prepare_imported_origin_witness_53` mints it. It borrows the actual
+/// database and ordinary writer window, and the checkpoint reader accepts it
+/// only through `accepts`, which revalidates it against one fresh snapshot.
+/// It credits B as a handled inbound boundary only; Git after B stays eligible
+/// for projection and replay.
+pub(crate) struct ImportedOriginWitness53<'a, 'db> {
+    db: &'a Database,
+    window: &'a OrdinaryWriterWindow<'db>,
+    identity: CapturedIdentity,
+    records: WitnessRecords,
+}
+
+impl std::fmt::Debug for ImportedOriginWitness53<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportedOriginWitness53")
+            .field("repo_id", &self.identity.repo_id)
+            .field("inbound", &self.records.inbound)
+            .field("svn_rev", &self.records.origin.svn_rev)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ImportedOriginWitness53<'_, '_> {
+    /// Consumption by the checkpoint reader. True only if the reader's own
+    /// inbound cursor and column are the witnessed ones and the database is the
+    /// witness's. The borrowed window must still own this engine scope (checked
+    /// outside SQLite), and one fresh snapshot must show the captured identity
+    /// (epoch, scope, generation, admitted policy, lineage) and every bound
+    /// record unchanged. Drift or a read error is an error, never acceptance.
+    pub(crate) fn accepts(
+        &self,
+        db: &Database,
+        repo_id: &str,
+        inbound: &str,
+        column: &str,
+    ) -> Result<bool, SyncError> {
+        if !std::ptr::eq::<Database>(self.db, db)
+            || self.identity.repo_id != repo_id
+            || self.records.inbound != inbound
+            || self.records.column != column
+        {
+            return Ok(false);
+        }
+        self.window
+            .require_engine_scope(db, Some(repo_id))
+            .map_err(SyncError::DatabaseError)?;
+        let current = {
+            let conn = db.conn();
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| SyncError::DatabaseError(e.into()))?;
+            let checked = self
+                .identity
+                .revalidate_tx(&tx)
+                .and_then(|()| witness_records_tx(&tx, repo_id));
+            drop(tx);
+            checked.map_err(SyncError::DatabaseError)?
+        };
+        if current.as_ref() != Some(&self.records) {
+            return Err(SyncError::DatabaseError(witness_refused(
+                "imported-origin records changed before the checkpoint reader consumed the witness",
+            )));
+        }
+        Ok(true)
+    }
+}
+
+impl SyncEngine {
+    /// E2: prepare the imported-origin witness before history admission, under
+    /// the actual ordinary writer window. Empty rules, no managed repository or
+    /// records that do not form a verified snapshot origin pinned as the
+    /// lineage baseline give `None` (the reader keeps its original arms).
+    ///
+    /// The SVN reads hold no SQLite reservation. The records are read in one
+    /// snapshot before them and again after them. The captured identity and
+    /// owner checks run before and after one more snapshot. A historical
+    /// identity that differs from the pin, the live identity or the pinned
+    /// lineage gives `None`, so the reader refuses as before. An SVN read
+    /// error, a database error or records that change across the reads is an
+    /// error, never a witness.
+    pub(super) async fn prepare_imported_origin_witness_53<'a, 'db>(
+        &'a self,
+        window: &'a OrdinaryWriterWindow<'db>,
+    ) -> Result<Option<ImportedOriginWitness53<'a, 'db>>, SyncError> {
+        if self.allowed_paths.is_empty() && self.blocked_patterns.is_empty() {
+            return Ok(None);
+        }
+        let Some(repo_id) = self.effective_repo_id() else {
+            return Ok(None);
+        };
+        window
+            .require_engine_scope(&self.db, Some(repo_id))
+            .map_err(SyncError::DatabaseError)?;
+        let Some(records) =
+            read_witness_records(&self.db, repo_id).map_err(SyncError::DatabaseError)?
+        else {
+            return Ok(None);
+        };
+        let svn = self
+            .svn_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let historical = observe_historical_svn_identity_at(&svn, records.origin.svn_rev)
+            .await
+            .map_err(SyncError::SvnError)?;
+        let info = svn.info().await.map_err(SyncError::SvnError)?;
+        let live = observe_live_svn_identity(&svn, &info)
+            .await
+            .map_err(SyncError::SvnError)?;
+        let difference = pin_identity_difference(&historical, &records.origin.pin)
+            .or_else(|| svn_identity_difference(&historical, &live))
+            .or_else(|| lineage_identity_difference(&historical, &records.lineage));
+        if let Some(difference) = difference {
+            warn!(
+                repo_id,
+                svn_rev = records.origin.svn_rev,
+                %difference,
+                "no imported-origin witness: the snapshot's historical SVN identity differs"
+            );
+            return Ok(None);
+        }
+        if svn.url().trim_end_matches('/') != records.svn_url.trim_end_matches('/') {
+            return Ok(None);
+        }
+        let identity = CapturedIdentity::capture(
+            &self.db,
+            window,
+            repo_id,
+            &live,
+            &self.no_target_projection(),
+        )
+        .map_err(SyncError::DatabaseError)?;
+        let again = read_witness_records(&self.db, repo_id).map_err(SyncError::DatabaseError)?;
+        if again.as_ref() != Some(&records)
+            || identity.scope_uuid != records.scope_uuid
+            || identity.generation != records.generation
+            || identity.writer_epoch != records.writer_epoch
+            || identity.policy_snapshot != records.admitted_policy
+        {
+            return Err(SyncError::DatabaseError(witness_refused(
+                "imported-origin records changed while the historical SVN identity was observed",
+            )));
+        }
+        info!(
+            repo_id,
+            svn_rev = records.origin.svn_rev,
+            inbound = %records.inbound,
+            "imported-origin witness prepared"
+        );
+        Ok(Some(ImportedOriginWitness53 {
+            db: &self.db,
+            window,
+            identity,
+            records,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1584,5 +1910,340 @@ mod tests {
             .active_team_cycle_mapping_operation("pair")
             .unwrap()
             .is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Imported-origin witness (RS53-IMPORTED-ORIGIN-HISTORICAL-INCARNATION-1):
+    // record links, generation branch, drift and owner refusals. Fabricated
+    // rows establish witness behavior only, not native provenance.
+    // -----------------------------------------------------------------------
+
+    const ORIGIN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const COLUMN_X: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    const ORIGIN_DOC: &str = "import_operation_v1:document:op53";
+
+    fn snapshot_journal() -> crate::db::import_operations::ImportOperation {
+        use crate::db::import_operations::{ImportOperation, ImportOperationState, SnapshotPin};
+        ImportOperation {
+            version: 1,
+            id: "op53".into(),
+            repo_id: "pair".into(),
+            operation_type: "snapshot_import".into(),
+            initiator_id: "admin".into(),
+            request_id: "req".into(),
+            target_fingerprint: "fp".into(),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            state: ImportOperationState::Completed,
+            cancel_requested: false,
+            processed_revisions: 1,
+            total_revisions: Some(1),
+            local_commits: 1,
+            confirmed_batches: 1,
+            last_local_svn_rev: Some(1),
+            last_local_git_sha: Some(ORIGIN_B.into()),
+            last_confirmed_svn_rev: Some(1),
+            last_confirmed_git_sha: Some(ORIGIN_B.into()),
+            intended_ref: None,
+            intended_git_sha: None,
+            outcome_detail: None,
+            resume_authorized: false,
+            snapshot_pin: Some(SnapshotPin {
+                svn_uuid: "uuid-53".into(),
+                canonical_url: "file:///repo".into(),
+                operative_rev: 1,
+                peg_rev: 1,
+                copy_from_path: None,
+                copy_from_rev: None,
+                requested: "1".into(),
+            }),
+            pending_commit_maps: Vec::new(),
+        }
+    }
+
+    /// A pair whose inbound cursor is the snapshot import B and whose column is
+    /// the later emitted tip X, with B pinned as the current lineage baseline.
+    fn origin_pair_db(dir: &Path) -> Database {
+        let db = Database::new(dir.join("state.db")).unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid,allowed_paths,last_svn_rev,last_git_sha)
+                 VALUES ('pair','pair','file:///repo','','','','r','main',1,'t','t',?1,'[\"team-a/\"]',2,?2)",
+                rusqlite::params![SCOPE, COLUMN_X],
+            )
+            .unwrap();
+        let generation = {
+            let conn = db.conn();
+            current_generation_read_only(&conn, "pair", SCOPE).unwrap()
+        };
+        pin_canonical_lineage(
+            &db.conn(),
+            &CanonicalLineage {
+                scope_uuid: SCOPE.into(),
+                generation,
+                repo_id: "pair".into(),
+                svn_uuid: "uuid-53".into(),
+                svn_root_url: "file:///repo".into(),
+                svn_url: "file:///repo".into(),
+                svn_branch_path: String::new(),
+                incarnation_created_rev: 1,
+                copy_from_path: None,
+                copy_from_rev: None,
+                git_baseline_sha: Some(ORIGIN_B.into()),
+                git_ref: Some("main".into()),
+                projection_version: String::new(),
+                policy_hash: String::new(),
+            },
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+                 VALUES ('snapshot-import:op53', 'pair', 1, ?1, 'svn_to_git', '', 'Verified SVN snapshot baseline', 't', 't', 'applied')",
+                [ORIGIN_B],
+            )
+            .unwrap();
+        db.set_state(
+            ORIGIN_DOC,
+            &serde_json::to_string(&snapshot_journal()).unwrap(),
+        )
+        .unwrap();
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(&db.conn(), "pair", ORIGIN_B, "t")
+            .unwrap();
+        db
+    }
+
+    fn records(db: &Database) -> Result<Option<WitnessRecords>, DatabaseError> {
+        read_witness_records(db, "pair")
+    }
+
+    #[test]
+    fn witness_records_bind_the_verified_origin_that_is_the_lineage_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = origin_pair_db(dir.path());
+        let bound = records(&db)
+            .unwrap()
+            .expect("a verified, pinned snapshot origin");
+        assert_eq!(
+            (bound.inbound.as_str(), bound.column.as_str()),
+            (ORIGIN_B, COLUMN_X)
+        );
+        assert_eq!(bound.origin.operation_id, "op53");
+        assert_eq!(bound.origin.svn_rev, 1);
+        assert_eq!(bound.lineage.git_baseline_sha.as_deref(), Some(ORIGIN_B));
+        assert_eq!(bound.generation_source, GenerationSource::PairDefault);
+        assert_eq!(
+            (bound.svn_url.as_str(), bound.git_branch.as_str()),
+            ("file:///repo", "main")
+        );
+    }
+
+    #[test]
+    fn no_witness_records_without_a_split_cursor_a_verified_origin_or_the_pinned_resource() {
+        let cases: [(&str, String, String); 7] = [
+            (
+                "cursor copies agree",
+                format!("UPDATE repositories SET last_git_sha='{ORIGIN_B}' WHERE id='pair'"),
+                format!("UPDATE repositories SET last_git_sha='{COLUMN_X}' WHERE id='pair'"),
+            ),
+            (
+                "origin row not applied",
+                "UPDATE sync_records SET status='pending' WHERE id='snapshot-import:op53'".into(),
+                "UPDATE sync_records SET status='applied' WHERE id='snapshot-import:op53'".into(),
+            ),
+            (
+                "journal missing",
+                format!("UPDATE kv_state SET key='{ORIGIN_DOC}-moved' WHERE key='{ORIGIN_DOC}'"),
+                format!("UPDATE kv_state SET key='{ORIGIN_DOC}' WHERE key='{ORIGIN_DOC}-moved'"),
+            ),
+            (
+                "lineage baseline is another commit",
+                format!("UPDATE canonical_lineage SET git_baseline_sha='{COLUMN_X}' WHERE scope_uuid='{SCOPE}'"),
+                format!("UPDATE canonical_lineage SET git_baseline_sha='{ORIGIN_B}' WHERE scope_uuid='{SCOPE}'"),
+            ),
+            (
+                "lineage pinned for another Git ref",
+                format!("UPDATE canonical_lineage SET git_ref='release' WHERE scope_uuid='{SCOPE}'"),
+                format!("UPDATE canonical_lineage SET git_ref='main' WHERE scope_uuid='{SCOPE}'"),
+            ),
+            (
+                "repository now targets another Git branch",
+                "UPDATE repositories SET git_branch='dev' WHERE id='pair'".into(),
+                "UPDATE repositories SET git_branch='main' WHERE id='pair'".into(),
+            ),
+            (
+                "inbound cursor is not a full object id",
+                format!(
+                    "UPDATE kv_state SET value='bbbb' WHERE key='{}'",
+                    crate::db::repo_scope_identity::last_git_sha_kv_key(SCOPE)
+                ),
+                format!(
+                    "UPDATE kv_state SET value='{ORIGIN_B}' WHERE key='{}'",
+                    crate::db::repo_scope_identity::last_git_sha_kv_key(SCOPE)
+                ),
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let db = origin_pair_db(dir.path());
+        for (name, change, undo) in cases {
+            db.conn().execute_batch(&change).unwrap();
+            assert!(
+                records(&db).unwrap().is_none(),
+                "{name}: no witness records"
+            );
+            db.conn().execute_batch(&undo).unwrap();
+            assert!(
+                records(&db).unwrap().is_some(),
+                "{name}: undo restores the records"
+            );
+        }
+        db.set_state("import_operation_v1:document:op-broken", "{not json")
+            .unwrap();
+        assert!(
+            records(&db).is_err(),
+            "a malformed journal is an error, never absence"
+        );
+    }
+
+    #[test]
+    fn generation_source_names_the_documented_branch_that_resolved_the_generation() {
+        use crate::db::repo_scope_identity::{
+            legacy_repo_echo_generation_kv_key, LEGACY_REPO_ID_KV_READS_KEY,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = origin_pair_db(dir.path());
+        let source = |db: &Database, generation: i64| {
+            let conn = db.conn();
+            generation_source_tx(&conn, "pair", SCOPE, generation)
+        };
+        assert_eq!(source(&db, 1).unwrap(), GenerationSource::PairDefault);
+        assert!(
+            source(&db, 2).is_err(),
+            "a default branch that disagrees with the value is refused"
+        );
+        db.set_state(LEGACY_REPO_ID_KV_READS_KEY, "1").unwrap();
+        db.set_state(&legacy_repo_echo_generation_kv_key("pair"), "1")
+            .unwrap();
+        assert_eq!(
+            source(&db, 1).unwrap(),
+            GenerationSource::LegacySingleRepository
+        );
+        db.set_state(&repo_echo_generation_kv_key(SCOPE), "1")
+            .unwrap();
+        assert_eq!(source(&db, 1).unwrap(), GenerationSource::Scoped);
+    }
+
+    #[test]
+    fn the_reader_accepts_a_witness_only_for_its_database_cursor_unchanged_records_and_live_owner()
+    {
+        let _lock = crate::writer_fence::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db = origin_pair_db(dir.path());
+        let _fence = crate::writer_fence::claim(&db, dir.path()).unwrap();
+        let window = db.begin_ordinary_writer_window(Some("pair")).unwrap();
+        let identity =
+            CapturedIdentity::capture(&db, &window, "pair", &live(), &engine_policy(&["team-a/"]))
+                .unwrap();
+        let witness = ImportedOriginWitness53 {
+            db: &db,
+            window: &window,
+            identity,
+            records: records(&db).unwrap().unwrap(),
+        };
+        assert!(witness.accepts(&db, "pair", ORIGIN_B, COLUMN_X).unwrap());
+        // Another database with identical rows, or another cursor, is not this proof.
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = origin_pair_db(other_dir.path());
+        assert!(!witness.accepts(&other, "pair", ORIGIN_B, COLUMN_X).unwrap());
+        assert!(!witness.accepts(&db, "pair", COLUMN_X, COLUMN_X).unwrap());
+        assert!(!witness.accepts(&db, "pair", ORIGIN_B, ORIGIN_B).unwrap());
+        assert!(!witness.accepts(&db, "other", ORIGIN_B, COLUMN_X).unwrap());
+        // Each drift after preparation is an error at consumption, never acceptance.
+        let touched = {
+            let mut op = snapshot_journal();
+            op.updated_at = "later".into();
+            serde_json::to_string(&op).unwrap()
+        };
+        let original = serde_json::to_string(&snapshot_journal()).unwrap();
+        let drifts: [(&str, String, String); 6] = [
+            (
+                "admitted policy",
+                "UPDATE repositories SET allowed_paths='[\"team-b/\"]' WHERE id='pair'".into(),
+                "UPDATE repositories SET allowed_paths='[\"team-a/\"]' WHERE id='pair'".into(),
+            ),
+            (
+                "journal document",
+                format!("UPDATE kv_state SET value='{}' WHERE key='{ORIGIN_DOC}'", touched.replace('\'', "''")),
+                format!("UPDATE kv_state SET value='{}' WHERE key='{ORIGIN_DOC}'", original.replace('\'', "''")),
+            ),
+            (
+                "duplicate origin row",
+                format!(
+                    "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status) VALUES ('snapshot-import:op-dup','pair',1,'{ORIGIN_B}','svn_to_git','','','t','t','applied')"
+                ),
+                "DELETE FROM sync_records WHERE id='snapshot-import:op-dup'".into(),
+            ),
+            (
+                "lineage Git ref",
+                format!("UPDATE canonical_lineage SET git_ref='release' WHERE scope_uuid='{SCOPE}'"),
+                format!("UPDATE canonical_lineage SET git_ref='main' WHERE scope_uuid='{SCOPE}'"),
+            ),
+            (
+                "scope generation",
+                format!(
+                    "INSERT INTO kv_state(key,value,updated_at) VALUES('{}','2','t')",
+                    repo_echo_generation_kv_key(SCOPE)
+                ),
+                format!("DELETE FROM kv_state WHERE key='{}'", repo_echo_generation_kv_key(SCOPE)),
+            ),
+            (
+                "malformed journal elsewhere",
+                "INSERT INTO kv_state(key,value,updated_at) VALUES('import_operation_v1:document:op-broken','{not json','t')".into(),
+                "DELETE FROM kv_state WHERE key='import_operation_v1:document:op-broken'".into(),
+            ),
+        ];
+        for (name, drift, undo) in drifts {
+            db.conn().execute_batch(&drift).unwrap();
+            assert!(
+                witness.accepts(&db, "pair", ORIGIN_B, COLUMN_X).is_err(),
+                "{name}: drift refuses consumption"
+            );
+            db.conn().execute_batch(&undo).unwrap();
+            assert!(
+                witness.accepts(&db, "pair", ORIGIN_B, COLUMN_X).unwrap(),
+                "{name}: undo restores acceptance"
+            );
+        }
+        // The owner is checked outside SQLite: an expired window refuses.
+        let documents: Vec<(String, String)> = {
+            let conn = db.conn();
+            let mut query = conn
+                .prepare(
+                    "SELECT key, value FROM kv_state \
+                     WHERE key LIKE 'pair_refresh_writer_window_v1:document:%'",
+                )
+                .unwrap();
+            let rows = query
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(documents.len(), 1, "exactly the live window's document");
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key = ?1", [&documents[0].0])
+            .unwrap();
+        assert!(witness.accepts(&db, "pair", ORIGIN_B, COLUMN_X).is_err());
+        db.conn()
+            .execute(
+                "INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,'t')",
+                [&documents[0].0, &documents[0].1],
+            )
+            .unwrap();
+        assert!(witness.accepts(&db, "pair", ORIGIN_B, COLUMN_X).unwrap());
     }
 }

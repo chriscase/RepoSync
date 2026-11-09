@@ -1986,3 +1986,329 @@ async fn r2_fresh_engine_follows_a_widened_admitted_policy_for_a_new_selected_pa
     let tip = fx.git_tip();
     assert_team_applied(&fresh, &fx, r3, &tip);
 }
+
+// ---------------------------------------------------------------------------
+// RS53-IMPORTED-ORIGIN-HISTORICAL-INCARNATION-1: branch-path fixture and the
+// imported-origin incarnation cases. The default root fixture is unchanged.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// A pair whose SVN URL is the branch path `<repo>/<branch>`, so the
+    /// imported path has its own line of history (the repository root cannot
+    /// be deleted and recreated).
+    /// - Uncopied: `svn mkdir` creates the branch at r1.
+    /// - Copied (`copied_from_trunk`): trunk is created at r1 and given content
+    ///   at r2, and the branch is copied from `trunk@2` at r3.
+    ///
+    /// The baseline is then committed on the branch and imported at that
+    /// revision, exactly as `Fixture::new` does for the root.
+    async fn new_branch(branch: &str, copied_from_trunk: bool, baseline: &[(&str, &str)]) -> Self {
+        require_toolchain();
+        let tmp = TempDir::new().unwrap();
+        let repo_dir = tmp.path().join("svn_repo");
+        run(
+            tmp.path(),
+            "svnadmin",
+            &["create", repo_dir.to_str().unwrap()],
+        );
+        let hook = repo_dir.join("hooks/pre-revprop-change");
+        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let root = format!("file://{}", repo_dir.display());
+        if copied_from_trunk {
+            run(
+                tmp.path(),
+                "svn",
+                &[
+                    "mkdir",
+                    "--parents",
+                    "-m",
+                    "create trunk",
+                    &format!("{root}/trunk"),
+                ],
+            );
+            let trunk_wc = tmp.path().join("trunk_wc");
+            run(
+                tmp.path(),
+                "svn",
+                &[
+                    "checkout",
+                    &format!("{root}/trunk"),
+                    trunk_wc.to_str().unwrap(),
+                    "--non-interactive",
+                ],
+            );
+            std::fs::write(trunk_wc.join("seed.txt"), "trunk seed\n").unwrap();
+            run(&trunk_wc, "svn", &["add", &op("seed.txt")]);
+            run(
+                &trunk_wc,
+                "svn",
+                &["commit", "-m", "trunk content", ".", "--non-interactive"],
+            );
+            run(
+                tmp.path(),
+                "svn",
+                &[
+                    "copy",
+                    "--parents",
+                    "-m",
+                    "branch from trunk@2",
+                    &format!("{root}/trunk@2"),
+                    &format!("{root}/{branch}"),
+                ],
+            );
+        } else {
+            run(
+                tmp.path(),
+                "svn",
+                &[
+                    "mkdir",
+                    "--parents",
+                    "-m",
+                    "create branch",
+                    &format!("{root}/{branch}"),
+                ],
+            );
+        }
+        let svn_url = format!("{root}/{branch}");
+        let wc = tmp.path().join("svn_wc");
+        run(
+            tmp.path(),
+            "svn",
+            &[
+                "checkout",
+                &svn_url,
+                wc.to_str().unwrap(),
+                "--non-interactive",
+            ],
+        );
+        let fixture_paths = Fixture {
+            svn_url,
+            wc,
+            bare: tmp.path().join("origin.git"),
+            git_work: tmp.path().join("git_work"),
+            data_dir: tmp.path().join("data"),
+            db_path: tmp.path().join("data").join("reposync.db"),
+            developer: None,
+            tmp,
+        };
+        for (path, bytes) in baseline {
+            fixture_paths.write(path, bytes);
+        }
+        std::env::set_var(
+            "REPOSYNC_RS53_OBSERVE_DIR",
+            fixture_paths.tmp.path().join("observe"),
+        );
+        let baseline_rev = fixture_paths.commit("baseline on the branch");
+        fixture_paths.import(baseline_rev).await;
+        fixture_paths
+    }
+
+    /// The SVN repository root URL (the pair's URL is a branch below it).
+    fn svn_root(&self) -> String {
+        format!("file://{}", self.tmp.path().join("svn_repo").display())
+    }
+
+    /// An SVN operation on repository URLs, not the working copy.
+    fn svn_remote(&self, args: &[&str]) -> String {
+        run(self.tmp.path(), "svn", args)
+    }
+}
+
+/// One canonical lineage row of the pair, read directly with no side effects.
+#[derive(Debug, PartialEq, Eq)]
+struct LineageRow {
+    created_rev: i64,
+    copy_from_path: Option<String>,
+    copy_from_rev: Option<i64>,
+    git_baseline_sha: Option<String>,
+    svn_url: String,
+}
+
+fn lineage_rows(engine: &SyncEngine) -> Vec<LineageRow> {
+    let conn = engine.db().conn();
+    let mut stmt = conn
+        .prepare(
+            "SELECT incarnation_created_rev, copy_from_path, copy_from_rev, git_baseline_sha, svn_url \
+             FROM canonical_lineage WHERE repo_id = ?1 ORDER BY generation",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([REPO], |r| {
+            Ok(LineageRow {
+                created_rev: r.get(0)?,
+                copy_from_path: r.get(1)?,
+                copy_from_rev: r.get(2)?,
+                git_baseline_sha: r.get(3)?,
+                svn_url: r.get(4)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows
+}
+
+fn sync_record_ids(engine: &SyncEngine) -> Vec<String> {
+    let conn = engine.db().conn();
+    let mut stmt = conn
+        .prepare("SELECT id FROM sync_records WHERE repo_id = ?1 ORDER BY id")
+        .unwrap();
+    let rows = stmt
+        .query_map([REPO], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows
+}
+
+/// After an import, the first lineage pin is refused (held) with `needle` in
+/// the identity-change detail. Nothing is pinned, published, mapped or moved.
+async fn assert_first_pin_held(fx: &Fixture, imported: &str, imported_rev: i64, needle: &str) {
+    let commits = fx.git_commits();
+    let engine = fx.engine(&["team-a/"], &[]);
+    let origin_only = sync_record_ids(&engine);
+    let mapped = rows(&engine);
+    let refused = format!("{:?}", engine.run_sync_cycle().await.unwrap_err());
+    assert!(
+        refused.contains("svn_identity_changed"),
+        "a different incarnation is an identity change: {refused}"
+    );
+    assert!(refused.contains(needle), "{needle:?} in {refused}");
+    assert!(
+        lineage_rows(&engine).is_empty(),
+        "no canonical lineage row is pinned for the replacement incarnation"
+    );
+    assert_eq!(svn_watermark(&engine), imported_rev, "SVN cursor unchanged");
+    assert_eq!(
+        inbound_git_cursor(&engine).as_deref(),
+        Some(imported),
+        "inbound Git cursor unchanged"
+    );
+    assert_eq!(sync_record_ids(&engine), origin_only, "no new sync record");
+    assert_eq!(rows(&engine), mapped, "no new mapping");
+    assert!(latest_cycle_mapping(&engine).is_none());
+    assert_eq!(
+        (fx.git_tip(), fx.git_commits()),
+        (imported.to_owned(), commits),
+        "no remote Git effect"
+    );
+    // The hold is durable: a second cycle is refused the same way and pins nothing.
+    let again = format!("{:?}", engine.run_sync_cycle().await.unwrap_err());
+    assert!(!again.contains("WriterFenced"), "{again}");
+    assert!(lineage_rows(&engine).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_branch_first_pins_its_incarnation_and_round_trips_with_pending_git() {
+    let _serial = serial().lock().await;
+    // trunk created uncopied at r1, baseline r2 imported at R = 2 (C = 1 < R).
+    let mut fx = Fixture::new_branch("trunk", false, BASELINE).await;
+    let imported = fx.git_tip();
+    fx.write("team-a/round.txt", "from svn\n");
+    fx.write("team-b/noise.txt", "excluded noise\n");
+    let r3 = fx.commit("r3 svn origin");
+    let engine = fx.engine(&["team-a/"], &[]);
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let lineage = lineage_rows(&engine);
+    assert_eq!(lineage.len(), 1, "one first pin");
+    let pinned = &lineage[0];
+    assert_eq!(
+        (
+            pinned.created_rev,
+            pinned.copy_from_path.as_deref(),
+            pinned.copy_from_rev
+        ),
+        (1, None, None),
+        "the pinned incarnation is the one the snapshot read at R"
+    );
+    assert_eq!(
+        pinned.git_baseline_sha.as_deref(),
+        Some(imported.as_str()),
+        "baseline B"
+    );
+    assert!(pinned.svn_url.ends_with("/trunk"), "{}", pinned.svn_url);
+    let r3_publication = fx.git_tip();
+    assert_team_applied(&engine, &fx, r3, &r3_publication);
+    assert_eq!(fx.git_file("team-b/noise.txt"), None);
+    assert_eq!(
+        inbound_git_cursor(&engine).as_deref(),
+        Some(imported.as_str()),
+        "the inbound Git cursor stays at B; Git after B stays pending"
+    );
+    // Git work after B is replayed under the current policy (the witness path).
+    fx.git_push(&[("team-a/round.txt", "edited in git\n")], "Git edit");
+    assert_eq!(engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    assert_eq!(
+        fx.svn_file("team-a/round.txt").as_deref(),
+        Some("edited in git\n")
+    );
+    assert_eq!(
+        fx.svn_file("team-b/noise.txt").as_deref(),
+        Some("excluded noise\n"),
+        "outside work in SVN is untouched"
+    );
+    let head = fx.svn_head();
+    let tip = fx.git_tip();
+    let commits = fx.git_commits();
+    let mapped = rows(&engine);
+    assert_team_applied(&engine, &fx, r3, &r3_publication);
+    drop(engine);
+    let reopened = fx.engine(&["team-a/"], &[]);
+    for _ in 0..2 {
+        let quiet = reopened.run_sync_cycle().await.unwrap();
+        assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
+    }
+    assert_eq!(
+        (fx.svn_head(), fx.git_tip(), fx.git_commits()),
+        (head, tip, commits)
+    );
+    assert_eq!(
+        rows(&reopened),
+        mapped,
+        "no duplicated mapping after reopen"
+    );
+    assert_eq!(
+        lineage_rows(&reopened).len(),
+        1,
+        "the lineage row is never rewritten"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_and_recreating_the_imported_uncopied_branch_holds_the_first_pin() {
+    let _serial = serial().lock().await;
+    // N1: trunk created uncopied at r1, baseline r2 imported at R = 2.
+    let fx = Fixture::new_branch("trunk", false, BASELINE).await;
+    let imported = fx.git_tip();
+    let root = fx.svn_root();
+    // Same UUID, same URL, no copy origin on either incarnation.
+    fx.svn_remote(&["rm", "-m", "delete trunk", &format!("{root}/trunk")]);
+    fx.svn_remote(&["mkdir", "-m", "recreate trunk", &format!("{root}/trunk")]);
+    assert_eq!(fx.svn_head(), 4);
+    assert_first_pin_held(&fx, &imported, 2, "incarnation_created_rev: 1 != 4").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recopying_the_imported_branch_from_the_same_source_holds_the_first_pin() {
+    let _serial = serial().lock().await;
+    // N2: branches/b copied from trunk@2 at r3, baseline r4 imported at R = 4.
+    let fx = Fixture::new_branch("branches/b", true, BASELINE).await;
+    let imported = fx.git_tip();
+    let root = fx.svn_root();
+    fx.svn_remote(&["rm", "-m", "delete branch", &format!("{root}/branches/b")]);
+    fx.svn_remote(&[
+        "copy",
+        "-m",
+        "recopy branch from trunk@2",
+        &format!("{root}/trunk@2"),
+        &format!("{root}/branches/b"),
+    ]);
+    // Same UUID, URL and copy source /trunk@2; only the creation differs.
+    assert_eq!(fx.svn_head(), 6);
+    assert_first_pin_held(&fx, &imported, 4, "incarnation_created_rev: 3 != 6").await;
+}

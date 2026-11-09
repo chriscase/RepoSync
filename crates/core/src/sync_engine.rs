@@ -1287,6 +1287,15 @@ impl SyncEngine {
     /// pair's global maximum. A missing or conflicting cursor is not a new
     /// baseline. The schema transition remains #63.
     fn team_git_checkpoint(&self) -> Result<Option<String>, SyncError> {
+        self.team_git_checkpoint_with(None)
+    }
+
+    /// `team_git_checkpoint` with an optional sealed imported-origin witness
+    /// (#53). `None` is the original reader; the witness adds one alternative.
+    fn team_git_checkpoint_with(
+        &self,
+        imported_origin: Option<&svn_projection_53::ImportedOriginWitness53<'_, '_>>,
+    ) -> Result<Option<String>, SyncError> {
         if let Some(rid) = self.effective_repo_id() {
             let column: Option<String> = {
                 let conn = self.db.conn();
@@ -1404,6 +1413,10 @@ impl SyncEngine {
                 // verified stale-generation receipt for that SHA.
                 let old_import_projection =
                     self.allowed_paths.is_empty() && self.blocked_patterns.is_empty();
+                // #53 (E2): the last alternative needs a sealed current-cycle
+                // witness that the inbound cursor is this repository's snapshot
+                // import whose historical SVN incarnation is the pinned lineage's,
+                // revalidated against current records. Every check below holds.
                 let kv_handled_proved = applied_outbound > 0
                     || (old_import_projection && svn_origin > 0)
                     || kv_no_target
@@ -1412,7 +1425,16 @@ impl SyncEngine {
                         rid,
                         kv.as_deref().unwrap(),
                         &self.no_target_projection(),
-                    )?;
+                    )?
+                    || match imported_origin {
+                        Some(witness) if !old_import_projection => witness.accepts(
+                            &self.db,
+                            rid,
+                            kv.as_deref().unwrap(),
+                            column.as_deref().unwrap(),
+                        )?,
+                        _ => false,
+                    };
                 let column_sha = column.as_deref().unwrap();
                 let column_emit_proved = self.proved_svn_emitted_column_git_sha(rid, column_sha)?;
                 let column_stale_receipt_only =
@@ -2396,6 +2418,15 @@ impl SyncEngine {
     /// only a complete, linear path from the durably handled P to fresh R.
     /// This runs before SVN legacy adoption or any checkout reset.
     fn inspect_team_history(&self) -> Result<TeamHistoryAdmission, SyncError> {
+        self.inspect_team_history_with(None)
+    }
+
+    /// `inspect_team_history` with an optional sealed imported-origin witness
+    /// (#53), forwarded only to the checkpoint reader. `None` is the original.
+    fn inspect_team_history_with(
+        &self,
+        imported_origin: Option<&svn_projection_53::ImportedOriginWitness53<'_, '_>>,
+    ) -> Result<TeamHistoryAdmission, SyncError> {
         enforce_durable_history_block(&self.db, &self.history_block_key())?;
         if let Some(rid) = self.effective_repo_id() {
             let legacy = history_block_key(Some(rid));
@@ -2403,7 +2434,10 @@ impl SyncEngine {
                 enforce_durable_history_block(&self.db, &legacy)?;
             }
         }
-        let p = self.team_git_checkpoint()?;
+        let p = match imported_origin {
+            None => self.team_git_checkpoint()?,
+            Some(witness) => self.team_git_checkpoint_with(Some(witness))?,
+        };
         let git = self
             .git_client
             .lock()
@@ -2490,7 +2524,18 @@ impl SyncEngine {
         self.resume_authorized_svn_to_git_push(stats)?;
         // SVN inspection may adopt a legacy checkpoint. Admit Git history
         // before that call, not merely before the later destructive reset.
-        let admission = tokio::task::block_in_place(|| self.inspect_team_history())?;
+        // #53 (E2): prepare the imported-origin witness before history
+        // admission, with no SQLite reservation across its SVN reads. It lives
+        // only for this admission.
+        let admission = {
+            let imported_origin = self
+                .prepare_imported_origin_witness_53(writer_window)
+                .await?;
+            tokio::task::block_in_place(|| match imported_origin.as_ref() {
+                None => self.inspect_team_history(),
+                Some(witness) => self.inspect_team_history_with(Some(witness)),
+            })?
+        };
 
         // On a pinned old import, both legacy copies point to the imported
         // SVN mapping. Materialize that verified baseline before diagnostics
