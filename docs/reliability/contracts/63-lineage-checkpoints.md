@@ -1,11 +1,13 @@
 # #63 contract: canonical lineage, directional checkpoints, non-destructive migration
 
-**Status:** operational activation. Ordinary exclusive-owner startup is SQLite
-`user_version=14` with durable `repositories.scope_uuid` (v13) plus typed
-canonical lineage/checkpoint tables (v14). Candidate CopySession tables
+**Status:** operational activation. This contract's schema is durable
+`repositories.scope_uuid` (v13) plus typed canonical lineage/checkpoint tables
+(v14). Ordinary exclusive-owner startup is now SQLite `user_version=15`, which
+adds #54's nullable `commit_map.git_sha` on top of v14. Candidate CopySession tables
 `pair_lineages` / `pair_frontiers` / `pair_outcomes` remain fixture-only and
 must stay absent from ordinary `STARTUP`. `#54` nullable `commit_map.git_sha`
-is **not** activated here: operational `git_sha` stays `NOT NULL`.
+is not part of this contract. It is operational v15, which reuses the candidate
+v13 rebuild shape; see [54-nullable-commit-map.md](54-nullable-commit-map.md).
 
 **Depends on:** #62 catalog (`docs/reliability/acceptance-matrix.json`).
 **Coordinates with:** #54 nullable `commit_map.git_sha`; do not introduce a
@@ -19,8 +21,9 @@ second migration directory. Current migrations are embedded in
 | --- | --- | --- |
 | 12 | Pre-scope legacy file. Lone file-backed install with `last_git_sha_<id>` stays at 12 through `Database::initialize` (R01). | Exclusive `{data_dir}/reposync.lock` owner. Old executable may reopen only this snapshot. |
 | 13 | Durable `repositories.scope_uuid` plus scoped echo/receipt/checkpoint KV. Intermediate committed state if v14 has not yet applied. | Same exclusive owner. A v12 executable is not a safe concurrent writer. |
-| 14 | Current. v13 plus `canonical_lineage`, `canonical_checkpoints`, `canonical_mapping_outcomes`. Zero `pair_%` tables. | Current executable with exclusive owner. |
-| >14 | Unsupported. | Refused before any migration write (`UnsupportedSchema`). `user_version` is left unchanged. |
+| 14 | v13 plus `canonical_lineage`, `canonical_checkpoints`, `canonical_mapping_outcomes`. Zero `pair_%` tables. Intermediate committed state if v15 has not yet applied. | Same exclusive owner. |
+| 15 | Current. v14 plus nullable `commit_map.git_sha` ([#54 contract](54-nullable-commit-map.md)). | Current executable with exclusive owner. |
+| >15 | Unsupported. | Refused before any migration write (`UnsupportedSchema`). `user_version` is left unchanged. |
 
 Candidate CopySession v13/v14 (`candidate_migration.rs`) is a sealed-copy
 qualification registry. It is **not** the operational schema and must not be

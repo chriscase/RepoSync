@@ -6,10 +6,11 @@
 
 | Version | Ordinary startup | Notes |
 | --- | --- | --- |
-| 12 | Lone file-backed legacy install stays here through `Database::initialize` | Exclusive owner later applies v13+v14 in one checked path |
+| 12 | Lone file-backed legacy install stays here through `Database::initialize` | Exclusive owner later applies v13, v14 and v15 in one checked path |
 | 13 | Durable `repositories.scope_uuid` | Echo/receipt/checkpoint KV scope; intermediate committed state |
-| 14 | **Current.** Canonical lineage + typed directional checkpoints | `canonical_*` tables; zero `pair_%` tables; `commit_map.git_sha` stays NOT NULL (#54 deferred) |
-| >14 | Refused | `UnsupportedSchema`; no write; `user_version` unchanged |
+| 14 | Canonical lineage + typed directional checkpoints | `canonical_*` tables; zero `pair_%` tables; `commit_map.git_sha` NOT NULL |
+| 15 | **Current.** Nullable `commit_map.git_sha` (#54) | Verified table rebuild reusing the candidate v13 shape; NULL rows are only projections of canonical no-target outcomes ([contract](contracts/54-nullable-commit-map.md)) |
+| >15 | Refused | `UnsupportedSchema`; no write; `user_version` unchanged |
 
 Each registered migration SQL batch and its `PRAGMA user_version` bump run in **one** SQLite transaction. Mixed-version policy: one `{data_dir}/reposync.lock` owner. An old executable is not a safe writer after new records exist. Honest rollback is restore of a pre-upgrade snapshot **only before** new SVN/Git effects; after remote writes, inspect and roll forward. No destructive down migration.
 
