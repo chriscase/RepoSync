@@ -1555,8 +1555,25 @@ async fn copies_never_delete_sources_and_moves_across_the_boundary_are_endpoint_
     let _serial = serial().lock().await;
     let fx = Fixture::new(BASELINE).await;
     let engine = fx.engine(&["team-a/"], &[]);
-    fx.svn(&["copy", &op("team-a/a.txt"), &op("team-b/copied.txt")]);
+    fx.svn(&["copy", &op("team-a/a.txt"), "team-b/copied.txt"]);
     let r2 = fx.commit("r2 copy out of scope");
+    // Committed SVN at HEAD: the literal destination holds the source bytes,
+    // no `@`-suffixed destination exists, and the copy source is kept.
+    assert_eq!(
+        fx.svn_file("team-b/copied.txt").as_deref(),
+        Some("team-a baseline\n"),
+        "committed copy destination spelled exactly"
+    );
+    assert_eq!(
+        fx.svn_file("team-b/copied.txt@"),
+        None,
+        "no @-suffixed copy destination"
+    );
+    assert_eq!(
+        fx.svn_file("team-a/a.txt").as_deref(),
+        Some("team-a baseline\n"),
+        "committed copy source preserved"
+    );
     assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 0);
     assert_eq!(
         fx.git_file("team-a/a.txt").as_deref(),
@@ -1565,8 +1582,24 @@ async fn copies_never_delete_sources_and_moves_across_the_boundary_are_endpoint_
     );
     assert_eq!(fx.git_file("team-b/copied.txt"), None);
     assert_filtered_once(&engine, r2);
-    fx.svn(&["move", &op("team-b/b.txt"), &op("team-a/moved-in.txt")]);
+    fx.svn(&["move", &op("team-b/b.txt"), "team-a/moved-in.txt"]);
     fx.commit("r3 move into scope");
+    // Committed SVN at HEAD: exact destination, no `@` suffix, source deleted.
+    assert_eq!(
+        fx.svn_file("team-a/moved-in.txt").as_deref(),
+        Some("team-b baseline\n"),
+        "committed move destination spelled exactly"
+    );
+    assert_eq!(
+        fx.svn_file("team-a/moved-in.txt@"),
+        None,
+        "no @-suffixed move destination"
+    );
+    assert_eq!(
+        fx.svn_file("team-b/b.txt"),
+        None,
+        "committed move source deleted"
+    );
     assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
     assert_eq!(
         fx.git_file("team-a/moved-in.txt").as_deref(),
@@ -1577,8 +1610,24 @@ async fn copies_never_delete_sources_and_moves_across_the_boundary_are_endpoint_
         Some("team-b baseline\n"),
         "excluded delete not applied"
     );
-    fx.svn(&["move", &op("team-a/old.txt"), &op("team-b/moved-out.txt")]);
+    fx.svn(&["move", &op("team-a/old.txt"), "team-b/moved-out.txt"]);
     fx.commit("r4 move out of scope");
+    // Committed SVN at HEAD: exact destination, no `@` suffix, source deleted.
+    assert_eq!(
+        fx.svn_file("team-b/moved-out.txt").as_deref(),
+        Some("team-a old\n"),
+        "committed move destination spelled exactly"
+    );
+    assert_eq!(
+        fx.svn_file("team-b/moved-out.txt@"),
+        None,
+        "no @-suffixed move destination"
+    );
+    assert_eq!(
+        fx.svn_file("team-a/old.txt"),
+        None,
+        "committed move source deleted"
+    );
     assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
     assert_eq!(
         fx.git_file("team-a/old.txt"),
