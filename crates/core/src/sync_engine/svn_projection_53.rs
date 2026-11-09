@@ -364,6 +364,48 @@ fn select_revision_sections(
     })
 }
 
+/// Observation-only capture for native fixtures: debug builds only, and only when
+/// `REPOSYNC_RS53_OBSERVE_DIR` is set. It writes the raw `svn diff` the producer
+/// actually read, the changed-path log it validated against, and the plan it
+/// actually computed (selected patch, endpoints, counts, effect, or hold detail).
+/// It never recomputes or alters a plan, and write failures are ignored.
+#[cfg(debug_assertions)]
+fn observe_plan_53(change: &SvnChangeSet, raw: &str, outcome: &Result<PlanState, String>) {
+    let Some(dir) = std::env::var_os("REPOSYNC_RS53_OBSERVE_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let rev = change.revision;
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join(format!("r{rev}.raw.diff")), raw);
+    let log: Vec<(&str, &str, Option<&str>)> = change
+        .changed_files
+        .iter()
+        .map(|f| (f.path.as_str(), f.action.as_str(), f.rename_from.as_deref()))
+        .collect();
+    let summary = match outcome {
+        Ok(PlanState::Ready {
+            effect,
+            selected_patch,
+            files,
+            counts,
+        }) => {
+            let _ = std::fs::write(dir.join(format!("r{rev}.selected.patch")), selected_patch);
+            let endpoints: Vec<(&str, &str, bool)> = files
+                .iter()
+                .map(|f| (f.path.as_str(), f.action.as_str(), f.is_binary))
+                .collect();
+            format!("effect={effect:?}\ncounts={counts:?}\nendpoints={endpoints:?}\n")
+        }
+        Ok(other) => format!("state={other:?}\n"),
+        Err(detail) => format!("held={detail}\n"),
+    };
+    let _ = std::fs::write(
+        dir.join(format!("r{rev}.plan.txt")),
+        format!("revision={rev}\nlog={log:?}\n{summary}"),
+    );
+}
+
 fn policy_identity(policy_snapshot: &str) -> String {
     hex::encode(Sha256::digest(policy_snapshot.as_bytes()))[..16].to_owned()
 }
@@ -458,14 +500,27 @@ impl SyncEngine {
         svn: &SvnClient,
         change: &SvnChangeSet,
     ) -> Result<PlanState, String> {
+        let raw = svn
+            .diff_full(change.revision)
+            .await
+            .map_err(|e| format!("svn diff read failed: {e}"))?;
+        let outcome = self.plan_from_diff_53(svn, change, &raw).await;
+        #[cfg(debug_assertions)]
+        observe_plan_53(change, &raw, &outcome);
+        outcome
+    }
+
+    /// The plan for one revision from the diff text actually read for it.
+    async fn plan_from_diff_53(
+        &self,
+        svn: &SvnClient,
+        change: &SvnChangeSet,
+        raw: &str,
+    ) -> Result<PlanState, String> {
         let rev = change.revision;
         let allowed = &self.allowed_paths;
         let blocked = &self.blocked_patterns;
-        let raw = svn
-            .diff_full(rev)
-            .await
-            .map_err(|e| format!("svn diff read failed: {e}"))?;
-        let sections = split_svn_diff(&raw)?;
+        let sections = split_svn_diff(raw)?;
         let mut facts = Vec::with_capacity(sections.len());
         for section in &sections {
             // The branch root has no Git file. A header-only root section

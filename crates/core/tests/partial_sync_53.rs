@@ -16,6 +16,9 @@ use tokio::sync::RwLock;
 
 use reposync_core::config::{AppConfig, IdentityConfig, SvnLayout};
 use reposync_core::db::import_operations::import_target_fingerprint;
+use reposync_core::db::lineage_checkpoints::{
+    load_mapping_outcome, svn_source_key, CheckpointDirection, MappingOutcome,
+};
 use reposync_core::db::nullable_commit_map::CommitMapTarget;
 use reposync_core::db::team_cycle_mapping_operations::{
     TeamCycleMappingOutcome, TeamCycleMappingState,
@@ -166,6 +169,12 @@ impl Fixture {
         for (path, bytes) in baseline {
             fixture_paths.write(path, bytes);
         }
+        // Observation-only: the projection producer records what it actually read
+        // and planned here (debug builds); dumped only if this case panics.
+        std::env::set_var(
+            "REPOSYNC_RS53_OBSERVE_DIR",
+            fixture_paths.tmp.path().join("observe"),
+        );
         let baseline_rev = fixture_paths.commit("baseline r1");
         fixture_paths.import(baseline_rev).await;
         fixture_paths
@@ -484,6 +493,204 @@ impl Fixture {
     }
 }
 
+/// Observation-only dump, printed only when a case is already failing.
+/// It reads Git, files and records; it never changes them.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("{}", self.observations());
+        }
+        std::env::remove_var("REPOSYNC_RS53_OBSERVE_DIR");
+    }
+}
+
+impl Fixture {
+    fn observations(&self) -> String {
+        let quiet = |dir: &Path, args: &[&str]| -> String {
+            match Command::new("git").args(args).current_dir(dir).output() {
+                Ok(out) => format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+                Err(e) => format!("<git failed: {e}>"),
+            }
+        };
+        let bare = self.bare.to_str().unwrap_or_default();
+        let mut out = String::from("=== RS53 OBSERVATION (read-only) ===\n");
+        let observe = self.tmp.path().join("observe");
+        let mut files: Vec<_> = std::fs::read_dir(&observe)
+            .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .unwrap_or_default();
+        files.sort();
+        for file in files {
+            out += &format!(
+                "--- producer {} ---\n{}\n",
+                file.display(),
+                std::fs::read_to_string(&file).unwrap_or_default()
+            );
+        }
+        out += "--- bare main: commit tree subject ---\n";
+        out += &quiet(
+            self.tmp.path(),
+            &["--git-dir", bare, "log", "--format=%H %T %s", "main"],
+        );
+        out += "--- bare main tree ---\n";
+        out += &quiet(
+            self.tmp.path(),
+            &["--git-dir", bare, "ls-tree", "-r", "main"],
+        );
+        out += "--- bridge index ---\n";
+        out += &quiet(&self.git_work, &["ls-files", "-s"]);
+        out += "--- bridge worktree status ---\n";
+        out += &quiet(
+            &self.git_work,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        );
+        if let Ok(db) = Database::new(&self.db_path) {
+            let conn = db.conn();
+            for sql in [
+                "SELECT id, last_svn_rev, last_git_sha, scope_uuid, allowed_paths, blocked_patterns FROM repositories",
+                "SELECT svn_rev, git_sha, direction, status FROM sync_records ORDER BY rowid",
+                "SELECT svn_rev, git_sha, direction, repo_id FROM commit_map ORDER BY id",
+                "SELECT * FROM canonical_checkpoints",
+                "SELECT * FROM canonical_mapping_outcomes",
+                "SELECT key, value FROM kv_state WHERE key LIKE '%git%' OR key LIKE '%svn_rev%' OR key LIKE 'team_cycle_mapping%' ORDER BY key",
+            ] {
+                out += &format!("--- {sql} ---\n");
+                match conn.prepare(sql) {
+                    Ok(mut stmt) => {
+                        let n = stmt.column_count();
+                        let rows = stmt.query_map([], |row| {
+                            Ok((0..n)
+                                .map(|i| match row.get_ref(i) {
+                                    Ok(v) => format!("{v:?}"),
+                                    Err(e) => format!("<{e}>"),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" | "))
+                        });
+                        match rows {
+                            Ok(rows) => {
+                                for row in rows.flatten() {
+                                    out += &row;
+                                    out += "\n";
+                                }
+                            }
+                            Err(e) => out += &format!("<{e}>\n"),
+                        }
+                    }
+                    Err(e) => out += &format!("<{e}>\n"),
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Current repository scope and generation, read without side effects: the scope
+/// from the registration row, the generation from that scope's single canonical
+/// SVN→Git checkpoint row.
+fn scope_and_generation(engine: &SyncEngine) -> (String, i64) {
+    let conn = engine.db().conn();
+    let scope: String = conn
+        .query_row(
+            "SELECT scope_uuid FROM repositories WHERE id = ?1",
+            [REPO],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut stmt = conn
+        .prepare("SELECT generation FROM canonical_checkpoints WHERE scope_uuid = ?1 AND direction = 'svn_to_git'")
+        .unwrap();
+    let generations: Vec<i64> = stmt
+        .query_map([&scope], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        generations.len(),
+        1,
+        "one current SVN→Git checkpoint for scope {scope}"
+    );
+    (scope, generations[0])
+}
+
+/// The team publication record of `rev`, equal to `sha` everywhere: exactly one
+/// applied svn_to_git `sync_records` row; the canonical AppliedAndVerified outcome
+/// in the current scope/generation; the push journal's observed SHA and tree.
+/// Team mode writes no applied legacy `commit_map` row, and an applied revision
+/// has no NULL row either.
+fn assert_team_applied(engine: &SyncEngine, fx: &Fixture, rev: i64, sha: &str) {
+    let applied: Vec<String> = {
+        let conn = engine.db().conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND svn_rev = ?2 \
+                 AND direction = 'svn_to_git' AND status = 'applied'",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![REPO, rev], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(
+        applied,
+        vec![sha.to_owned()],
+        "one applied sync record for r{rev}"
+    );
+    let (scope, generation) = scope_and_generation(engine);
+    let outcome = load_mapping_outcome(
+        &engine.db().conn(),
+        &scope,
+        generation,
+        CheckpointDirection::SvnToGit,
+        &svn_source_key(rev),
+    )
+    .unwrap()
+    .expect("canonical SVN→Git outcome");
+    assert_eq!(outcome.outcome, MappingOutcome::AppliedAndVerified);
+    assert_eq!(outcome.target_git_sha.as_deref(), Some(sha));
+    let op = engine
+        .db()
+        .latest_git_push_operation(REPO)
+        .unwrap()
+        .expect("push journal");
+    assert_eq!(op.source_svn_rev, rev);
+    assert_eq!(op.last_confirmed_git_sha.as_deref(), Some(sha));
+    let tree = fx.git(&["rev-parse", &format!("{sha}^{{tree}}")]);
+    assert_eq!(op.last_confirmed_git_tree.as_deref(), Some(tree.trim()));
+    assert_eq!(
+        filtered_row_count(engine, rev),
+        0,
+        "no NULL row for an applied revision"
+    );
+}
+
+/// The current SVN→Git checkpoint is `rev`, filtered with no target.
+fn assert_svn_checkpoint_filtered(engine: &SyncEngine, rev: i64) {
+    let (scope, generation) = scope_and_generation(engine);
+    let (key, outcome, target): (String, String, Option<String>) = engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT handled_source_key, outcome, target_git_sha FROM canonical_checkpoints \
+             WHERE scope_uuid = ?1 AND generation = ?2 AND direction = 'svn_to_git'",
+            rusqlite::params![scope, generation],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(key, svn_source_key(rev));
+    assert_eq!(
+        outcome,
+        MappingOutcome::IntentionallyFilteredNoTarget.as_str()
+    );
+    assert_eq!(target, None);
+}
+
 fn rows(engine: &SyncEngine) -> Vec<(i64, Option<String>, CommitMapTarget)> {
     let mut listed: Vec<_> = engine
         .db()
@@ -618,10 +825,11 @@ async fn sc01_only_admitted_paths_and_bytes_enter_git_and_excluded_work_is_accou
         "the scoped frontier accounts for r3"
     );
     assert_filtered_once(&engine, r3);
-    let mapped = rows(&engine);
-    assert!(mapped
-        .iter()
-        .any(|(rev, sha, _)| *rev == r2 && sha.as_deref() == Some(fx.git_tip().as_str())));
+    // The current remote tip at this point is r2's publication.
+    let tip = fx.git_tip();
+    assert_team_applied(&engine, &fx, r2, &tip);
+    // The later r3 is the current checkpoint: filtered, no target.
+    assert_svn_checkpoint_filtered(&engine, r3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -790,6 +998,8 @@ async fn sc06_svn_git_edit_svn_round_trip_keeps_exact_bytes_without_duplication(
         Some("from svn\n")
     );
     assert_eq!(fx.git_file("team-b/noise.txt"), None);
+    let r2_publication = fx.git_tip();
+    assert_team_applied(&engine, &fx, r2, &r2_publication);
     fx.git_push(&[("team-a/round.txt", "edited in git\n")], "Git edit");
     assert_eq!(engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
     let head = fx.svn_head();
@@ -800,9 +1010,7 @@ async fn sc06_svn_git_edit_svn_round_trip_keeps_exact_bytes_without_duplication(
     let tip = fx.git_tip();
     let commits = fx.git_commits();
     let mapped = rows(&engine);
-    assert!(mapped
-        .iter()
-        .any(|(rev, sha, _)| *rev == r2 && sha.is_some()));
+    assert_team_applied(&engine, &fx, r2, &r2_publication);
     drop(engine);
     let reopened = fx.engine(&["team-a/"], &[]);
     for _ in 0..2 {
@@ -1300,11 +1508,60 @@ async fn r2_admitted_policy_change_refuses_the_stale_engine_and_a_fresh_engine_f
     assert_eq!(svn_watermark(&stale), r2);
     assert_eq!(filtered_row_count(&stale, r3), 0);
     drop(stale);
+    // r3 depends on r2's bytes, which the old policy filtered forever (forward-only,
+    // no reimport). The fresh engine must fail closed at the durable frontier:
+    // no reset, no repair, no automatic catch-up.
+    let fresh = fx.engine_with_rules_from_row();
+    let failed = fresh.run_sync_cycle().await.unwrap_err();
+    assert!(
+        format!("{failed:?}").contains("ApplyFailed"),
+        "dependent history fails to apply: {failed:?}"
+    );
+    assert_eq!(fx.git_tip(), tip, "no Git effect");
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("team-b baseline\n"),
+        "the diverged file is neither repaired nor reset"
+    );
+    assert_eq!(
+        svn_watermark(&fresh),
+        r2,
+        "r3 stays pending at the frontier"
+    );
+    assert_eq!(
+        filtered_row_count(&fresh, r3),
+        0,
+        "a failed apply is never filtering"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_fresh_engine_follows_a_widened_admitted_policy_for_a_new_selected_path() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let stale = fx.engine(&["team-a/"], &[]);
+    fx.write("team-b/b.txt", "excluded under team-a\n");
+    let r2 = fx.commit("r2 team-b");
+    assert_eq!(stale.run_sync_cycle().await.unwrap().svn_to_git_count, 0);
+    assert_filtered_once(&stale, r2);
+    fx.admit_policy(&["team-b/"], &[]);
+    fx.write("team-b/new-admitted.txt", "new under team-b\n");
+    let r3 = fx.commit("r3 new team-b path");
+    let refused = stale.run_sync_cycle().await.unwrap_err();
+    assert!(refused.to_string().contains("admitted policy"), "{refused}");
+    drop(stale);
     let fresh = fx.engine_with_rules_from_row();
     assert_eq!(fresh.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
     assert_eq!(
+        fx.git_file("team-b/new-admitted.txt").as_deref(),
+        Some("new under team-b\n")
+    );
+    assert_eq!(
         fx.git_file("team-b/b.txt").as_deref(),
-        Some("admitted under team-b\n")
+        Some("team-b baseline\n"),
+        "no automatic catch-up of filtered history"
     );
     assert_eq!(svn_watermark(&fresh), r3);
+    let tip = fx.git_tip();
+    assert_team_applied(&fresh, &fx, r3, &tip);
 }
