@@ -2829,6 +2829,12 @@ mod tests {
         let db = setup();
         let r = repo("push-repo", "Push", None);
         db.insert_repository(&r).unwrap();
+        db.set_state("secret_svn_password_push-repo", "owned-secret")
+            .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let owned = data.path().join("repos").join("push-repo");
+        std::fs::create_dir_all(owned.join("git-repo")).unwrap();
+        std::fs::write(owned.join("git-repo").join("owned.txt"), "owned\n").unwrap();
 
         let intent = GitPushIntent {
             repo_id: "push-repo",
@@ -2860,6 +2866,29 @@ mod tests {
             other => panic!("expected git-push wait, got {other:?}"),
         }
         assert!(!db.get_repository("push-repo").unwrap().unwrap().enabled);
+        let refused = db
+            .complete_managed_remove(
+                "push-repo",
+                &db.managed_removal("push-repo").unwrap().unwrap().id,
+                &ManagedRemoveRemoteOutcome::untouched(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "in-flight SVN-to-Git push still owns the repository; local data was not deleted"
+        );
+        assert!(db.get_repository("push-repo").unwrap().is_some());
+        assert_eq!(
+            db.get_state("secret_svn_password_push-repo")
+                .unwrap()
+                .as_deref(),
+            Some("owned-secret")
+        );
+        assert_eq!(
+            std::fs::read_to_string(owned.join("git-repo").join("owned.txt")).unwrap(),
+            "owned\n"
+        );
+        assert!(db.removal_tombstone("push-repo").unwrap().is_none());
     }
 
     #[test]
@@ -2869,6 +2898,12 @@ mod tests {
         let db = setup();
         let r = repo("held-repo", "Held", None);
         db.insert_repository(&r).unwrap();
+        db.set_state("secret_svn_password_held-repo", "owned-secret")
+            .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let owned = data.path().join("repos").join("held-repo");
+        std::fs::create_dir_all(owned.join("git-repo")).unwrap();
+        std::fs::write(owned.join("git-repo").join("owned.txt"), "owned\n").unwrap();
 
         let intent = GitPushIntent {
             repo_id: "held-repo",
@@ -2907,6 +2942,30 @@ mod tests {
             }
             other => panic!("expected git-push reconcile wait, got {other:?}"),
         }
+        let refused = db
+            .complete_managed_remove(
+                "held-repo",
+                &db.managed_removal("held-repo").unwrap().unwrap().id,
+                &ManagedRemoveRemoteOutcome::untouched(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "SVN-to-Git push has an unresolved external effect; registration and local data were kept"
+        );
+        let registration = db.get_repository("held-repo").unwrap().unwrap();
+        assert!(!registration.enabled);
+        assert_eq!(
+            db.get_state("secret_svn_password_held-repo")
+                .unwrap()
+                .as_deref(),
+            Some("owned-secret")
+        );
+        assert_eq!(
+            std::fs::read_to_string(owned.join("git-repo").join("owned.txt")).unwrap(),
+            "owned\n"
+        );
+        assert!(db.removal_tombstone("held-repo").unwrap().is_none());
     }
 
     #[test]
