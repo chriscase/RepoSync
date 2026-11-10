@@ -2,12 +2,14 @@
 
 These documents are the reviewable handoff from the current-main #62 catalog
 to later runtime work. They do not claim live acceptance. The #63 row below
-records operational v14 canonical lineage activation on this epic; candidate
+records operational v14 canonical lineage activation on this epic. The #54 row
+records the operational v15 nullable `commit_map.git_sha` projection. Candidate
 `pair_%` tables and live qualification remain unactivated.
 
 | Issue | Contract | Product merge in this PR |
 | --- | --- | --- |
 | #63 | [63-lineage-checkpoints.md](63-lineage-checkpoints.md) | Operational v14 canonical lineage/checkpoints; candidate `pair_%` tables remain fixture-only; does not close #63 |
+| #54 | [54-nullable-commit-map.md](54-nullable-commit-map.md) | Operational v15 nullable `commit_map.git_sha` as a projection of a canonical no-target outcome; does not close #54 |
 | #64 | [64-durable-jobs.md](64-durable-jobs.md) | No |
 | #66 | [66-history-containment.md](66-history-containment.md) | No |
 | #65 | [65-managed-remove.md](65-managed-remove.md) | Additive removal API only; does not close #65 |
@@ -25,5 +27,6 @@ Authoritative sources that these contracts must not silently rewrite:
 - Existing [import-cancellation.md](../import-cancellation.md) and [RS64-B-reconciliation.md](../RS64-B-reconciliation.md)
 - Existing team-gate description in [design.md](../design.md)
 
-Monorepo epic #52 / schema #54 / tests #60 remain separate. Coordinate numbers
-and nullable mapping semantics; do not absorb that scope here.
+Monorepo epic #52 path filtering and tests #60 remain separate. Schema #54 is
+the v15 projection above; do not absorb path projection here, and do not close
+#54.
