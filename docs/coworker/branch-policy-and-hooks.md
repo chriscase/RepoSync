@@ -146,7 +146,7 @@ RepoSync Git publication with the two illustrated rules only (`deletion` and
 | v2 pair-refresh publication to Git (draft) | Pushes the prepared commit to the child ref with a refspec that has no force marker, and checks that the remote's old value equals the pinned tip. | Unaffected when the result is a fast-forward; a non-fast-forward would be refused by the remote. |
 | **Journaled initial import** (snapshot import, or a full import that has an operation record) | The first publication uses `--force-with-lease=refs/heads/<branch>:` with an **empty expected value**. By Git's lease semantics that creates the branch only if it is **absent** and refuses if it already exists. Later batches are plain pushes. | A creation is neither a non-fast-forward update nor a deletion, so these two rules do not address it. It is not a rewrite path. |
 | Older **un-journaled** full-import path (used when no repository and operation record are present) | The first batch is pushed with a plain `git push --force`. | Can overwrite an existing destination branch, so a `non_fast_forward` rule on that ref would be expected to refuse such an update. |
-| Setup wizard **Reset & Reimport** | Deletes RepoSync's local Git clone, then runs `git push --force origin <branch>` with a fresh import. | A rewrite of the configured branch: a `non_fast_forward` rule would be expected to refuse it, which is the correct outcome for a paired ref. Don't use it on one. |
+| Setup wizard **Reset & Reimport** | Deletes RepoSync's local Git clone and first force-pushes a new empty reset commit (`Reset for full SVN reimport`) to the configured branch; it then prepares and starts the reimport. The object on that push is the empty commit, not imported SVN contents. | A rewrite of the configured branch: a `non_fast_forward` rule would be expected to refuse it, which is the correct outcome for a paired ref. Don't use it on one. |
 | Legacy `DELETE /api/repos/{id}/branch-pair` | Does **not** attempt a Git or SVN deletion on this route's default inputs; see the next section. | Nothing for the deletion rule to refuse. |
 
 Expectations about what a host would refuse are inferences from the rule
@@ -229,7 +229,7 @@ Sources: [flag interpretation][delete-flags], [legacy handler forwarding][delete
 [import-final]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L4099-L4115
 [import-legacy-a]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L3884-L3930
 [import-legacy-b]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L4144-L4162
-[reset-reimport]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/setup.rs#L1515-L1520
+[reset-reimport]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/setup.rs#L1468-L1572
 [delete-flags]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L3952-L3969
 [delete-handler]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L4002-L4023
 [remove-guard]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L948-L955
