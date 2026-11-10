@@ -1,8 +1,10 @@
 //! #69 coordinated pair-refresh preview (no execute, no re-anchor).
 //!
 //! The default operation is **update pair from parent**: pin both sides and
-//! report unsynced work without discarding it. Re-anchor and execution are
-//! refused. Published Git commits and SVN revisions are not rewritten.
+//! report unsynced work without discarding it. The live preview refuses
+//! re-anchor and execution. Published Git commits and SVN revisions are not
+//! rewritten. `synthetic` is the fixture-only model for those operations and
+//! does not call a live engine.
 
 use std::path::Path;
 use std::process::Output;
@@ -31,6 +33,7 @@ pub mod svn_observation;
 pub mod svn_preparation;
 pub mod svn_sources;
 pub mod svn_visibility;
+pub mod synthetic;
 pub mod workspace;
 
 /// Policy identity pinned into every preview from this slice.
