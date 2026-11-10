@@ -603,6 +603,22 @@ pub fn build_preview(obs: &RefreshObservations) -> RefreshPlan {
     {
         conflicts.push("unpinned_svn".into());
     }
+    let pair_svn_behind = svn_head_behind_mapping(
+        obs.pair_baseline.as_ref(),
+        obs.pair_svn_revision,
+        obs.pair_svn_missing,
+    );
+    let parent_svn_behind = svn_head_behind_mapping(
+        obs.parent_baseline.as_ref(),
+        obs.parent_svn_revision,
+        obs.parent_svn_missing,
+    );
+    if pair_svn_behind {
+        conflicts.push("pair_svn_behind_mapping".into());
+    }
+    if parent_svn_behind {
+        conflicts.push("parent_svn_behind_mapping".into());
+    }
     if let (Some(parent_uuid), Some(pair_uuid)) = (&obs.svn_uuid, &obs.pair_svn_uuid) {
         if parent_uuid != pair_uuid {
             conflicts.push("uuid_mismatch".into());
@@ -655,6 +671,8 @@ pub fn build_preview(obs: &RefreshObservations) -> RefreshPlan {
         && obs.parent_pending_git.complete
         && pair_svn.knowable
         && parent_svn.knowable
+        && !pair_svn_behind
+        && !parent_svn_behind
         && !obs.pair_local_diverged
         && !obs.parent_local_diverged
         && obs.pair_local_ahead_complete
@@ -664,6 +682,7 @@ pub fn build_preview(obs: &RefreshObservations) -> RefreshPlan {
         parent_unsynced,
         &obs.pair_pending_git,
         &obs.parent_pending_git,
+        pair_svn_behind || parent_svn_behind,
     );
     let identity = PlanIdentity {
         operation: OPERATION_UPDATE,
@@ -773,11 +792,26 @@ fn side_unsynced(git: &ClassifiedPending, svn: &PendingSvn, local: &PendingLocal
         || local.diverged
 }
 
+fn svn_head_behind_mapping(
+    baseline: Option<&BaselinePin>,
+    head: Option<i64>,
+    missing: bool,
+) -> bool {
+    if missing {
+        return false;
+    }
+    matches!(
+        (baseline.map(|pin| pin.svn_revision), head),
+        (Some(mapped), Some(head)) if head < mapped
+    )
+}
+
 fn intended_result(
     pair_unsynced: bool,
     parent_unsynced: bool,
     pair_git: &ClassifiedPending,
     parent_git: &ClassifiedPending,
+    svn_behind_mapping: bool,
 ) -> IntendedResult {
     let summary = if pair_git.rewritten || parent_git.rewritten {
         "Read-only preview of update pair from parent. Published lineage does not match a verified mapping. Rewritten commits are not counted as new work and are not discarded. This slice does not execute the refresh.".into()
@@ -787,6 +821,8 @@ fn intended_result(
         "Read-only preview of update pair from parent. The pair has unsynced work. It is preserved and is not discarded. This slice does not execute the refresh.".into()
     } else if parent_unsynced {
         "Read-only preview of update pair from parent. The parent has changes the pair does not contain. A later update would integrate them as new history without rewriting published revisions. This slice does not execute the refresh.".into()
+    } else if svn_behind_mapping {
+        "Read-only preview of update pair from parent. An SVN head is behind its verified mapping. Published revisions are not rewritten to catch up, and unsynced work is not discarded. This slice does not execute the refresh.".into()
     } else {
         "Read-only preview of update pair from parent. Pinned inputs show no unsynced work on either side. A later execution with these inputs would be a no-op. This slice does not execute the refresh.".into()
     };
@@ -1218,6 +1254,46 @@ mod tests {
         assert!(plan.pending.pair_git.rewritten);
         assert!(!plan.intended_result.discards_unsynced_work);
         assert!(plan.intended_result.summary.contains("not discarded"));
+    }
+
+    #[test]
+    fn svn_head_behind_mapping_is_not_a_noop() {
+        let mut obs = sample();
+        obs.pair_baseline = Some(baseline(&sha(1), 8, Some(true)));
+        obs.pair_svn_revision = Some(5);
+        let plan = build_preview(&obs);
+        assert!(plan
+            .conflicts
+            .iter()
+            .any(|c| c == "pair_svn_behind_mapping"));
+        assert!(!plan
+            .conflicts
+            .iter()
+            .any(|c| c == "parent_svn_behind_mapping"));
+        assert_eq!(plan.pending.pair_svn.count, 0);
+        assert!(plan.pending.pair_svn.knowable);
+        assert!(plan.pending.pair_svn.note.contains("not rewritten"));
+        assert!(!plan.pins_complete);
+        assert!(!plan.intended_result.summary.contains("no-op"));
+        assert!(plan.intended_result.summary.contains("not rewritten"));
+        assert!(plan.intended_result.summary.contains("not discarded"));
+        assert!(!plan.intended_result.discards_unsynced_work);
+        assert!(plan.intended_result.preserves_published_svn_revisions);
+        assert!(!plan.intended_result.rewrites_svn_revisions);
+        assert!(!plan.executed);
+        assert!(!plan.approval.eligible);
+        assert_ne!(plan.plan_digest, build_preview(&sample()).plan_digest);
+
+        let mut parent = sample();
+        parent.parent_baseline = Some(baseline(&sha(1), 9, Some(true)));
+        parent.parent_svn_revision = Some(4);
+        let parent_plan = build_preview(&parent);
+        assert!(parent_plan
+            .conflicts
+            .iter()
+            .any(|c| c == "parent_svn_behind_mapping"));
+        assert!(!parent_plan.intended_result.summary.contains("no-op"));
+        assert!(!parent_plan.pins_complete);
     }
 
     #[test]
