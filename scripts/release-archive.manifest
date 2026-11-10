@@ -4,4 +4,6 @@ config.example.toml
 authors.example.toml
 reposync.service
 static/index.html
-static/assets/app.js
+static/favicon.svg
+static/assets/index-CMTDqfvH.js
+static/assets/index-De9InfNN.css

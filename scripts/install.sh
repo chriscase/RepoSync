@@ -14,6 +14,7 @@ fi
 INSTALL_DIR="${REPOSYNC_INSTALL_DIR:-/usr/local/bin}"
 CONFIG_DIR="${REPOSYNC_CONFIG_DIR:-/etc/reposync}"
 DATA_DIR="${REPOSYNC_DATA_DIR:-/var/lib/reposync}"
+SYSTEMD_UNIT_DIR="${REPOSYNC_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 
 # Members install.sh will copy. Validated after the digest check and before
 # any install-prefix, config, key, or data mutation.
@@ -24,7 +25,9 @@ REQUIRED_ARCHIVE_MEMBERS=(
     authors.example.toml
     reposync.service
     static/index.html
-    static/assets/app.js
+    static/favicon.svg
+    static/assets/index-CMTDqfvH.js
+    static/assets/index-De9InfNN.css
 )
 
 archive_sha256() {
@@ -42,52 +45,73 @@ verify_archive_digest() {
     fi
 }
 
-member_name_is_forbidden() {
-    local name="$1"
-    [[ "$name" == /* || "$name" == *..* || "$name" == *\\* ]]
-}
-
 require_archive_members() {
     local archive="$1"
-    local listing missing=0 name normalized allowed
-    if ! listing="$(tar -tzf "$archive" 2>/dev/null)"; then
-        echo "Error: corrupt or unreadable archive" >&2
-        exit 1
-    fi
-    local -a present=()
-    while IFS= read -r name; do
-        [[ -n "$name" ]] || continue
-        normalized="${name#./}"
-        normalized="${normalized%/}"
-        [[ -n "$normalized" ]] || continue
-        if member_name_is_forbidden "$normalized"; then
-            echo "Error: archive member is not allowed: $name" >&2
-            exit 1
-        fi
-        present+=("$normalized")
-    done <<<"$listing"
-    for name in "${REQUIRED_ARCHIVE_MEMBERS[@]}"; do
-        if ! printf '%s\n' "${present[@]}" | grep -Fxq "$name"; then
-            echo "Error: archive is missing required member: $name" >&2
-            missing=1
-        fi
-    done
-    if [[ "$missing" -ne 0 ]]; then
-        exit 1
-    fi
-    for name in "${present[@]}"; do
-        allowed=0
-        for required in "${REQUIRED_ARCHIVE_MEMBERS[@]}"; do
-            if [[ "$name" == "$required" ]]; then
-                allowed=1
-                break
-            fi
-        done
-        if [[ "$allowed" -eq 0 ]]; then
-            echo "Error: archive has an extra member: $name" >&2
-            exit 1
-        fi
-    done
+    python3 - "$archive" "${REQUIRED_ARCHIVE_MEMBERS[@]}" <<'PY'
+import sys
+import tarfile
+
+archive = sys.argv[1]
+allowed = sys.argv[2:]
+try:
+    handle = tarfile.open(archive, "r:gz")
+except (tarfile.TarError, OSError):
+    print("Error: corrupt or unreadable archive", file=sys.stderr)
+    sys.exit(1)
+
+def normalized(name):
+    if name.startswith("./"):
+        name = name[2:]
+    return name.rstrip("/")
+
+seen = []
+with handle:
+    for member in handle.getmembers():
+        name = normalized(member.name)
+        if (
+            name.startswith("/")
+            or ".." in name.split("/")
+            or "\\" in name
+            or name == ""
+        ):
+            print(f"Error: archive member is not allowed: {member.name}", file=sys.stderr)
+            sys.exit(1)
+        if member.issym():
+            kind = "symlink"
+        elif member.islnk():
+            kind = "hardlink"
+        elif member.isreg():
+            kind = "file"
+        else:
+            kind = "other"
+        seen.append((name, kind))
+
+names = [name for name, _kind in seen]
+if len(names) != len(set(names)):
+    for name in names:
+        if names.count(name) > 1:
+            print(f"Error: duplicate archive member: {name}", file=sys.stderr)
+            sys.exit(1)
+for name, kind in seen:
+    if kind == "symlink":
+        print(f"Error: archive member is a symlink: {name}", file=sys.stderr)
+        sys.exit(1)
+    if kind == "hardlink":
+        print(f"Error: archive member is a hard link: {name}", file=sys.stderr)
+        sys.exit(1)
+    if kind != "file":
+        print(f"Error: archive member is not a regular file: {name}", file=sys.stderr)
+        sys.exit(1)
+present = set(names)
+for required in allowed:
+    if required not in present:
+        print(f"Error: archive is missing required member: {required}", file=sys.stderr)
+        sys.exit(1)
+for name in names:
+    if name not in allowed:
+        print(f"Error: archive has an extra member: {name}", file=sys.stderr)
+        sys.exit(1)
+PY
 }
 
 install_from_verified_archive() {
@@ -110,14 +134,21 @@ install_from_verified_archive() {
             use_sudo=0
         fi
     fi
-    # Parents must exist before install(1) without -D, including a fresh
-    # /etc/reposync on the default path.
+    # Parents must exist before copying. The systemd unit directory is a
+    # default-install destination, including a direct root install that does
+    # not escalate. A prefix install never uses it.
     if [[ "$use_sudo" -eq 1 ]]; then
         sudo mkdir -p "$install_dir" "$config_dir" "$data_dir" \
             "${install_dir}/static/assets"
+        if [[ -z "$prefix" ]]; then
+            sudo mkdir -p "$SYSTEMD_UNIT_DIR"
+        fi
     else
         mkdir -p "$install_dir" "$config_dir" "$data_dir" \
             "${install_dir}/static/assets"
+        if [[ -z "$prefix" ]]; then
+            mkdir -p "$SYSTEMD_UNIT_DIR"
+        fi
     fi
 
     stage="$(mktemp -d)"
@@ -142,11 +173,18 @@ install_from_verified_archive() {
         fi
     }
 
+    echo "==> install mode uid=$(id -u) sudo=${use_sudo} prefix=${prefix:-default}"
     echo "==> Installing binaries to ${install_dir}"
     copy_file "${stage}/reposync-daemon" "${install_dir}/reposync-daemon" 755
     copy_file "${stage}/reposync" "${install_dir}/reposync" 755
-    copy_tree_file "${stage}/static/index.html" "${install_dir}/static/index.html"
-    copy_tree_file "${stage}/static/assets/app.js" "${install_dir}/static/assets/app.js"
+    local member
+    for member in "${REQUIRED_ARCHIVE_MEMBERS[@]}"; do
+        case "$member" in
+            static/*)
+                copy_tree_file "${stage}/${member}" "${install_dir}/${member}"
+                ;;
+        esac
+    done
 
     # Existing configuration, keys, and data are preserved. Examples are
     # copied only when the destination file is absent.
@@ -160,12 +198,20 @@ install_from_verified_archive() {
         sudo mkdir -p "$data_dir"
     fi
 
-    if [[ "$use_sudo" -eq 1 ]] && command -v systemctl &>/dev/null; then
-        echo "==> Installing systemd service"
-        sudo cp "${stage}/reposync.service" /etc/systemd/system/reposync.service
-        sudo systemctl daemon-reload || true
+    # Service destination is not the privilege decision. Default and direct
+    # root installs place the unit. Prefix installs keep it under the prefix.
+    if [[ -n "$prefix" ]]; then
+        copy_file "${stage}/reposync.service" "${config_dir}/reposync.service" 644
     else
-        cp "${stage}/reposync.service" "${config_dir}/reposync.service"
+        echo "==> Installing systemd unit to ${SYSTEMD_UNIT_DIR}"
+        copy_file "${stage}/reposync.service" "${SYSTEMD_UNIT_DIR}/reposync.service" 644
+        if [[ "$SYSTEMD_UNIT_DIR" == "/etc/systemd/system" ]] && command -v systemctl &>/dev/null; then
+            if [[ "$use_sudo" -eq 1 ]]; then
+                sudo systemctl daemon-reload || true
+            elif [[ "$(id -u)" -eq 0 ]]; then
+                systemctl daemon-reload || true
+            fi
+        fi
     fi
 
     rm -rf "$stage"

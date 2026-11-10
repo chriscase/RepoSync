@@ -6,26 +6,175 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="${ROOT}/target/release"
 OUT="${ROOT}/target/reposync-candidate-x86_64-unknown-linux-gnu.tar.gz"
 
+: >/tmp/rs118-inner-exits.txt
+echo "QUALIFY_ARGV bash scripts/qualify_release_artifact.sh"
 echo "HOST $(uname -s) $(uname -m)"
+echo "NOT_RUN docker"
+echo "NOT_RUN aarch64-unknown-linux-gnu"
+echo "NOT_RUN x86_64-apple-darwin"
+echo "NOT_RUN aarch64-apple-darwin"
 echo "NARROW this host builds only x86_64-unknown-linux-gnu."
-echo "NARROW aarch64-unknown-linux-gnu, x86_64-apple-darwin, and aarch64-apple-darwin are not built here."
 echo "NARROW Docker image build is not run: no docker daemon, and Dockerfile FROM rust:1.83 cannot parse the locked edition2024 crates."
 
 python3 "${ROOT}/scripts/check_docker_context.py"
 
-# Digest and missing-member checks use stub binaries so they do not depend
-# on a release build. The native startup check below uses real binaries.
+fail() {
+    echo "FAIL $*" >&2
+    exit 1
+}
+
+host_unit="/etc/systemd/system/reposync.service"
+if [[ -e "$host_unit" ]]; then
+    host_unit_before="$(stat -c '%F %s %Y' "$host_unit")"
+else
+    host_unit_before="ABSENT"
+fi
+if [[ -e /etc/reposync ]]; then
+    etc_before="$(stat -c '%F %s %Y' /etc/reposync)"
+else
+    etc_before="ABSENT"
+fi
+
+# Assembler output is checked with sha256sum -c from the artifact directory.
+verified_digest() {
+    local archive="$1"
+    local label="$2"
+    local dir base code
+    dir="$(cd -- "$(dirname -- "$archive")" && pwd)"
+    base="$(basename -- "$archive")"
+    set +e
+    (
+        cd "$dir"
+        sha256sum -c "${base}.sha256"
+    ) >/tmp/rs118-${label}.out 2>/tmp/rs118-${label}.err
+    code=$?
+    set -e
+    printf 'INNER_EXIT %s %s\n' "$label" "$code" | tee -a /tmp/rs118-inner-exits.txt >&2
+    [[ "$code" -eq 0 ]] || fail "${label} rejected the checksum sidecar"
+    awk 'NR==1 { print $1 }' "${dir}/${base}.sha256"
+}
+
 stub_dir="$(mktemp -d)"
 printf '#!/bin/sh\nprintf "reposync stub\\n"\nexit 0\n' > "${stub_dir}/reposync"
 printf '#!/bin/sh\nprintf "reposync-daemon stub\\n"\nexit 0\n' > "${stub_dir}/reposync-daemon"
 chmod 755 "${stub_dir}/reposync" "${stub_dir}/reposync-daemon"
 stub_archive="$(mktemp)"
 bash "${ROOT}/scripts/assemble_release_archive.sh" --bin-dir "$stub_dir" --out "$stub_archive"
-stub_sha="$(awk '{print $1}' "${stub_archive}.sha256")"
+stub_sha="$(verified_digest "$stub_archive" sha256sum_c_stub)"
 
-fail() {
-    echo "FAIL $*" >&2
-    exit 1
+sentinel="$(mktemp)"
+printf 'external-sentinel\n' > "$sentinel"
+
+state_of() {
+    local prefix="$1"
+    {
+        find "$prefix" -printf '%P %y %s\n' | sort
+        sha256sum "$sentinel"
+    } | sha256sum | awk '{print $1}'
+}
+
+write_variant() {
+    python3 - "$1" "$stub_archive" "$2" <<'PY'
+import io
+import sys
+import tarfile
+
+kind, source, dest = sys.argv[1:]
+
+def load():
+    items = []
+    with tarfile.open(source, "r:gz") as handle:
+        for member in handle.getmembers():
+            data = handle.extractfile(member).read() if member.isreg() else b""
+            items.append((member.name, data))
+    return items
+
+def add_file(out, name, data):
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    info.mode = 0o644
+    info.type = tarfile.REGTYPE
+    out.addfile(info, io.BytesIO(data))
+
+items = load()
+with tarfile.open(dest, "w:gz") as out:
+    if kind == "missing":
+        for name, data in items:
+            if name != "authors.example.toml":
+                add_file(out, name, data)
+    elif kind == "type":
+        for name, data in items:
+            if name == "authors.example.toml":
+                info = tarfile.TarInfo(name)
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                out.addfile(info)
+            else:
+                add_file(out, name, data)
+    elif kind == "symlink":
+        for name, data in items:
+            if name == "reposync":
+                info = tarfile.TarInfo(name)
+                info.type = tarfile.SYMTYPE
+                info.linkname = "reposync-daemon"
+                out.addfile(info)
+            else:
+                add_file(out, name, data)
+    elif kind == "hardlink":
+        for name, data in items:
+            if name == "reposync":
+                info = tarfile.TarInfo(name)
+                info.type = tarfile.LNKTYPE
+                info.linkname = "reposync-daemon"
+                out.addfile(info)
+            else:
+                add_file(out, name, data)
+    elif kind == "duplicate":
+        for name, data in items:
+            add_file(out, name, data)
+            if name == "config.example.toml":
+                add_file(out, name, data)
+    elif kind == "extra":
+        for name, data in items:
+            add_file(out, name, data)
+        add_file(out, "notes.txt", b"nope\n")
+    elif kind == "traversal":
+        for name, data in items:
+            add_file(out, name, data)
+        add_file(out, "../escaped", b"nope\n")
+    else:
+        raise SystemExit(f"unknown variant {kind}")
+PY
+}
+
+refuse() {
+    local label="$1"
+    local expect="$2"
+    local archive prefix digest before after code
+    archive="$(mktemp)"
+    write_variant "$label" "$archive"
+    prefix="$(mktemp -d)"
+    printf 'prefix-keep\n' > "${prefix}/KEEP"
+    case "$sentinel" in
+        "$prefix"|"$prefix"/*) fail "sentinel is inside the ${label} prefix" ;;
+    esac
+    digest="$(sha256sum "$archive" | awk '{print $1}')"
+    before="$(state_of "$prefix")"
+    set +e
+    bash "${ROOT}/scripts/install.sh" --from-archive \
+        --archive "$archive" --sha256 "$digest" --prefix "$prefix" \
+        >/tmp/rs118-${label}.out 2>/tmp/rs118-${label}.err
+    code=$?
+    set -e
+    printf 'INNER_EXIT %s %s\n' "$label" "$code" | tee -a /tmp/rs118-inner-exits.txt
+    after="$(state_of "$prefix")"
+    [[ "$code" -ne 0 ]] || fail "${label} was accepted"
+    [[ "$before" == "$after" ]] || fail "${label} changed the prefix or external sentinel"
+    grep -F -q "$expect" /tmp/rs118-${label}.err || {
+        cat /tmp/rs118-${label}.err >&2
+        fail "${label} did not report ${expect}"
+    }
+    rm -rf "$prefix" "$archive"
 }
 
 # Corrupt digest is rejected before any prefix exists.
@@ -35,110 +184,138 @@ set +e
 bash "${ROOT}/scripts/install.sh" --from-archive --archive "$stub_archive" --sha256 "$(printf '0%.0s' {1..64})" --prefix "$bad_prefix" >/tmp/rs118-bad-digest.out 2>/tmp/rs118-bad-digest.err
 bad_digest=$?
 set -e
+printf 'INNER_EXIT bad_digest %s\n' "$bad_digest" | tee -a /tmp/rs118-inner-exits.txt
 [[ "$bad_digest" -ne 0 ]] || fail "corrupt digest was accepted"
 [[ ! -d "$bad_prefix" ]] || fail "corrupt digest mutated the prefix"
 
-# Missing member is rejected before prefix mutation.
-missing_stage="$(mktemp -d)"
-tar -xzf "$stub_archive" -C "$missing_stage"
-rm -f "${missing_stage}/authors.example.toml"
-missing_archive="$(mktemp)"
-tar -C "$missing_stage" -czf "$missing_archive" .
-missing_sha="$(sha256sum "$missing_archive" | awk '{print $1}')"
-missing_prefix="$(mktemp -d)"
-rmdir "$missing_prefix"
-set +e
-bash "${ROOT}/scripts/install.sh" --from-archive --archive "$missing_archive" --sha256 "$missing_sha" --prefix "$missing_prefix" >/tmp/rs118-missing.out 2>/tmp/rs118-missing.err
-missing_code=$?
-set -e
-[[ "$missing_code" -ne 0 ]] || fail "missing member was accepted"
-[[ ! -d "$missing_prefix" ]] || fail "missing member mutated the prefix"
-rm -rf "$missing_stage" "$missing_archive"
+refuse missing "missing required member"
+refuse type "not a regular file"
+refuse symlink "is a symlink"
+refuse hardlink "is a hard link"
+refuse duplicate "duplicate archive member"
+refuse extra "extra member"
+refuse traversal "not allowed"
 
-# authors.example.toml is a required archive member, not an extra file.
-archive_names="$(tar -tzf "$stub_archive" | sed 's#^\./##' | sed '/^$/d' | sort)"
-manifest_names="$(grep -v '^$' "${ROOT}/scripts/release-archive.manifest" | sort)"
-[[ "$archive_names" == "$manifest_names" ]] || fail "archive members differ from the manifest"
-grep -Fxq authors.example.toml <<<"$manifest_names" || fail "authors.example.toml is not in the manifest"
+python3 - "$stub_archive" "${ROOT}/web-ui/dist" "${ROOT}/packaging/static/assets/app.js" <<'PY'
+import sys
+import tarfile
+from pathlib import Path
 
-# Default paths (no --prefix) create the config directory before copying.
-# The root stands in for / and /etc; the live /etc is not written.
+archive, dist_root, fixture = sys.argv[1:]
+dist = Path(dist_root)
+sentinel = 'window.reposyncStatic = "synthetic"'
+fixture_text = Path(fixture).read_text()
+if sentinel not in fixture_text:
+    raise SystemExit("synthetic fixture lost its sentinel")
+product = {}
+with tarfile.open(archive, "r:gz") as handle:
+    for member in handle.getmembers():
+        if not member.name.startswith("static/"):
+            continue
+        product[member.name[len("static/"):]] = handle.extractfile(member).read()
+expected = {
+    path.relative_to(dist).as_posix(): path.read_bytes()
+    for path in dist.rglob("*")
+    if path.is_file() and path.suffix != ".map"
+}
+if set(product) != set(expected):
+    raise SystemExit("product static names differ from the web-ui build")
+for name, data in expected.items():
+    if product[name] != data:
+        raise SystemExit(f"product bytes differ from the web-ui build: {name}")
+    if sentinel.encode() in data:
+        raise SystemExit(f"synthetic sentinel shipped in {name}")
+print("PRODUCT_UI_SEPARATE_FROM_SYNTHETIC_FIXTURE")
+PY
+
+# Default/direct-root paths create parents and place the unit under a temp root.
 default_root="$(mktemp -d)"
-etc_before=""
-if [[ -e /etc/reposync ]]; then
-    etc_before="$(stat -c '%Y %s' /etc/reposync)"
-fi
 REPOSYNC_INSTALL_DIR="${default_root}/usr/local/bin" \
 REPOSYNC_CONFIG_DIR="${default_root}/etc/reposync" \
 REPOSYNC_DATA_DIR="${default_root}/var/lib/reposync" \
+REPOSYNC_SYSTEMD_UNIT_DIR="${default_root}/etc/systemd/system" \
     bash "${ROOT}/scripts/install.sh" --from-archive --archive "$stub_archive" --sha256 "$stub_sha"
-[[ -d "${default_root}/etc/reposync" ]] || fail "default config directory was not created"
 [[ -f "${default_root}/etc/reposync/config.toml" ]] || fail "default config was not installed"
 [[ -x "${default_root}/usr/local/bin/reposync" ]] || fail "default binary parent was not created"
-if [[ -n "$etc_before" ]]; then
-    [[ "$(stat -c '%Y %s' /etc/reposync)" == "$etc_before" ]] || fail "live /etc/reposync changed"
-else
-    [[ ! -e /etc/reposync ]] || fail "live /etc/reposync was created"
-fi
+[[ -f "${default_root}/etc/systemd/system/reposync.service" ]] || fail "default install did not place the unit"
+[[ -f "${default_root}/usr/local/bin/static/assets/index-CMTDqfvH.js" ]] || fail "default install missed the product asset"
 rm -rf "$default_root"
 
-# Extra members and path traversal are refused before the prefix changes.
-hostile_prefix="$(mktemp -d)"
-printf 'unchanged\n' > "${hostile_prefix}/KEEP"
-python3 - "$stub_archive" "${hostile_prefix}/hostile.tar.gz" <<'PY'
-import io, sys, tarfile
-source, dest = sys.argv[1], sys.argv[2]
-with tarfile.open(source, "r:gz") as incoming, tarfile.open(dest, "w:gz") as outgoing:
-    for member in incoming.getmembers():
-        extracted = incoming.extractfile(member) if member.isfile() else None
-        outgoing.addfile(member, extracted)
-    payload = b"nope\n"
-    extra = tarfile.TarInfo("notes.txt")
-    extra.size = len(payload)
-    outgoing.addfile(extra, io.BytesIO(payload))
-    climb = tarfile.TarInfo("../etc/passwd")
-    climb.size = len(payload)
-    outgoing.addfile(climb, io.BytesIO(payload))
-PY
-hostile_sha="$(sha256sum "${hostile_prefix}/hostile.tar.gz" | awk '{print $1}')"
+# The same default destination as uid 0, still confined to a temp root.
+root_root="$(mktemp -d)"
 set +e
-bash "${ROOT}/scripts/install.sh" --from-archive \
-    --archive "${hostile_prefix}/hostile.tar.gz" --sha256 "$hostile_sha" \
-    --prefix "$hostile_prefix" >/tmp/rs118-hostile.out 2>/tmp/rs118-hostile.err
-hostile_code=$?
+sudo env \
+    REPOSYNC_INSTALL_DIR="${root_root}/usr/local/bin" \
+    REPOSYNC_CONFIG_DIR="${root_root}/etc/reposync" \
+    REPOSYNC_DATA_DIR="${root_root}/var/lib/reposync" \
+    REPOSYNC_SYSTEMD_UNIT_DIR="${root_root}/etc/systemd/system" \
+    bash "${ROOT}/scripts/install.sh" --from-archive --archive "$stub_archive" --sha256 "$stub_sha"
+root_code=$?
 set -e
-[[ "$hostile_code" -ne 0 ]] || fail "traversal or extra member was accepted"
-[[ "$(cat "${hostile_prefix}/KEEP")" == "unchanged" ]] || fail "hostile archive changed the prefix"
-[[ ! -e "${hostile_prefix}/bin" && ! -e "${hostile_prefix}/etc" ]] || fail "hostile archive wrote the prefix"
-rm -rf "$hostile_prefix"
+printf 'INNER_EXIT direct_root %s\n' "$root_code" | tee -a /tmp/rs118-inner-exits.txt
+[[ "$root_code" -eq 0 ]] || fail "direct-root temp install failed"
+[[ -f "${root_root}/etc/systemd/system/reposync.service" ]] || fail "direct-root install did not place the unit"
+sudo rm -rf "$root_root"
 
 prefix="$(mktemp -d)"
-# Seed configuration, a key file, and data that must survive replacement.
+unit_trap="$(mktemp -d)"
 mkdir -p "${prefix}/etc/reposync" "${prefix}/var/lib/reposync" "${prefix}/bin"
 printf 'kept-config\n' > "${prefix}/etc/reposync/config.toml"
 printf 'kept-secret\n' > "${prefix}/etc/reposync/env"
 printf 'kept-data\n' > "${prefix}/var/lib/reposync/reposync.db"
-# Placeholder binaries so the prefix is an existing install.
 printf '#!/bin/sh\nexit 9\n' > "${prefix}/bin/reposync"
 chmod 755 "${prefix}/bin/reposync"
 cp "${prefix}/bin/reposync" "${prefix}/bin/reposync-daemon"
 
-bash "${ROOT}/scripts/install.sh" --from-archive --archive "$stub_archive" --sha256 "$stub_sha" --prefix "$prefix"
+REPOSYNC_SYSTEMD_UNIT_DIR="${unit_trap}" \
+    bash "${ROOT}/scripts/install.sh" --from-archive --archive "$stub_archive" --sha256 "$stub_sha" --prefix "$prefix"
 [[ "$(cat "${prefix}/etc/reposync/config.toml")" == "kept-config" ]] || fail "config was replaced"
 [[ "$(cat "${prefix}/etc/reposync/env")" == "kept-secret" ]] || fail "key file was replaced"
 [[ "$(cat "${prefix}/var/lib/reposync/reposync.db")" == "kept-data" ]] || fail "data was replaced"
-[[ -f "${prefix}/bin/static/index.html" && -f "${prefix}/bin/static/assets/app.js" ]] || fail "static members missing"
+[[ -f "${prefix}/etc/reposync/reposync.service" ]] || fail "prefix install did not keep the unit under the prefix"
+[[ -z "$(find "$unit_trap" -mindepth 1 -print -quit)" ]] || fail "prefix install wrote the systemd directory"
+[[ -f "${prefix}/bin/static/index.html" && -f "${prefix}/bin/static/assets/index-CMTDqfvH.js" ]] || fail "static members missing"
+grep -q "Welcome to RepoSync" "${prefix}/bin/static/assets/index-CMTDqfvH.js" || fail "installed asset is not the product bundle"
+if grep -q 'window.reposyncStatic = "synthetic"' "${prefix}/bin/static/assets/index-CMTDqfvH.js"; then
+    fail "installed asset is the synthetic fixture"
+fi
 
 echo "building native release binaries"
 (cd "$ROOT" && rustup run stable cargo build --release --bin reposync --bin reposync-daemon)
 bash "${ROOT}/scripts/assemble_release_archive.sh" --bin-dir "$BIN_DIR" --out "$OUT"
-SHA="$(awk '{print $1}' "${OUT}.sha256")"
-bash "${ROOT}/scripts/install.sh" --from-archive --archive "$OUT" --sha256 "$SHA" --prefix "$prefix"
+product_sha="$(verified_digest "$OUT" sha256sum_c_product)"
+bash "${ROOT}/scripts/install.sh" --from-archive --archive "$OUT" --sha256 "$product_sha" --prefix "$prefix"
 [[ "$(cat "${prefix}/etc/reposync/config.toml")" == "kept-config" ]] || fail "config changed during binary replacement"
+[[ -f "${prefix}/etc/reposync/reposync.service" ]] || fail "prefix unit missing after binary replacement"
 help_out="$("${prefix}/bin/reposync" --help)"
 printf '%s\n' "$help_out" | grep -q "reposync" || fail "CLI help missing"
 
-# Synthetic runtime config. The preserved config.toml is not the daemon input.
+python3 - "$OUT" "${ROOT}/web-ui/dist" <<'PY'
+import sys
+import tarfile
+from pathlib import Path
+
+archive, dist_root = sys.argv[1:]
+dist = Path(dist_root)
+sentinel = b'window.reposyncStatic = "synthetic"'
+with tarfile.open(archive, "r:gz") as handle:
+    payload = {
+        member.name[len("static/"):]: handle.extractfile(member).read()
+        for member in handle.getmembers()
+        if member.name.startswith("static/")
+    }
+expected = {
+    path.relative_to(dist).as_posix(): path.read_bytes()
+    for path in dist.rglob("*")
+    if path.is_file() and path.suffix != ".map"
+}
+if payload != expected:
+    raise SystemExit("release archive static bytes are not the web-ui build")
+if any(sentinel in data for data in payload.values()):
+    raise SystemExit("release archive contains the synthetic sentinel")
+print("PRODUCT_ARCHIVE_MATCHES_WEB_UI_DIST")
+PY
+
 port=18080
 runtime="${prefix}/etc/reposync/runtime.toml"
 cat > "$runtime" <<EOF
@@ -192,12 +369,40 @@ for _ in $(seq 1 40); do
 done
 [[ "$ready" -eq 1 ]] || { echo "daemon did not serve health"; tail -50 "$log"; fail "daemon startup"; }
 curl -fsS "http://127.0.0.1:${port}/" -o /tmp/rs118-index.html
-grep -q "RepoSync" /tmp/rs118-index.html || fail "static index missing"
-curl -fsS "http://127.0.0.1:${port}/assets/app.js" -o /tmp/rs118-app.js
-grep -q "reposyncStatic" /tmp/rs118-app.js || fail "static asset missing"
+grep -q "RepoSync Dashboard" /tmp/rs118-index.html || fail "product index missing"
+asset="$(python3 - <<'PY'
+import re
+html = open("/tmp/rs118-index.html").read()
+match = re.search(r'src="(/assets/[^"]+)"', html)
+if not match:
+    raise SystemExit("index has no product script")
+print(match.group(1))
+PY
+)"
+curl -fsS "http://127.0.0.1:${port}${asset}" -o /tmp/rs118-app.js
+grep -q "Welcome to RepoSync" /tmp/rs118-app.js || fail "served asset is not the product bundle"
+if grep -q 'window.reposyncStatic = "synthetic"' /tmp/rs118-app.js; then
+    fail "served asset is the synthetic fixture"
+fi
+cmp /tmp/rs118-app.js "${ROOT}/web-ui/dist/assets/index-CMTDqfvH.js" || fail "served asset differs from the web-ui build"
+
+if [[ -e "$host_unit" ]]; then
+    [[ "$(stat -c '%F %s %Y' "$host_unit")" == "$host_unit_before" ]] || fail "host systemd unit changed"
+else
+    [[ "$host_unit_before" == "ABSENT" && ! -e "$host_unit" ]] || fail "host systemd unit was created"
+fi
+if [[ -e /etc/reposync ]]; then
+    [[ "$(stat -c '%F %s %Y' /etc/reposync)" == "$etc_before" ]] || fail "live /etc/reposync changed"
+else
+    [[ "$etc_before" == "ABSENT" && ! -e /etc/reposync ]] || fail "live /etc/reposync was created"
+fi
+
+echo "INNER_EXITS_BEGIN"
+cat /tmp/rs118-inner-exits.txt
+echo "INNER_EXITS_END"
 echo "QUALIFIED native x86_64-unknown-linux-gnu prefix=${prefix}"
 kill "$daemon_pid"
 wait "$daemon_pid" || true
 trap - EXIT
-rm -rf "$prefix"
+rm -rf "$prefix" "$unit_trap" "$stub_dir"
 echo "QUALIFY_EXIT 0"
