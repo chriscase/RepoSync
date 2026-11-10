@@ -55,6 +55,63 @@ set -e
 [[ ! -d "$missing_prefix" ]] || fail "missing member mutated the prefix"
 rm -rf "$missing_stage" "$missing_archive"
 
+# authors.example.toml is a required archive member, not an extra file.
+archive_names="$(tar -tzf "$stub_archive" | sed 's#^\./##' | sed '/^$/d' | sort)"
+manifest_names="$(grep -v '^$' "${ROOT}/scripts/release-archive.manifest" | sort)"
+[[ "$archive_names" == "$manifest_names" ]] || fail "archive members differ from the manifest"
+grep -Fxq authors.example.toml <<<"$manifest_names" || fail "authors.example.toml is not in the manifest"
+
+# Default paths (no --prefix) create the config directory before copying.
+# The root stands in for / and /etc; the live /etc is not written.
+default_root="$(mktemp -d)"
+etc_before=""
+if [[ -e /etc/reposync ]]; then
+    etc_before="$(stat -c '%Y %s' /etc/reposync)"
+fi
+REPOSYNC_INSTALL_DIR="${default_root}/usr/local/bin" \
+REPOSYNC_CONFIG_DIR="${default_root}/etc/reposync" \
+REPOSYNC_DATA_DIR="${default_root}/var/lib/reposync" \
+    bash "${ROOT}/scripts/install.sh" --from-archive --archive "$stub_archive" --sha256 "$stub_sha"
+[[ -d "${default_root}/etc/reposync" ]] || fail "default config directory was not created"
+[[ -f "${default_root}/etc/reposync/config.toml" ]] || fail "default config was not installed"
+[[ -x "${default_root}/usr/local/bin/reposync" ]] || fail "default binary parent was not created"
+if [[ -n "$etc_before" ]]; then
+    [[ "$(stat -c '%Y %s' /etc/reposync)" == "$etc_before" ]] || fail "live /etc/reposync changed"
+else
+    [[ ! -e /etc/reposync ]] || fail "live /etc/reposync was created"
+fi
+rm -rf "$default_root"
+
+# Extra members and path traversal are refused before the prefix changes.
+hostile_prefix="$(mktemp -d)"
+printf 'unchanged\n' > "${hostile_prefix}/KEEP"
+python3 - "$stub_archive" "${hostile_prefix}/hostile.tar.gz" <<'PY'
+import io, sys, tarfile
+source, dest = sys.argv[1], sys.argv[2]
+with tarfile.open(source, "r:gz") as incoming, tarfile.open(dest, "w:gz") as outgoing:
+    for member in incoming.getmembers():
+        extracted = incoming.extractfile(member) if member.isfile() else None
+        outgoing.addfile(member, extracted)
+    payload = b"nope\n"
+    extra = tarfile.TarInfo("notes.txt")
+    extra.size = len(payload)
+    outgoing.addfile(extra, io.BytesIO(payload))
+    climb = tarfile.TarInfo("../etc/passwd")
+    climb.size = len(payload)
+    outgoing.addfile(climb, io.BytesIO(payload))
+PY
+hostile_sha="$(sha256sum "${hostile_prefix}/hostile.tar.gz" | awk '{print $1}')"
+set +e
+bash "${ROOT}/scripts/install.sh" --from-archive \
+    --archive "${hostile_prefix}/hostile.tar.gz" --sha256 "$hostile_sha" \
+    --prefix "$hostile_prefix" >/tmp/rs118-hostile.out 2>/tmp/rs118-hostile.err
+hostile_code=$?
+set -e
+[[ "$hostile_code" -ne 0 ]] || fail "traversal or extra member was accepted"
+[[ "$(cat "${hostile_prefix}/KEEP")" == "unchanged" ]] || fail "hostile archive changed the prefix"
+[[ ! -e "${hostile_prefix}/bin" && ! -e "${hostile_prefix}/etc" ]] || fail "hostile archive wrote the prefix"
+rm -rf "$hostile_prefix"
+
 prefix="$(mktemp -d)"
 # Seed configuration, a key file, and data that must survive replacement.
 mkdir -p "${prefix}/etc/reposync" "${prefix}/var/lib/reposync" "${prefix}/bin"

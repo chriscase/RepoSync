@@ -11,6 +11,10 @@ if [[ "${1:-}" == "--offline-update" ]]; then
     exec python3 "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/install_offline.py" "$@"
 fi
 
+INSTALL_DIR="${REPOSYNC_INSTALL_DIR:-/usr/local/bin}"
+CONFIG_DIR="${REPOSYNC_CONFIG_DIR:-/etc/reposync}"
+DATA_DIR="${REPOSYNC_DATA_DIR:-/var/lib/reposync}"
+
 # Members install.sh will copy. Validated after the digest check and before
 # any install-prefix, config, key, or data mutation.
 REQUIRED_ARCHIVE_MEMBERS=(
@@ -38,15 +42,32 @@ verify_archive_digest() {
     fi
 }
 
+member_name_is_forbidden() {
+    local name="$1"
+    [[ "$name" == /* || "$name" == *..* || "$name" == *\\* ]]
+}
+
 require_archive_members() {
     local archive="$1"
-    local listing missing=0 name
+    local listing missing=0 name normalized allowed
     if ! listing="$(tar -tzf "$archive" 2>/dev/null)"; then
         echo "Error: corrupt or unreadable archive" >&2
         exit 1
     fi
+    local -a present=()
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        normalized="${name#./}"
+        normalized="${normalized%/}"
+        [[ -n "$normalized" ]] || continue
+        if member_name_is_forbidden "$normalized"; then
+            echo "Error: archive member is not allowed: $name" >&2
+            exit 1
+        fi
+        present+=("$normalized")
+    done <<<"$listing"
     for name in "${REQUIRED_ARCHIVE_MEMBERS[@]}"; do
-        if ! grep -Fxq "$name" <<<"$listing"; then
+        if ! printf '%s\n' "${present[@]}" | grep -Fxq "$name"; then
             echo "Error: archive is missing required member: $name" >&2
             missing=1
         fi
@@ -54,6 +75,19 @@ require_archive_members() {
     if [[ "$missing" -ne 0 ]]; then
         exit 1
     fi
+    for name in "${present[@]}"; do
+        allowed=0
+        for required in "${REQUIRED_ARCHIVE_MEMBERS[@]}"; do
+            if [[ "$name" == "$required" ]]; then
+                allowed=1
+                break
+            fi
+        done
+        if [[ "$allowed" -eq 0 ]]; then
+            echo "Error: archive has an extra member: $name" >&2
+            exit 1
+        fi
+    done
 }
 
 install_from_verified_archive() {
@@ -66,11 +100,24 @@ install_from_verified_archive() {
         install_dir="${prefix}/bin"
         config_dir="${prefix}/etc/reposync"
         data_dir="${prefix}/var/lib/reposync"
-        mkdir -p "$install_dir" "$config_dir" "$data_dir"
     else
         install_dir="${INSTALL_DIR}"
         config_dir="${CONFIG_DIR}"
         data_dir="${DATA_DIR}"
+        if [[ "$(id -u)" -ne 0 && "$config_dir" == "/etc/reposync" ]]; then
+            use_sudo=1
+        else
+            use_sudo=0
+        fi
+    fi
+    # Parents must exist before install(1) without -D, including a fresh
+    # /etc/reposync on the default path.
+    if [[ "$use_sudo" -eq 1 ]]; then
+        sudo mkdir -p "$install_dir" "$config_dir" "$data_dir" \
+            "${install_dir}/static/assets"
+    else
+        mkdir -p "$install_dir" "$config_dir" "$data_dir" \
+            "${install_dir}/static/assets"
     fi
 
     stage="$(mktemp -d)"
@@ -79,9 +126,9 @@ install_from_verified_archive() {
     copy_file() {
         local src="$1" dest="$2" mode="$3"
         if [[ "$use_sudo" -eq 1 ]]; then
-            sudo install -m "$mode" "$src" "$dest"
+            sudo install -D -m "$mode" "$src" "$dest"
         else
-            install -m "$mode" "$src" "$dest"
+            install -D -m "$mode" "$src" "$dest"
         fi
     }
     copy_tree_file() {
@@ -137,8 +184,8 @@ if [[ "${1:-}" == "--from-archive" ]]; then
             *) echo "Error: unknown argument: $1" >&2; exit 1 ;;
         esac
     done
-    if [[ -z "$ARCHIVE" || -z "$ARCHIVE_SHA" || -z "$PREFIX" ]]; then
-        echo "Error: --from-archive requires --archive, --sha256, and --prefix" >&2
+    if [[ -z "$ARCHIVE" || -z "$ARCHIVE_SHA" ]]; then
+        echo "Error: --from-archive requires --archive and --sha256" >&2
         exit 1
     fi
     if [[ ! -f "$ARCHIVE" ]]; then
@@ -149,14 +196,15 @@ if [[ "${1:-}" == "--from-archive" ]]; then
     verify_archive_digest "$ARCHIVE" "$ARCHIVE_SHA"
     require_archive_members "$ARCHIVE"
     install_from_verified_archive "$ARCHIVE" "$PREFIX"
-    echo "==> RepoSync installed under ${PREFIX}"
+    if [[ -n "$PREFIX" ]]; then
+        echo "==> RepoSync installed under ${PREFIX}"
+    else
+        echo "==> RepoSync installed; binaries ${INSTALL_DIR}; config ${CONFIG_DIR}"
+    fi
     exit 0
 fi
 
 VERSION="${REPOSYNC_VERSION:-latest}"
-INSTALL_DIR="${REPOSYNC_INSTALL_DIR:-/usr/local/bin}"
-CONFIG_DIR="/etc/reposync"
-DATA_DIR="/var/lib/reposync"
 
 REPO="chriscase/RepoSync"
 

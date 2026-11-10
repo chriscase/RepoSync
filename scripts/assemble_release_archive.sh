@@ -31,7 +31,6 @@ cp "${ROOT}/scripts/reposync.service" "${stage}/reposync.service"
 mkdir -p "${stage}/static/assets"
 cp "${ROOT}/packaging/static/index.html" "${stage}/static/index.html"
 cp "${ROOT}/packaging/static/assets/app.js" "${stage}/static/assets/app.js"
-cp "${ROOT}/scripts/release-archive.manifest" "${stage}/RELEASE-MANIFEST"
 
 while IFS= read -r member; do
     [[ -n "$member" ]] || continue
@@ -43,6 +42,6 @@ done < "${ROOT}/scripts/release-archive.manifest"
 
 tar -C "$stage" -czf "$OUT" \
     reposync reposync-daemon config.example.toml authors.example.toml \
-    reposync.service static/index.html static/assets/app.js RELEASE-MANIFEST
+    reposync.service static/index.html static/assets/app.js
 sha256sum "$OUT" | awk '{print $1}' > "${OUT}.sha256"
 echo "assembled ${OUT}"
