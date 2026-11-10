@@ -85,7 +85,11 @@ pub async fn run_local(
     }
     let key = journal_key(child_id, &request.request_id);
     if let Some(existing) = load(engine, &key)? {
-        let digest_ok = request.approve_current || existing.digest == request.approval_digest;
+        let digest_ok = if request.approval_digest.is_empty() {
+            request.approve_current
+        } else {
+            existing.digest == request.approval_digest
+        };
         if !digest_ok
             || existing.operation != request.operation
             || existing.same_name != request.same_name
@@ -1328,5 +1332,230 @@ token_env = ""
             .await
             .unwrap_err();
         assert!(error.to_string().contains("non-local SVN URL"), "{error}");
+    }
+
+    fn call(
+        id: &str,
+        digest: &str,
+        operation: LocalOperation,
+        approve_current: bool,
+        stop_after: Option<&str>,
+    ) -> LocalRequest {
+        LocalRequest {
+            request_id: id.into(),
+            approval_digest: digest.into(),
+            operation,
+            same_name: false,
+            retire: false,
+            approve_current,
+            stop_after: stop_after.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_id_is_bound_to_operation_and_digest_before_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let engine = Arc::new(engine_for(&root));
+        let svn_dir = root.join("svn");
+        command("svnadmin", &["create", svn_dir.to_str().unwrap()]);
+        let svn_url = format!("file://{}", svn_dir.display());
+        command(
+            "svn",
+            &[
+                "mkdir",
+                &format!("{svn_url}/trunk"),
+                &format!("{svn_url}/branches"),
+                "-m",
+                "layout",
+                "--non-interactive",
+            ],
+        );
+        let parent_wc = root.join("parent-wc");
+        command(
+            "svn",
+            &[
+                "checkout",
+                &format!("{svn_url}/trunk"),
+                parent_wc.to_str().unwrap(),
+                "--non-interactive",
+            ],
+        );
+        std::fs::write(parent_wc.join("readme.txt"), "origin\n").unwrap();
+        assert!(Command::new("svn")
+            .current_dir(&parent_wc)
+            .args(["add", "readme.txt", "--non-interactive"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("svn")
+            .current_dir(&parent_wc)
+            .args(["commit", "-m", "origin", "--non-interactive"])
+            .status()
+            .unwrap()
+            .success());
+        command(
+            "svn",
+            &[
+                "copy",
+                &format!("{svn_url}/trunk"),
+                &format!("{svn_url}/branches/feature"),
+                "-m",
+                "pair",
+                "--non-interactive",
+            ],
+        );
+        let trunk = svn_revision(&format!("{svn_url}/trunk")).unwrap();
+        let feature = svn_revision(&format!("{svn_url}/branches/feature")).unwrap();
+        let parent_git = root.join("repos/parent/git-repo");
+        let pair_git = root.join("repos/child/git-repo");
+        std::fs::create_dir_all(&parent_git).unwrap();
+        std::fs::create_dir_all(&pair_git).unwrap();
+        command("git", &["init", "-b", "main", parent_git.to_str().unwrap()]);
+        command(
+            "git",
+            &["init", "-b", "feature", pair_git.to_str().unwrap()],
+        );
+        let parent_sha = git_commit(&parent_git, "readme.txt", "origin\n");
+        let pair_sha = git_commit(&pair_git, "readme.txt", "origin\n");
+        engine
+            .db()
+            .insert_repository(&repo("parent", None, &svn_url, "trunk", trunk, &parent_sha))
+            .unwrap();
+        engine
+            .db()
+            .insert_repository(&repo(
+                "child",
+                Some("parent"),
+                &svn_url,
+                "branches/feature",
+                feature,
+                &pair_sha,
+            ))
+            .unwrap();
+        let service = RefreshService::new(engine.clone());
+        let digest =
+            current_digest(&engine, "child", LocalOperation::Update, false, false).unwrap();
+        let youngest = svnlook_youngest(&svn_url).unwrap();
+        let receipt = service
+            .run_admitted_local(
+                "local-session",
+                "child",
+                call("bound", &digest, LocalOperation::Update, false, None),
+            )
+            .await
+            .unwrap();
+        assert!(receipt.noop);
+        assert_eq!(svnlook_youngest(&svn_url).unwrap(), youngest);
+        let retry = service
+            .run_admitted_local(
+                "local-session",
+                "child",
+                call("bound", &digest, LocalOperation::Update, false, None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.operation_id, receipt.operation_id);
+        let changed = service
+            .run_admitted_local(
+                "local-session",
+                "child",
+                call("bound", "other-digest", LocalOperation::Update, true, None),
+            )
+            .await
+            .unwrap_err();
+        assert!(changed.to_string().contains("already bound"), "{changed}");
+        let crossed = service
+            .run_admitted_local(
+                "local-session",
+                "child",
+                call("bound", "", LocalOperation::Reanchor, true, None),
+            )
+            .await
+            .unwrap_err();
+        assert!(crossed.to_string().contains("already bound"), "{crossed}");
+        assert_eq!(svnlook_youngest(&svn_url).unwrap(), youngest);
+        assert!(
+            Command::new("svn")
+                .args([
+                    "info",
+                    &format!("{svn_url}/branches/feature-g2"),
+                    "--non-interactive",
+                ])
+                .status()
+                .unwrap()
+                .code()
+                != Some(0)
+        );
+
+        std::fs::write(parent_wc.join("readme.txt"), "parent\n").unwrap();
+        assert!(Command::new("svn")
+            .current_dir(&parent_wc)
+            .args(["commit", "-m", "parent", "--non-interactive"])
+            .status()
+            .unwrap()
+            .success());
+        let _parent_tip = git_commit(&parent_git, "readme.txt", "parent\n");
+        let mut child = engine.db().get_repository("child").unwrap().unwrap();
+        child.last_svn_rev = svn_revision(&format!("{svn_url}/branches/feature")).unwrap();
+        engine.db().update_repository(&child).unwrap();
+        let active =
+            current_digest(&engine, "child", LocalOperation::Update, false, false).unwrap();
+        let before = svnlook_youngest(&svn_url).unwrap();
+        let crashed = service
+            .run_admitted_local(
+                "local-session",
+                "child",
+                call(
+                    "active",
+                    &active,
+                    LocalOperation::Update,
+                    false,
+                    Some("svn_intent"),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(crashed.to_string().contains("svn_intent"), "{crashed}");
+        assert_eq!(svnlook_youngest(&svn_url).unwrap(), before);
+        let changed = service
+            .run_admitted_local(
+                "local-session",
+                "child",
+                call("active", "other-digest", LocalOperation::Update, true, None),
+            )
+            .await
+            .unwrap_err();
+        assert!(changed.to_string().contains("already bound"), "{changed}");
+        let crossed = service
+            .run_admitted_local(
+                "local-session",
+                "child",
+                call("active", &active, LocalOperation::Reanchor, false, None),
+            )
+            .await
+            .unwrap_err();
+        assert!(crossed.to_string().contains("already bound"), "{crossed}");
+        assert_eq!(svnlook_youngest(&svn_url).unwrap(), before);
+        let resumed = service
+            .run_admitted_local(
+                "local-session",
+                "child",
+                call("active", &active, LocalOperation::Update, false, None),
+            )
+            .await
+            .unwrap();
+        assert!(!resumed.noop);
+        assert_eq!(svnlook_youngest(&svn_url).unwrap(), before + 1);
+        let again = service
+            .run_admitted_local(
+                "local-session",
+                "child",
+                call("active", &active, LocalOperation::Update, false, None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.operation_id, resumed.operation_id);
+        assert_eq!(svnlook_youngest(&svn_url).unwrap(), before + 1);
     }
 }
