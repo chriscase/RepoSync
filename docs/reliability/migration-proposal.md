@@ -1,12 +1,12 @@
 # Candidate #54/#63 copy migration contract
 
-**Status:** this file remains the sealed-copy **candidate** contract. Candidate v13 (nullable `commit_map.git_sha`) and candidate v14 (`pair_lineages` / `pair_frontiers` / `pair_outcomes`) stay behind `reliability-fixture` and `CopySession`. Ordinary `schema::MIGRATIONS` now ends at operational v14 (`canonical_lineage` / `canonical_checkpoints` / `canonical_mapping_outcomes`) and still never calls this registry; ordinary startup must observe zero `pair_%` tables. Installer/daemon exclusive-owner activation of operational v13/v14 is documented in [contracts/63-lineage-checkpoints.md](contracts/63-lineage-checkpoints.md). The previous reviewed proposal is preserved byte-for-byte in [review-6-migration-proposal.md](review/review-6-migration-proposal.md). Original GOAL and issue acceptance criteria remain unchanged. No issue is closed by this prototype.
+**Status:** this file remains the sealed-copy **candidate** contract. Candidate v13 (nullable `commit_map.git_sha`) and candidate v14 (`pair_lineages` / `pair_frontiers` / `pair_outcomes`) stay behind `reliability-fixture` and `CopySession`. Ordinary `schema::MIGRATIONS` now ends at operational v15 (nullable `commit_map.git_sha`, [contracts/54-nullable-commit-map.md](contracts/54-nullable-commit-map.md)) and still never calls this registry; ordinary startup must observe zero `pair_%` tables. Installer/daemon exclusive-owner activation of operational v13/v14 is documented in [contracts/63-lineage-checkpoints.md](contracts/63-lineage-checkpoints.md). The previous reviewed proposal is preserved byte-for-byte in [review-6-migration-proposal.md](review/review-6-migration-proposal.md). Original GOAL and issue acceptance criteria remain unchanged. No issue is closed by this prototype.
 
 ## One implementation and one future activation decision
 
 `crates/core/src/db/candidate_migration.rs` owns the ordered candidate registry `[13,14]`, v13 rebuild, exact physical-schema validation, conversion, version updates and reports. `crates/core/src/db/candidate/v14.sql` owns v14 DDL and structural/trigger constraints. `candidate_authority.rs` owns the single resolved-transition writer. Tests invoke these implementations directly. They do not contain an alternate migration algorithm. Normal `schema::MIGRATIONS` is unchanged and never calls the candidate registry.
 
-Activation requires a separate reviewed change covering deployed executable/schema inventory, all writers and installer/daemon ownership, compatible typed readers, backups and remote lineage. If #54 lands with another migration number, coordinate/reuse its rebuild rather than introduce competing DDL. No down migration is implemented.
+Activation of this candidate registry requires a separate reviewed change covering deployed executable/schema inventory, all writers and installer/daemon ownership, compatible typed readers, backups and remote lineage. Operational #54 landed as v15 and reuses the candidate v13 rebuild shape. Do not introduce a second rebuild, and do not treat this candidate registry as the activation plan. No down migration is implemented.
 
 ## Candidate v13
 
@@ -39,6 +39,8 @@ For each version, check physical shape and foreign-key enforcement before `BEGIN
 Qualification covers injected errors and abrupt child-process exits at pre-transaction, create/copy/replace, validation and pre/post-version boundaries, plus v14 partial repository conversion; actual SQLite query-only/read-only, FK-off and NOT NULL failures; forged physical schemas/future versions; and v13-complete/v14-failed restart. Logical preservation is always checked; handled-error v13 failures additionally preserve exact DB bytes.
 
 ## #54 reader audit and activation requirements
+
+This section describes the copy-only prototype. Current operational readers are the v15 contract in [contracts/54-nullable-commit-map.md](contracts/54-nullable-commit-map.md), not the v12 behavior below.
 
 The new `CopySession::readers()` API implements generation/direction/source-qualified lookup, deterministic raw-row pagination, status and last-emitted targets on sealed migrated copies. It separates canonical handled-chain evidence from legacy display/NULL/ownerless/conflicting/missing results. See [decision matrix and safety contract](typed-readers.md). The retained prototype `lookup_mapping` supports only the historical MAPPING_NULL display oracle and cannot supply canonical authority. Operational readers remain unchanged at12.
 

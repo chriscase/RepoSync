@@ -39,7 +39,7 @@ NULL, the empty string and a missing row are never aliases of one another.
 - Physical shape: the v15 `commit_map` table body and its four indexes are
   byte-identical to the candidate v13 rebuild in
   `crates/core/src/db/candidate_migration.rs`, as the #63 contract requires
-  ("If #54 lands another version number, reuse that rebuild"). A test fails if
+  (operational #54 reuses that rebuild and does not add a second one). A test fails if
   the two texts drift. No new `CHECK` is added, so the shape does not compete
   with the candidate one; the direction rule below is enforced by the writer.
 - Transaction: the rebuild and the `user_version` bump run in the registry's

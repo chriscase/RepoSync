@@ -111,9 +111,12 @@ Typed mapping outcomes, not overloaded NULL/missing:
 A no-target row has a reason, policy snapshot, and NULL target as appropriate.
 NULL is not “missing row.” Empty-string SHA is refused. A missing row classifies
 as `pending`. Preserve source/target parents/trees or stable fingerprints
-sufficient to verify an external effect. Operational `commit_map.git_sha`
-remains `NOT NULL`; typed no-target lives in `canonical_mapping_outcomes`, not
-as a NULL mapping SHA.
+sufficient to verify an external effect. The canonical outcome table keeps the
+explicit outcome and NULL targets. Operational `commit_map.git_sha` may be NULL
+only as a legacy projection of an already recorded
+`intentionally_filtered_no_target` outcome
+([#54 contract](54-nullable-commit-map.md)). A NULL `commit_map` row does not
+mint `applied_and_verified` or `intentionally_filtered_no_target`.
 
 ## Operational v13 scope identity (shipped slice)
 
@@ -207,8 +210,8 @@ absent / inherited / global / explicit / revoked / read-failure.
 is that physical contract. Ordinary startup must keep passing with zero
 candidate `pair_%` tables.
 
-If #54 lands another version number, reuse that rebuild. Do not register a
-competing `crates/core/src/db/migrations/` tree.
+Operational #54 landed as schema v15 and reuses that rebuild. Do not register
+a competing `crates/core/src/db/migrations/` tree or a second nullable rebuild.
 
 ## Backup and honest rollback
 
