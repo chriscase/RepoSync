@@ -51,7 +51,8 @@ lumped together:
 - **An older un-journaled full-import path**, used when no repository and
   operation record are present, pushes its first batch with a plain `git push --force`.
 - **Setup "Reset & Reimport"** (admin-only) deletes RepoSync's local clone and
-  runs `git push --force`, which rewrites the configured branch.
+  first force-pushes a new empty reset commit to the configured branch; it then
+  prepares and starts the reimport. That push rewrites the configured branch.
 
 None of these is part of ordinary sync. How they relate to a branch rule is in
 [branch policy](branch-policy-and-hooks.md#what-rules-will-and-will-not-interfere-with-reposync).
@@ -124,4 +125,4 @@ Sources: [`github_webhook`][gh-webhook], [`svn_webhook`][svn-webhook],
 [import-snap]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L3121-L3135
 [import-full]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L3846-L3860
 [import-legacy]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L3884-L3930
-[reset-reimport]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/setup.rs#L1515-L1520
+[reset-reimport]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/setup.rs#L1468-L1572
