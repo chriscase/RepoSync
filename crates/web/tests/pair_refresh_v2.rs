@@ -213,7 +213,7 @@ async fn v2_rejects_unknown_fields_reanchor_empty_request_and_fabricated_handle(
     let response = client.post(&action).bearer_auth("token-admin").json(&serde_json::json!({
         "request_id":"request","preparation_id":uuid::Uuid::new_v4(),"approval_digest":"fake","action":"reanchor"
     })).send().await.unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
     assert_eq!(state(&f), saved);
 }
 

@@ -18,6 +18,10 @@ use crate::api::status::AppError;
 use crate::AppState;
 
 pub fn routes(engine: Arc<SyncEngine>) -> Router<Arc<AppState>> {
+    routes_with(RefreshService::new(engine))
+}
+
+pub fn routes_with(service: Arc<RefreshService>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v2/repos/:id/refresh/review", post(review))
         .route(
@@ -31,7 +35,7 @@ pub fn routes(engine: Arc<SyncEngine>) -> Router<Arc<AppState>> {
         )
         .route("/api/v2/repos/:id/refresh/action", post(act))
         .route("/api/v2/repos/:id/refresh/requests/:request", get(receipt))
-        .layer(Extension(RefreshService::new(engine)))
+        .layer(Extension(service))
 }
 
 /// Recovery-only surface: no new preparations or ordinary writer routes.
@@ -58,6 +62,7 @@ enum Action {
     Execute,
     Reconcile,
     Cancel,
+    Reanchor,
 }
 
 #[derive(Deserialize)]
@@ -67,6 +72,10 @@ struct ActionRequest {
     preparation_id: Uuid,
     approval_digest: String,
     action: Action,
+    #[serde(default)]
+    same_name: bool,
+    #[serde(default)]
+    retire: bool,
 }
 
 fn authenticated_bearer(
@@ -134,10 +143,40 @@ async fn act(
     Json(body): Json<ActionRequest>,
 ) -> Result<Json<RefreshReceiptView>, AppError> {
     let bearer = authenticated_bearer(&state, &service, &headers)?;
+    if matches!(body.action, Action::Reanchor) {
+        let receipt = service
+            .run_admitted_local(
+                &bearer,
+                &child,
+                reposync_core::pair_refresh::local_operations::LocalRequest {
+                    request_id: body.request_id,
+                    approval_digest: body.approval_digest,
+                    operation:
+                        reposync_core::pair_refresh::local_operations::LocalOperation::Reanchor,
+                    same_name: body.same_name,
+                    retire: body.retire,
+                    approve_current: false,
+                    stop_after: None,
+                },
+            )
+            .await
+            .map_err(refused)?;
+        return Ok(Json(RefreshReceiptView {
+            version: 2,
+            operation_id: receipt.operation_id,
+            request_id: receipt.request_id,
+            child_id: receipt.child_id,
+            parent_id: receipt.parent_id,
+            phase: receipt.phase,
+            svn_revision: receipt.svn_revision,
+            git_sha: receipt.git_sha,
+        }));
+    }
     let action = match body.action {
         Action::Execute => RefreshAction::Execute,
         Action::Reconcile => RefreshAction::Reconcile,
         Action::Cancel => RefreshAction::Cancel,
+        Action::Reanchor => unreachable!("reanchor is handled above"),
     };
     service
         .act(

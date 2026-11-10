@@ -1,10 +1,9 @@
-//! #69 coordinated pair-refresh preview (no execute, no re-anchor).
+//! #69 coordinated pair refresh.
 //!
 //! The default operation is **update pair from parent**: pin both sides and
-//! report unsynced work without discarding it. The live preview refuses
-//! re-anchor and execution. Published Git commits and SVN revisions are not
-//! rewritten. `synthetic` is the fixture-only model for those operations and
-//! does not call a live engine.
+//! report unsynced work without discarding it. Preview does not publish.
+//! Re-anchor and execution run through RefreshService on local file
+//! repositories. Published Git commits and SVN revisions are not rewritten.
 
 use std::path::Path;
 use std::process::Output;
@@ -23,6 +22,7 @@ pub mod git_sources;
 mod http_transport;
 pub mod lineage;
 pub mod live_preparation;
+pub mod local_operations;
 pub mod native_owner;
 pub mod noop;
 pub mod preparation;
@@ -33,7 +33,6 @@ pub mod svn_observation;
 pub mod svn_preparation;
 pub mod svn_sources;
 pub mod svn_visibility;
-pub mod synthetic;
 pub mod workspace;
 
 /// Policy identity pinned into every preview from this slice.
@@ -70,19 +69,19 @@ pub fn execution_requested(execute: bool, dry_run: Option<bool>) -> bool {
 
 pub fn reanchor_refusal() -> (&'static str, &'static str) {
     (
-        "reanchor_not_implemented",
-        "recreate/re-anchor is a separate explicit mode and is NOT IMPLEMENTED. It is not an alias for update-from-parent, reset, force-push, or removal of the old SVN path.",
+        "reanchor_requires_local_approval",
+        "re-anchor runs through RefreshService on a local file repository. It keeps the old generation and does not delete the old SVN path or force-push.",
     )
 }
 
 pub fn execute_refusal(digest: Option<&str>) -> (String, String) {
     let detail = match digest {
         Some(digest) => format!(
-            "update-pair-from-parent execution is a later slice and was not started. No durable job was created and no external Git or SVN write was performed. plan_digest={digest}"
+            "update-pair-from-parent execution runs through RefreshService. plan_digest={digest} is a preview pin, not an approval."
         ),
-        None => "update-pair-from-parent execution is a later slice and was not started. No durable job was created and no external Git or SVN write was performed.".into(),
+        None => "update-pair-from-parent execution runs through RefreshService.".into(),
     };
-    ("refresh_execute_not_implemented".into(), detail)
+    ("refresh_execute_requires_service".into(), detail)
 }
 
 pub fn format_refusal(reason: &str, detail: &str) -> String {
@@ -740,7 +739,7 @@ pub fn build_preview(obs: &RefreshObservations) -> RefreshPlan {
         plan_digest,
         approval: Approval {
             eligible: false,
-            reason: "execution_not_implemented".into(),
+            reason: "preview_is_not_an_approval".into(),
             binds_to: "plan_digest".into(),
         },
         git: GitPins {
@@ -776,8 +775,8 @@ pub fn build_preview(obs: &RefreshObservations) -> RefreshPlan {
         conflicts,
         unknowns,
         intended_result: intended,
-        reanchor_status: "NOT_IMPLEMENTED".into(),
-        execute_status: "NOT_IMPLEMENTED".into(),
+        reanchor_status: "refresh_service".into(),
+        execute_status: "refresh_service".into(),
         inspection: Inspection {
             namespace: "refs/reposync/pair-refresh/".into(),
             external_git_writes: false,
@@ -1192,7 +1191,7 @@ mod tests {
         assert_eq!(plan.plan_digest.len(), 64);
         assert!(!plan.approval.eligible);
         assert!(!plan.executed);
-        assert_eq!(plan.reanchor_status, "NOT_IMPLEMENTED");
+        assert_eq!(plan.reanchor_status, "refresh_service");
         let mut moved = sample();
         moved.parent_git_tip = Some(sha(3));
         assert_ne!(build_preview(&moved).plan_digest, plan.plan_digest);
@@ -1311,16 +1310,15 @@ mod tests {
     }
 
     #[test]
-    fn reanchor_and_execute_refusals_are_explicit() {
+    fn reanchor_and_execute_use_the_service() {
         let (reason, detail) = reanchor_refusal();
         let message = format_refusal(reason, detail);
-        assert!(message.starts_with("reanchor_not_implemented:"));
-        assert!(message.contains("NOT IMPLEMENTED"));
+        assert!(message.starts_with("reanchor_requires_local_approval:"));
+        assert!(message.contains("RefreshService"));
         let (reason, detail) = execute_refusal(Some("abc"));
         let message = format_refusal(&reason, &detail);
-        assert!(message.starts_with("refresh_execute_not_implemented:"));
+        assert!(message.starts_with("refresh_execute_requires_service:"));
         assert!(message.contains("plan_digest=abc"));
-        assert!(message.contains("No durable job"));
         assert_eq!(parse_operation("recreate"), Ok(RefreshOperation::Reanchor));
         assert_eq!(
             parse_operation("update_pair_from_parent"),
