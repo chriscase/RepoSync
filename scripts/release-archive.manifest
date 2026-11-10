@@ -1,0 +1,7 @@
+reposync
+reposync-daemon
+config.example.toml
+authors.example.toml
+reposync.service
+static/index.html
+static/assets/app.js

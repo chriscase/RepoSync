@@ -48,10 +48,9 @@ jobs:
         run: |
           TAG=${GITHUB_REF#refs/tags/}
           ARCHIVE="reposync-${TAG}-${{ matrix.target }}.tar.gz"
-          cd target/${{ matrix.target }}/release
-          tar czf "../../../${ARCHIVE}" reposync-daemon reposync
-          cd ../../..
-          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          bash scripts/assemble_release_archive.sh \
+            --bin-dir "target/${{ matrix.target }}/release" \
+            --out "${ARCHIVE}"
           echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
 
       - name: Upload artifact
