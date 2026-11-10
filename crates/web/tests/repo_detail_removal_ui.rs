@@ -74,14 +74,36 @@ fn repo_root() -> PathBuf {
 }
 
 fn accepts_strip_types(bin: &Path) -> bool {
-    Command::new(bin)
+    let probe = Command::new(bin)
         .args(["--experimental-strip-types", "-e", "process.exit(0)"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .stderr(Stdio::piped())
+        .output();
+    match probe {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            let stderr: String = String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(240)
+                .map(|ch| match ch {
+                    '\n' | '\r' => ' ',
+                    other => other,
+                })
+                .collect();
+            eprintln!(
+                "node probe failed path={} status={} stderr={}",
+                bin.display(),
+                output.status,
+                stderr
+            );
+            false
+        }
+        Err(error) => {
+            eprintln!("node probe failed path={} error={error}", bin.display());
+            false
+        }
+    }
 }
 
 /// Explicit override, then a PATH `node` that accepts `--experimental-strip-types`,
@@ -457,6 +479,11 @@ fn node_runtime_prefers_compatible_path_over_older_system_node() {
     let system_nodejs = system.join("nodejs");
     write_executable(&path_node, compatible_node_script());
     write_executable(&system_nodejs, older_node_script());
+    eprintln!(
+        "node fixture path_candidate={} system_candidate={}",
+        path_node.display(),
+        system_nodejs.display()
+    );
 
     let selected = select_node_runtime(
         None,

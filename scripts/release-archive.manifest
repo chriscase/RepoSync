@@ -1,0 +1,9 @@
+reposync
+reposync-daemon
+config.example.toml
+authors.example.toml
+reposync.service
+static/index.html
+static/favicon.svg
+static/assets/index-CMTDqfvH.js
+static/assets/index-De9InfNN.css
