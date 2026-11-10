@@ -951,32 +951,84 @@ def baseline_self_test():
     print("Parent parser/writer and runtime prerequisite boundary controls: PASS")
 
 
+# Same canonicalization as ui_source_bind in repo_detail_removal_ui.rs.
+UI_IDENTITY_FILES = (
+    "web-ui/src/branchPairDeletion.ts",
+    "web-ui/src/managedRemoval.ts",
+)
+SYSTEM_NODE_FALLBACKS = (Path("/usr/bin/node"), Path("/usr/bin/nodejs"))
+
+
+def ui_source_bind(root):
+    """Identity of the UI files the prebuilt Node contracts execute."""
+    hasher = hashlib.sha256()
+    for relative in UI_IDENTITY_FILES:
+        try:
+            data = (Path(root) / relative).read_bytes()
+        except OSError:
+            return None
+        hasher.update(relative.encode())
+        hasher.update(b"\0")
+        hasher.update(len(data).to_bytes(8, "big"))
+        hasher.update(data)
+    return hasher.hexdigest()
+
+
+def bind_relocated_ui_source(src=Path("/src")):
+    """Admit /src only when its UI identity is published for the test process."""
+    binding = ui_source_bind(src)
+    if binding is None:
+        os.environ.pop("REPOSYNC_UI_SOURCE_ROOT", None)
+        os.environ.pop("REPOSYNC_UI_SOURCE_BIND", None)
+        return None
+    os.environ["REPOSYNC_UI_SOURCE_ROOT"] = str(src)
+    os.environ["REPOSYNC_UI_SOURCE_BIND"] = binding
+    return binding
+
+
+def accepts_strip_types(binary):
+    try:
+        probe = subprocess.run(
+            [str(binary), "--experimental-strip-types", "-e", "process.exit(0)"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
+
+
+def select_node_runtime(path_dirs, system_fallbacks):
+    """PATH Node that accepts strip-types, then a supported system fallback."""
+    for directory in path_dirs:
+        candidate = Path(directory) / "node"
+        if candidate.is_file() and accepts_strip_types(candidate):
+            return candidate
+    for candidate in system_fallbacks:
+        if Path(candidate).is_file() and accepts_strip_types(candidate):
+            return Path(candidate)
+    raise AssertionError("no compatible Node runtime (PATH or system fallback)")
+
+
 def materialize_node_wrapper():
-    """Prebuilt tests invoke Node for R65 UI contracts; expose a fixture-owned wrapper."""
-    for candidate in (Path("/usr/bin/nodejs"), Path("/usr/bin/node")):
-        if candidate.is_file():
-            wrapper = FIXTURE / "tmp" / "reposync-node"
-            wrapper.parent.mkdir(parents=True, exist_ok=True)
-            wrapper.write_text(f"#!/bin/sh\nexec {candidate} \"$@\"\n")
-            wrapper.chmod(0o755)
-            os.environ["REPOSYNC_NODE_BIN"] = str(wrapper)
-            probe = subprocess.run(
-                [str(wrapper), "--version"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if probe.returncode != 0:
-                raise AssertionError(
-                    f"node wrapper probe failed: {probe.stderr or probe.stdout}"
-                )
-            return
-    raise AssertionError("nodejs runtime missing from reliability image")
+    """Point the explicit Node override at a compatible runtime, via a fixture shim."""
+    path_dirs = [item for item in os.environ.get("PATH", "").split(os.pathsep) if item]
+    chosen = select_node_runtime(path_dirs, SYSTEM_NODE_FALLBACKS)
+    wrapper = FIXTURE / "tmp" / "reposync-node"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text(f"#!/bin/sh\nexec {chosen} \"$@\"\n")
+    wrapper.chmod(0o755)
+    os.environ["REPOSYNC_NODE_BIN"] = str(wrapper)
+    if not accepts_strip_types(wrapper):
+        raise AssertionError(f"node wrapper probe failed for {chosen}")
+    return chosen
 
 
 def main():
     os.environ.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     materialize_node_wrapper()
+    bind_relocated_ui_source()
     mode = sys.argv[1]
     assert mode in ("diagnostics", "candidate", "all", "baseline"), mode
     def preflight():
