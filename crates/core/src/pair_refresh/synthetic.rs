@@ -31,7 +31,10 @@ struct Generation {
     git_branch: String,
     svn_path: String,
     git_tip: String,
+    /// Latest pair-path revision, including SVN-only edits not yet refreshed.
     svn_revision: i64,
+    /// SVN revision that corresponds to the mapped Git baseline.
+    mapped_svn: i64,
     parent_baseline_svn: i64,
     baseline_sha: String,
     retained_ref: String,
@@ -163,6 +166,7 @@ impl SyntheticPairRefresh {
             svn_path: "branches/feature".into(),
             git_tip: sha.clone(),
             svn_revision: 1,
+            mapped_svn: 1,
             parent_baseline_svn: 1,
             baseline_sha: sha.clone(),
             retained_ref: "refs/reposync/pair-refresh/generation/1".into(),
@@ -279,8 +283,8 @@ impl SyntheticPairRefresh {
     }
 
     pub fn append_pair_svn(&mut self, path: &str, content: &str) {
-        let tip = self.active_gen().git_tip.clone();
-        let mut tree = self.tree_of(&tip);
+        let observed = self.active_gen().svn_revision;
+        let mut tree = self.revision_tree(observed);
         tree.insert(path.to_string(), content.to_string());
         let number = self.next_rev;
         self.next_rev += 1;
@@ -293,6 +297,7 @@ impl SyntheticPairRefresh {
                 mergeinfo: None,
             },
         );
+        // The mapped baseline stays put. Only the observed tip moves.
         self.active_gen_mut().svn_revision = number;
     }
 
@@ -427,6 +432,7 @@ impl SyntheticPairRefresh {
             svn_path,
             git_tip: self.parent_tip.clone(),
             svn_revision: number,
+            mapped_svn: number,
             parent_baseline_svn: self.parent_svn,
             baseline_sha: self.parent_tip.clone(),
             retained_ref: format!("refs/reposync/pair-refresh/generation/{id}"),
@@ -469,6 +475,12 @@ impl SyntheticPairRefresh {
 
     pub fn revision_exists(&self, number: i64) -> bool {
         self.revisions.contains_key(&number)
+    }
+
+    pub fn revision_file(&self, number: i64, path: &str) -> Option<&str> {
+        self.revisions
+            .get(&number)
+            .and_then(|rev| rev.tree.get(path).map(String::as_str))
     }
 
     pub fn revisions_on(&self, path: &str) -> Vec<i64> {
@@ -613,6 +625,7 @@ impl SyntheticPairRefresh {
         let gen = self.active_gen_mut();
         gen.mapping.insert(new_git.clone(), new_svn);
         gen.baseline_sha = new_git;
+        gen.mapped_svn = new_svn;
         gen.parent_baseline_svn = parent_svn;
         self.mark(request, "checkpoint")?;
         let job = self.job(request).clone();
@@ -675,7 +688,7 @@ impl SyntheticPairRefresh {
         let pending_pair_svn = self
             .revisions
             .iter()
-            .filter(|(number, rev)| **number > gen.svn_revision && rev.path == gen.svn_path)
+            .filter(|(number, rev)| **number > gen.mapped_svn && rev.path == gen.svn_path)
             .count();
         let overlap = self.overlapping_conflicts(&gen.git_tip, &self.parent_tip);
         for path in &overlap {
@@ -696,6 +709,7 @@ impl SyntheticPairRefresh {
             gen.svn_path.clone(),
             self.parent_branch.clone(),
             self.parent_path.clone(),
+            gen.mapped_svn.to_string(),
             gen.svn_revision.to_string(),
             self.parent_svn.to_string(),
             same_name.to_string(),
@@ -758,7 +772,7 @@ impl SyntheticPairRefresh {
     ) -> Result<BTreeMap<String, String>, String> {
         let base = self.lowest_common(pair_tip, parent_tip);
         let base_tree = self.tree_of(&base);
-        let pair_tree = self.tree_of(pair_tip);
+        let pair_tree = self.svn_augmented_pair_tree(pair_tip)?;
         let parent_tree = self.tree_of(parent_tip);
         let mut paths = BTreeSet::new();
         paths.extend(base_tree.keys().cloned());
@@ -798,6 +812,45 @@ impl SyntheticPairRefresh {
             }
         }
         Ok(result)
+    }
+
+    /// Pair Git content plus SVN-only edits since the mapped baseline.
+    /// Git and SVN changes to the same path must already agree.
+    fn svn_augmented_pair_tree(&self, pair_tip: &str) -> Result<BTreeMap<String, String>, String> {
+        let gen = self.active_gen();
+        let mut tree = self.tree_of(pair_tip);
+        let mapped = self.revision_tree(gen.mapped_svn);
+        let observed = self.revision_tree(gen.svn_revision);
+        let mut paths = BTreeSet::new();
+        paths.extend(mapped.keys().cloned());
+        paths.extend(observed.keys().cloned());
+        for path in paths {
+            let was = mapped.get(&path).map(String::as_str);
+            let now = observed.get(&path).map(String::as_str);
+            if was == now {
+                continue;
+            }
+            let git_value = tree.get(&path).map(String::as_str);
+            if git_value != was && git_value != now {
+                return Err(format!("resolution required for {path}"));
+            }
+            match now {
+                Some(value) => {
+                    tree.insert(path, value.to_string());
+                }
+                None => {
+                    tree.remove(&path);
+                }
+            }
+        }
+        Ok(tree)
+    }
+
+    fn revision_tree(&self, number: i64) -> BTreeMap<String, String> {
+        self.revisions
+            .get(&number)
+            .map(|rev| rev.tree.clone())
+            .unwrap_or_default()
     }
 
     fn pending_commits(
@@ -1110,11 +1163,50 @@ mod tests {
         let mut pair = SyntheticPairRefresh::origin();
         pair.append_pair_svn("notes.txt", "svn-only");
         let svn_rev = pair.active_gen().svn_revision;
+        assert!(pair.preview().pending_pair_svn > 0);
         pair.advance_parent("readme", "parent");
+        let plan = pair.preview();
+        assert!(plan.pending_pair_svn > 0);
         let before = pair.revision_count();
-        pair.execute("svn-only", &pair.preview().digest).unwrap();
+        let receipt = pair.execute("svn-only", &plan.digest).unwrap();
         assert!(pair.revision_exists(svn_rev));
+        assert_eq!(pair.revision_file(svn_rev, "notes.txt"), Some("svn-only"));
         assert_eq!(pair.revision_count(), before + 1);
+        assert_eq!(
+            pair.tree_file(pair.git_tip(), "notes.txt"),
+            Some("svn-only")
+        );
+        assert_eq!(pair.tree_file(pair.git_tip(), "readme"), Some("parent"));
+        assert_eq!(
+            pair.revision_file(receipt.svn_revision, "notes.txt"),
+            Some("svn-only")
+        );
+        assert_eq!(
+            pair.revision_file(receipt.svn_revision, "readme"),
+            Some("parent")
+        );
+
+        let mut pair = SyntheticPairRefresh::origin();
+        pair.append_pair_svn("notes.txt", "svn-only");
+        pair.append_pair_svn("extra.txt", "earlier");
+        assert!(pair.preview().pending_pair_svn >= 2);
+        pair.advance_parent("readme", "parent");
+        let receipt = pair
+            .execute("svn-only-consecutive", &pair.preview().digest)
+            .unwrap();
+        assert_eq!(
+            pair.tree_file(pair.git_tip(), "notes.txt"),
+            Some("svn-only")
+        );
+        assert_eq!(pair.tree_file(pair.git_tip(), "extra.txt"), Some("earlier"));
+        assert_eq!(
+            pair.revision_file(receipt.svn_revision, "notes.txt"),
+            Some("svn-only")
+        );
+        assert_eq!(
+            pair.revision_file(receipt.svn_revision, "extra.txt"),
+            Some("earlier")
+        );
     }
 
     #[test]
