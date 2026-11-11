@@ -2218,3 +2218,498 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #53 imported origin (RS53-IMPORTED-ORIGIN-HISTORICAL-INCARNATION-1, I1)
+// ---------------------------------------------------------------------------
+
+/// The stored records of one completed snapshot import whose published commit
+/// is a given Git SHA: its `snapshot-import:<op_id>` origin row joined with its
+/// journal document. These are records only. They grant nothing by themselves;
+/// the historical SVN identity at `svn_rev` must still be observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotOriginRecord {
+    pub(crate) origin_id: String,
+    pub(crate) operation_id: String,
+    pub(crate) repo_id: String,
+    /// The snapshot's operative (= peg) SVN revision R.
+    pub(crate) svn_rev: i64,
+    /// The commit B the snapshot published.
+    pub(crate) git_sha: String,
+    pub(crate) pin: SnapshotPin,
+    /// SHA-256 of the stored journal text, so a later read can tell whether it
+    /// is still the document that was validated.
+    pub(crate) document_sha256: String,
+}
+
+/// What the stored records say about a snapshot-import origin for one exact
+/// repository and commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SnapshotOriginEvidence {
+    /// No origin row and no snapshot journal of this repository names the commit.
+    Absent,
+    /// Something names the commit, but a required link is missing or
+    /// contradicts another. The detail names it.
+    Refused(String),
+    /// Exactly one complete, consistent snapshot origin.
+    Verified(Box<SnapshotOriginRecord>),
+}
+
+const SNAPSHOT_ORIGIN_PREFIX: &str = "snapshot-import:";
+
+/// Decode and validate the snapshot-import origin of `git_sha` for `repo_id`
+/// from the caller's connection. Reads only; run it inside one read transaction
+/// for a consistent snapshot. A malformed or unsupported journal document and
+/// any SQLite error are returned as errors, never as `Absent`.
+pub(crate) fn snapshot_origin_evidence(
+    conn: &Connection,
+    repo_id: &str,
+    git_sha: &str,
+) -> Result<SnapshotOriginEvidence, DatabaseError> {
+    let refused = |detail: String| Ok(SnapshotOriginEvidence::Refused(detail));
+    // Origin rows of this repository that name the commit, whatever their status.
+    let origins: Vec<(String, Option<i64>, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, svn_rev, direction, status FROM sync_records
+             WHERE repo_id = ?1 AND git_sha = ?2 AND substr(id, 1, length(?3)) = ?3
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![repo_id, git_sha, SNAPSHOT_ORIGIN_PREFIX], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    // Snapshot journals of this repository that claim the commit anywhere.
+    let mut claims: Vec<(String, ImportOperation, String)> = Vec::new();
+    {
+        let document_prefix = key("document", "");
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM kv_state WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key",
+        )?;
+        let rows = stmt.query_map([&document_prefix], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (name, raw) = row?;
+            let op = parse(&raw)?;
+            let names_commit = [
+                op.last_local_git_sha.as_deref(),
+                op.last_confirmed_git_sha.as_deref(),
+                op.intended_git_sha.as_deref(),
+            ]
+            .contains(&Some(git_sha));
+            if op.repo_id == repo_id && op.operation_type == "snapshot_import" && names_commit {
+                let op_id = name.get(document_prefix.len()..).unwrap_or("").to_owned();
+                claims.push((op_id, op, raw));
+            }
+        }
+    }
+    if origins.is_empty() && claims.is_empty() {
+        return Ok(SnapshotOriginEvidence::Absent);
+    }
+    let [(origin_id, origin_rev, direction, status)] = origins.as_slice() else {
+        return refused(format!(
+            "{} snapshot-import origin rows name commit {git_sha}",
+            origins.len()
+        ));
+    };
+    if direction != "svn_to_git" || status != "applied" {
+        return refused(format!(
+            "origin {origin_id} is {direction}/{status}, not an applied svn_to_git record"
+        ));
+    }
+    let op_id = origin_id.get(SNAPSHOT_ORIGIN_PREFIX.len()..).unwrap_or("");
+    let Some(rev) = *origin_rev else {
+        return refused(format!("origin {origin_id} has no SVN revision"));
+    };
+    let [(claim_id, op, raw)] = claims.as_slice() else {
+        let ids: Vec<&str> = claims.iter().map(|(id, _, _)| id.as_str()).collect();
+        return refused(format!(
+            "snapshot journals naming commit {git_sha} are {ids:?}; origin {origin_id} names one"
+        ));
+    };
+    if op_id.is_empty() || claim_id != op_id {
+        return refused(format!(
+            "origin {origin_id} does not name the journal {claim_id} that claims commit {git_sha}"
+        ));
+    }
+    if op.id != op_id || op.repo_id != repo_id {
+        return refused(format!(
+            "journal {claim_id} records id {} for repository {}",
+            op.id, op.repo_id
+        ));
+    }
+    if op.state != ImportOperationState::Completed {
+        return refused(format!("journal {op_id} is {:?}, not completed", op.state));
+    }
+    if op.total_revisions != Some(1) || op.processed_revisions != 1 || op.local_commits != 1 {
+        return refused(format!(
+            "journal {op_id} is not one single-revision baseline"
+        ));
+    }
+    if op.last_local_svn_rev != Some(rev)
+        || op.last_confirmed_svn_rev != Some(rev)
+        || op.last_local_git_sha.as_deref() != Some(git_sha)
+        || op.last_confirmed_git_sha.as_deref() != Some(git_sha)
+    {
+        return refused(format!(
+            "journal {op_id} local/confirmed revision and commit do not both equal r{rev} and {git_sha}"
+        ));
+    }
+    if op.intended_ref.is_some()
+        || op.intended_git_sha.is_some()
+        || !op.pending_commit_maps.is_empty()
+    {
+        return refused(format!(
+            "journal {op_id} still has a publication intent or pending mappings"
+        ));
+    }
+    let Some(pin) = op.snapshot_pin.clone() else {
+        return refused(format!("journal {op_id} has no snapshot pin"));
+    };
+    if pin.operative_rev != rev || pin.peg_rev != rev {
+        return refused(format!(
+            "journal {op_id} pins operative r{} and peg r{}, origin is r{rev}",
+            pin.operative_rev, pin.peg_rev
+        ));
+    }
+    Ok(SnapshotOriginEvidence::Verified(Box::new(
+        SnapshotOriginRecord {
+            origin_id: origin_id.clone(),
+            operation_id: op_id.to_owned(),
+            repo_id: repo_id.to_owned(),
+            svn_rev: rev,
+            git_sha: git_sha.to_owned(),
+            pin,
+            document_sha256: hex::encode(Sha256::digest(raw.as_bytes())),
+        },
+    )))
+}
+
+#[cfg(test)]
+mod snapshot_origin_tests {
+    //! Decoder and refusal behavior from fabricated rows. These establish the
+    //! decoder only, not native provenance.
+    use super::*;
+
+    const REPO: &str = "repo-origin";
+    const B: &str = "1111111111111111111111111111111111111111";
+    const OP: &str = "op-snapshot";
+
+    fn db() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(dir.path().join("state.db")).unwrap();
+        db.initialize().unwrap();
+        (dir, db)
+    }
+
+    fn completed(op_id: &str, repo_id: &str, rev: i64, sha: &str) -> ImportOperation {
+        ImportOperation {
+            version: 1,
+            id: op_id.into(),
+            repo_id: repo_id.into(),
+            operation_type: "snapshot_import".into(),
+            initiator_id: "admin".into(),
+            request_id: "req".into(),
+            target_fingerprint: "fp".into(),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            state: ImportOperationState::Completed,
+            cancel_requested: false,
+            processed_revisions: 1,
+            total_revisions: Some(1),
+            local_commits: 1,
+            confirmed_batches: 1,
+            last_local_svn_rev: Some(rev),
+            last_local_git_sha: Some(sha.into()),
+            last_confirmed_svn_rev: Some(rev),
+            last_confirmed_git_sha: Some(sha.into()),
+            intended_ref: None,
+            intended_git_sha: None,
+            outcome_detail: None,
+            resume_authorized: false,
+            snapshot_pin: Some(SnapshotPin {
+                svn_uuid: "uuid-1".into(),
+                canonical_url: "file:///svn/trunk".into(),
+                operative_rev: rev,
+                peg_rev: rev,
+                copy_from_path: None,
+                copy_from_rev: None,
+                requested: rev.to_string(),
+            }),
+            pending_commit_maps: Vec::new(),
+        }
+    }
+
+    fn put_document(db: &Database, op_id: &str, op: &ImportOperation) {
+        write_value(
+            &db.conn(),
+            &key("document", op_id),
+            &serde_json::to_string(op).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn put_origin(
+        db: &Database,
+        id: &str,
+        repo_id: &str,
+        rev: Option<i64>,
+        sha: &str,
+        status: &str,
+    ) {
+        db.conn()
+            .execute(
+                "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+                 VALUES (?1, ?2, ?3, ?4, 'svn_to_git', '', '', 't', 't', ?5)",
+                params![id, repo_id, rev, sha, status],
+            )
+            .unwrap();
+    }
+
+    fn evidence(db: &Database) -> Result<SnapshotOriginEvidence, DatabaseError> {
+        snapshot_origin_evidence(&db.conn(), REPO, B)
+    }
+
+    fn genuine(db: &Database) {
+        put_document(db, OP, &completed(OP, REPO, 7, B));
+        put_origin(
+            db,
+            &format!("snapshot-import:{OP}"),
+            REPO,
+            Some(7),
+            B,
+            "applied",
+        );
+    }
+
+    fn refused_with(db: &Database, needle: &str) {
+        match evidence(db).unwrap() {
+            SnapshotOriginEvidence::Refused(detail) => {
+                assert!(
+                    detail.contains(needle),
+                    "{detail:?} should mention {needle:?}"
+                )
+            }
+            other => panic!("expected a refusal mentioning {needle:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn genuine_origin_and_completed_journal_verify_with_the_document_digest() {
+        let (_dir, db) = db();
+        genuine(&db);
+        let SnapshotOriginEvidence::Verified(record) = evidence(&db).unwrap() else {
+            panic!("a genuine snapshot origin must verify");
+        };
+        assert_eq!(record.origin_id, format!("snapshot-import:{OP}"));
+        assert_eq!(record.operation_id, OP);
+        assert_eq!((record.svn_rev, record.git_sha.as_str()), (7, B));
+        assert_eq!((record.pin.operative_rev, record.pin.peg_rev), (7, 7));
+        let raw = read_value(&db.conn(), &key("document", OP))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.document_sha256,
+            hex::encode(Sha256::digest(raw.as_bytes()))
+        );
+        let mut touched = completed(OP, REPO, 7, B);
+        touched.updated_at = "later".into();
+        put_document(&db, OP, &touched);
+        let SnapshotOriginEvidence::Verified(again) = evidence(&db).unwrap() else {
+            panic!("still verified");
+        };
+        assert_ne!(again.document_sha256, record.document_sha256);
+    }
+
+    #[test]
+    fn nothing_naming_the_commit_is_absent_and_a_foreign_repository_row_is_not_a_claim() {
+        let (_dir, db) = db();
+        assert_eq!(evidence(&db).unwrap(), SnapshotOriginEvidence::Absent);
+        put_document(
+            &db,
+            "op-foreign",
+            &completed("op-foreign", "other-repo", 7, B),
+        );
+        put_origin(
+            &db,
+            "snapshot-import:op-foreign",
+            "other-repo",
+            Some(7),
+            B,
+            "applied",
+        );
+        put_origin(&db, "ordinary-row", REPO, Some(7), B, "applied");
+        assert_eq!(evidence(&db).unwrap(), SnapshotOriginEvidence::Absent);
+    }
+
+    #[test]
+    fn missing_or_duplicate_origin_rows_refuse() {
+        let (_dir, db) = db();
+        put_document(&db, OP, &completed(OP, REPO, 7, B));
+        refused_with(&db, "0 snapshot-import origin rows");
+        put_origin(
+            &db,
+            &format!("snapshot-import:{OP}"),
+            REPO,
+            Some(7),
+            B,
+            "applied",
+        );
+        put_origin(
+            &db,
+            "snapshot-import:op-second",
+            REPO,
+            Some(7),
+            B,
+            "applied",
+        );
+        refused_with(&db, "2 snapshot-import origin rows");
+    }
+
+    #[test]
+    fn origin_without_its_journal_or_with_another_claimant_refuses() {
+        let (_dir, db) = db();
+        put_origin(
+            &db,
+            &format!("snapshot-import:{OP}"),
+            REPO,
+            Some(7),
+            B,
+            "applied",
+        );
+        refused_with(&db, "snapshot journals naming commit");
+        put_document(&db, "op-other", &completed("op-other", REPO, 7, B));
+        refused_with(&db, "does not name the journal");
+        put_document(&db, OP, &completed(OP, REPO, 7, B));
+        refused_with(&db, "snapshot journals naming commit");
+    }
+
+    #[test]
+    fn origin_status_direction_and_revision_must_be_an_applied_svn_record() {
+        let (_dir, db) = db();
+        put_document(&db, OP, &completed(OP, REPO, 7, B));
+        put_origin(
+            &db,
+            &format!("snapshot-import:{OP}"),
+            REPO,
+            Some(7),
+            B,
+            "pending",
+        );
+        refused_with(&db, "not an applied svn_to_git record");
+        let (_dir2, db2) = self::db();
+        put_document(&db2, OP, &completed(OP, REPO, 7, B));
+        put_origin(
+            &db2,
+            &format!("snapshot-import:{OP}"),
+            REPO,
+            None,
+            B,
+            "applied",
+        );
+        assert!(matches!(
+            snapshot_origin_evidence(&db2.conn(), REPO, B).unwrap(),
+            SnapshotOriginEvidence::Refused(detail) if detail.contains("no SVN revision")
+        ));
+    }
+
+    #[test]
+    fn journal_identity_state_counters_revision_commit_intent_and_pin_mismatches_refuse() {
+        type Mutation = Box<dyn Fn(&mut ImportOperation)>;
+        let cases: Vec<(&str, Mutation)> = vec![
+            ("records id", Box::new(|op| op.id = "op-renamed".into())),
+            (
+                "not completed",
+                Box::new(|op| op.state = ImportOperationState::ReconciliationRequired),
+            ),
+            (
+                "single-revision baseline",
+                Box::new(|op| op.total_revisions = Some(2)),
+            ),
+            (
+                "single-revision baseline",
+                Box::new(|op| op.processed_revisions = 2),
+            ),
+            (
+                "single-revision baseline",
+                Box::new(|op| op.local_commits = 2),
+            ),
+            (
+                "do not both equal",
+                Box::new(|op| op.last_confirmed_svn_rev = Some(6)),
+            ),
+            (
+                "do not both equal",
+                Box::new(|op| op.last_local_svn_rev = Some(8)),
+            ),
+            (
+                "publication intent",
+                Box::new(|op| op.intended_ref = Some("refs/heads/main".into())),
+            ),
+            (
+                "publication intent",
+                Box::new(|op| {
+                    op.pending_commit_maps.push(PendingImportCommitMap {
+                        svn_rev: 7,
+                        git_sha: B.into(),
+                        svn_author: "a".into(),
+                        git_author: "a".into(),
+                    })
+                }),
+            ),
+            ("no snapshot pin", Box::new(|op| op.snapshot_pin = None)),
+            (
+                "pins operative",
+                Box::new(|op| {
+                    if let Some(pin) = op.snapshot_pin.as_mut() {
+                        pin.peg_rev = 6;
+                    }
+                }),
+            ),
+        ];
+        for (needle, mutate) in cases {
+            let (_dir, db) = db();
+            let mut op = completed(OP, REPO, 7, B);
+            mutate(&mut op);
+            put_document(&db, OP, &op);
+            put_origin(
+                &db,
+                &format!("snapshot-import:{OP}"),
+                REPO,
+                Some(7),
+                B,
+                "applied",
+            );
+            refused_with(&db, needle);
+        }
+    }
+
+    #[test]
+    fn a_journal_of_another_repository_under_the_origin_id_is_not_this_origin() {
+        let (_dir, db) = db();
+        put_document(&db, OP, &completed(OP, "other-repo", 7, B));
+        put_origin(
+            &db,
+            &format!("snapshot-import:{OP}"),
+            REPO,
+            Some(7),
+            B,
+            "applied",
+        );
+        refused_with(&db, "snapshot journals naming commit");
+    }
+
+    #[test]
+    fn malformed_or_unsupported_documents_are_errors_not_absence() {
+        let (_dir, db) = db();
+        genuine(&db);
+        write_value(&db.conn(), &key("document", "op-broken"), "{not json").unwrap();
+        assert!(evidence(&db).is_err());
+        let (_dir2, db2) = self::db();
+        let mut op = completed(OP, REPO, 7, B);
+        op.version = 2;
+        put_document(&db2, OP, &op);
+        assert!(snapshot_origin_evidence(&db2.conn(), REPO, B).is_err());
+    }
+}
