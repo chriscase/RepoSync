@@ -200,10 +200,43 @@ fn record_engine_lfs_pattern(repo_root: &Path, pattern: &str) -> std::io::Result
 
 fn gitattributes_line_attributes(line: &str) -> Option<&str> {
     let trimmed = line.trim();
-    trimmed
-        .find(|c: char| c.is_whitespace())
-        .map(|idx| trimmed[idx..].trim_start())
-        .filter(|attrs| !attrs.is_empty())
+    let rest = if let Some(after_quotes) = quoted_attribute_pattern_rest(trimmed) {
+        after_quotes
+    } else {
+        let idx = trimmed.find(|c: char| c.is_whitespace())?;
+        &trimmed[idx..]
+    };
+    let attrs = rest.trim_start();
+    if attrs.is_empty() {
+        None
+    } else {
+        Some(attrs)
+    }
+}
+
+/// Text after a leading C-style quoted pattern, not including the closing quote.
+///
+/// Git attributes splits an unquoted pattern at whitespace. A quoted pattern
+/// may contain spaces, so the attribute list starts after the closing quote.
+fn quoted_attribute_pattern_rest(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut index = 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                index += 2;
+                if index > bytes.len() {
+                    return None;
+                }
+            }
+            b'"' => return Some(&line[index + 1..]),
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 fn gitattributes_line_has_exact_attribute(line: &str, attribute: &str) -> bool {
@@ -527,17 +560,42 @@ pub fn pattern_for_path(rel_path: &str) -> String {
 /// Anchor one repository path so the LFS clean filter matches only that file.
 ///
 /// The leading slash keeps a root file from matching the same name in a
-/// subdirectory. Glob metacharacters and whitespace are escaped so the path
-/// stays one pattern rather than an attribute separator or a broader glob.
+/// subdirectory. Glob metacharacters are escaped for Git's pattern matcher.
+/// A path that contains whitespace or a double quote is then wrapped in Git's
+/// C-style double quotes. A backslash before a space is not a quoted pattern,
+/// and Git would still split the line at that space.
 pub fn exact_lfs_pattern(rel_path: &str) -> String {
     let mut pattern = String::from("/");
     for ch in rel_path.chars() {
-        if matches!(ch, ' ' | '\t' | '\\' | '*' | '?' | '[' | ']' | '#' | '!') {
+        if matches!(ch, '\\' | '*' | '?' | '[' | ']') {
             pattern.push('\\');
         }
         pattern.push(ch);
     }
-    pattern
+    if pattern.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+        quote_gitattributes_pattern(&pattern)
+    } else {
+        pattern
+    }
+}
+
+/// C-style quoting used by Git attributes when a pattern contains whitespace
+/// or a double quote. Glob escapes already in `pattern` are escaped again so
+/// they survive unquoting.
+fn quote_gitattributes_pattern(pattern: &str) -> String {
+    let mut quoted = String::from("\"");
+    for ch in pattern.chars() {
+        match ch {
+            '\\' | '"' => {
+                quoted.push('\\');
+                quoted.push(ch);
+            }
+            '\t' => quoted.push_str("\\t"),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn attributes_line_tracks_pattern(line: &str, pattern: &str) -> bool {
@@ -905,12 +963,81 @@ mod tests {
     fn test_exact_lfs_pattern_does_not_broaden_by_extension() {
         assert_eq!(exact_lfs_pattern("large.bin"), "/large.bin");
         assert_eq!(exact_lfs_pattern("models/large.bin"), "/models/large.bin");
-        assert_eq!(exact_lfs_pattern("my file.bin"), "/my\\ file.bin");
-        assert_eq!(exact_lfs_pattern("weird*[!].bin"), "/weird\\*\\[\\!\\].bin");
+        assert_eq!(exact_lfs_pattern("my file.bin"), "\"/my file.bin\"");
+        assert_eq!(exact_lfs_pattern("glob*.bin"), "/glob\\*.bin");
+        assert_eq!(exact_lfs_pattern("both *.bin"), "\"/both \\\\*.bin\"");
         assert_ne!(
             exact_lfs_pattern("large.bin"),
             pattern_for_path("large.bin")
         );
+    }
+
+    #[test]
+    fn test_quoted_engine_line_is_still_a_full_lfs_rule() {
+        let line = "\"/my file.bin\" filter=lfs diff=lfs merge=lfs -text";
+        assert!(gitattributes_line_is_full_engine_lfs(line));
+    }
+
+    #[test]
+    fn test_exact_lfs_pattern_matches_only_the_selected_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", dir.path().to_str().unwrap()])
+            .status()
+            .unwrap();
+        let selected = [
+            "my file.bin",
+            "tab\tname.bin",
+            "quote\"name.bin",
+            "back\\slash.bin",
+            "glob*.bin",
+        ];
+        let nearby = [
+            "near file.bin",
+            "tab\tother.bin",
+            "quoteXname.bin",
+            "backXslash.bin",
+            "globX.bin",
+        ];
+        for name in selected.iter().chain(nearby.iter()) {
+            let path = dir.path().join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut body = String::new();
+        for name in &selected {
+            body.push_str(&lfs_tracking_line(&exact_lfs_pattern(name)));
+            body.push('\n');
+        }
+        std::fs::write(dir.path().join(".gitattributes"), body).unwrap();
+        for name in &selected {
+            let value = git_check_attr_filter(dir.path(), name);
+            assert_eq!(value, "lfs", "{name} must be selected, got {value}");
+        }
+        for name in &nearby {
+            let value = git_check_attr_filter(dir.path(), name);
+            assert_eq!(
+                value, "unspecified",
+                "{name} must stay unselected, got {value}"
+            );
+        }
+    }
+
+    fn git_check_attr_filter(repo: &std::path::Path, path: &str) -> String {
+        let output = std::process::Command::new("git")
+            .args(["check-attr", "filter", "--", path])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git check-attr failed for {path}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.rsplit(':').next().unwrap_or("").trim().to_string()
     }
 
     #[test]

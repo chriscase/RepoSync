@@ -532,10 +532,6 @@ pub(crate) enum PersonalRevisionCommit {
     Unchanged(String),
 }
 
-fn git_error_is_clean_tree(error: &reposync_core::errors::GitError) -> bool {
-    error.to_string().contains("nothing to commit")
-}
-
 pub(crate) fn commit_personal_revision(
     git: &GitClient,
     lfs_paths: &[String],
@@ -573,15 +569,15 @@ pub(crate) fn commit_personal_revision(
         reposync_core::lfs::install_lfs_hooks(repo)
             .map_err(|error| anyhow::anyhow!("git lfs install --local failed: {error}"))?;
     }
-    let oid = match git.commit_via_cli(
+    let sha = match git.stage_and_commit(
         message,
         author_name,
         author_email,
         committer_name,
         committer_email,
     ) {
-        Ok(oid) => oid,
-        Err(error) if git_error_is_clean_tree(&error) => {
+        Ok(reposync_core::git::client::CliCommitOutcome::Created(oid)) => oid.to_string(),
+        Ok(reposync_core::git::client::CliCommitOutcome::Clean) => {
             let head = git.get_head_sha().map_err(|head_error| {
                 anyhow::anyhow!("LFS tree was unchanged but HEAD could not be read: {head_error}")
             })?;
@@ -589,7 +585,6 @@ pub(crate) fn commit_personal_revision(
         }
         Err(error) => return Err(anyhow::Error::from(error)),
     };
-    let sha = oid.to_string();
     if !lfs_paths.is_empty() {
         reposync_core::lfs::require_committed_lfs_pointers(repo, &sha, lfs_paths)
             .map_err(|error| anyhow::anyhow!(error))?;
@@ -894,5 +889,112 @@ mod tests {
         std::env::remove_var(&key);
         assert!(fired, "path-scoped fixture must fire for that work tree");
         assert!(!other, "path-scoped fixture must not fire for other trees");
+    }
+
+    #[test]
+    fn special_paths_commit_as_exact_lfs_pointers() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        let git = GitClient::init(&dst).unwrap();
+        let large = "Q".repeat(48);
+        let selected = [
+            "my file.bin",
+            "tab\tname.bin",
+            "quote\"name.bin",
+            "back\\slash.bin",
+            "glob*.bin",
+        ];
+        let nearby = [
+            "near file.bin",
+            "tab\tother.bin",
+            "quoteXname.bin",
+            "backXslash.bin",
+            "globX.bin",
+        ];
+        for name in &selected {
+            std::fs::write(src.join(name), &large).unwrap();
+        }
+        for name in &nearby {
+            std::fs::write(src.join(name), "x").unwrap();
+        }
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        let policy = FilePolicy::with_lfs(0, vec![], 16, &[]);
+        let stats = SvnToGitSync::copy_tree_with_policy(&src, &dst, &policy, &db).unwrap();
+        assert_eq!(stats.lfs_paths.len(), selected.len());
+        reposync_core::import::remove_stale_files(&src, &dst).unwrap();
+        let committed = commit_personal_revision(
+            &git,
+            &stats.lfs_paths,
+            "special paths",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+        let PersonalRevisionCommit::Created(sha) = committed else {
+            panic!("special paths must create a pointer commit");
+        };
+        for name in &selected {
+            let blob = git_show_path(&dst, &sha, name);
+            assert!(
+                reposync_core::lfs::is_lfs_pointer(&blob),
+                "{name} must be a pointer, got {}",
+                String::from_utf8_lossy(&blob)
+            );
+            assert_eq!(git_check_attr_filter(&dst, name), "lfs", "{name}");
+        }
+        for name in &nearby {
+            let blob = git_show_path(&dst, &sha, name);
+            assert_eq!(
+                blob,
+                b"x",
+                "{name} must stay an ordinary blob, got {}",
+                String::from_utf8_lossy(&blob)
+            );
+            assert_eq!(git_check_attr_filter(&dst, name), "unspecified", "{name}");
+        }
+    }
+
+    fn git_show_path(repo: &Path, sha: &str, path: &str) -> Vec<u8> {
+        let spec = format!("{sha}:{path}");
+        let output = std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "cat-file", "-p", &spec])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git cat-file {spec} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn git_check_attr_filter(repo: &Path, path: &str) -> String {
+        let output = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "check-attr",
+                "filter",
+                "--",
+                path,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git check-attr failed for {path}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .rsplit(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string()
     }
 }

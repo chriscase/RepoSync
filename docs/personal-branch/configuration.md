@@ -189,8 +189,10 @@ Behavioral options that control how files and changes are synced.
 > Git repository has local LFS filters (`git lfs install --local`).
 >
 > SVN→Git sync and full import copy a qualifying file, record that exact path
-> in `.gitattributes` (for example `/models/large.bin`, with glob characters
-> and spaces escaped), then commit with the Git command-line clean filter.
+> in `.gitattributes` (for example `/models/large.bin`), then commit with the
+> Git command-line clean filter. Glob characters are escaped. A path that
+> contains whitespace or a double quote is written as a double-quoted Git
+> attribute pattern; a backslash before a space does not keep the path together.
 > The rule matches only the selected file. A size threshold does not become
 > an extension glob, and a pattern such as `models/*.bin` does not track a
 > `.bin` file outside `models/`. The recorded commit is a pointer
