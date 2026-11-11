@@ -2877,26 +2877,25 @@ token_env = ""
         command_in(&parent_wc, &["commit", "-m", "unrelated other path"]);
         let hidden = svnlook_youngest(&svn_url).unwrap();
         assert!(hidden > own);
-        let git_boundary = service
-            .run_admitted_local(
-                "local-session",
-                "rs69-receipt-child",
-                call(
-                    "publish",
-                    &digest,
-                    LocalOperation::Update,
-                    false,
-                    Some("git_intent"),
-                ),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            git_boundary.to_string().contains("git_intent"),
-            "{git_boundary}"
-        );
-        assert_eq!(svnlook_youngest(&svn_url).unwrap(), hidden);
-        assert_reservation_blocks(&engine, &service).await;
+        for boundary in ["svn_observed", "git_intent", "git_observed", "checkpoint"] {
+            let stopped = service
+                .run_admitted_local(
+                    "local-session",
+                    "rs69-receipt-child",
+                    call(
+                        "publish",
+                        &digest,
+                        LocalOperation::Update,
+                        false,
+                        Some(boundary),
+                    ),
+                )
+                .await
+                .unwrap_err();
+            assert!(stopped.to_string().contains(boundary), "{stopped}");
+            assert_eq!(svnlook_youngest(&svn_url).unwrap(), hidden);
+            assert_reservation_blocks(&engine, &service).await;
+        }
         let done = service
             .run_admitted_local(
                 "local-session",
@@ -2924,11 +2923,22 @@ token_env = ""
     }
 
     async fn assert_reservation_blocks(engine: &SyncEngine, service: &RefreshService) {
-        let sync = engine
-            .db()
-            .update_repo_watermark("rs69-receipt-child", 1, "abc");
-        let message = sync.unwrap_err().to_string();
-        assert!(message.contains("durable pair refresh"), "{message}");
+        for id in ["rs69-receipt-child", "rs69-receipt-parent"] {
+            let message = match engine.db().begin_ordinary_writer_window(Some(id)) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("ordinary sync was admitted for {id}"),
+            };
+            assert!(
+                message.contains("durable pair refresh"),
+                "{id} ordinary sync: {message}"
+            );
+            let watermark = engine.db().update_repo_watermark(id, 1, "abc");
+            let message = watermark.unwrap_err().to_string();
+            assert!(
+                message.contains("durable pair refresh"),
+                "{id} watermark: {message}"
+            );
+        }
         let competing = service
             .run_admitted_local(
                 "local-session",
