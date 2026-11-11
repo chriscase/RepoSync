@@ -1,16 +1,153 @@
 //! Static UI contract checks for #65 RS-16 disable vs remove vs remote deletion.
 
-use std::path::Path;
-use std::process::Command;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use sha2::{Digest, Sha256};
+
+/// Files the Node contracts execute. Their bytes are the relocated tree's identity.
+const UI_IDENTITY_FILES: &[&str] = &[
+    "web-ui/src/branchPairDeletion.ts",
+    "web-ui/src/managedRemoval.ts",
+];
+
+const SYSTEM_NODE_FALLBACKS: &[&str] = &["/usr/bin/node", "/usr/bin/nodejs"];
+
+fn compiled_repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// sha256 over each identity file as `relative || 0x00 || u64be(len) || bytes`.
+fn ui_source_bind(root: &Path) -> Option<String> {
+    let mut hasher = Sha256::new();
+    for relative in UI_IDENTITY_FILES {
+        let bytes = fs::read(root.join(relative)).ok()?;
+        hasher.update(relative.as_bytes());
+        hasher.update([0u8]);
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+/// Ordinary runs stay on the checkout that compiled this test.
+/// A relocated sealed-image root is admitted only when
+/// `REPOSYNC_UI_SOURCE_ROOT` is set and `REPOSYNC_UI_SOURCE_BIND` equals
+/// [`ui_source_bind`] of that root.
+fn resolve_repo_root(
+    compiled: &Path,
+    opted_root: Option<&str>,
+    bind: Option<&str>,
+) -> Result<PathBuf, String> {
+    let Some(opted) = opted_root.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(compiled.to_path_buf());
+    };
+    let Some(bind) = bind.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err(
+            "relocated UI source requires REPOSYNC_UI_SOURCE_BIND to match its identity".into(),
+        );
+    };
+    let root = PathBuf::from(opted);
+    let actual = ui_source_bind(&root).ok_or_else(|| {
+        format!(
+            "relocated UI source {} is missing a bindable web-ui identity",
+            root.display()
+        )
+    })?;
+    if actual != bind {
+        return Err(format!(
+            "relocated UI source {} identity does not match REPOSYNC_UI_SOURCE_BIND",
+            root.display()
+        ));
+    }
+    Ok(root)
+}
+
+fn repo_root() -> PathBuf {
+    resolve_repo_root(
+        &compiled_repo_root(),
+        std::env::var("REPOSYNC_UI_SOURCE_ROOT").ok().as_deref(),
+        std::env::var("REPOSYNC_UI_SOURCE_BIND").ok().as_deref(),
+    )
+    .unwrap_or_else(|error| panic!("repo root: {error}"))
+}
+
+fn accepts_strip_types(bin: &Path) -> bool {
+    let probe = Command::new(bin)
+        .args(["--experimental-strip-types", "-e", "process.exit(0)"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    match probe {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            let stderr: String = String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(240)
+                .map(|ch| match ch {
+                    '\n' | '\r' => ' ',
+                    other => other,
+                })
+                .collect();
+            eprintln!(
+                "node probe failed path={} status={} stderr={}",
+                bin.display(),
+                output.status,
+                stderr
+            );
+            false
+        }
+        Err(error) => {
+            eprintln!("node probe failed path={} error={error}", bin.display());
+            false
+        }
+    }
+}
+
+/// Explicit override, then a PATH `node` that accepts `--experimental-strip-types`,
+/// then the first supported system binary that does.
+fn select_node_runtime(
+    override_bin: Option<&str>,
+    path_dirs: &[PathBuf],
+    system_fallbacks: &[PathBuf],
+) -> Result<PathBuf, String> {
+    if let Some(bin) = override_bin.map(str::trim).filter(|bin| !bin.is_empty()) {
+        return Ok(PathBuf::from(bin));
+    }
+    for dir in path_dirs {
+        let candidate = dir.join("node");
+        if candidate.is_file() && accepts_strip_types(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    for candidate in system_fallbacks {
+        if candidate.is_file() && accepts_strip_types(candidate) {
+            return Ok(candidate.clone());
+        }
+    }
+    Err("no compatible Node runtime (override, PATH, or system fallback)".into())
+}
 
 fn node_command() -> Command {
-    let bin = std::env::var("REPOSYNC_NODE_BIN").unwrap_or_else(|_| "node".into());
-    Command::new(bin)
+    let override_bin = std::env::var("REPOSYNC_NODE_BIN").ok();
+    let path_dirs: Vec<PathBuf> = std::env::var("PATH")
+        .ok()
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    let fallbacks = SYSTEM_NODE_FALLBACKS
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let selected = select_node_runtime(override_bin.as_deref(), &path_dirs, &fallbacks)
+        .unwrap_or_else(|error| panic!("node runtime: {error}"));
+    Command::new(selected)
 }
 
 #[test]
 fn branch_pair_delete_query_defaults_explicit_safe() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = repo_root();
     let script = r#"
 import { buildBranchPairDeleteQuery } from './web-ui/src/branchPairDeletion.ts';
 const empty = buildBranchPairDeleteQuery();
@@ -162,7 +299,7 @@ fn repo_detail_ui_distinguishes_pause_disable_and_managed_remove() {
 
 #[test]
 fn managed_removal_receipt_display_gate_and_roundtrip() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = repo_root();
     let script = r#"
 const store = new Map();
 globalThis.localStorage = {
@@ -262,4 +399,217 @@ if (readManagedRemovalReceipt('repo-a') !== null) process.exit(6);
         "managed removal receipt behavioral check failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn write_executable(path: &Path, body: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(path, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+}
+
+fn compatible_node_script() -> &'static str {
+    "#!/bin/sh\nif [ \"$1\" = \"--experimental-strip-types\" ]; then exit 0; fi\nexit 1\n"
+}
+
+fn older_node_script() -> &'static str {
+    "#!/bin/sh\nexit 1\n"
+}
+
+fn write_ui_root(root: &Path, behavior: &str) {
+    let source = root.join("web-ui/src");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("branchPairDeletion.ts"),
+        format!("export const rootBehavior = \"{behavior}\";\n"),
+    )
+    .unwrap();
+    fs::write(
+        source.join("managedRemoval.ts"),
+        format!("export const side = \"{behavior}\";\n"),
+    )
+    .unwrap();
+}
+
+fn executed_ui_behavior(root: &Path) -> String {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let path_dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    let fallbacks = SYSTEM_NODE_FALLBACKS
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let node = select_node_runtime(None, &path_dirs, &fallbacks)
+        .expect("host Node is required to prove UI behavior");
+    let script = r#"
+import { rootBehavior } from './web-ui/src/branchPairDeletion.ts';
+import { side } from './web-ui/src/managedRemoval.ts';
+process.stdout.write(`${rootBehavior}:${side}`);
+"#;
+    let output = Command::new(node)
+        .args([
+            "--experimental-strip-types",
+            "--input-type=module",
+            "-e",
+            script,
+        ])
+        .current_dir(root)
+        .output()
+        .expect("execute relocated UI behavior");
+    assert!(
+        output.status.success(),
+        "ui behavior failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn node_runtime_prefers_compatible_path_over_older_system_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_dir = dir.path().join("path");
+    let system = dir.path().join("system");
+    let path_node = path_dir.join("node");
+    let system_nodejs = system.join("nodejs");
+    write_executable(&path_node, compatible_node_script());
+    write_executable(&system_nodejs, older_node_script());
+    eprintln!(
+        "node fixture path_candidate={} system_candidate={}",
+        path_node.display(),
+        system_nodejs.display()
+    );
+
+    let selected = select_node_runtime(
+        None,
+        std::slice::from_ref(&path_dir),
+        std::slice::from_ref(&system_nodejs),
+    )
+    .unwrap();
+    assert_eq!(
+        selected, path_node,
+        "older system Node must not override PATH"
+    );
+}
+
+#[test]
+fn node_runtime_uses_nodejs_only_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_dir = dir.path().join("path");
+    fs::create_dir_all(&path_dir).unwrap();
+    let system_nodejs = dir.path().join("nodejs");
+    write_executable(&system_nodejs, compatible_node_script());
+
+    let selected = select_node_runtime(
+        None,
+        std::slice::from_ref(&path_dir),
+        std::slice::from_ref(&system_nodejs),
+    )
+    .unwrap();
+    assert_eq!(selected, system_nodejs);
+}
+
+#[test]
+fn node_runtime_honors_explicit_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_dir = dir.path().join("path");
+    let override_bin = dir.path().join("override-node");
+    let path_node = path_dir.join("node");
+    let system_nodejs = dir.path().join("nodejs");
+    write_executable(&override_bin, older_node_script());
+    write_executable(&path_node, compatible_node_script());
+    write_executable(&system_nodejs, compatible_node_script());
+
+    let selected = select_node_runtime(
+        Some(override_bin.to_str().unwrap()),
+        &[path_dir],
+        &[system_nodejs],
+    )
+    .unwrap();
+    assert_eq!(selected, override_bin);
+}
+
+#[test]
+fn node_runtime_rejects_when_no_runtime_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_dir = dir.path().join("path");
+    fs::create_dir_all(&path_dir).unwrap();
+    let missing_node = dir.path().join("missing-node");
+    let missing_nodejs = dir.path().join("missing-nodejs");
+
+    let error = select_node_runtime(None, &[path_dir], &[missing_node, missing_nodejs])
+        .expect_err("absent runtimes must not fall through to a bare node name");
+    assert!(
+        error.contains("no compatible Node runtime"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn ui_source_bind_matches_the_runtime_canonicalization() {
+    let dir = tempfile::tempdir().unwrap();
+    write_ui_root(dir.path(), "a");
+    assert_eq!(
+        ui_source_bind(dir.path()).as_deref(),
+        Some("e2b7b767784ff9d3339e030731e4777ea4ddaf5d7f519329b42bf214eb742e71")
+    );
+}
+
+#[test]
+fn relocated_ui_source_requires_an_explicit_identity_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let compiled = dir.path().join("compiled-checkout");
+    let other = dir.path().join("unrelated-src");
+    let fixture = dir.path().join("sealed-image");
+    write_ui_root(&compiled, "compiled-checkout");
+    write_ui_root(&other, "unrelated-src");
+    write_ui_root(&fixture, "sealed-image");
+    assert_ne!(
+        ui_source_bind(&compiled),
+        ui_source_bind(&other),
+        "distinct UI behavior must not share an identity"
+    );
+    assert_ne!(ui_source_bind(&compiled), ui_source_bind(&fixture));
+
+    let ordinary = resolve_repo_root(&compiled, None, None).unwrap();
+    assert_eq!(ordinary, compiled);
+    assert_eq!(
+        executed_ui_behavior(&ordinary),
+        "compiled-checkout:compiled-checkout"
+    );
+    assert_eq!(
+        executed_ui_behavior(&other),
+        "unrelated-src:unrelated-src",
+        "the decoy tree must actually behave differently"
+    );
+
+    let unbound = resolve_repo_root(&compiled, Some(other.to_str().unwrap()), None);
+    assert!(
+        unbound.is_err(),
+        "a present web-ui directory is not an opt-in"
+    );
+    let mismatched = resolve_repo_root(
+        &compiled,
+        Some(other.to_str().unwrap()),
+        ui_source_bind(&compiled).as_deref(),
+    );
+    assert!(
+        mismatched.is_err(),
+        "a binding for the compiled tree must not select the other tree"
+    );
+
+    let fixture_bind = ui_source_bind(&fixture).unwrap();
+    let admitted = resolve_repo_root(
+        &compiled,
+        Some(fixture.to_str().unwrap()),
+        Some(&fixture_bind),
+    )
+    .unwrap();
+    assert_eq!(admitted, fixture);
+    assert_eq!(executed_ui_behavior(&admitted), "sealed-image:sealed-image");
 }

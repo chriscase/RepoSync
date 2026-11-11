@@ -104,8 +104,8 @@ not treat it as complete.
 - Do not run `svn merge`, `svn copy`, `svn delete` or `svn commit` against the
   paired branch to "line it up".
 - Do not use the setup wizard's "Reset & Reimport" to "fix" a held repository.
-  It deletes RepoSync's local Git clone and force-pushes a fresh import to the
-  configured branch.
+  It deletes RepoSync's local Git clone and first force-pushes a new empty
+  reset commit to the configured branch; it then prepares and starts the reimport.
 - Do not try to "clean up" a held pair with the legacy `DELETE /api/repos/{id}/branch-pair`.
   Its handler *interprets* an omitted `delete_git` or `delete_svn` as `true` when
   `explicit_remote_deletion_opts=true` is not given, and the reply's `remote_deletion`
@@ -177,7 +177,7 @@ hand; it is not something a developer can or should engineer around.
 [commit-routes]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L2702-L2800
 [route-table]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L308-L383
 [delete-flags]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L3952-L3969
-[reset-reimport]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/setup.rs#L1376-L1385
+[reset-reimport]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/setup.rs#L1468-L1572
 [rs64b]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/docs/reliability/RS64-B-reconciliation.md
 [c66]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/docs/reliability/contracts/66-history-containment.md
 [reasons]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/history_inspect.rs#L1-L30

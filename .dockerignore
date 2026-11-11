@@ -1,5 +1,7 @@
 *
+!config.example.toml
 !Cargo.toml
+!Cargo.lock
 !crates/
 !crates/**
 !web-ui/
