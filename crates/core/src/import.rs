@@ -215,6 +215,17 @@ pub fn copy_tree_with_policy(
         visited: &mut visited,
     };
     copy_tree_policy_inner(src, dst, &mut ctx)?;
+    let selected: Vec<String> = stats
+        .lfs_paths
+        .iter()
+        .map(|path| crate::lfs::exact_lfs_pattern(path))
+        .collect();
+    crate::lfs::replace_engine_lfs_patterns(dst, &selected).with_context(|| {
+        format!(
+            "failed to record the current LFS selection in {}",
+            dst.display()
+        )
+    })?;
     if stats.lfs_tracked > 0 {
         refresh_export_present_engine_lfs(dst, src)?;
     }
@@ -460,7 +471,7 @@ fn copy_tree_policy_inner(src: &Path, dst: &Path, ctx: &mut CopyTreePolicyCtx<'_
             }
             FilePolicyDecision::LfsTrack { size, threshold } => {
                 copy_regular_file_no_follow(&src_path, ctx.dst_root, &dst_path, &meta)?;
-                let pattern = crate::lfs::pattern_for_path(&rel);
+                let pattern = crate::lfs::exact_lfs_pattern(&rel);
                 crate::lfs::ensure_lfs_tracked(ctx.dst_root, &pattern).with_context(|| {
                     format!("failed to record LFS tracking for {rel} ({pattern})")
                 })?;
@@ -1704,7 +1715,7 @@ pub fn independent_export_projection(
     // Check each independently derived required rule. Merely trusting a
     // marker written by the copier would conceal a missing tracking rule.
     for path in &lfs_paths {
-        let rule = crate::lfs::lfs_tracking_line(&crate::lfs::pattern_for_path(path));
+        let rule = crate::lfs::lfs_tracking_line(&crate::lfs::exact_lfs_pattern(path));
         if !engine
             .as_deref()
             .is_some_and(|body| body.lines().any(|line| line == rule))
@@ -5255,7 +5266,7 @@ mod tests {
 
         remove_stale_files(src.path(), dst.path()).unwrap();
         let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
-        assert_eq!(after, "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+        assert_eq!(after, "/model.bin filter=lfs diff=lfs merge=lfs -text\n");
         assert!(
             !after.contains("evil"),
             "planted filter rules must not remain: {after}"
@@ -5333,7 +5344,7 @@ mod tests {
         let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
         assert_eq!(
             after,
-            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+            "* text=auto\n/model.bin filter=lfs diff=lfs merge=lfs -text\n"
         );
         assert!(
             !after.contains("evil"),
@@ -5564,7 +5575,7 @@ mod tests {
         let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
         assert_eq!(
             after,
-            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+            "* text=auto\n/model.bin filter=lfs diff=lfs merge=lfs -text\n"
         );
         assert!(
             !after.lines().any(|line| line.trim() == "* filter=lfs"),

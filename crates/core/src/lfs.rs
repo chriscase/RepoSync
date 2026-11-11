@@ -384,11 +384,10 @@ pub fn ensure_lfs_tracked(repo_root: &Path, pattern: &str) -> std::io::Result<bo
     // Read existing content through an O_NOFOLLOW fd so a swapped-in symlink is not followed.
     let existing = read_gitattributes_existing_nofollow(repo_root)?;
 
-    // Check if already tracked.
+    // Check if already tracked. The pattern must end at the attribute
+    // separator so `/model.bin` does not count as `/model.binary`.
     for line in existing.lines() {
-        let trimmed = line.trim();
-        // Match on the pattern part before the attributes.
-        if trimmed.starts_with(pattern) && trimmed.contains("filter=lfs") {
+        if attributes_line_tracks_pattern(line, pattern) {
             debug!(pattern, "LFS pattern already tracked in .gitattributes");
             return Ok(false);
         }
@@ -514,12 +513,95 @@ fn read_gitattributes_existing_nofollow(repo_root: &Path) -> std::io::Result<Str
 ///
 /// For example, `assets/model.bin` produces `*.bin` (extension-based).
 /// If the file has no extension, the exact path is used.
+///
+/// Personal Mode does not use this for new tracking. The clean filter would
+/// then convert every file of that extension. Use [`exact_lfs_pattern`].
 pub fn pattern_for_path(rel_path: &str) -> String {
     if let Some(ext) = Path::new(rel_path).extension() {
         format!("*.{}", ext.to_string_lossy())
     } else {
         rel_path.to_string()
     }
+}
+
+/// Anchor one repository path so the LFS clean filter matches only that file.
+///
+/// The leading slash keeps a root file from matching the same name in a
+/// subdirectory. Glob metacharacters and whitespace are escaped so the path
+/// stays one pattern rather than an attribute separator or a broader glob.
+pub fn exact_lfs_pattern(rel_path: &str) -> String {
+    let mut pattern = String::from("/");
+    for ch in rel_path.chars() {
+        if matches!(ch, ' ' | '\t' | '\\' | '*' | '?' | '[' | ']' | '#' | '!') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern
+}
+
+fn attributes_line_tracks_pattern(line: &str, pattern: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(rest) = trimmed.strip_prefix(pattern) else {
+        return false;
+    };
+    rest.starts_with(|ch: char| ch.is_whitespace()) && trimmed.contains("filter=lfs")
+}
+
+/// Replace the engine LFS marker with exactly the patterns selected by this copy.
+///
+/// Passing an empty list removes the marker. Stale-remove then drops engine
+/// rules that no longer qualify, including after a file shrinks under the
+/// threshold or LFS is disabled.
+pub(crate) fn replace_engine_lfs_patterns(
+    repo_root: &Path,
+    patterns: &[String],
+) -> std::io::Result<()> {
+    for pattern in patterns {
+        if !is_single_line_pattern(pattern) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to record a .gitattributes LFS pattern that is empty or contains a newline",
+            ));
+        }
+    }
+    let Some(git_dir) = git_metadata_dir(repo_root) else {
+        return Ok(());
+    };
+    let path = git_dir.join(ENGINE_LFS_PATTERN_MARKER);
+    if patterns.is_empty() {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
+                std::fs::remove_file(&path)?;
+            }
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "engine LFS pattern marker is not a file",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        return Ok(());
+    }
+    let mut seen = Vec::new();
+    let mut body = String::new();
+    for pattern in patterns {
+        if seen.iter().any(|existing| existing == pattern) {
+            continue;
+        }
+        seen.push(pattern.clone());
+        body.push_str(pattern);
+        body.push('\n');
+    }
+    if std::fs::symlink_metadata(&path)
+        .map(|meta| !meta.file_type().is_file())
+        .unwrap_or(false)
+    {
+        std::fs::remove_file(&path)?;
+    }
+    std::fs::write(path, body)
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +899,39 @@ mod tests {
     fn test_pattern_for_path_without_extension() {
         assert_eq!(pattern_for_path("Makefile"), "Makefile");
         assert_eq!(pattern_for_path("scripts/build"), "scripts/build");
+    }
+
+    #[test]
+    fn test_exact_lfs_pattern_does_not_broaden_by_extension() {
+        assert_eq!(exact_lfs_pattern("large.bin"), "/large.bin");
+        assert_eq!(exact_lfs_pattern("models/large.bin"), "/models/large.bin");
+        assert_eq!(exact_lfs_pattern("my file.bin"), "/my\\ file.bin");
+        assert_eq!(exact_lfs_pattern("weird*[!].bin"), "/weird\\*\\[\\!\\].bin");
+        assert_ne!(
+            exact_lfs_pattern("large.bin"),
+            pattern_for_path("large.bin")
+        );
+    }
+
+    #[test]
+    fn test_replace_engine_lfs_patterns_drops_previous_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", dir.path().to_str().unwrap()])
+            .status()
+            .unwrap();
+        ensure_lfs_tracked(dir.path(), "*.bin").unwrap();
+        replace_engine_lfs_patterns(dir.path(), &["/large.bin".to_string()]).unwrap();
+        let marker =
+            std::fs::read_to_string(dir.path().join(".git").join(ENGINE_LFS_PATTERN_MARKER))
+                .unwrap();
+        assert_eq!(marker, "/large.bin\n");
+        replace_engine_lfs_patterns(dir.path(), &[]).unwrap();
+        assert!(!dir
+            .path()
+            .join(".git")
+            .join(ENGINE_LFS_PATTERN_MARKER)
+            .exists());
     }
 
     #[test]

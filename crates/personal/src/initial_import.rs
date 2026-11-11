@@ -21,6 +21,35 @@ use reposync_core::svn::SvnClient;
 use crate::commit_format::CommitFormatter;
 use crate::svn_to_git::SvnToGitSync;
 
+enum AcceptedImportCommit {
+    /// A new Git commit was stored.
+    New(String),
+    /// Qualifying files were already pointer commits and this revision did not
+    /// change the tree. The string is the existing HEAD.
+    Unchanged(String),
+    /// A non-LFS revision produced no commit. Real LFS failures are not skipped.
+    Skipped,
+}
+
+fn accept_import_commit(
+    result: Result<crate::svn_to_git::PersonalRevisionCommit>,
+    qualifying_paths: usize,
+) -> Result<AcceptedImportCommit> {
+    match result {
+        Ok(crate::svn_to_git::PersonalRevisionCommit::Created(sha)) => {
+            Ok(AcceptedImportCommit::New(sha))
+        }
+        Ok(crate::svn_to_git::PersonalRevisionCommit::Unchanged(sha)) => {
+            Ok(AcceptedImportCommit::Unchanged(sha))
+        }
+        Err(error) if qualifying_paths == 0 => {
+            debug!(error = %error, "commit failed (possibly empty revision)");
+            Ok(AcceptedImportCommit::Skipped)
+        }
+        Err(error) => Err(error).context("qualifying files were not stored as pointer commits"),
+    }
+}
+
 /// Import mode selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportMode {
@@ -473,7 +502,7 @@ impl<'a> InitialImport<'a> {
             };
 
             let git_client = self.git_client.lock().unwrap();
-            match crate::svn_to_git::commit_personal_revision(
+            let committed = crate::svn_to_git::commit_personal_revision(
                 &git_client,
                 &copy_stats.lfs_paths,
                 &message,
@@ -481,10 +510,12 @@ impl<'a> InitialImport<'a> {
                 &author_email,
                 &self.config.developer.name,
                 &self.config.developer.email,
-            ) {
-                Ok(sha) => {
+            );
+            match accept_import_commit(committed, copy_stats.lfs_paths.len())
+                .with_context(|| format!("LFS import commit failed for r{rev}"))?
+            {
+                AcceptedImportCommit::New(sha) => {
                     debug!(rev, sha = %sha, author = %author_name, "committed revision");
-
                     self.db
                         .record_personal_import_revision(
                             rev,
@@ -498,18 +529,26 @@ impl<'a> InitialImport<'a> {
                                 rev
                             )
                         })?;
-
                     count += 1;
                 }
-                Err(e) => {
-                    if !copy_stats.lfs_paths.is_empty() {
-                        anyhow::bail!(
-                            "LFS import commit failed for r{rev}: {e}. Qualifying files were not stored as pointer commits."
-                        );
-                    }
-                    // Empty commits (no file changes) are expected for property-only revisions
-                    debug!(rev, error = %e, "commit failed (possibly empty revision)");
+                AcceptedImportCommit::Unchanged(sha) => {
+                    debug!(
+                        rev,
+                        sha = %sha,
+                        "SVN revision did not change the Git tree"
+                    );
+                    self.db
+                        .record_personal_import_revision(
+                            rev,
+                            &sha,
+                            &entry.author,
+                            &format!("{} <{}>", author_name, author_email),
+                        )
+                        .with_context(|| {
+                            format!("failed to record unchanged personal import revision r{rev}")
+                        })?;
                 }
+                AcceptedImportCommit::Skipped => {}
             }
             drop(git_client);
         }
@@ -575,5 +614,31 @@ impl<'a> InitialImport<'a> {
             "full import completed"
         );
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{accept_import_commit, AcceptedImportCommit};
+    use crate::svn_to_git::PersonalRevisionCommit;
+
+    #[test]
+    fn unchanged_lfs_import_is_recorded_and_real_failures_stay_closed() {
+        let unchanged =
+            accept_import_commit(Ok(PersonalRevisionCommit::Unchanged("abc".into())), 1).unwrap();
+        assert!(matches!(unchanged, AcceptedImportCommit::Unchanged(sha) if sha == "abc"));
+
+        let created =
+            accept_import_commit(Ok(PersonalRevisionCommit::Created("def".into())), 1).unwrap();
+        assert!(matches!(created, AcceptedImportCommit::New(sha) if sha == "def"));
+
+        let fatal = accept_import_commit(
+            Err(anyhow::anyhow!("git lfs smudge failed for model.bin")),
+            1,
+        );
+        assert!(fatal.is_err(), "filter and object errors stay closed");
+
+        let empty = accept_import_commit(Err(anyhow::anyhow!("nothing to commit")), 0).unwrap();
+        assert!(matches!(empty, AcceptedImportCommit::Skipped));
     }
 }

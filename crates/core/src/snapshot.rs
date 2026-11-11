@@ -537,7 +537,7 @@ mod tests {
 
         let good = tempfile::tempdir().unwrap();
         git2::Repository::init(good.path()).unwrap();
-        crate::lfs::ensure_lfs_tracked(good.path(), &crate::lfs::pattern_for_path("large.bin"))
+        crate::lfs::ensure_lfs_tracked(good.path(), &crate::lfs::exact_lfs_pattern("large.bin"))
             .unwrap();
         let attributes = std::fs::read(good.path().join(".gitattributes")).unwrap();
         let sha = commit_files(
@@ -566,7 +566,7 @@ mod tests {
         let wrong = pointer.replace("size 19", "size 18");
         let bad = tempfile::tempdir().unwrap();
         git2::Repository::init(bad.path()).unwrap();
-        crate::lfs::ensure_lfs_tracked(bad.path(), &crate::lfs::pattern_for_path("large.bin"))
+        crate::lfs::ensure_lfs_tracked(bad.path(), &crate::lfs::exact_lfs_pattern("large.bin"))
             .unwrap();
         let bad_sha = commit_files(
             bad.path(),

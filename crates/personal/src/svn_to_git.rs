@@ -290,7 +290,23 @@ impl SvnToGitSync {
                 .with_context(|| format!("failed to create Git commit for SVN r{}", rev))?
             };
 
-            let sha_str = git_sha;
+            let sha_str = match git_sha {
+                PersonalRevisionCommit::Unchanged(head) => {
+                    self.db
+                        .record_personal_import_revision(rev, &head, &entry.author, &git_author)
+                        .with_context(|| {
+                            format!("failed to record unchanged personal SVN revision r{rev}")
+                        })?;
+                    self.advance_watermark(rev)?;
+                    debug!(
+                        rev,
+                        sha = %head,
+                        "SVN revision did not change the Git tree"
+                    );
+                    continue;
+                }
+                PersonalRevisionCommit::Created(sha) => sha,
+            };
             info!(rev, sha = %sha_str, "committed SVN revision as Git commit");
 
             let (intended_parent, intended_tree) = {
@@ -508,6 +524,18 @@ impl SvnToGitSync {
     }
 }
 
+pub(crate) enum PersonalRevisionCommit {
+    /// A new commit was created.
+    Created(String),
+    /// The staged tree matches HEAD. The string is that existing commit.
+    /// This is a clean no-content-change, not a filter or object failure.
+    Unchanged(String),
+}
+
+fn git_error_is_clean_tree(error: &reposync_core::errors::GitError) -> bool {
+    error.to_string().contains("nothing to commit")
+}
+
 pub(crate) fn commit_personal_revision(
     git: &GitClient,
     lfs_paths: &[String],
@@ -516,8 +544,14 @@ pub(crate) fn commit_personal_revision(
     author_email: &str,
     committer_name: &str,
     committer_email: &str,
-) -> Result<String> {
-    if lfs_paths.is_empty() {
+) -> Result<PersonalRevisionCommit> {
+    let repo = git.repo_path();
+    // A repository that already has LFS filters must stage through the CLI even
+    // when this revision selects nothing. That is how a shrink or a disable
+    // removes the exact rule and stores an ordinary blob. libgit2 does not
+    // record deletions or run clean filters.
+    let filters_ready = reposync_core::lfs::repo_lfs_ready(repo).is_ok();
+    if lfs_paths.is_empty() && !filters_ready {
         return git
             .commit(
                 message,
@@ -526,31 +560,41 @@ pub(crate) fn commit_personal_revision(
                 committer_name,
                 committer_email,
             )
-            .map(|oid| oid.to_string())
+            .map(|oid| PersonalRevisionCommit::Created(oid.to_string()))
             .map_err(Into::into);
     }
-    let repo = git.repo_path();
-    reposync_core::lfs::preflight_check().map_err(|error| {
-        anyhow::anyhow!(
-            "Git LFS is required for {count} file(s) but is not available: {error}",
-            count = lfs_paths.len()
-        )
-    })?;
-    reposync_core::lfs::install_lfs_hooks(repo)
-        .map_err(|error| anyhow::anyhow!("git lfs install --local failed: {error}"))?;
-    let oid = git
-        .commit_via_cli(
-            message,
-            author_name,
-            author_email,
-            committer_name,
-            committer_email,
-        )
-        .map_err(anyhow::Error::from)?;
+    if !lfs_paths.is_empty() {
+        reposync_core::lfs::preflight_check().map_err(|error| {
+            anyhow::anyhow!(
+                "Git LFS is required for {count} file(s) but is not available: {error}",
+                count = lfs_paths.len()
+            )
+        })?;
+        reposync_core::lfs::install_lfs_hooks(repo)
+            .map_err(|error| anyhow::anyhow!("git lfs install --local failed: {error}"))?;
+    }
+    let oid = match git.commit_via_cli(
+        message,
+        author_name,
+        author_email,
+        committer_name,
+        committer_email,
+    ) {
+        Ok(oid) => oid,
+        Err(error) if git_error_is_clean_tree(&error) => {
+            let head = git.get_head_sha().map_err(|head_error| {
+                anyhow::anyhow!("LFS tree was unchanged but HEAD could not be read: {head_error}")
+            })?;
+            return Ok(PersonalRevisionCommit::Unchanged(head));
+        }
+        Err(error) => return Err(anyhow::Error::from(error)),
+    };
     let sha = oid.to_string();
-    reposync_core::lfs::require_committed_lfs_pointers(repo, &sha, lfs_paths)
-        .map_err(|error| anyhow::anyhow!(error))?;
-    Ok(sha)
+    if !lfs_paths.is_empty() {
+        reposync_core::lfs::require_committed_lfs_pointers(repo, &sha, lfs_paths)
+            .map_err(|error| anyhow::anyhow!(error))?;
+    }
+    Ok(PersonalRevisionCommit::Created(sha))
 }
 
 fn blocking_svn_commit_hold(op: &SvnCommitOperation) -> Option<String> {

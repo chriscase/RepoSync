@@ -188,12 +188,24 @@ Behavioral options that control how files and changes are synced.
 > `reposync personal doctor` reports the tool version and whether the personal
 > Git repository has local LFS filters (`git lfs install --local`).
 >
-> SVN→Git sync and full import copy a qualifying file, record its pattern in
-> `.gitattributes`, then commit with the Git command-line clean filter. The
-> recorded commit is a pointer (`version https://git-lfs.github.com/spec/v1`)
-> and the bytes are stored under `.git/lfs/objects`. A file under the threshold
-> that matches no pattern stays an ordinary blob. Each copy writes `lfs_tracked`
-> and `lfs_skipped` audit rows.
+> SVN→Git sync and full import copy a qualifying file, record that exact path
+> in `.gitattributes` (for example `/models/large.bin`, with glob characters
+> and spaces escaped), then commit with the Git command-line clean filter.
+> The rule matches only the selected file. A size threshold does not become
+> an extension glob, and a pattern such as `models/*.bin` does not track a
+> `.bin` file outside `models/`. The recorded commit is a pointer
+> (`version https://git-lfs.github.com/spec/v1`) and the bytes are stored
+> under `.git/lfs/objects`. A file under the threshold that matches no pattern
+> stays an ordinary blob. Each copy writes `lfs_tracked` and `lfs_skipped`
+> audit rows.
+>
+> When a tracked file later shrinks below the threshold, or LFS is disabled,
+> that exact rule is removed and the next content commit stores an ordinary
+> blob. An SVN revision that does not change file bytes, such as a
+> property-only revision, is recorded against the existing Git commit. It
+> does not fail the import or the sync. A missing `git-lfs` tool, a clean
+> filter failure, or a qualifying path that was committed as a regular blob
+> still stops the run.
 >
 > Git→SVN replay reads the pointer and writes the real bytes to SVN when the
 > local object exists. If the object is missing, replay stops before the SVN
