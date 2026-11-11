@@ -1,8 +1,9 @@
-//! #69 coordinated pair-refresh preview (no execute, no re-anchor).
+//! #69 coordinated pair refresh.
 //!
 //! The default operation is **update pair from parent**: pin both sides and
-//! report unsynced work without discarding it. Re-anchor and execution are
-//! refused. Published Git commits and SVN revisions are not rewritten.
+//! report unsynced work without discarding it. Preview does not publish.
+//! Re-anchor and execution run through RefreshService on local file
+//! repositories. Published Git commits and SVN revisions are not rewritten.
 
 use std::path::Path;
 use std::process::Output;
@@ -21,6 +22,7 @@ pub mod git_sources;
 mod http_transport;
 pub mod lineage;
 pub mod live_preparation;
+pub mod local_operations;
 pub mod native_owner;
 pub mod noop;
 pub mod preparation;
@@ -67,19 +69,19 @@ pub fn execution_requested(execute: bool, dry_run: Option<bool>) -> bool {
 
 pub fn reanchor_refusal() -> (&'static str, &'static str) {
     (
-        "reanchor_not_implemented",
-        "recreate/re-anchor is a separate explicit mode and is NOT IMPLEMENTED. It is not an alias for update-from-parent, reset, force-push, or removal of the old SVN path.",
+        "reanchor_requires_local_approval",
+        "re-anchor runs through RefreshService on a local file repository. It keeps the old generation and does not delete the old SVN path or force-push.",
     )
 }
 
 pub fn execute_refusal(digest: Option<&str>) -> (String, String) {
     let detail = match digest {
         Some(digest) => format!(
-            "update-pair-from-parent execution is a later slice and was not started. No durable job was created and no external Git or SVN write was performed. plan_digest={digest}"
+            "update-pair-from-parent execution runs through RefreshService. plan_digest={digest} is a preview pin, not an approval."
         ),
-        None => "update-pair-from-parent execution is a later slice and was not started. No durable job was created and no external Git or SVN write was performed.".into(),
+        None => "update-pair-from-parent execution runs through RefreshService.".into(),
     };
-    ("refresh_execute_not_implemented".into(), detail)
+    ("refresh_execute_requires_service".into(), detail)
 }
 
 pub fn format_refusal(reason: &str, detail: &str) -> String {
@@ -603,6 +605,22 @@ pub fn build_preview(obs: &RefreshObservations) -> RefreshPlan {
     {
         conflicts.push("unpinned_svn".into());
     }
+    let pair_svn_behind = svn_head_behind_mapping(
+        obs.pair_baseline.as_ref(),
+        obs.pair_svn_revision,
+        obs.pair_svn_missing,
+    );
+    let parent_svn_behind = svn_head_behind_mapping(
+        obs.parent_baseline.as_ref(),
+        obs.parent_svn_revision,
+        obs.parent_svn_missing,
+    );
+    if pair_svn_behind {
+        conflicts.push("pair_svn_behind_mapping".into());
+    }
+    if parent_svn_behind {
+        conflicts.push("parent_svn_behind_mapping".into());
+    }
     if let (Some(parent_uuid), Some(pair_uuid)) = (&obs.svn_uuid, &obs.pair_svn_uuid) {
         if parent_uuid != pair_uuid {
             conflicts.push("uuid_mismatch".into());
@@ -655,6 +673,8 @@ pub fn build_preview(obs: &RefreshObservations) -> RefreshPlan {
         && obs.parent_pending_git.complete
         && pair_svn.knowable
         && parent_svn.knowable
+        && !pair_svn_behind
+        && !parent_svn_behind
         && !obs.pair_local_diverged
         && !obs.parent_local_diverged
         && obs.pair_local_ahead_complete
@@ -664,6 +684,7 @@ pub fn build_preview(obs: &RefreshObservations) -> RefreshPlan {
         parent_unsynced,
         &obs.pair_pending_git,
         &obs.parent_pending_git,
+        pair_svn_behind || parent_svn_behind,
     );
     let identity = PlanIdentity {
         operation: OPERATION_UPDATE,
@@ -718,7 +739,7 @@ pub fn build_preview(obs: &RefreshObservations) -> RefreshPlan {
         plan_digest,
         approval: Approval {
             eligible: false,
-            reason: "execution_not_implemented".into(),
+            reason: "preview_is_not_an_approval".into(),
             binds_to: "plan_digest".into(),
         },
         git: GitPins {
@@ -754,8 +775,8 @@ pub fn build_preview(obs: &RefreshObservations) -> RefreshPlan {
         conflicts,
         unknowns,
         intended_result: intended,
-        reanchor_status: "NOT_IMPLEMENTED".into(),
-        execute_status: "NOT_IMPLEMENTED".into(),
+        reanchor_status: "refresh_service".into(),
+        execute_status: "refresh_service".into(),
         inspection: Inspection {
             namespace: "refs/reposync/pair-refresh/".into(),
             external_git_writes: false,
@@ -773,11 +794,26 @@ fn side_unsynced(git: &ClassifiedPending, svn: &PendingSvn, local: &PendingLocal
         || local.diverged
 }
 
+fn svn_head_behind_mapping(
+    baseline: Option<&BaselinePin>,
+    head: Option<i64>,
+    missing: bool,
+) -> bool {
+    if missing {
+        return false;
+    }
+    matches!(
+        (baseline.map(|pin| pin.svn_revision), head),
+        (Some(mapped), Some(head)) if head < mapped
+    )
+}
+
 fn intended_result(
     pair_unsynced: bool,
     parent_unsynced: bool,
     pair_git: &ClassifiedPending,
     parent_git: &ClassifiedPending,
+    svn_behind_mapping: bool,
 ) -> IntendedResult {
     let summary = if pair_git.rewritten || parent_git.rewritten {
         "Read-only preview of update pair from parent. Published lineage does not match a verified mapping. Rewritten commits are not counted as new work and are not discarded. This slice does not execute the refresh.".into()
@@ -787,6 +823,8 @@ fn intended_result(
         "Read-only preview of update pair from parent. The pair has unsynced work. It is preserved and is not discarded. This slice does not execute the refresh.".into()
     } else if parent_unsynced {
         "Read-only preview of update pair from parent. The parent has changes the pair does not contain. A later update would integrate them as new history without rewriting published revisions. This slice does not execute the refresh.".into()
+    } else if svn_behind_mapping {
+        "Read-only preview of update pair from parent. An SVN head is behind its verified mapping. Published revisions are not rewritten to catch up, and unsynced work is not discarded. This slice does not execute the refresh.".into()
     } else {
         "Read-only preview of update pair from parent. Pinned inputs show no unsynced work on either side. A later execution with these inputs would be a no-op. This slice does not execute the refresh.".into()
     };
@@ -1153,7 +1191,7 @@ mod tests {
         assert_eq!(plan.plan_digest.len(), 64);
         assert!(!plan.approval.eligible);
         assert!(!plan.executed);
-        assert_eq!(plan.reanchor_status, "NOT_IMPLEMENTED");
+        assert_eq!(plan.reanchor_status, "refresh_service");
         let mut moved = sample();
         moved.parent_git_tip = Some(sha(3));
         assert_ne!(build_preview(&moved).plan_digest, plan.plan_digest);
@@ -1221,6 +1259,46 @@ mod tests {
     }
 
     #[test]
+    fn svn_head_behind_mapping_is_not_a_noop() {
+        let mut obs = sample();
+        obs.pair_baseline = Some(baseline(&sha(1), 8, Some(true)));
+        obs.pair_svn_revision = Some(5);
+        let plan = build_preview(&obs);
+        assert!(plan
+            .conflicts
+            .iter()
+            .any(|c| c == "pair_svn_behind_mapping"));
+        assert!(!plan
+            .conflicts
+            .iter()
+            .any(|c| c == "parent_svn_behind_mapping"));
+        assert_eq!(plan.pending.pair_svn.count, 0);
+        assert!(plan.pending.pair_svn.knowable);
+        assert!(plan.pending.pair_svn.note.contains("not rewritten"));
+        assert!(!plan.pins_complete);
+        assert!(!plan.intended_result.summary.contains("no-op"));
+        assert!(plan.intended_result.summary.contains("not rewritten"));
+        assert!(plan.intended_result.summary.contains("not discarded"));
+        assert!(!plan.intended_result.discards_unsynced_work);
+        assert!(plan.intended_result.preserves_published_svn_revisions);
+        assert!(!plan.intended_result.rewrites_svn_revisions);
+        assert!(!plan.executed);
+        assert!(!plan.approval.eligible);
+        assert_ne!(plan.plan_digest, build_preview(&sample()).plan_digest);
+
+        let mut parent = sample();
+        parent.parent_baseline = Some(baseline(&sha(1), 9, Some(true)));
+        parent.parent_svn_revision = Some(4);
+        let parent_plan = build_preview(&parent);
+        assert!(parent_plan
+            .conflicts
+            .iter()
+            .any(|c| c == "parent_svn_behind_mapping"));
+        assert!(!parent_plan.intended_result.summary.contains("no-op"));
+        assert!(!parent_plan.pins_complete);
+    }
+
+    #[test]
     fn unchanged_inputs_describe_a_noop_without_execution() {
         let plan = build_preview(&sample());
         assert!(plan.intended_result.summary.contains("no-op"));
@@ -1232,16 +1310,15 @@ mod tests {
     }
 
     #[test]
-    fn reanchor_and_execute_refusals_are_explicit() {
+    fn reanchor_and_execute_use_the_service() {
         let (reason, detail) = reanchor_refusal();
         let message = format_refusal(reason, detail);
-        assert!(message.starts_with("reanchor_not_implemented:"));
-        assert!(message.contains("NOT IMPLEMENTED"));
+        assert!(message.starts_with("reanchor_requires_local_approval:"));
+        assert!(message.contains("RefreshService"));
         let (reason, detail) = execute_refusal(Some("abc"));
         let message = format_refusal(&reason, &detail);
-        assert!(message.starts_with("refresh_execute_not_implemented:"));
+        assert!(message.starts_with("refresh_execute_requires_service:"));
         assert!(message.contains("plan_digest=abc"));
-        assert!(message.contains("No durable job"));
         assert_eq!(parse_operation("recreate"), Ok(RefreshOperation::Reanchor));
         assert_eq!(
             parse_operation("update_pair_from_parent"),

@@ -396,6 +396,9 @@ impl WebServer {
         };
         let serve_spa = serve_static.fallback(spa_fallback);
 
+        let refresh = reposync_core::pair_refresh::service::RefreshService::new(
+            self.state.sync_engine.clone(),
+        );
         let app = Router::new()
             // API routes
             .merge(api::status::routes())
@@ -409,7 +412,8 @@ impl WebServer {
             .merge(api::setup::routes())
             .merge(api::users::routes())
             .merge(api::repos::routes())
-            .merge(api::pair_refresh::routes(self.state.sync_engine.clone()))
+            .merge(api::pair_refresh::routes_with(refresh.clone()))
+            .layer(axum::extract::Extension(refresh))
             // WebSocket
             .merge(ws::routes())
             // React SPA (fallback for everything else)

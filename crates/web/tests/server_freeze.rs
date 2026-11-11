@@ -1715,6 +1715,7 @@ async fn import_fixture() -> (
         GitClient::new(&dummy_git).unwrap(),
         Arc::new(IdentityMapper::new(&IdentityConfig::default()).unwrap()),
     ));
+    let refresh = reposync_core::pair_refresh::service::RefreshService::new(engine.clone());
     let (sync_tx, _) = tokio::sync::mpsc::channel(1);
     let (ws_tx, _) = tokio::sync::broadcast::channel(32);
     let state = Arc::new(AppState {
@@ -1738,6 +1739,7 @@ async fn import_fixture() -> (
     );
     let app = Router::new()
         .merge(api::repos::routes())
+        .layer(axum::extract::Extension(refresh))
         .with_state(state.clone());
     let (addr, server) = spawn_isolated_test_server(app);
     let client = authed_client();
@@ -7311,8 +7313,8 @@ async fn candidate_r13_preview_pins_inputs() {
     assert_eq!(plan["plan_id"], digest);
     assert_eq!(plan["approval"]["eligible"], false);
     assert_eq!(plan["approval"]["binds_to"], "plan_digest");
-    assert_eq!(plan["reanchor_status"], "NOT_IMPLEMENTED");
-    assert_eq!(plan["execute_status"], "NOT_IMPLEMENTED");
+    assert_eq!(plan["reanchor_status"], "refresh_service");
+    assert_eq!(plan["execute_status"], "refresh_service");
     assert_eq!(plan["intended_result"]["discards_unsynced_work"], false);
     assert_eq!(plan["inspection"]["external_git_writes"], false);
     assert_eq!(plan["inspection"]["external_svn_writes"], false);
@@ -7516,11 +7518,10 @@ async fn candidate_r13_execute_refused() {
         assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{payload}");
         let error = payload["error"].as_str().unwrap_or("");
         assert!(
-            error.contains("refresh_execute_not_implemented"),
+            error.contains("administrator session") || error.contains("database admin"),
             "{payload}"
         );
-        assert!(error.contains("No durable job"), "{payload}");
-        assert!(error.contains("plan_digest="), "{payload}");
+        assert!(!error.contains("not_implemented"), "{payload}");
     }
     assert_eq!(
         refresh_unchanged(&state, &parent_id, &pair_id, &bare, &svn_repo),
@@ -7538,7 +7539,7 @@ async fn candidate_r13_execute_refused() {
     server.abort();
 }
 
-/// R13: re-anchor/recreate is an explicit NOT IMPLEMENTED refusal.
+/// R13: re-anchor preview is read-only, and execution without a digest does not approve the current plan.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r13_reanchor_not_implemented() {
     let (addr, state, server, tmp, parent_id, pair_id, bare) = refresh_pair_fixture().await;
@@ -7556,8 +7557,35 @@ async fn candidate_r13_reanchor_not_implemented() {
         let payload: serde_json::Value = response.json().await.unwrap();
         assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{payload}");
         let error = payload["error"].as_str().unwrap_or("");
-        assert!(error.contains("reanchor_not_implemented"), "{payload}");
-        assert!(error.contains("NOT IMPLEMENTED"), "{payload}");
+        assert!(error.contains("explicit approval digest"), "{payload}");
+        assert!(!error.contains("not_implemented"), "{payload}");
+        for body in [
+            serde_json::json!({"operation": operation}),
+            serde_json::json!({"operation": operation, "dry_run": true}),
+            serde_json::json!({"operation": operation, "execute": true, "dry_run": true}),
+        ] {
+            let response = client
+                .post(format!("http://{addr}/api/repos/{pair_id}/refresh"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let payload: serde_json::Value = response.json().await.unwrap();
+            assert!(
+                status == reqwest::StatusCode::OK || status == reqwest::StatusCode::BAD_REQUEST,
+                "{payload}"
+            );
+            if status == reqwest::StatusCode::OK {
+                assert_eq!(payload["executed"], false, "{payload}");
+                assert!(payload.get("svn_revision").is_none(), "{payload}");
+            }
+            assert_eq!(
+                refresh_unchanged(&state, &parent_id, &pair_id, &bare, &svn_repo),
+                before,
+                "{payload}"
+            );
+        }
     }
     assert_eq!(
         refresh_unchanged(&state, &parent_id, &pair_id, &bare, &svn_repo),

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
@@ -37,9 +37,8 @@ use reposync_core::late_pair_publish::{
     LatePairPublishRefusal, PublishCredentials,
 };
 use reposync_core::pair_refresh::{
-    analyze_git_preview, branch_svn_url, build_preview, execute_refusal, execution_requested,
-    format_refusal, parse_operation, reanchor_refusal, svn_path_missing, GitLayout,
-    RefreshObservations, RefreshOperation,
+    analyze_git_preview, branch_svn_url, build_preview, execution_requested, parse_operation,
+    svn_path_missing, GitLayout, RefreshObservations, RefreshOperation,
 };
 use reposync_core::skip_commit::{build_skip_context, reason as skip_reason, SkipCommitRequest};
 use reposync_core::svn::SvnClient;
@@ -3716,10 +3715,14 @@ struct RefreshPreviewRequest {
     /// `false` is an execute attempt and is refused. Omitted means preview.
     #[serde(default)]
     dry_run: Option<bool>,
+    /// Re-anchor execution requires this digest. Preview never approves the current plan.
+    #[serde(default)]
+    approval_digest: String,
 }
 
 async fn preview_pair_refresh(
     State(state): State<Arc<AppState>>,
+    extension: Option<Extension<Arc<reposync_core::pair_refresh::service::RefreshService>>>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<RefreshPreviewRequest>,
@@ -3735,13 +3738,50 @@ async fn preview_pair_refresh(
 
     let operation = parse_operation(&body.operation).map_err(|other| {
         AppError::BadRequest(format!(
-            "unknown_refresh_operation: '{other}' is not a refresh mode. Supported preview is update_pair_from_parent. reanchor is NOT IMPLEMENTED."
+            "unknown_refresh_operation: '{other}' is not a refresh mode. Supported operations are update_pair_from_parent and reanchor."
         ))
     })?;
-    if operation == RefreshOperation::Reanchor {
-        let (reason, detail) = reanchor_refusal();
-        info!(pair_id = %id, "pair refresh re-anchor refused; not implemented");
-        return Err(AppError::BadRequest(format_refusal(reason, detail)));
+    let publish = body.dry_run != Some(true) && execution_requested(body.execute, body.dry_run);
+    if publish {
+        if operation == RefreshOperation::Reanchor && body.approval_digest.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "reanchor requires an explicit approval digest".into(),
+            ));
+        }
+        let Some(Extension(service)) = extension else {
+            return Err(AppError::BadRequest(
+                "refresh service is not attached".into(),
+            ));
+        };
+        let bearer = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or("");
+        let local_operation = if operation == RefreshOperation::Reanchor {
+            reposync_core::pair_refresh::local_operations::LocalOperation::Reanchor
+        } else {
+            reposync_core::pair_refresh::local_operations::LocalOperation::Update
+        };
+        let receipt = service
+            .run_admitted_local(
+                bearer,
+                &id,
+                reposync_core::pair_refresh::local_operations::LocalRequest {
+                    request_id: format!("v1:{id}:{}", body.operation),
+                    approval_digest: body.approval_digest.clone(),
+                    operation: local_operation,
+                    same_name: false,
+                    retire: false,
+                    approve_current: operation != RefreshOperation::Reanchor,
+                    stop_after: None,
+                },
+            )
+            .await
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        return Ok(Json(
+            serde_json::to_value(receipt).map_err(|error| AppError::Internal(error.to_string()))?,
+        ));
     }
 
     let db = &state.db;
@@ -3860,10 +3900,6 @@ async fn preview_pair_refresh(
         pins_complete = plan.pins_complete,
         "pair refresh preview; no durable job and no external write"
     );
-    if execution_requested(body.execute, body.dry_run) {
-        let (reason, detail) = execute_refusal(Some(&plan.plan_digest));
-        return Err(AppError::BadRequest(format_refusal(&reason, &detail)));
-    }
     Ok(Json(serde_json::to_value(&plan).map_err(|e| {
         AppError::Internal(format!("serialization error: {e}"))
     })?))

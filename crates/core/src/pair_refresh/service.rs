@@ -556,6 +556,18 @@ impl RefreshService {
         result.await.context("refresh preparation worker stopped")?
     }
 
+    pub async fn run_admitted_local(
+        &self,
+        bearer: &str,
+        child: &str,
+        request: super::local_operations::LocalRequest,
+    ) -> Result<super::local_operations::LocalReceipt> {
+        self.engine
+            .capture_pair_refresh_actor_policy(bearer)
+            .map_err(|error| anyhow::anyhow!("current administrator session required: {error}"))?;
+        super::recovery::resume_local_refresh(&self.engine, child, request).await
+    }
+
     pub async fn act(
         &self,
         bearer: String,

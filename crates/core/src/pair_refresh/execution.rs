@@ -1878,3 +1878,7 @@ mod lifecycle_tests {
         );
     }
 }
+
+pub use super::local_operations::{
+    current_digest, run_local, LocalOperation, LocalReceipt, LocalRequest,
+};
