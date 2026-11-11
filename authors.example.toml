@@ -1,0 +1,7 @@
+# Copy to /etc/reposync/authors.toml and edit. Synthetic example only.
+
+[authors]
+sync-service = { name = "RepoSync", email = "sync@example.com", github = "reposync" }
+
+[defaults]
+email_domain = "example.com"

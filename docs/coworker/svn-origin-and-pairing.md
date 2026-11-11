@@ -16,7 +16,8 @@ is a refusal before anything is copied, written or checkpointed.
 protocols) requires:
 
 - a **verified mapping** exists for the parent (an applied Git-SHA ↔ SVN-revision pairing recorded by RepoSync for that repository), otherwise `missing_baseline`;
-- your branch tip can be resolved, and **descends from** one of those mapped commits (an actual Git ancestor, checked with the equivalent of `git merge-base --is-ancestor`), otherwise `unrelated_git_first` or `missing_git_objects`;
+- your branch tip can be resolved, and **descends from** one of those mapped commits. With Git objects available this is checked by ancestry, the equivalent of `git merge-base --is-ancestor`. Otherwise the refusal is `unrelated_git_first` or `missing_git_objects`;
+- when no local workdir is available, shared admission also allows a trusted provider tip exactly equal to a verified mapping SHA. It reports zero pending Git work and records that no object walk was possible. A different provider SHA cannot prove descent without objects;
 - no unsafe "start from now" (`skip_import`) request.
 
 **Reviewed (v2) preparation** is stronger. Before it produces a preview, it
