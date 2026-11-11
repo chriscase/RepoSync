@@ -312,7 +312,7 @@ fn drive(
     let git_sha = journal.new_git.clone().context("git receipt")?;
     let svn_rev = journal.new_svn.context("svn receipt")?;
     let parent_mark = (journal.operation == LocalOperation::Update)
-        .then(|| (observed.parent_svn, observed.parent_tip.clone()));
+        .then(|| (journal.parent_svn, journal.parent_tip.clone()));
     journal.phase = "checkpoint".into();
     save(engine, &key, &journal)?;
     if stop_after == Some("checkpoint") {
@@ -767,11 +767,21 @@ fn write_journal(
                         "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
                         params![rev, sha, child_id],
                     )?;
+                    tx.execute(
+                        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                        params![format!("last_svn_rev_{child_id}"), rev.to_string(), now],
+                    )?;
                 }
                 if let Some((rev, sha)) = &parent_mark {
                     tx.execute(
                         "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
                         params![rev, sha, parent_id],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                        params![format!("last_svn_rev_{parent_id}"), rev.to_string(), now],
                     )?;
                 }
             } else {
@@ -1059,20 +1069,72 @@ enum NodeKind {
 struct Node {
     kind: NodeKind,
     bytes: Vec<u8>,
-    props: BTreeMap<String, String>,
+    props: BTreeMap<String, Vec<u8>>,
 }
 
 fn list_nodes(dir: &Path, url: &str, revision: i64) -> Result<BTreeMap<String, Node>> {
     let mut out = BTreeMap::new();
     let revision = revision.to_string();
-    walk_nodes(dir, dir, Some((url, revision.as_str())), &mut out)?;
+    let source = Some((url, revision.as_str()));
+    record_node(dir, "", source, &mut out)?;
+    walk_nodes(dir, dir, source, &mut out)?;
     Ok(out)
 }
 
 fn list_working_copy(dir: &Path) -> Result<BTreeMap<String, Node>> {
     let mut out = BTreeMap::new();
+    record_node(dir, "", None, &mut out)?;
     walk_nodes(dir, dir, None, &mut out)?;
     Ok(out)
+}
+
+fn record_node(
+    root: &Path,
+    rel: &str,
+    source: Option<(&str, &str)>,
+    out: &mut BTreeMap<String, Node>,
+) -> Result<()> {
+    let full = if rel.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel)
+    };
+    let target = if let Some((url, _)) = source {
+        if rel.is_empty() {
+            url.to_string()
+        } else {
+            join_svn(url, rel)
+        }
+    } else {
+        full.to_str().context("working copy path")?.to_string()
+    };
+    let revision = source.map(|(_, revision)| revision);
+    let mut props = svn_props(&target, revision)?;
+    props.remove("svn:mergeinfo");
+    let meta = std::fs::symlink_metadata(&full)?;
+    if meta.file_type().is_symlink() {
+        bail!("refresh refuses a symlink in the published tree");
+    }
+    if meta.is_dir() {
+        out.insert(
+            rel.to_string(),
+            Node {
+                kind: NodeKind::Dir,
+                bytes: Vec::new(),
+                props,
+            },
+        );
+    } else {
+        out.insert(
+            rel.to_string(),
+            Node {
+                kind: NodeKind::File,
+                bytes: std::fs::read(&full)?,
+                props,
+            },
+        );
+    }
+    Ok(())
 }
 
 fn walk_nodes(
@@ -1096,33 +1158,9 @@ fn walk_nodes(
             .context("published path escaped the export")?
             .to_string_lossy()
             .replace('\\', "/");
-        let target = if let Some((url, _)) = source {
-            join_svn(url, &rel)
-        } else {
-            full.to_str().context("working copy path")?.to_string()
-        };
-        let revision = source.map(|(_, revision)| revision);
-        let mut props = svn_props(&target, revision)?;
-        props.remove("svn:mergeinfo");
+        record_node(root, &rel, source, out)?;
         if meta.is_dir() {
-            out.insert(
-                rel,
-                Node {
-                    kind: NodeKind::Dir,
-                    bytes: Vec::new(),
-                    props,
-                },
-            );
             walk_nodes(root, &full, source, out)?;
-        } else {
-            out.insert(
-                rel,
-                Node {
-                    kind: NodeKind::File,
-                    bytes: std::fs::read(&full)?,
-                    props,
-                },
-            );
         }
     }
     Ok(())
@@ -1191,7 +1229,7 @@ fn merge_props(
     parent: Option<&Node>,
     pair: Option<&Node>,
     path: &str,
-) -> Result<BTreeMap<String, String>> {
+) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut names = std::collections::BTreeSet::new();
     for node in [base, parent, pair].into_iter().flatten() {
         names.extend(node.props.keys().cloned());
@@ -1231,13 +1269,16 @@ fn apply_tree(wc: &Path, tree: &BTreeMap<String, Node>) -> Result<()> {
     }
     doomed.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
     for path in doomed {
-        if wc.join(&path).exists() {
+        if !path.is_empty() && wc.join(&path).exists() {
             svn_in(&["delete", "--force", &path], Some(wc))?;
         }
     }
     let mut create: Vec<_> = tree.iter().collect();
     create.sort_by_key(|(path, _)| path.matches('/').count());
     for (path, node) in create {
+        if path.is_empty() {
+            continue;
+        }
         let target = wc.join(path);
         match node.kind {
             NodeKind::Dir => std::fs::create_dir_all(&target)?,
@@ -1256,14 +1297,22 @@ fn apply_tree(wc: &Path, tree: &BTreeMap<String, Node>) -> Result<()> {
     Ok(())
 }
 
-fn sync_props(wc: &Path, rel: &str, wanted: &BTreeMap<String, String>) -> Result<()> {
-    let target = wc.join(rel);
-    let target = target.to_str().context("property path")?;
+fn sync_props(wc: &Path, rel: &str, wanted: &BTreeMap<String, Vec<u8>>) -> Result<()> {
+    let target_path = if rel.is_empty() {
+        wc.to_path_buf()
+    } else {
+        wc.join(rel)
+    };
+    let target = target_path.to_str().context("property path")?;
     let mut current = svn_props(target, None)?;
     current.remove("svn:mergeinfo");
     for (name, value) in wanted {
         if current.get(name) != Some(value) {
-            svn(&["propset", name, value, target])?;
+            let payload = wc.with_file_name(format!("prop-{}", hash(&[rel, name])));
+            std::fs::write(&payload, value)?;
+            let payload = payload.to_str().context("property payload")?;
+            svn(&["propset", name, "-F", payload, target])?;
+            let _ = std::fs::remove_file(payload);
         }
     }
     for name in current.keys() {
@@ -1280,12 +1329,19 @@ fn record_mergeinfo(wc: &Path, parent_path: &str, mapped: i64, parent_rev: i64) 
     }
     let current = svn_in(&["propget", "svn:mergeinfo", "."], Some(wc)).unwrap_or_default();
     let path = format!("/{}", parent_path.trim_matches('/'));
-    let merged = union_mergeinfo(&current, &path, mapped + 1, parent_rev);
+    let merged = union_mergeinfo(&current, &path, mapped + 1, parent_rev)?;
     svn_in(&["propset", "svn:mergeinfo", &merged, "."], Some(wc))?;
     Ok(())
 }
 
-fn union_mergeinfo(existing: &str, path: &str, start: i64, end: i64) -> String {
+#[derive(Clone, Copy)]
+struct MergeRange {
+    start: i64,
+    end: i64,
+    non_inheritable: bool,
+}
+
+fn union_mergeinfo(existing: &str, path: &str, start: i64, end: i64) -> Result<String> {
     let mut lines = Vec::new();
     let mut found = false;
     for line in existing.lines().filter(|line| !line.trim().is_empty()) {
@@ -1298,78 +1354,136 @@ fn union_mergeinfo(existing: &str, path: &str, start: i64, end: i64) -> String {
             continue;
         }
         found = true;
-        let mut ranges = parse_ranges(spec);
-        ranges.push((start, end));
+        let mut ranges = parse_ranges(spec)?;
+        let blocked = ranges
+            .iter()
+            .filter(|range| range.non_inheritable)
+            .map(|range| (range.start, range.end))
+            .collect::<Vec<_>>();
+        for (piece_start, piece_end) in subtract_ranges(start, end, &blocked) {
+            ranges.push(MergeRange {
+                start: piece_start,
+                end: piece_end,
+                non_inheritable: false,
+            });
+        }
         lines.push(format!("{path}:{}", format_ranges(&coalesce(ranges))));
     }
     if !found {
         lines.push(format!(
             "{path}:{}",
-            format_ranges(&coalesce(vec![(start, end)]))
+            format_ranges(&coalesce(vec![MergeRange {
+                start,
+                end,
+                non_inheritable: false,
+            }]))
         ));
     }
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
-fn parse_ranges(spec: &str) -> Vec<(i64, i64)> {
-    spec.split(',')
-        .filter_map(|token| {
-            let token = token.trim();
-            if token.is_empty() {
-                return None;
-            }
-            if let Some((start, end)) = token.split_once('-') {
-                Some((start.parse().ok()?, end.parse().ok()?))
-            } else {
-                let rev = token.parse().ok()?;
-                Some((rev, rev))
-            }
-        })
-        .collect()
+fn parse_ranges(spec: &str) -> Result<Vec<MergeRange>> {
+    let mut ranges = Vec::new();
+    for token in spec.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let (body, non_inheritable) = match token.strip_suffix('*') {
+            Some(body) => (body, true),
+            None => (token, false),
+        };
+        let (start, end) = if let Some((start, end)) = body.split_once('-') {
+            (
+                start
+                    .parse::<i64>()
+                    .context("unsupported mergeinfo range")?,
+                end.parse::<i64>().context("unsupported mergeinfo range")?,
+            )
+        } else {
+            let revision = body.parse::<i64>().context("unsupported mergeinfo range")?;
+            (revision, revision)
+        };
+        if start <= 0 || end < start {
+            bail!("unsupported mergeinfo range");
+        }
+        ranges.push(MergeRange {
+            start,
+            end,
+            non_inheritable,
+        });
+    }
+    Ok(ranges)
 }
 
-fn coalesce(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+fn subtract_ranges(start: i64, end: i64, blocked: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut pieces = vec![(start, end)];
+    for &(block_start, block_end) in blocked {
+        let mut next = Vec::new();
+        for (piece_start, piece_end) in pieces {
+            if piece_end < block_start || piece_start > block_end {
+                next.push((piece_start, piece_end));
+                continue;
+            }
+            if piece_start < block_start {
+                next.push((piece_start, block_start - 1));
+            }
+            if piece_end > block_end {
+                next.push((block_end + 1, piece_end));
+            }
+        }
+        pieces = next;
+    }
+    pieces
+}
+
+fn coalesce(mut ranges: Vec<MergeRange>) -> Vec<MergeRange> {
     if ranges.is_empty() {
         return ranges;
     }
-    ranges.sort();
+    ranges.sort_by_key(|range| (range.start, range.end, range.non_inheritable));
     let mut out = vec![ranges[0]];
-    for (start, end) in ranges.into_iter().skip(1) {
+    for range in ranges.into_iter().skip(1) {
         let last = out.last_mut().expect("range");
-        if start <= last.1 + 1 {
-            last.1 = last.1.max(end);
+        if last.non_inheritable == range.non_inheritable && range.start <= last.end + 1 {
+            last.end = last.end.max(range.end);
         } else {
-            out.push((start, end));
+            out.push(range);
         }
     }
     out
 }
 
-fn format_ranges(ranges: &[(i64, i64)]) -> String {
+fn format_ranges(ranges: &[MergeRange]) -> String {
     ranges
         .iter()
-        .map(|(start, end)| {
-            if start == end {
-                start.to_string()
+        .map(|range| {
+            let body = if range.start == range.end {
+                range.start.to_string()
             } else {
-                format!("{start}-{end}")
+                format!("{}-{}", range.start, range.end)
+            };
+            if range.non_inheritable {
+                format!("{body}*")
+            } else {
+                body
             }
         })
         .collect::<Vec<_>>()
         .join(",")
 }
 
-fn svn_props(target: &str, revision: Option<&str>) -> Result<BTreeMap<String, String>> {
+fn svn_props(target: &str, revision: Option<&str>) -> Result<BTreeMap<String, Vec<u8>>> {
     let xml = if let Some(revision) = revision {
         let pegged = format!("{target}@{revision}");
         svn(&["proplist", "-v", "--xml", "-r", revision, &pegged])?
     } else {
         svn(&["proplist", "-v", "--xml", target])?
     };
-    Ok(parse_svn_proplist(&xml))
+    parse_svn_proplist(&xml)
 }
 
-fn parse_svn_proplist(xml: &str) -> BTreeMap<String, String> {
+fn parse_svn_proplist(xml: &str) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut out = BTreeMap::new();
     let mut rest = xml;
     while let Some(start) = rest.find("<property") {
@@ -1388,11 +1502,19 @@ fn parse_svn_proplist(xml: &str) -> BTreeMap<String, String> {
         let Some(close) = rest.find("</property>") else {
             break;
         };
-        let value = xml_unescape(&rest[body_at + 1..close]).trim().to_string();
+        let header = &rest[..body_at];
+        let raw = &rest[body_at + 1..close];
+        let value = if header.contains("encoding=\"base64\"") {
+            let encoded: String = raw.chars().filter(|ch| !ch.is_whitespace()).collect();
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+                .context("svn property encoding was not preserved")?
+        } else {
+            xml_unescape(raw).into_bytes()
+        };
         out.insert(name, value);
         rest = &rest[close + "</property>".len()..];
     }
-    out
+    Ok(out)
 }
 
 fn xml_unescape(value: &str) -> String {
@@ -2720,7 +2842,7 @@ token_env = ""
         assert_eq!(fetched, admitted);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_refresh_reconciles_its_own_commit_and_keeps_the_reservation() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -2766,6 +2888,7 @@ token_env = ""
         let feature_base = svn_revision(&format!("{svn_url}/branches/feature")).unwrap();
         std::fs::write(parent_wc.join("readme.txt"), "parent\n").unwrap();
         command_in(&parent_wc, &["commit", "-m", "parent advance"]);
+        let admitted_parent = svnlook_youngest(&svn_url).unwrap();
         let parent_git = root.join("repos/rs69-receipt-parent/git-repo");
         let pair_git = root.join("repos/rs69-receipt-child/git-repo");
         std::fs::create_dir_all(&parent_git).unwrap();
@@ -2812,7 +2935,7 @@ token_env = ""
             .get_repository("rs69-receipt-parent")
             .unwrap()
             .unwrap();
-        parent.last_git_sha = parent_tip;
+        parent.last_git_sha = parent_tip.clone();
         engine.db().update_repository(&parent).unwrap();
         let service = RefreshService::new(engine.clone());
         let digest = current_digest(
@@ -2895,6 +3018,14 @@ token_env = ""
             assert!(stopped.to_string().contains(boundary), "{stopped}");
             assert_eq!(svnlook_youngest(&svn_url).unwrap(), hidden);
             assert_reservation_blocks(&engine, &service).await;
+            if boundary == "git_observed" || boundary == "checkpoint" {
+                let paused = engine
+                    .db()
+                    .get_repository("rs69-receipt-parent")
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(paused.last_svn_rev, hidden);
+            }
         }
         let done = service
             .run_admitted_local(
@@ -2907,6 +3038,34 @@ token_env = ""
         assert!(!done.noop);
         assert_eq!(svnlook_youngest(&svn_url).unwrap(), hidden);
         assert_eq!(done.svn_revision, Some(own));
+        let parent_row = engine
+            .db()
+            .get_repository("rs69-receipt-parent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent_row.last_svn_rev, admitted_parent);
+        assert_eq!(parent_row.last_git_sha, parent_tip);
+        assert_ne!(parent_row.last_svn_rev, hidden);
+        let absent = Command::new("git")
+            .args([
+                "-C",
+                parent_git.to_str().unwrap(),
+                "cat-file",
+                "-e",
+                "HEAD:other.txt",
+            ])
+            .status()
+            .unwrap();
+        assert!(!absent.success());
+        import_parent_svn(&root, &svn_url, &parent_git).await;
+        let imported = run(&mut Command::new("git").args([
+            "-C",
+            parent_git.to_str().unwrap(),
+            "show",
+            "HEAD:other.txt",
+        ]))
+        .unwrap();
+        assert_eq!(imported, "later");
         crate::db::pair_refresh_operations::require_no_pair_refresh_hold(
             &engine.db().conn(),
             Some("rs69-receipt-child"),
@@ -2920,6 +3079,81 @@ token_env = ""
         ]))
         .unwrap();
         assert_eq!(integrated, "parent");
+    }
+
+    async fn import_parent_svn(root: &Path, svn_url: &str, parent_git: &Path) {
+        let mut config: AppConfig = toml::from_str(
+            r#"
+[daemon]
+data_dir = "/unused"
+[svn]
+url = "file:///unused"
+username = ""
+password_env = ""
+[github]
+repo = "fixture/repo"
+token_env = ""
+[identity]
+email_domain = "localhost"
+"#,
+        )
+        .unwrap();
+        config.daemon.data_dir = root.to_path_buf();
+        config.svn.url = format!("{svn_url}/trunk");
+        let origin = parent_git.with_file_name("parent-origin.git");
+        command(
+            "git",
+            &["init", "--bare", "-b", "main", origin.to_str().unwrap()],
+        );
+        command(
+            "git",
+            &[
+                "-C",
+                parent_git.to_str().unwrap(),
+                "remote",
+                "add",
+                "origin",
+                origin.to_str().unwrap(),
+            ],
+        );
+        command(
+            "git",
+            &[
+                "-C",
+                parent_git.to_str().unwrap(),
+                "push",
+                "origin",
+                "HEAD:refs/heads/main",
+            ],
+        );
+        let db = Database::new(root.join("reposync.db")).unwrap();
+        let uuid = run(&mut Command::new("svn").args([
+            "info",
+            "--show-item",
+            "repos-uuid",
+            svn_url,
+            "--non-interactive",
+        ]))
+        .unwrap();
+        crate::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            &db,
+            "rs69-receipt-parent",
+            &uuid,
+        )
+        .unwrap();
+        let identity = Arc::new(IdentityMapper::new(&config.identity).unwrap());
+        let mut engine = SyncEngine::new(
+            config,
+            db,
+            SvnClient::new(&format!("{svn_url}/trunk"), "", ""),
+            GitClient::new(parent_git).unwrap(),
+            identity,
+        );
+        engine.set_repo_id("rs69-receipt-parent".into());
+        engine
+            .run_sync_cycle()
+            .await
+            .expect("ordinary sync imports the later parent commit");
     }
 
     async fn assert_reservation_blocks(engine: &SyncEngine, service: &RefreshService) {
@@ -3088,9 +3322,21 @@ token_env = ""
             &feature_wc,
             &["propset", "custom:note", "keep", "readme.txt"],
         );
+        let root_note = root.join("root-note");
+        std::fs::write(&root_note, b"keep-root").unwrap();
         command_in(
             &feature_wc,
-            &["propset", "svn:mergeinfo", "/trunk:2-3", "."],
+            &[
+                "propset",
+                "custom:root",
+                "-F",
+                root_note.to_str().unwrap(),
+                ".",
+            ],
+        );
+        command_in(
+            &feature_wc,
+            &["propset", "svn:mergeinfo", "/trunk:2-4*,6", "."],
         );
         command_in(&feature_wc, &["commit", "-m", "child retained"]);
         command_in(&parent_wc, &["update"]);
@@ -3098,6 +3344,36 @@ token_env = ""
         command_in(
             &parent_wc,
             &["propset", "svn:executable", "*", "readme.txt"],
+        );
+        let padded = root.join("padded-value");
+        std::fs::write(&padded, b"  spaced \n").unwrap();
+        command_in(
+            &parent_wc,
+            &[
+                "propset",
+                "custom:pad",
+                "-F",
+                padded.to_str().unwrap(),
+                "readme.txt",
+            ],
+        );
+        let binary = root.join("binary-value");
+        std::fs::write(&binary, [0_u8, 32, 255, 10]).unwrap();
+        command_in(
+            &parent_wc,
+            &[
+                "propset",
+                "custom:bin",
+                "-F",
+                binary.to_str().unwrap(),
+                "readme.txt",
+            ],
+        );
+        let ignore = root.join("ignore-value");
+        std::fs::write(&ignore, b"generated\n").unwrap();
+        command_in(
+            &parent_wc,
+            &["propset", "svn:ignore", "-F", ignore.to_str().unwrap(), "."],
         );
         std::fs::create_dir(parent_wc.join("emptydir")).unwrap();
         command_in(&parent_wc, &["add", "emptydir"]);
@@ -3181,7 +3457,33 @@ token_env = ""
             "{mergeinfo}"
         );
         assert!(mergeinfo.contains("trunk:"), "{mergeinfo}");
-        assert_ne!(mergeinfo.trim(), format!("/trunk:{published}"));
+        assert!(mergeinfo.contains("2-4*"), "{mergeinfo}");
+        let branch = svn_props(
+            &format!("{svn_url}/branches/feature"),
+            Some(&published.to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            branch.get("svn:ignore").map(Vec::as_slice),
+            Some(b"generated\n".as_slice())
+        );
+        assert_eq!(
+            branch.get("custom:root").map(Vec::as_slice),
+            Some(b"keep-root".as_slice())
+        );
+        let readme = svn_props(
+            &format!("{svn_url}/branches/feature/readme.txt"),
+            Some(&published.to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            readme.get("custom:pad").map(Vec::as_slice),
+            Some(b"  spaced \n".as_slice())
+        );
+        assert_eq!(
+            readme.get("custom:bin").map(Vec::as_slice),
+            Some([0_u8, 32, 255, 10].as_slice())
+        );
     }
 
     fn command_in(dir: &Path, args: &[&str]) {
