@@ -215,6 +215,17 @@ pub fn copy_tree_with_policy(
         visited: &mut visited,
     };
     copy_tree_policy_inner(src, dst, &mut ctx)?;
+    let selected: Vec<String> = stats
+        .lfs_paths
+        .iter()
+        .map(|path| crate::lfs::exact_lfs_pattern(path))
+        .collect();
+    crate::lfs::replace_engine_lfs_patterns(dst, &selected).with_context(|| {
+        format!(
+            "failed to record the current LFS selection in {}",
+            dst.display()
+        )
+    })?;
     if stats.lfs_tracked > 0 {
         refresh_export_present_engine_lfs(dst, src)?;
     }
@@ -294,6 +305,37 @@ fn record_copy_exclusions(db: &Database, stats: &CopyStats) {
             true,
         );
     }
+    if !stats.lfs_paths.is_empty() {
+        let _ = db.insert_audit_log(
+            "lfs_tracked",
+            Some("svn_to_git"),
+            None,
+            None,
+            None,
+            Some(&format!(
+                "Tracked {} file(s) with Git LFS: {}",
+                stats.lfs_paths.len(),
+                stats.lfs_paths.join(", ")
+            )),
+            true,
+        );
+    }
+    if !stats.lfs_skipped_paths.is_empty() {
+        let shown = stats.lfs_skipped_paths.len().min(20);
+        let _ = db.insert_audit_log(
+            "lfs_skipped",
+            Some("svn_to_git"),
+            None,
+            None,
+            None,
+            Some(&format!(
+                "Left {} file(s) as ordinary blobs; they are under the LFS threshold and match no LFS pattern: {}",
+                stats.lfs_skipped_paths.len(),
+                stats.lfs_skipped_paths[..shown].join(", ")
+            )),
+            true,
+        );
+    }
     if stats.reserved_excluded > 0 {
         let reserved: Vec<&str> = stats
             .exclusions
@@ -323,6 +365,10 @@ pub struct CopyStats {
     pub copied: usize,
     pub skipped: usize,
     pub lfs_tracked: usize,
+    /// Paths stored through Git LFS on this copy.
+    pub lfs_paths: Vec<String>,
+    /// Paths copied as ordinary blobs while LFS is enabled.
+    pub lfs_skipped_paths: Vec<String>,
     /// Deliberate reserved-VCS exclusions (not file-policy skips).
     pub reserved_excluded: usize,
     /// Every deliberate exclusion, e.g. `reserved:.svn` or `policy:ignored:tmp.log`.
@@ -419,28 +465,26 @@ fn copy_tree_policy_inner(src: &Path, dst: &Path, ctx: &mut CopyTreePolicyCtx<'_
             FilePolicyDecision::Allow => {
                 copy_regular_file_no_follow(&src_path, ctx.dst_root, &dst_path, &meta)?;
                 ctx.stats.copied += 1;
+                if ctx.policy.lfs_enabled() {
+                    ctx.stats.lfs_skipped_paths.push(rel.clone());
+                }
             }
             FilePolicyDecision::LfsTrack { size, threshold } => {
                 copy_regular_file_no_follow(&src_path, ctx.dst_root, &dst_path, &meta)?;
-                let pattern = crate::lfs::pattern_for_path(&rel);
-                if let Err(e) = crate::lfs::ensure_lfs_tracked(ctx.dst_root, &pattern) {
-                    warn!(
-                        path = rel.as_str(),
-                        pattern = pattern.as_str(),
-                        error = %e,
-                        "failed to update .gitattributes for LFS tracking"
-                    );
-                } else {
-                    info!(
-                        path = rel.as_str(),
-                        size,
-                        threshold,
-                        pattern = pattern.as_str(),
-                        "LFS: file copied and .gitattributes updated"
-                    );
-                }
+                let pattern = crate::lfs::exact_lfs_pattern(&rel);
+                crate::lfs::ensure_lfs_tracked(ctx.dst_root, &pattern).with_context(|| {
+                    format!("failed to record LFS tracking for {rel} ({pattern})")
+                })?;
+                info!(
+                    path = rel.as_str(),
+                    size,
+                    threshold,
+                    pattern = pattern.as_str(),
+                    "LFS: file copied and .gitattributes updated"
+                );
                 ctx.stats.copied += 1;
                 ctx.stats.lfs_tracked += 1;
+                ctx.stats.lfs_paths.push(rel.clone());
             }
             FilePolicyDecision::Ignored { pattern } => {
                 warn!(
@@ -1671,7 +1715,7 @@ pub fn independent_export_projection(
     // Check each independently derived required rule. Merely trusting a
     // marker written by the copier would conceal a missing tracking rule.
     for path in &lfs_paths {
-        let rule = crate::lfs::lfs_tracking_line(&crate::lfs::pattern_for_path(path));
+        let rule = crate::lfs::lfs_tracking_line(&crate::lfs::exact_lfs_pattern(path));
         if !engine
             .as_deref()
             .is_some_and(|body| body.lines().any(|line| line == rule))
@@ -5222,7 +5266,7 @@ mod tests {
 
         remove_stale_files(src.path(), dst.path()).unwrap();
         let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
-        assert_eq!(after, "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+        assert_eq!(after, "/model.bin filter=lfs diff=lfs merge=lfs -text\n");
         assert!(
             !after.contains("evil"),
             "planted filter rules must not remain: {after}"
@@ -5300,7 +5344,7 @@ mod tests {
         let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
         assert_eq!(
             after,
-            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+            "* text=auto\n/model.bin filter=lfs diff=lfs merge=lfs -text\n"
         );
         assert!(
             !after.contains("evil"),
@@ -5531,7 +5575,7 @@ mod tests {
         let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
         assert_eq!(
             after,
-            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+            "* text=auto\n/model.bin filter=lfs diff=lfs merge=lfs -text\n"
         );
         assert!(
             !after.lines().any(|line| line.trim() == "* filter=lfs"),

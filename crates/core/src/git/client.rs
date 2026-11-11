@@ -64,6 +64,15 @@ pub struct PendingCommitSelection {
     pub batch_tip: String,
 }
 
+/// Outcome of staging and committing through the Git CLI.
+#[derive(Debug)]
+pub enum CliCommitOutcome {
+    /// `git add` and `git commit` both succeeded.
+    Created(Oid),
+    /// `git add` succeeded and the index matches HEAD.
+    Clean,
+}
+
 impl GitClient {
     /// Open an existing Git repository at `repo_path`.
     pub fn new<P: AsRef<Path>>(repo_path: P) -> Result<Self, GitError> {
@@ -452,7 +461,9 @@ impl GitClient {
     /// the LFS clean filter which replaces large files with pointer files,
     /// whereas `git2::Index::add_all()` adds the raw file content as a blob.
     ///
-    /// Returns the commit SHA on success.
+    /// Returns the commit SHA on success. A clean index is an error so existing
+    /// callers keep their previous behavior. Personal sync uses
+    /// [`Self::stage_and_commit`] when a clean index is a successful no-op.
     #[instrument(skip(self, message))]
     pub fn commit_via_cli(
         &self,
@@ -462,6 +473,35 @@ impl GitClient {
         committer_name: &str,
         committer_email: &str,
     ) -> Result<Oid, GitError> {
+        match self.stage_and_commit(
+            message,
+            author_name,
+            author_email,
+            committer_name,
+            committer_email,
+        )? {
+            CliCommitOutcome::Created(oid) => Ok(oid),
+            CliCommitOutcome::Clean => Err(GitError::Git2Error(git2::Error::from_str(
+                "nothing to commit (working tree clean)",
+            ))),
+        }
+    }
+
+    /// Stage with `git add --all`, then commit only when the index changed.
+    ///
+    /// [`CliCommitOutcome::Clean`] is returned only after `git add` succeeds and
+    /// `git diff --cached --quiet` reports an empty index. A failing clean
+    /// filter, hook, or commit is an error even when its stderr contains
+    /// "nothing to commit".
+    #[instrument(skip(self, message))]
+    pub fn stage_and_commit(
+        &self,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+        committer_name: &str,
+        committer_email: &str,
+    ) -> Result<CliCommitOutcome, GitError> {
         let repo_path = self.repo.workdir().unwrap_or_else(|| self.repo.path());
 
         info!(
@@ -506,11 +546,16 @@ impl GitClient {
             .output()
             .map_err(GitError::IoError)?;
 
-        if diff_output.status.success() {
-            // Exit code 0 means no staged changes — nothing to commit.
-            return Err(GitError::Git2Error(git2::Error::from_str(
-                "nothing to commit (working tree clean)",
-            )));
+        match diff_output.status.code() {
+            Some(0) => return Ok(CliCommitOutcome::Clean),
+            Some(1) => {}
+            other => {
+                let stderr = String::from_utf8_lossy(&diff_output.stderr);
+                return Err(GitError::Git2Error(git2::Error::from_str(&format!(
+                    "git diff --cached --quiet failed ({other:?}): {}",
+                    stderr.trim()
+                ))));
+            }
         }
 
         // Build the commit via git CLI with explicit author/committer.
@@ -567,7 +612,7 @@ impl GitClient {
         }
 
         info!(sha = %oid, "created commit via CLI (LFS-aware)");
-        Ok(oid)
+        Ok(CliCommitOutcome::Created(oid))
     }
 
     /// Push a local branch to a remote.

@@ -207,12 +207,16 @@ impl SvnToGitSync {
                 git_client.repo_path().to_path_buf()
             }; // Release lock before blocking I/O.
 
-            let skipped =
+            let copy_stats =
                 Self::copy_tree_with_policy(export_dir.path(), &repo_path, &self.policy, &self.db)
                     .with_context(|| format!("failed to copy exported files for r{}", rev))?;
 
-            if skipped > 0 {
-                info!(rev, skipped, "SVN→Git: files skipped by policy during copy");
+            if copy_stats.skipped > 0 {
+                info!(
+                    rev,
+                    skipped = copy_stats.skipped,
+                    "SVN→Git: files skipped by policy during copy"
+                );
             }
 
             // 6b. Remove files from the Git tree that are no longer in the SVN export.
@@ -267,10 +271,13 @@ impl SvnToGitSync {
                 let committer_email = author_email.clone();
                 let msg = commit_message.clone();
                 let gc = self.git_client.clone();
+                let lfs_paths = copy_stats.lfs_paths.clone();
 
                 tokio::task::spawn_blocking(move || {
                     let git_client = gc.lock().unwrap();
-                    git_client.commit(
+                    commit_personal_revision(
+                        &git_client,
+                        &lfs_paths,
                         &msg,
                         &author_name,
                         &author_email,
@@ -283,7 +290,23 @@ impl SvnToGitSync {
                 .with_context(|| format!("failed to create Git commit for SVN r{}", rev))?
             };
 
-            let sha_str = git_sha.to_string();
+            let sha_str = match git_sha {
+                PersonalRevisionCommit::Unchanged(head) => {
+                    self.db
+                        .record_personal_import_revision(rev, &head, &entry.author, &git_author)
+                        .with_context(|| {
+                            format!("failed to record unchanged personal SVN revision r{rev}")
+                        })?;
+                    self.advance_watermark(rev)?;
+                    debug!(
+                        rev,
+                        sha = %head,
+                        "SVN revision did not change the Git tree"
+                    );
+                    continue;
+                }
+                PersonalRevisionCommit::Created(sha) => sha,
+            };
             info!(rev, sha = %sha_str, "committed SVN revision as Git commit");
 
             let (intended_parent, intended_tree) = {
@@ -482,15 +505,14 @@ impl SvnToGitSync {
     /// Recursively copy files from `src` into `dst`, enforcing `FilePolicy`.
     ///
     /// Delegates to the shared core writer used by full import and team snapshot.
-    /// Returns the number of files skipped by policy.
+    /// Returns the copy statistics, including which paths were LFS-tracked.
     pub fn copy_tree_with_policy(
         src: &Path,
         dst: &Path,
         policy: &FilePolicy,
         db: &Database,
-    ) -> Result<usize> {
-        let stats = copy_tree_with_policy_shared(src, dst, policy, db)?;
-        Ok(stats.skipped)
+    ) -> Result<reposync_core::import::CopyStats> {
+        copy_tree_with_policy_shared(src, dst, policy, db)
     }
 
     /// Remove files and directories from `dst` that do not exist in `src`.
@@ -500,6 +522,74 @@ impl SvnToGitSync {
     fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
         remove_stale_files_shared(src, dst)
     }
+}
+
+pub(crate) enum PersonalRevisionCommit {
+    /// A new commit was created.
+    Created(String),
+    /// The staged tree matches HEAD. The string is that existing commit.
+    /// This is a clean no-content-change, not a filter or object failure.
+    Unchanged(String),
+}
+
+pub(crate) fn commit_personal_revision(
+    git: &GitClient,
+    lfs_paths: &[String],
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+    committer_name: &str,
+    committer_email: &str,
+) -> Result<PersonalRevisionCommit> {
+    let repo = git.repo_path();
+    // A repository that already has LFS filters must stage through the CLI even
+    // when this revision selects nothing. That is how a shrink or a disable
+    // removes the exact rule and stores an ordinary blob. libgit2 does not
+    // record deletions or run clean filters.
+    let filters_ready = reposync_core::lfs::repo_lfs_ready(repo).is_ok();
+    if lfs_paths.is_empty() && !filters_ready {
+        return git
+            .commit(
+                message,
+                author_name,
+                author_email,
+                committer_name,
+                committer_email,
+            )
+            .map(|oid| PersonalRevisionCommit::Created(oid.to_string()))
+            .map_err(Into::into);
+    }
+    if !lfs_paths.is_empty() {
+        reposync_core::lfs::preflight_check().map_err(|error| {
+            anyhow::anyhow!(
+                "Git LFS is required for {count} file(s) but is not available: {error}",
+                count = lfs_paths.len()
+            )
+        })?;
+        reposync_core::lfs::install_lfs_hooks(repo)
+            .map_err(|error| anyhow::anyhow!("git lfs install --local failed: {error}"))?;
+    }
+    let sha = match git.stage_and_commit(
+        message,
+        author_name,
+        author_email,
+        committer_name,
+        committer_email,
+    ) {
+        Ok(reposync_core::git::client::CliCommitOutcome::Created(oid)) => oid.to_string(),
+        Ok(reposync_core::git::client::CliCommitOutcome::Clean) => {
+            let head = git.get_head_sha().map_err(|head_error| {
+                anyhow::anyhow!("LFS tree was unchanged but HEAD could not be read: {head_error}")
+            })?;
+            return Ok(PersonalRevisionCommit::Unchanged(head));
+        }
+        Err(error) => return Err(anyhow::Error::from(error)),
+    };
+    if !lfs_paths.is_empty() {
+        reposync_core::lfs::require_committed_lfs_pointers(repo, &sha, lfs_paths)
+            .map_err(|error| anyhow::anyhow!(error))?;
+    }
+    Ok(PersonalRevisionCommit::Created(sha))
 }
 
 fn blocking_svn_commit_hold(op: &SvnCommitOperation) -> Option<String> {
@@ -799,5 +889,112 @@ mod tests {
         std::env::remove_var(&key);
         assert!(fired, "path-scoped fixture must fire for that work tree");
         assert!(!other, "path-scoped fixture must not fire for other trees");
+    }
+
+    #[test]
+    fn special_paths_commit_as_exact_lfs_pointers() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        let git = GitClient::init(&dst).unwrap();
+        let large = "Q".repeat(48);
+        let selected = [
+            "my file.bin",
+            "tab\tname.bin",
+            "quote\"name.bin",
+            "back\\slash.bin",
+            "glob*.bin",
+        ];
+        let nearby = [
+            "near file.bin",
+            "tab\tother.bin",
+            "quoteXname.bin",
+            "backXslash.bin",
+            "globX.bin",
+        ];
+        for name in &selected {
+            std::fs::write(src.join(name), &large).unwrap();
+        }
+        for name in &nearby {
+            std::fs::write(src.join(name), "x").unwrap();
+        }
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        let policy = FilePolicy::with_lfs(0, vec![], 16, &[]);
+        let stats = SvnToGitSync::copy_tree_with_policy(&src, &dst, &policy, &db).unwrap();
+        assert_eq!(stats.lfs_paths.len(), selected.len());
+        reposync_core::import::remove_stale_files(&src, &dst).unwrap();
+        let committed = commit_personal_revision(
+            &git,
+            &stats.lfs_paths,
+            "special paths",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+        let PersonalRevisionCommit::Created(sha) = committed else {
+            panic!("special paths must create a pointer commit");
+        };
+        for name in &selected {
+            let blob = git_show_path(&dst, &sha, name);
+            assert!(
+                reposync_core::lfs::is_lfs_pointer(&blob),
+                "{name} must be a pointer, got {}",
+                String::from_utf8_lossy(&blob)
+            );
+            assert_eq!(git_check_attr_filter(&dst, name), "lfs", "{name}");
+        }
+        for name in &nearby {
+            let blob = git_show_path(&dst, &sha, name);
+            assert_eq!(
+                blob,
+                b"x",
+                "{name} must stay an ordinary blob, got {}",
+                String::from_utf8_lossy(&blob)
+            );
+            assert_eq!(git_check_attr_filter(&dst, name), "unspecified", "{name}");
+        }
+    }
+
+    fn git_show_path(repo: &Path, sha: &str, path: &str) -> Vec<u8> {
+        let spec = format!("{sha}:{path}");
+        let output = std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "cat-file", "-p", &spec])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git cat-file {spec} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn git_check_attr_filter(repo: &Path, path: &str) -> String {
+        let output = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "check-attr",
+                "filter",
+                "--",
+                path,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git check-attr failed for {path}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .rsplit(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string()
     }
 }

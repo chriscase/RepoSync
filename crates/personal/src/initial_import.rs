@@ -21,6 +21,35 @@ use reposync_core::svn::SvnClient;
 use crate::commit_format::CommitFormatter;
 use crate::svn_to_git::SvnToGitSync;
 
+enum AcceptedImportCommit {
+    /// A new Git commit was stored.
+    New(String),
+    /// Qualifying files were already pointer commits and this revision did not
+    /// change the tree. The string is the existing HEAD.
+    Unchanged(String),
+    /// A non-LFS revision produced no commit. Real LFS failures are not skipped.
+    Skipped,
+}
+
+fn accept_import_commit(
+    result: Result<crate::svn_to_git::PersonalRevisionCommit>,
+    qualifying_paths: usize,
+) -> Result<AcceptedImportCommit> {
+    match result {
+        Ok(crate::svn_to_git::PersonalRevisionCommit::Created(sha)) => {
+            Ok(AcceptedImportCommit::New(sha))
+        }
+        Ok(crate::svn_to_git::PersonalRevisionCommit::Unchanged(sha)) => {
+            Ok(AcceptedImportCommit::Unchanged(sha))
+        }
+        Err(error) if qualifying_paths == 0 => {
+            debug!(error = %error, "commit failed (possibly empty revision)");
+            Ok(AcceptedImportCommit::Skipped)
+        }
+        Err(error) => Err(error).context("qualifying files were not stored as pointer commits"),
+    }
+}
+
 /// Import mode selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportMode {
@@ -65,20 +94,23 @@ impl<'a> InitialImport<'a> {
         self.db
             .require_legacy_import_watermarks_available()
             .context("Personal initial import checkpoint admission refused")?;
-        // LFS preflight: if LFS is configured, verify git-lfs is available.
-        if self.config.options.lfs_threshold > 0 {
+        // LFS preflight: a threshold or any explicit pattern enables LFS.
+        let lfs_policy = FilePolicy::from(&self.config.options);
+        if lfs_policy.lfs_enabled() {
             match reposync_core::lfs::preflight_check() {
                 Ok(version) => {
                     info!(
                         version = %version,
-                        lfs_threshold = self.config.options.lfs_threshold,
+                        lfs_threshold = lfs_policy.lfs_threshold(),
+                        lfs_patterns = self.config.options.lfs_patterns.len(),
                         "Git LFS preflight passed"
                     );
                 }
                 Err(e) => {
                     anyhow::bail!(
-                        "Git LFS is configured (lfs_threshold = {}) but git-lfs is not available: {}",
-                        self.config.options.lfs_threshold,
+                        "Git LFS is enabled (threshold {}, {} pattern(s)) but git-lfs is not available: {}",
+                        lfs_policy.lfs_threshold(),
+                        self.config.options.lfs_patterns.len(),
                         e
                     );
                 }
@@ -401,13 +433,13 @@ impl<'a> InitialImport<'a> {
 
             // Copy with policy enforcement — propagate hard I/O errors
             // instead of silently swallowing them.
-            let skipped = match SvnToGitSync::copy_tree_with_policy(
+            let copy_stats = match SvnToGitSync::copy_tree_with_policy(
                 export_dir.path(),
                 &repo_path,
                 &policy,
                 self.db,
             ) {
-                Ok(s) => s,
+                Ok(stats) => stats,
                 Err(e) => {
                     error!(rev, error = %e, "policy copy failed for revision");
                     let _ = self.db.insert_audit_log(
@@ -423,8 +455,12 @@ impl<'a> InitialImport<'a> {
                 }
             };
 
-            if skipped > 0 {
-                debug!(rev, skipped, "files skipped by policy during import");
+            if copy_stats.skipped > 0 {
+                debug!(
+                    rev,
+                    skipped = copy_stats.skipped,
+                    "files skipped by policy during import"
+                );
             }
 
             // This consumer is separate from the ordinary synchronization
@@ -466,17 +502,20 @@ impl<'a> InitialImport<'a> {
             };
 
             let git_client = self.git_client.lock().unwrap();
-            match git_client.commit(
+            let committed = crate::svn_to_git::commit_personal_revision(
+                &git_client,
+                &copy_stats.lfs_paths,
                 &message,
                 &author_name,
                 &author_email,
                 &self.config.developer.name,
                 &self.config.developer.email,
-            ) {
-                Ok(oid) => {
-                    let sha = oid.to_string();
+            );
+            match accept_import_commit(committed, copy_stats.lfs_paths.len())
+                .with_context(|| format!("LFS import commit failed for r{rev}"))?
+            {
+                AcceptedImportCommit::New(sha) => {
                     debug!(rev, sha = %sha, author = %author_name, "committed revision");
-
                     self.db
                         .record_personal_import_revision(
                             rev,
@@ -490,13 +529,26 @@ impl<'a> InitialImport<'a> {
                                 rev
                             )
                         })?;
-
                     count += 1;
                 }
-                Err(e) => {
-                    // Empty commits (no file changes) are expected for property-only revisions
-                    debug!(rev, error = %e, "commit failed (possibly empty revision)");
+                AcceptedImportCommit::Unchanged(sha) => {
+                    debug!(
+                        rev,
+                        sha = %sha,
+                        "SVN revision did not change the Git tree"
+                    );
+                    self.db
+                        .record_personal_import_revision(
+                            rev,
+                            &sha,
+                            &entry.author,
+                            &format!("{} <{}>", author_name, author_email),
+                        )
+                        .with_context(|| {
+                            format!("failed to record unchanged personal import revision r{rev}")
+                        })?;
                 }
+                AcceptedImportCommit::Skipped => {}
             }
             drop(git_client);
         }
@@ -562,5 +614,260 @@ impl<'a> InitialImport<'a> {
             "full import completed"
         );
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{accept_import_commit, AcceptedImportCommit};
+    use crate::svn_to_git::PersonalRevisionCommit;
+
+    #[test]
+    fn unchanged_lfs_import_is_recorded_and_real_failures_stay_closed() {
+        let unchanged =
+            accept_import_commit(Ok(PersonalRevisionCommit::Unchanged("abc".into())), 1).unwrap();
+        assert!(matches!(unchanged, AcceptedImportCommit::Unchanged(sha) if sha == "abc"));
+
+        let created =
+            accept_import_commit(Ok(PersonalRevisionCommit::Created("def".into())), 1).unwrap();
+        assert!(matches!(created, AcceptedImportCommit::New(sha) if sha == "def"));
+
+        let fatal = accept_import_commit(
+            Err(anyhow::anyhow!("git lfs smudge failed for model.bin")),
+            1,
+        );
+        assert!(fatal.is_err(), "filter and object errors stay closed");
+
+        let empty = accept_import_commit(Err(anyhow::anyhow!("nothing to commit")), 0).unwrap();
+        assert!(matches!(empty, AcceptedImportCommit::Skipped));
+    }
+
+    /// Full import of an LFS asset, a property-only revision, then an ordinary
+    /// file. The property revision is recorded against the existing pointer
+    /// commit and does not abort the import.
+    #[tokio::test]
+    async fn full_import_property_only_revision_keeps_the_pointer_commit() {
+        let svn_ok = std::process::Command::new("svn")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        let svnadmin_ok = std::process::Command::new("svnadmin")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !svn_ok || !svnadmin_ok {
+            eprintln!("SKIP: svn/svnadmin not available");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join("svn_repo");
+        assert!(std::process::Command::new("svnadmin")
+            .args(["create", repo_dir.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let svn_url = format!("file://{}", repo_dir.display());
+        let svn_wc = dir.path().join("svn_wc");
+        assert!(std::process::Command::new("svn")
+            .args([
+                "checkout",
+                &svn_url,
+                svn_wc.to_str().unwrap(),
+                "--non-interactive",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let asset = svn_wc.join("asset.bin");
+        std::fs::write(&asset, "Q".repeat(80)).unwrap();
+        assert!(std::process::Command::new("svn")
+            .args(["add", asset.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let added = std::process::Command::new("svn")
+            .args([
+                "commit",
+                "-m",
+                "add asset",
+                svn_wc.to_str().unwrap(),
+                "--non-interactive",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            added.status.success(),
+            "svn add commit failed: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        let prop = std::process::Command::new("svn")
+            .args([
+                "propset",
+                "reposync:note",
+                "marker",
+                asset.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            prop.status.success(),
+            "svn propset failed: {}",
+            String::from_utf8_lossy(&prop.stderr)
+        );
+        let property_commit = std::process::Command::new("svn")
+            .args([
+                "commit",
+                "-m",
+                "property only",
+                svn_wc.to_str().unwrap(),
+                "--non-interactive",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            property_commit.status.success(),
+            "property commit failed: {}",
+            String::from_utf8_lossy(&property_commit.stderr)
+        );
+        let note = svn_wc.join("note.txt");
+        std::fs::write(&note, "after").unwrap();
+        assert!(std::process::Command::new("svn")
+            .args(["add", note.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let note_commit = std::process::Command::new("svn")
+            .args([
+                "commit",
+                "-m",
+                "add note",
+                svn_wc.to_str().unwrap(),
+                "--non-interactive",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            note_commit.status.success(),
+            "note commit failed: {}",
+            String::from_utf8_lossy(&note_commit.stderr)
+        );
+
+        let git_bare = dir.path().join("git_bare");
+        let git_work = dir.path().join("git_work");
+        git2::Repository::init_bare(&git_bare).unwrap();
+        let git = reposync_core::git::GitClient::init(&git_work).unwrap();
+        git.ensure_head_on_branch("main").unwrap();
+        git2::Repository::open(&git_work)
+            .unwrap()
+            .remote("origin", git_bare.to_str().unwrap())
+            .unwrap();
+
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db = reposync_core::db::Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        let config: reposync_core::personal_config::PersonalConfig =
+            serde_json::from_value(serde_json::json!({
+                "personal": {"data_dir": data_dir},
+                "svn": {"url": svn_url, "username": "fixture", "password_env": "UNUSED"},
+                "github": {
+                    "api_url": "http://127.0.0.1:1",
+                    "repo": "fixture/repo",
+                    "token_env": "UNUSED",
+                    "default_branch": "main",
+                    "auto_create": false,
+                    "private": true
+                },
+                "developer": {
+                    "name": "Fixture",
+                    "email": "fixture@example.com",
+                    "svn_username": "fixture"
+                },
+                "options": {"lfs_threshold": 40}
+            }))
+            .unwrap();
+        let formatter = crate::commit_format::CommitFormatter::new(&config.commit_format);
+        let svn = reposync_core::svn::SvnClient::new(&config.svn.url, "fixture", "");
+        let github = reposync_core::git::github::GitHubClient::new(
+            &config.github.api_url,
+            "",
+            reposync_core::config::GitProvider::GitHub,
+        );
+        let git = std::sync::Arc::new(std::sync::Mutex::new(git));
+        let importer = super::InitialImport {
+            svn_client: &svn,
+            git_client: &git,
+            github_client: &github,
+            db: &db,
+            config: &config,
+            formatter: &formatter,
+        };
+        let window = db.begin_ordinary_writer_window(None).unwrap();
+        let count = importer
+            .import_full(&window)
+            .await
+            .expect("full import must accept the property-only revision");
+        assert_eq!(count, 2, "r1 and r3 create commits; r2 does not");
+        for rev in 1..=3 {
+            assert!(
+                db.is_personal_svn_rev_synced(rev).unwrap(),
+                "r{rev} must have an import receipt"
+            );
+        }
+        assert_eq!(db.get_watermark("svn_rev").unwrap().as_deref(), Some("3"));
+        let mapped = db.list_commit_map(10).unwrap();
+        let sha_for = |rev: i64| {
+            mapped
+                .iter()
+                .find(|entry| entry.svn_rev == rev)
+                .map(|entry| entry.git_sha.clone())
+                .unwrap_or_else(|| panic!("missing commit map for r{rev}"))
+        };
+        assert_eq!(
+            sha_for(1),
+            sha_for(2),
+            "property-only revision must reuse the existing pointer commit"
+        );
+        assert_ne!(sha_for(2), sha_for(3));
+        let blob = std::process::Command::new("git")
+            .args([
+                "-C",
+                git_work.to_str().unwrap(),
+                "cat-file",
+                "-p",
+                "HEAD:asset.bin",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            reposync_core::lfs::is_lfs_pointer(&blob.stdout),
+            "imported asset must stay a pointer, got {}",
+            String::from_utf8_lossy(&blob.stdout)
+        );
+        let note_blob = std::process::Command::new("git")
+            .args([
+                "-C",
+                git_work.to_str().unwrap(),
+                "cat-file",
+                "-p",
+                "HEAD:note.txt",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(note_blob.stdout, b"after");
+        let failed = db
+            .list_audit_log_by_action("lfs_resolution_failed", 10)
+            .unwrap();
+        assert!(
+            failed.is_empty(),
+            "property-only import must not fabricate an LFS failure"
+        );
     }
 }

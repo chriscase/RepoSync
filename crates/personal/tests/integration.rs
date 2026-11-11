@@ -2343,9 +2343,14 @@ async fn test_lfs_threshold_creates_gitattributes() {
     let svn_wc = dir.path().join("svn_wc");
     svn_checkout(&svn_url, &svn_wc);
 
-    // Commit a large file (200 bytes) and a small file (10 bytes).
+    // Commit a large file (200 bytes), a small file of the same extension,
+    // and a readme in a later revision.
     let large_content = "x".repeat(200);
-    svn_commit_file(&svn_wc, "model.bin", &large_content, "add large binary");
+    svn_commit_files(
+        &svn_wc,
+        &[("model.bin", large_content.as_str()), ("small.bin", "tiny")],
+        "add binaries",
+    );
     svn_commit_file(&svn_wc, "readme.txt", "hello", "add readme");
 
     let git_work = dir.path().join("git_work");
@@ -2390,15 +2395,368 @@ async fn test_lfs_threshold_creates_gitattributes() {
     );
     let gitattr_content = std::fs::read_to_string(&gitattr_path).unwrap();
     assert!(
-        gitattr_content.contains("*.bin filter=lfs diff=lfs merge=lfs -text"),
-        ".gitattributes should contain LFS tracking for *.bin, got: {}",
+        gitattr_content.contains("/model.bin filter=lfs diff=lfs merge=lfs -text"),
+        ".gitattributes should track the exact path, got: {}",
         gitattr_content
+    );
+    assert!(
+        !gitattr_content.contains("*.bin"),
+        "threshold tracking must not broaden to every .bin file, got: {gitattr_content}"
     );
 
     // Verify readme.txt was copied normally (under threshold).
     assert!(
         git_work.join("readme.txt").exists(),
         "readme.txt should be in Git tree"
+    );
+    let small = std::process::Command::new("git")
+        .args([
+            "-C",
+            git_work.to_str().unwrap(),
+            "cat-file",
+            "-p",
+            "HEAD:small.bin",
+        ])
+        .output()
+        .unwrap();
+    assert!(small.status.success());
+    assert!(
+        !reposync_core::lfs::is_lfs_pointer(&small.stdout),
+        "same-extension file under the threshold must stay an ordinary blob, got {}",
+        String::from_utf8_lossy(&small.stdout)
+    );
+    assert_eq!(small.stdout, b"tiny");
+
+    let blob = std::process::Command::new("git")
+        .args([
+            "-C",
+            git_work.to_str().unwrap(),
+            "cat-file",
+            "-p",
+            "HEAD:model.bin",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        blob.status.success(),
+        "model.bin must be in the commit: {}",
+        String::from_utf8_lossy(&blob.stderr)
+    );
+    assert!(
+        reposync_core::lfs::is_lfs_pointer(&blob.stdout),
+        "qualifying file must be an LFS pointer, got {}",
+        String::from_utf8_lossy(&blob.stdout)
+    );
+    let pointer = reposync_core::lfs::parse_lfs_pointer(&blob.stdout).unwrap();
+    assert!(reposync_core::lfs::local_lfs_object_available(
+        &git_work,
+        &pointer.oid
+    ));
+    let tracked = db.list_audit_log_by_action("lfs_tracked", 10).unwrap();
+    assert!(
+        tracked
+            .iter()
+            .any(|entry| entry.details.as_deref().unwrap_or("").contains("model.bin")),
+        "lfs_tracked audit must name model.bin"
+    );
+    let skipped = db.list_audit_log_by_action("lfs_skipped", 10).unwrap();
+    assert!(
+        skipped.iter().any(|entry| entry
+            .details
+            .as_deref()
+            .unwrap_or("")
+            .contains("readme.txt")),
+        "lfs_skipped audit must name the ordinary blob"
+    );
+}
+
+/// A property-only SVN revision between two content revisions must not abort
+/// an LFS-enabled sync. The unchanged revision keeps the existing pointer commit.
+#[tokio::test]
+async fn test_lfs_property_only_revision_continues_sync() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(dir.path());
+    let svn_wc = dir.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    let original = "Z".repeat(90);
+    svn_commit_file(&svn_wc, "asset.bin", &original, "add asset");
+    let prop = Command::new("svn")
+        .args([
+            "propset",
+            "reposync:note",
+            "marker",
+            svn_wc.join("asset.bin").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        prop.status.success(),
+        "svn propset failed: {}",
+        String::from_utf8_lossy(&prop.stderr)
+    );
+    let committed = Command::new("svn")
+        .args([
+            "commit",
+            "-m",
+            "property only",
+            svn_wc.to_str().unwrap(),
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        committed.status.success(),
+        "property commit failed: {}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+    svn_commit_file(&svn_wc, "note.txt", "after", "add note");
+
+    let git_work = dir.path().join("git_work");
+    let git_bare = dir.path().join("git_bare");
+    let git_client = setup_git_with_bare_origin(&git_work, &git_bare);
+    let git_client = Arc::new(Mutex::new(git_client));
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db = Arc::new(setup_db(&data_dir.join("test.db")));
+    let mut config = make_test_config(&svn_url, &data_dir);
+    config.options.lfs_threshold = 40;
+    let sync = SvnToGitSync::new(
+        SvnClient::new(&svn_url, "", ""),
+        git_client,
+        db.clone(),
+        config,
+    );
+    assert_eq!(sync.sync().await.unwrap(), 2);
+    assert_eq!(db.get_watermark("svn_rev").unwrap().as_deref(), Some("3"));
+    for rev in 1..=3 {
+        assert!(
+            db.is_personal_svn_rev_synced(rev).unwrap(),
+            "r{rev} must have a receipt"
+        );
+    }
+    let blob = std::process::Command::new("git")
+        .args([
+            "-C",
+            git_work.to_str().unwrap(),
+            "cat-file",
+            "-p",
+            "HEAD:asset.bin",
+        ])
+        .output()
+        .unwrap();
+    assert!(reposync_core::lfs::is_lfs_pointer(&blob.stdout));
+    let note = std::process::Command::new("git")
+        .args([
+            "-C",
+            git_work.to_str().unwrap(),
+            "cat-file",
+            "-p",
+            "HEAD:note.txt",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(note.stdout, b"after");
+}
+
+/// A configured directory glob tracks only the files that match it.
+#[tokio::test]
+async fn test_lfs_pattern_tracks_exact_paths_in_one_directory() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(dir.path());
+    let svn_wc = dir.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_files(
+        &svn_wc,
+        &[("models/big.bin", "selected"), ("other/tiny.bin", "plain")],
+        "add pattern candidates",
+    );
+
+    let git_work = dir.path().join("git_work");
+    let git_bare = dir.path().join("git_bare");
+    let git_client = setup_git_with_bare_origin(&git_work, &git_bare);
+    let git_client = Arc::new(Mutex::new(git_client));
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db = Arc::new(setup_db(&data_dir.join("test.db")));
+    let mut config = make_test_config(&svn_url, &data_dir);
+    config.options.lfs_patterns = vec!["models/*.bin".into()];
+    let sync = SvnToGitSync::new(SvnClient::new(&svn_url, "", ""), git_client, db, config);
+    assert_eq!(sync.sync().await.unwrap(), 1);
+
+    let selected = std::process::Command::new("git")
+        .args([
+            "-C",
+            git_work.to_str().unwrap(),
+            "cat-file",
+            "-p",
+            "HEAD:models/big.bin",
+        ])
+        .output()
+        .unwrap();
+    assert!(reposync_core::lfs::is_lfs_pointer(&selected.stdout));
+    let plain = std::process::Command::new("git")
+        .args([
+            "-C",
+            git_work.to_str().unwrap(),
+            "cat-file",
+            "-p",
+            "HEAD:other/tiny.bin",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(plain.stdout, b"plain");
+    let attributes = std::fs::read_to_string(git_work.join(".gitattributes")).unwrap();
+    assert!(attributes.contains("/models/big.bin filter=lfs"));
+    assert!(!attributes.contains("*.bin"), "{attributes}");
+}
+
+/// Shrinking a file under the threshold stores the new bytes as an ordinary blob.
+#[tokio::test]
+async fn test_lfs_shrink_commits_an_ordinary_blob() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(dir.path());
+    let svn_wc = dir.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "asset.bin", &"Q".repeat(80), "add asset");
+    svn_commit_file(&svn_wc, "asset.bin", "small", "shrink asset");
+
+    let git_work = dir.path().join("git_work");
+    let git_bare = dir.path().join("git_bare");
+    let git_client = setup_git_with_bare_origin(&git_work, &git_bare);
+    let git_client = Arc::new(Mutex::new(git_client));
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db = Arc::new(setup_db(&data_dir.join("test.db")));
+    let mut config = make_test_config(&svn_url, &data_dir);
+    config.options.lfs_threshold = 40;
+    let sync = SvnToGitSync::new(SvnClient::new(&svn_url, "", ""), git_client, db, config);
+    assert_eq!(sync.sync().await.unwrap(), 2);
+    let blob = std::process::Command::new("git")
+        .args([
+            "-C",
+            git_work.to_str().unwrap(),
+            "cat-file",
+            "-p",
+            "HEAD:asset.bin",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(blob.stdout, b"small");
+    let attributes = std::process::Command::new("git")
+        .args([
+            "-C",
+            git_work.to_str().unwrap(),
+            "cat-file",
+            "-p",
+            "HEAD:.gitattributes",
+        ])
+        .output()
+        .unwrap();
+    if attributes.status.success() {
+        let text = String::from_utf8_lossy(&attributes.stdout);
+        assert!(
+            !text.contains("asset.bin"),
+            "shrunk file must not keep an LFS rule in the commit, got: {text}"
+        );
+    }
+}
+
+/// SVN→Git stores a real LFS pointer, then Git→SVN replay writes the original
+/// bytes back into the SVN working copy.
+#[tokio::test]
+async fn test_lfs_replay_restores_bytes_and_missing_object_fails() {
+    use reposync_core::git::github::{GitHubCommit, GitHubCommitDetail, GitHubGitActor};
+    use reposync_personal::git_to_svn::GitToSvnSync;
+
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(dir.path());
+    let svn_wc = dir.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    let original = "Q".repeat(180);
+    svn_commit_file(&svn_wc, "asset.bin", &original, "add asset");
+
+    let git_work = dir.path().join("git_work");
+    let git_bare = dir.path().join("git_bare");
+    let git_client = setup_git_with_bare_origin(&git_work, &git_bare);
+    let git_client = Arc::new(Mutex::new(git_client));
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db = Arc::new(setup_db(&data_dir.join("test.db")));
+    let mut config = make_test_config(&svn_url, &data_dir);
+    config.options.lfs_threshold = 40;
+    let sync = SvnToGitSync::new(
+        SvnClient::new(&svn_url, "", ""),
+        git_client,
+        db.clone(),
+        config.clone(),
+    );
+    assert_eq!(sync.sync().await.unwrap(), 1);
+
+    let sha = std::process::Command::new("git")
+        .args(["-C", git_work.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(sha.status.success());
+    let commit_sha = String::from_utf8(sha.stdout).unwrap().trim().to_string();
+    std::fs::write(svn_wc.join("asset.bin"), b"not-the-asset").unwrap();
+
+    let replay = GitToSvnSync::new(
+        SvnClient::new(&svn_url, "test", "test"),
+        reposync_core::git::github::GitHubClient::new(
+            "https://localhost:0/unused",
+            "unused",
+            reposync_core::config::GitProvider::default(),
+        ),
+        db.clone(),
+        &config,
+        svn_wc.clone(),
+        git_work.clone(),
+    );
+    let gh_commit = GitHubCommit {
+        sha: commit_sha.clone(),
+        commit: GitHubCommitDetail {
+            message: "add asset".into(),
+            author: GitHubGitActor {
+                name: "Test User".into(),
+                email: "test@example.com".into(),
+                date: None,
+            },
+            committer: GitHubGitActor {
+                name: "Test User".into(),
+                email: "test@example.com".into(),
+                date: None,
+            },
+        },
+        author: None,
+    };
+    replay
+        .apply_git_changes_to_svn(&gh_commit)
+        .await
+        .expect("replay resolves the local LFS object");
+    assert_eq!(
+        std::fs::read(svn_wc.join("asset.bin")).unwrap(),
+        original.as_bytes(),
+        "SVN working copy must receive the object bytes, not the pointer"
     );
 }
 
