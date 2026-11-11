@@ -636,6 +636,62 @@ pub fn install_lfs_hooks(repo_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The repository has local Git LFS clean/smudge filters.
+pub fn repo_lfs_ready(repo_root: &Path) -> Result<String, String> {
+    if !repo_root.join(".git").exists() {
+        return Err("git repository is not initialized".to_string());
+    }
+    let output = Command::new("git")
+        .args(["config", "--local", "--get", "filter.lfs.clean"])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| format!("failed to read Git LFS filter config: {e}"))?;
+    if !output.status.success() {
+        return Err(
+            "Git LFS filters are not installed in this repository. Run: git lfs install --local"
+                .to_string(),
+        );
+    }
+    let clean = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if clean.is_empty() {
+        return Err("Git LFS clean filter is empty. Run: git lfs install --local".to_string());
+    }
+    Ok(clean)
+}
+
+/// The named commit stores each path as an LFS pointer with a local object.
+pub fn require_committed_lfs_pointers(
+    repo_root: &Path,
+    sha: &str,
+    paths: &[String],
+) -> Result<(), String> {
+    for path in paths {
+        let spec = format!("{sha}:{path}");
+        let output = Command::new("git")
+            .args(["cat-file", "-p", &spec])
+            .current_dir(repo_root)
+            .output()
+            .map_err(|e| format!("failed to read committed blob {spec}: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "committed blob {spec} is missing: {}",
+                stderr.trim()
+            ));
+        }
+        let pointer = parse_lfs_pointer(&output.stdout).ok_or_else(|| {
+            format!("{path} was committed as a regular blob, not a Git LFS pointer")
+        })?;
+        if !local_lfs_object_available(repo_root, &pointer.oid) {
+            return Err(format!(
+                "LFS object {} for {path} is missing from local storage",
+                pointer.oid
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Store a large file as an LFS object and return the pointer content.
 ///
 /// Uses `git lfs clean` to convert file content into an LFS pointer and
@@ -1018,6 +1074,20 @@ mod tests {
         assert!(path
             .ends_with("4d/7a/4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393"));
         assert!(!local_lfs_object_available(dir.path(), oid));
+    }
+
+    #[test]
+    fn test_repo_lfs_ready_requires_local_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        std::process::Command::new("git")
+            .args(["init", repo.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(repo_lfs_ready(repo).is_err());
+        install_lfs_hooks(repo).unwrap();
+        let clean = repo_lfs_ready(repo).unwrap();
+        assert!(clean.contains("git-lfs"), "{clean}");
     }
 
     #[test]

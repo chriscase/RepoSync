@@ -81,22 +81,25 @@ impl PersonalSyncEngine {
         let svn_wc_path = data_dir.join("svn-wc");
         let git_repo_path = git_client.repo_path().to_path_buf();
 
-        // LFS preflight: log warning (non-fatal) if LFS is configured but not available.
-        if config.options.lfs_threshold > 0 {
+        // LFS preflight: a threshold or any explicit pattern enables LFS.
+        let lfs_policy = reposync_core::file_policy::FilePolicy::from(&config.options);
+        if lfs_policy.lfs_enabled() {
             match reposync_core::lfs::preflight_check() {
                 Ok(version) => {
                     info!(
                         version = %version,
-                        lfs_threshold = config.options.lfs_threshold,
+                        lfs_threshold = lfs_policy.lfs_threshold(),
+                        lfs_patterns = config.options.lfs_patterns.len(),
                         "Git LFS is available"
                     );
                 }
                 Err(e) => {
                     warn!(
-                        lfs_threshold = config.options.lfs_threshold,
+                        lfs_threshold = lfs_policy.lfs_threshold(),
+                        lfs_patterns = config.options.lfs_patterns.len(),
                         error = %e,
-                        "Git LFS is configured but not available — \
-                         LFS-threshold files will be synced as regular blobs"
+                        "Git LFS is enabled but git-lfs is not available — \
+                         import and sync of qualifying files will fail closed"
                     );
                 }
             }

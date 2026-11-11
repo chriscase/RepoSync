@@ -207,12 +207,16 @@ impl SvnToGitSync {
                 git_client.repo_path().to_path_buf()
             }; // Release lock before blocking I/O.
 
-            let skipped =
+            let copy_stats =
                 Self::copy_tree_with_policy(export_dir.path(), &repo_path, &self.policy, &self.db)
                     .with_context(|| format!("failed to copy exported files for r{}", rev))?;
 
-            if skipped > 0 {
-                info!(rev, skipped, "SVN→Git: files skipped by policy during copy");
+            if copy_stats.skipped > 0 {
+                info!(
+                    rev,
+                    skipped = copy_stats.skipped,
+                    "SVN→Git: files skipped by policy during copy"
+                );
             }
 
             // 6b. Remove files from the Git tree that are no longer in the SVN export.
@@ -267,10 +271,13 @@ impl SvnToGitSync {
                 let committer_email = author_email.clone();
                 let msg = commit_message.clone();
                 let gc = self.git_client.clone();
+                let lfs_paths = copy_stats.lfs_paths.clone();
 
                 tokio::task::spawn_blocking(move || {
                     let git_client = gc.lock().unwrap();
-                    git_client.commit(
+                    commit_personal_revision(
+                        &git_client,
+                        &lfs_paths,
                         &msg,
                         &author_name,
                         &author_email,
@@ -283,7 +290,7 @@ impl SvnToGitSync {
                 .with_context(|| format!("failed to create Git commit for SVN r{}", rev))?
             };
 
-            let sha_str = git_sha.to_string();
+            let sha_str = git_sha;
             info!(rev, sha = %sha_str, "committed SVN revision as Git commit");
 
             let (intended_parent, intended_tree) = {
@@ -482,15 +489,14 @@ impl SvnToGitSync {
     /// Recursively copy files from `src` into `dst`, enforcing `FilePolicy`.
     ///
     /// Delegates to the shared core writer used by full import and team snapshot.
-    /// Returns the number of files skipped by policy.
+    /// Returns the copy statistics, including which paths were LFS-tracked.
     pub fn copy_tree_with_policy(
         src: &Path,
         dst: &Path,
         policy: &FilePolicy,
         db: &Database,
-    ) -> Result<usize> {
-        let stats = copy_tree_with_policy_shared(src, dst, policy, db)?;
-        Ok(stats.skipped)
+    ) -> Result<reposync_core::import::CopyStats> {
+        copy_tree_with_policy_shared(src, dst, policy, db)
     }
 
     /// Remove files and directories from `dst` that do not exist in `src`.
@@ -500,6 +506,51 @@ impl SvnToGitSync {
     fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
         remove_stale_files_shared(src, dst)
     }
+}
+
+pub(crate) fn commit_personal_revision(
+    git: &GitClient,
+    lfs_paths: &[String],
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+    committer_name: &str,
+    committer_email: &str,
+) -> Result<String> {
+    if lfs_paths.is_empty() {
+        return git
+            .commit(
+                message,
+                author_name,
+                author_email,
+                committer_name,
+                committer_email,
+            )
+            .map(|oid| oid.to_string())
+            .map_err(Into::into);
+    }
+    let repo = git.repo_path();
+    reposync_core::lfs::preflight_check().map_err(|error| {
+        anyhow::anyhow!(
+            "Git LFS is required for {count} file(s) but is not available: {error}",
+            count = lfs_paths.len()
+        )
+    })?;
+    reposync_core::lfs::install_lfs_hooks(repo)
+        .map_err(|error| anyhow::anyhow!("git lfs install --local failed: {error}"))?;
+    let oid = git
+        .commit_via_cli(
+            message,
+            author_name,
+            author_email,
+            committer_name,
+            committer_email,
+        )
+        .map_err(anyhow::Error::from)?;
+    let sha = oid.to_string();
+    reposync_core::lfs::require_committed_lfs_pointers(repo, &sha, lfs_paths)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    Ok(sha)
 }
 
 fn blocking_svn_commit_hold(op: &SvnCommitOperation) -> Option<String> {

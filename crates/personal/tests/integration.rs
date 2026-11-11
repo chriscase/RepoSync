@@ -2400,6 +2400,132 @@ async fn test_lfs_threshold_creates_gitattributes() {
         git_work.join("readme.txt").exists(),
         "readme.txt should be in Git tree"
     );
+
+    let blob = std::process::Command::new("git")
+        .args([
+            "-C",
+            git_work.to_str().unwrap(),
+            "cat-file",
+            "-p",
+            "HEAD:model.bin",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        blob.status.success(),
+        "model.bin must be in the commit: {}",
+        String::from_utf8_lossy(&blob.stderr)
+    );
+    assert!(
+        reposync_core::lfs::is_lfs_pointer(&blob.stdout),
+        "qualifying file must be an LFS pointer, got {}",
+        String::from_utf8_lossy(&blob.stdout)
+    );
+    let pointer = reposync_core::lfs::parse_lfs_pointer(&blob.stdout).unwrap();
+    assert!(reposync_core::lfs::local_lfs_object_available(
+        &git_work,
+        &pointer.oid
+    ));
+    let tracked = db.list_audit_log_by_action("lfs_tracked", 10).unwrap();
+    assert!(
+        tracked
+            .iter()
+            .any(|entry| entry.details.as_deref().unwrap_or("").contains("model.bin")),
+        "lfs_tracked audit must name model.bin"
+    );
+    let skipped = db.list_audit_log_by_action("lfs_skipped", 10).unwrap();
+    assert!(
+        skipped.iter().any(|entry| entry
+            .details
+            .as_deref()
+            .unwrap_or("")
+            .contains("readme.txt")),
+        "lfs_skipped audit must name the ordinary blob"
+    );
+}
+
+/// SVN→Git stores a real LFS pointer, then Git→SVN replay writes the original
+/// bytes back into the SVN working copy.
+#[tokio::test]
+async fn test_lfs_replay_restores_bytes_and_missing_object_fails() {
+    use reposync_core::git::github::{GitHubCommit, GitHubCommitDetail, GitHubGitActor};
+    use reposync_personal::git_to_svn::GitToSvnSync;
+
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(dir.path());
+    let svn_wc = dir.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    let original = "Q".repeat(180);
+    svn_commit_file(&svn_wc, "asset.bin", &original, "add asset");
+
+    let git_work = dir.path().join("git_work");
+    let git_bare = dir.path().join("git_bare");
+    let git_client = setup_git_with_bare_origin(&git_work, &git_bare);
+    let git_client = Arc::new(Mutex::new(git_client));
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db = Arc::new(setup_db(&data_dir.join("test.db")));
+    let mut config = make_test_config(&svn_url, &data_dir);
+    config.options.lfs_threshold = 40;
+    let sync = SvnToGitSync::new(
+        SvnClient::new(&svn_url, "", ""),
+        git_client,
+        db.clone(),
+        config.clone(),
+    );
+    assert_eq!(sync.sync().await.unwrap(), 1);
+
+    let sha = std::process::Command::new("git")
+        .args(["-C", git_work.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(sha.status.success());
+    let commit_sha = String::from_utf8(sha.stdout).unwrap().trim().to_string();
+    std::fs::write(svn_wc.join("asset.bin"), b"not-the-asset").unwrap();
+
+    let replay = GitToSvnSync::new(
+        SvnClient::new(&svn_url, "test", "test"),
+        reposync_core::git::github::GitHubClient::new(
+            "https://localhost:0/unused",
+            "unused",
+            reposync_core::config::GitProvider::default(),
+        ),
+        db.clone(),
+        &config,
+        svn_wc.clone(),
+        git_work.clone(),
+    );
+    let gh_commit = GitHubCommit {
+        sha: commit_sha.clone(),
+        commit: GitHubCommitDetail {
+            message: "add asset".into(),
+            author: GitHubGitActor {
+                name: "Test User".into(),
+                email: "test@example.com".into(),
+                date: None,
+            },
+            committer: GitHubGitActor {
+                name: "Test User".into(),
+                email: "test@example.com".into(),
+                date: None,
+            },
+        },
+        author: None,
+    };
+    replay
+        .apply_git_changes_to_svn(&gh_commit)
+        .await
+        .expect("replay resolves the local LFS object");
+    assert_eq!(
+        std::fs::read(svn_wc.join("asset.bin")).unwrap(),
+        original.as_bytes(),
+        "SVN working copy must receive the object bytes, not the pointer"
+    );
 }
 
 /// LFS pointer detection: is_lfs_pointer and parse_lfs_pointer.

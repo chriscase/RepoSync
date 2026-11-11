@@ -65,20 +65,23 @@ impl<'a> InitialImport<'a> {
         self.db
             .require_legacy_import_watermarks_available()
             .context("Personal initial import checkpoint admission refused")?;
-        // LFS preflight: if LFS is configured, verify git-lfs is available.
-        if self.config.options.lfs_threshold > 0 {
+        // LFS preflight: a threshold or any explicit pattern enables LFS.
+        let lfs_policy = FilePolicy::from(&self.config.options);
+        if lfs_policy.lfs_enabled() {
             match reposync_core::lfs::preflight_check() {
                 Ok(version) => {
                     info!(
                         version = %version,
-                        lfs_threshold = self.config.options.lfs_threshold,
+                        lfs_threshold = lfs_policy.lfs_threshold(),
+                        lfs_patterns = self.config.options.lfs_patterns.len(),
                         "Git LFS preflight passed"
                     );
                 }
                 Err(e) => {
                     anyhow::bail!(
-                        "Git LFS is configured (lfs_threshold = {}) but git-lfs is not available: {}",
-                        self.config.options.lfs_threshold,
+                        "Git LFS is enabled (threshold {}, {} pattern(s)) but git-lfs is not available: {}",
+                        lfs_policy.lfs_threshold(),
+                        self.config.options.lfs_patterns.len(),
                         e
                     );
                 }
@@ -401,13 +404,13 @@ impl<'a> InitialImport<'a> {
 
             // Copy with policy enforcement — propagate hard I/O errors
             // instead of silently swallowing them.
-            let skipped = match SvnToGitSync::copy_tree_with_policy(
+            let copy_stats = match SvnToGitSync::copy_tree_with_policy(
                 export_dir.path(),
                 &repo_path,
                 &policy,
                 self.db,
             ) {
-                Ok(s) => s,
+                Ok(stats) => stats,
                 Err(e) => {
                     error!(rev, error = %e, "policy copy failed for revision");
                     let _ = self.db.insert_audit_log(
@@ -423,8 +426,12 @@ impl<'a> InitialImport<'a> {
                 }
             };
 
-            if skipped > 0 {
-                debug!(rev, skipped, "files skipped by policy during import");
+            if copy_stats.skipped > 0 {
+                debug!(
+                    rev,
+                    skipped = copy_stats.skipped,
+                    "files skipped by policy during import"
+                );
             }
 
             // This consumer is separate from the ordinary synchronization
@@ -466,15 +473,16 @@ impl<'a> InitialImport<'a> {
             };
 
             let git_client = self.git_client.lock().unwrap();
-            match git_client.commit(
+            match crate::svn_to_git::commit_personal_revision(
+                &git_client,
+                &copy_stats.lfs_paths,
                 &message,
                 &author_name,
                 &author_email,
                 &self.config.developer.name,
                 &self.config.developer.email,
             ) {
-                Ok(oid) => {
-                    let sha = oid.to_string();
+                Ok(sha) => {
                     debug!(rev, sha = %sha, author = %author_name, "committed revision");
 
                     self.db
@@ -494,6 +502,11 @@ impl<'a> InitialImport<'a> {
                     count += 1;
                 }
                 Err(e) => {
+                    if !copy_stats.lfs_paths.is_empty() {
+                        anyhow::bail!(
+                            "LFS import commit failed for r{rev}: {e}. Qualifying files were not stored as pointer commits."
+                        );
+                    }
                     // Empty commits (no file changes) are expected for property-only revisions
                     debug!(rev, error = %e, "commit failed (possibly empty revision)");
                 }

@@ -3,6 +3,7 @@
 use anyhow::Result;
 
 use reposync_core::db::Database;
+use reposync_core::file_policy::FilePolicy;
 use reposync_core::personal_config::PersonalConfig;
 
 use super::style;
@@ -162,6 +163,39 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
                 println!("  {}", style::warn("Watermarks        Inconsistent"));
                 issues.push("Watermarks are out of sync. Run import to reset.".to_string());
             }
+        }
+    }
+
+    // 8. Git LFS, only when a threshold or pattern enables it.
+    let lfs = FilePolicy::from(&config.options);
+    if !lfs.lfs_enabled() {
+        println!("  {}", style::dim("  ○ Git LFS          Disabled"));
+    } else {
+        match reposync_core::lfs::preflight_check() {
+            Ok(version) => println!(
+                "  {}",
+                style::success(&format!("Git LFS           {version}"))
+            ),
+            Err(error) => {
+                println!("  {}", style::error(&format!("Git LFS           {error}")));
+                issues.push("Install git-lfs and confirm `git lfs version` succeeds.".to_string());
+            }
+        }
+        if git_path.join(".git").exists() {
+            match reposync_core::lfs::repo_lfs_ready(&git_path) {
+                Ok(clean) => println!(
+                    "  {}",
+                    style::success(&format!("LFS Repository    Ready ({clean})"))
+                ),
+                Err(error) => {
+                    println!("  {}", style::error(&format!("LFS Repository    {error}")));
+                    issues.push(
+                        "In the personal Git repository run: git lfs install --local".to_string(),
+                    );
+                }
+            }
+        } else {
+            println!("  {}", style::warn("LFS Repository    Not cloned yet"));
         }
     }
 

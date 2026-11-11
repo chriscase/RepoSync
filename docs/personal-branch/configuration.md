@@ -181,12 +181,26 @@ Behavioral options that control how files and changes are synced.
 > all sync paths (initial import, SVN→Git, Git→SVN). Blocked files produce structured
 > log warnings and `file_policy_skip` audit entries. There is no silent pass-through.
 >
-> When `lfs_threshold` is set, the daemon runs a preflight check for `git lfs` at
-> startup. If git-lfs is not installed, the import command fails with a clear error.
-> During SVN→Git sync, files above the threshold are copied to the working tree and
-> their extension is added to `.gitattributes` for LFS tracking. During Git→SVN sync,
-> LFS pointer files are automatically resolved to their actual content before being
-> committed to SVN.
+> LFS is **enabled** when `lfs_threshold` is greater than 0 or `lfs_patterns` is
+> not empty. Both at their defaults disables LFS. There is no separate boolean.
+>
+> When LFS is enabled, import fails closed unless `git lfs version` succeeds.
+> `reposync personal doctor` reports the tool version and whether the personal
+> Git repository has local LFS filters (`git lfs install --local`).
+>
+> SVN→Git sync and full import copy a qualifying file, record its pattern in
+> `.gitattributes`, then commit with the Git command-line clean filter. The
+> recorded commit is a pointer (`version https://git-lfs.github.com/spec/v1`)
+> and the bytes are stored under `.git/lfs/objects`. A file under the threshold
+> that matches no pattern stays an ordinary blob. Each copy writes `lfs_tracked`
+> and `lfs_skipped` audit rows.
+>
+> Git→SVN replay reads the pointer and writes the real bytes to SVN when the
+> local object exists. If the object is missing, replay stops before the SVN
+> commit, leaves the pointer text out of the working copy, and writes an
+> `lfs_resolution_failed` audit row naming the path. Restore the object with
+> `git lfs fetch` or `git lfs pull` in the personal repository, then run sync
+> again. Do not commit the pointer text into SVN.
 
 ---
 
