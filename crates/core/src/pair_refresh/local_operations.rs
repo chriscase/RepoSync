@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -101,10 +102,11 @@ pub async fn run_local(
         if existing.phase == "completed" {
             return Ok(receipt_of(&existing));
         }
-        let _busy = claim_pair(engine, child_id, &existing.parent_id)?;
+        let _busy = claim_pair(engine, child_id, &existing.parent_id, &request.request_id)?;
         return drive(engine, existing, request.stop_after.as_deref());
     }
     let observed = observe(engine, child_id)?;
+    let _busy = claim_pair(engine, child_id, &observed.parent_id, &request.request_id)?;
     let digest = approval_digest(
         &observed,
         request.operation,
@@ -150,7 +152,6 @@ pub async fn run_local(
         displaced: observed.pending_pair_git.clone(),
         error: None,
     };
-    let _busy = claim_pair(engine, child_id, &observed.parent_id)?;
     save(engine, &key, &journal)?;
     drive(engine, journal, request.stop_after.as_deref())
 }
@@ -178,7 +179,6 @@ struct Observed {
     pair_git: PathBuf,
     parent_git: PathBuf,
     pair_branch: String,
-    parent_branch: String,
     pending_pair_svn: usize,
     pending_parent_svn: usize,
     pending_pair_git: Vec<String>,
@@ -243,7 +243,6 @@ fn observe(engine: &SyncEngine, child_id: &str) -> Result<Observed> {
         pair_git,
         parent_git,
         pair_branch: child.git_branch,
-        parent_branch: parent.git_branch,
         pending_pair_svn,
         pending_parent_svn,
         pending_pair_git,
@@ -259,6 +258,7 @@ fn drive(
     stop_after: Option<&str>,
 ) -> Result<LocalReceipt> {
     let key = journal_key(&journal.child_id, &journal.request_id);
+    adopt_own_svn(engine, &key, &mut journal)?;
     let observed = observe(engine, &journal.child_id)?;
     require_pins(&journal, &observed)?;
     if journal.noop {
@@ -269,10 +269,25 @@ fn drive(
     mark(engine, &key, &mut journal, "svn_intent", stop_after)?;
     if journal.new_svn.is_none() {
         let observed = observe(engine, &journal.child_id)?;
-        require_pins(&journal, &observed)?;
-        journal.new_svn = Some(publish_svn(engine, &journal, &observed)?);
-        journal.new_svn_path = Some(published_path(&journal, &observed));
-        save(engine, &key, &journal)?;
+        adopt_own_svn(engine, &key, &mut journal)?;
+        if journal.new_svn.is_none() {
+            require_pins(&journal, &observed)?;
+            let revision = match publish_svn(engine, &journal, &observed) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    if error.to_string().contains("resolution required") {
+                        clear_local_attempt(engine, &key, &journal)?;
+                    }
+                    return Err(error);
+                }
+            };
+            if stop_after == Some("svn_committed") {
+                bail!("crashed after svn commit before the journal receipt");
+            }
+            journal.new_svn = Some(revision);
+            journal.new_svn_path = Some(published_path(&journal, &observed));
+            save(engine, &key, &journal)?;
+        }
     }
     mark(engine, &key, &mut journal, "svn_observed", stop_after)?;
     mark(engine, &key, &mut journal, "git_intent", stop_after)?;
@@ -296,23 +311,21 @@ fn drive(
     mark(engine, &key, &mut journal, "git_observed", stop_after)?;
     let git_sha = journal.new_git.clone().context("git receipt")?;
     let svn_rev = journal.new_svn.context("svn receipt")?;
-    engine
-        .db()
-        .update_repo_watermark_columns_only(&journal.child_id, svn_rev, &git_sha)?;
-    if journal.operation == LocalOperation::Update {
-        engine.db().update_repo_watermark_columns_only(
-            &journal.parent_id,
-            observed.parent_svn,
-            &observed.parent_tip,
-        )?;
-    }
+    let parent_mark = (journal.operation == LocalOperation::Update)
+        .then(|| (observed.parent_svn, observed.parent_tip.clone()));
     journal.phase = "checkpoint".into();
     save(engine, &key, &journal)?;
     if stop_after == Some("checkpoint") {
         bail!("crashed after checkpoint");
     }
     journal.phase = "completed".into();
-    save(engine, &key, &journal)?;
+    write_journal(
+        engine,
+        &key,
+        &journal,
+        Some((svn_rev, git_sha)),
+        parent_mark,
+    )?;
     Ok(receipt_of(&journal))
 }
 
@@ -370,42 +383,45 @@ fn publish_svn(engine: &SyncEngine, journal: &Journal, observed: &Observed) -> R
             let parent_new = space.join("parent-new");
             let parent_old = space.join("parent-old");
             remove_confined(&wc, &space)?;
+            let pair_url = join_svn(&observed.svn_root, &observed.pair_path);
+            let parent_url = join_svn(&observed.svn_root, &observed.parent_path);
             svn(&[
                 "checkout",
                 "-r",
                 &pair_rev,
-                &join_svn(&observed.svn_root, &observed.pair_path),
+                &format!("{pair_url}@{pair_rev}"),
                 wc.to_str().context("wc path")?,
             ])?;
+            export_revision(&pair_url, &pair_rev, &pair_tree)?;
+            export_revision(&parent_url, &parent_rev, &parent_new)?;
             export_revision(
-                &join_svn(&observed.svn_root, &observed.pair_path),
-                &pair_rev,
-                &pair_tree,
-            )?;
-            export_revision(
-                &join_svn(&observed.svn_root, &observed.parent_path),
-                &parent_rev,
-                &parent_new,
-            )?;
-            export_revision(
-                &join_svn(&observed.svn_root, &observed.parent_path),
+                &parent_url,
                 &journal.mapped_parent_svn.to_string(),
                 &parent_old,
             )?;
-            let merged = merge_projection(&parent_old, &parent_new, &pair_tree)?;
+            let merged = merge_projection(
+                TreeSide {
+                    url: &parent_url,
+                    revision: journal.mapped_parent_svn,
+                    dir: &parent_old,
+                },
+                TreeSide {
+                    url: &parent_url,
+                    revision: journal.parent_svn,
+                    dir: &parent_new,
+                },
+                TreeSide {
+                    url: &pair_url,
+                    revision: journal.pair_svn,
+                    dir: &pair_tree,
+                },
+            )?;
             apply_tree(&wc, &merged)?;
-            svn_in(
-                &[
-                    "propset",
-                    "svn:mergeinfo",
-                    &format!(
-                        "/{}:{}",
-                        observed.parent_path.trim_matches('/'),
-                        journal.parent_svn
-                    ),
-                    ".",
-                ],
-                Some(&wc),
+            record_mergeinfo(
+                &wc,
+                &observed.parent_path,
+                journal.mapped_parent_svn,
+                journal.parent_svn,
             )?;
             svn_in(&["commit", "-m", &token], Some(&wc))?;
         }
@@ -426,7 +442,11 @@ fn publish_svn(engine: &SyncEngine, journal: &Journal, observed: &Observed) -> R
                 &parent_rev,
                 &parent_new,
             )?;
-            let tree = list_files(&parent_new)?;
+            let tree = list_nodes(
+                &parent_new,
+                &join_svn(&observed.svn_root, &observed.parent_path),
+                journal.parent_svn,
+            )?;
             apply_tree(&wc, &tree)?;
             svn_in(&["commit", "-m", &token], Some(&wc))?;
         }
@@ -452,17 +472,10 @@ fn publish_svn(engine: &SyncEngine, journal: &Journal, observed: &Observed) -> R
 }
 
 fn publish_git(engine: &SyncEngine, journal: &Journal, observed: &Observed) -> Result<String> {
-    git(
+    pin_parent_commit(
         &observed.pair_git,
-        &[
-            "fetch",
-            "--no-tags",
-            observed.parent_git.to_str().context("parent git")?,
-            &format!(
-                "{}:refs/reposync/pair-refresh/parent",
-                observed.parent_branch
-            ),
-        ],
+        &observed.parent_git,
+        &journal.parent_tip,
     )?;
     let old = git(&observed.pair_git, &["rev-parse", &observed.pair_branch])?;
     if git(
@@ -716,10 +729,92 @@ fn load(engine: &SyncEngine, key: &str) -> Result<Option<Journal>> {
 }
 
 fn save(engine: &SyncEngine, key: &str, journal: &Journal) -> Result<()> {
+    write_journal(engine, key, journal, None, None)
+}
+
+fn write_journal(
+    engine: &SyncEngine,
+    key: &str,
+    journal: &Journal,
+    child_mark: Option<(i64, String)>,
+    parent_mark: Option<(i64, String)>,
+) -> Result<()> {
+    let payload = serde_json::to_string(journal)?;
+    let hold_key = format!("pair_refresh_local_hold:{}", journal.child_id);
+    let hold = serde_json::json!({
+        "child": journal.child_id,
+        "parent": journal.parent_id,
+        "request_id": journal.request_id,
+        "operation_id": journal.operation_id,
+    })
+    .to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let child_id = journal.child_id.clone();
+    let parent_id = journal.parent_id.clone();
+    let completed = journal.phase == "completed";
     engine
         .db()
-        .set_state(key, &serde_json::to_string(journal)?)
+        .immediate_transaction(|tx| {
+            tx.execute(
+                "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params![key, payload, now],
+            )?;
+            if completed || journal.phase == "refused" {
+                tx.execute("DELETE FROM kv_state WHERE key = ?1", params![hold_key])?;
+                if let Some((rev, sha)) = &child_mark {
+                    tx.execute(
+                        "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
+                        params![rev, sha, child_id],
+                    )?;
+                }
+                if let Some((rev, sha)) = &parent_mark {
+                    tx.execute(
+                        "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
+                        params![rev, sha, parent_id],
+                    )?;
+                }
+            } else {
+                tx.execute(
+                    "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                    params![hold_key, hold, now],
+                )?;
+            }
+            Ok(())
+        })
         .context("refresh journal was not stored")
+}
+
+fn clear_local_attempt(engine: &SyncEngine, key: &str, journal: &Journal) -> Result<()> {
+    let hold_key = format!("pair_refresh_local_hold:{}", journal.child_id);
+    engine
+        .db()
+        .immediate_transaction(|tx| {
+            tx.execute("DELETE FROM kv_state WHERE key = ?1", params![key])?;
+            tx.execute("DELETE FROM kv_state WHERE key = ?1", params![hold_key])?;
+            Ok(())
+        })
+        .context("refresh reservation was not released")
+}
+
+fn adopt_own_svn(engine: &SyncEngine, key: &str, journal: &mut Journal) -> Result<()> {
+    if journal.new_svn.is_some() {
+        return Ok(());
+    }
+    let observed = observe(engine, &journal.child_id)?;
+    let path = published_path(journal, &observed);
+    if let Some(revision) = own_revision(
+        &observed.svn_root,
+        &publication_token(journal),
+        &path,
+        journal.pair_svn,
+    )? {
+        journal.new_svn = Some(revision);
+        journal.new_svn_path = Some(path);
+        save(engine, key, journal)?;
+    }
+    Ok(())
 }
 
 fn require_file_url(url: &str) -> Result<()> {
@@ -777,13 +872,43 @@ fn claim_pair(
     engine: &SyncEngine,
     child: &str,
     parent: &str,
+    request_id: &str,
 ) -> Result<crate::busy::PairBusyGuard> {
     {
         let conn = engine.db().conn();
-        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&conn, Some(child))
-            .map_err(|error| anyhow::anyhow!("durable pair refresh hold: {error}"))?;
+        crate::db::pair_refresh_operations::require_no_versioned_pair_refresh_hold(
+            &conn,
+            Some(child),
+        )
+        .map_err(|error| anyhow::anyhow!("durable pair refresh hold: {error}"))?;
+        crate::db::pair_refresh_operations::require_no_versioned_pair_refresh_hold(
+            &conn,
+            Some(parent),
+        )
+        .map_err(|error| anyhow::anyhow!("durable pair refresh hold: {error}"))?;
+        crate::db::pair_refresh_operations::require_no_foreign_local_hold(
+            &conn, child, parent, request_id,
+        )
+        .map_err(|error| anyhow::anyhow!("durable pair refresh hold: {error}"))?;
     }
     crate::busy::try_acquire_pair(child, parent).context("pair refresh writer is busy")
+}
+
+fn pin_parent_commit(pair: &Path, parent: &Path, sha: &str) -> Result<()> {
+    git(
+        pair,
+        &[
+            "fetch",
+            "--no-tags",
+            parent.to_str().context("parent git")?,
+            &format!("{sha}:refs/reposync/pair-refresh/parent"),
+        ],
+    )?;
+    let fetched = git(pair, &["rev-parse", "refs/reposync/pair-refresh/parent"])?;
+    if fetched != sha {
+        bail!("parent git publication was not the admitted commit");
+    }
+    Ok(())
 }
 
 fn require_pins(journal: &Journal, observed: &Observed) -> Result<()> {
@@ -795,11 +920,21 @@ fn require_pins(journal: &Journal, observed: &Observed) -> Result<()> {
     if !pair_tip_ok {
         bail!("refresh pins drifted; resume was refused");
     }
-    let (pair_svn, parent_svn) = match journal.new_svn {
-        Some(revision) => (revision, revision),
-        None => (journal.pair_svn, journal.parent_svn),
-    };
-    if observed.pair_svn != pair_svn || observed.parent_svn != parent_svn {
+    if let Some(published) = journal.new_svn {
+        let path = journal
+            .new_svn_path
+            .clone()
+            .unwrap_or_else(|| published_path(journal, observed));
+        let found = own_revision(
+            &observed.svn_root,
+            &publication_token(journal),
+            &path,
+            journal.pair_svn,
+        )?;
+        if found != Some(published) {
+            bail!("refresh pins drifted; resume was refused");
+        }
+    } else if observed.pair_svn != journal.pair_svn || observed.parent_svn != journal.parent_svn {
         bail!("refresh pins drifted; resume was refused");
     }
     Ok(())
@@ -908,19 +1043,44 @@ fn export_revision(url: &str, revision: &str, dest: &Path) -> Result<()> {
         "export",
         "-r",
         revision,
-        url,
+        &format!("{url}@{revision}"),
         dest.to_str().context("export path")?,
     ])?;
     Ok(())
 }
 
-fn list_files(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NodeKind {
+    File,
+    Dir,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Node {
+    kind: NodeKind,
+    bytes: Vec<u8>,
+    props: BTreeMap<String, String>,
+}
+
+fn list_nodes(dir: &Path, url: &str, revision: i64) -> Result<BTreeMap<String, Node>> {
     let mut out = BTreeMap::new();
-    walk_files(dir, dir, &mut out)?;
+    let revision = revision.to_string();
+    walk_nodes(dir, dir, Some((url, revision.as_str())), &mut out)?;
     Ok(out)
 }
 
-fn walk_files(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> Result<()> {
+fn list_working_copy(dir: &Path) -> Result<BTreeMap<String, Node>> {
+    let mut out = BTreeMap::new();
+    walk_nodes(dir, dir, None, &mut out)?;
+    Ok(out)
+}
+
+fn walk_nodes(
+    root: &Path,
+    dir: &Path,
+    source: Option<(&str, &str)>,
+    out: &mut BTreeMap<String, Node>,
+) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if entry.file_name() == ".svn" {
@@ -930,74 +1090,318 @@ fn walk_files(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> R
         if meta.file_type().is_symlink() {
             bail!("refresh refuses a symlink in the published tree");
         }
-        if meta.is_dir() {
-            walk_files(root, &entry.path(), out)?;
+        let full = entry.path();
+        let rel = full
+            .strip_prefix(root)
+            .context("published path escaped the export")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let target = if let Some((url, _)) = source {
+            join_svn(url, &rel)
         } else {
-            let full = entry.path();
-            let rel = full
-                .strip_prefix(root)
-                .context("published path escaped the export")?;
+            full.to_str().context("working copy path")?.to_string()
+        };
+        let revision = source.map(|(_, revision)| revision);
+        let mut props = svn_props(&target, revision)?;
+        props.remove("svn:mergeinfo");
+        if meta.is_dir() {
             out.insert(
-                rel.to_string_lossy().replace('\\', "/"),
-                std::fs::read(entry.path())?,
+                rel,
+                Node {
+                    kind: NodeKind::Dir,
+                    bytes: Vec::new(),
+                    props,
+                },
+            );
+            walk_nodes(root, &full, source, out)?;
+        } else {
+            out.insert(
+                rel,
+                Node {
+                    kind: NodeKind::File,
+                    bytes: std::fs::read(&full)?,
+                    props,
+                },
             );
         }
     }
     Ok(())
 }
 
+struct TreeSide<'a> {
+    url: &'a str,
+    revision: i64,
+    dir: &'a Path,
+}
+
 fn merge_projection(
-    parent_old: &Path,
-    parent_new: &Path,
-    pair_now: &Path,
-) -> Result<BTreeMap<String, Vec<u8>>> {
-    let old = list_files(parent_old)?;
-    let new = list_files(parent_new)?;
-    let ours = list_files(pair_now)?;
+    parent_old: TreeSide<'_>,
+    parent_new: TreeSide<'_>,
+    pair_now: TreeSide<'_>,
+) -> Result<BTreeMap<String, Node>> {
+    let old = list_nodes(parent_old.dir, parent_old.url, parent_old.revision)?;
+    let new = list_nodes(parent_new.dir, parent_new.url, parent_new.revision)?;
+    let ours = list_nodes(pair_now.dir, pair_now.url, pair_now.revision)?;
     let mut paths = std::collections::BTreeSet::new();
     paths.extend(old.keys().cloned());
     paths.extend(new.keys().cloned());
     paths.extend(ours.keys().cloned());
     let mut result = BTreeMap::new();
     for path in paths {
-        let base = old.get(&path);
-        let parent = new.get(&path);
-        let pair = ours.get(&path);
-        if pair == parent {
-            if let Some(value) = pair {
-                result.insert(path, value.clone());
-            }
-        } else if pair == base {
-            if let Some(value) = parent {
-                result.insert(path, value.clone());
-            }
-        } else if parent == base {
-            if let Some(value) = pair {
-                result.insert(path, value.clone());
-            }
-        } else {
-            bail!("resolution required for {path}");
+        if let Some(node) = merge_node(old.get(&path), new.get(&path), ours.get(&path), &path)? {
+            result.insert(path, node);
         }
     }
     Ok(result)
 }
 
-fn apply_tree(wc: &Path, tree: &BTreeMap<String, Vec<u8>>) -> Result<()> {
-    let current = list_files(wc)?;
-    for path in current.keys() {
-        if !tree.contains_key(path) {
-            svn_in(&["delete", "--force", path], Some(wc))?;
+fn merge_node(
+    base: Option<&Node>,
+    parent: Option<&Node>,
+    pair: Option<&Node>,
+    path: &str,
+) -> Result<Option<Node>> {
+    if pair == parent || pair == base {
+        return Ok(if pair == base {
+            parent.cloned()
+        } else {
+            pair.cloned()
+        });
+    }
+    if parent == base {
+        return Ok(pair.cloned());
+    }
+    let same_kind = base.map(|node| node.kind.clone()) == parent.map(|node| node.kind.clone())
+        && parent.map(|node| node.kind.clone()) == pair.map(|node| node.kind.clone());
+    let same_bytes = base.map(|node| &node.bytes) == parent.map(|node| &node.bytes)
+        && parent.map(|node| &node.bytes) == pair.map(|node| &node.bytes);
+    if same_kind && same_bytes {
+        let source = pair.or(parent).or(base).context("empty projection")?;
+        return Ok(Some(Node {
+            kind: source.kind.clone(),
+            bytes: source.bytes.clone(),
+            props: merge_props(base, parent, pair, path)?,
+        }));
+    }
+    bail!("resolution required for {path}");
+}
+
+fn merge_props(
+    base: Option<&Node>,
+    parent: Option<&Node>,
+    pair: Option<&Node>,
+    path: &str,
+) -> Result<BTreeMap<String, String>> {
+    let mut names = std::collections::BTreeSet::new();
+    for node in [base, parent, pair].into_iter().flatten() {
+        names.extend(node.props.keys().cloned());
+    }
+    let mut merged = BTreeMap::new();
+    for name in names {
+        let base_value = base.and_then(|node| node.props.get(&name));
+        let parent_value = parent.and_then(|node| node.props.get(&name));
+        let pair_value = pair.and_then(|node| node.props.get(&name));
+        let value = if pair_value == parent_value || pair_value == base_value {
+            if pair_value == base_value {
+                parent_value
+            } else {
+                pair_value
+            }
+        } else if parent_value == base_value {
+            pair_value
+        } else {
+            bail!("resolution required for {path} property {name}");
+        };
+        if let Some(value) = value {
+            merged.insert(name, value.clone());
         }
     }
-    for (path, bytes) in tree {
-        let target = wc.join(path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+    Ok(merged)
+}
+
+fn apply_tree(wc: &Path, tree: &BTreeMap<String, Node>) -> Result<()> {
+    let current = list_working_copy(wc)?;
+    let mut doomed = Vec::new();
+    for (path, node) in &current {
+        match tree.get(path) {
+            None => doomed.push(path.clone()),
+            Some(wanted) if wanted.kind != node.kind => doomed.push(path.clone()),
+            Some(_) => {}
         }
-        std::fs::write(target, bytes)?;
+    }
+    doomed.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
+    for path in doomed {
+        if wc.join(&path).exists() {
+            svn_in(&["delete", "--force", &path], Some(wc))?;
+        }
+    }
+    let mut create: Vec<_> = tree.iter().collect();
+    create.sort_by_key(|(path, _)| path.matches('/').count());
+    for (path, node) in create {
+        let target = wc.join(path);
+        match node.kind {
+            NodeKind::Dir => std::fs::create_dir_all(&target)?,
+            NodeKind::File => {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&target, &node.bytes)?;
+            }
+        }
     }
     svn_in(&["add", "--force", "."], Some(wc))?;
+    for (path, node) in tree {
+        sync_props(wc, path, &node.props)?;
+    }
     Ok(())
+}
+
+fn sync_props(wc: &Path, rel: &str, wanted: &BTreeMap<String, String>) -> Result<()> {
+    let target = wc.join(rel);
+    let target = target.to_str().context("property path")?;
+    let mut current = svn_props(target, None)?;
+    current.remove("svn:mergeinfo");
+    for (name, value) in wanted {
+        if current.get(name) != Some(value) {
+            svn(&["propset", name, value, target])?;
+        }
+    }
+    for name in current.keys() {
+        if !wanted.contains_key(name) {
+            svn(&["propdel", name, target])?;
+        }
+    }
+    Ok(())
+}
+
+fn record_mergeinfo(wc: &Path, parent_path: &str, mapped: i64, parent_rev: i64) -> Result<()> {
+    if parent_rev <= mapped {
+        return Ok(());
+    }
+    let current = svn_in(&["propget", "svn:mergeinfo", "."], Some(wc)).unwrap_or_default();
+    let path = format!("/{}", parent_path.trim_matches('/'));
+    let merged = union_mergeinfo(&current, &path, mapped + 1, parent_rev);
+    svn_in(&["propset", "svn:mergeinfo", &merged, "."], Some(wc))?;
+    Ok(())
+}
+
+fn union_mergeinfo(existing: &str, path: &str, start: i64, end: i64) -> String {
+    let mut lines = Vec::new();
+    let mut found = false;
+    for line in existing.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((entry, spec)) = line.split_once(':') else {
+            lines.push(line.to_string());
+            continue;
+        };
+        if entry != path {
+            lines.push(line.to_string());
+            continue;
+        }
+        found = true;
+        let mut ranges = parse_ranges(spec);
+        ranges.push((start, end));
+        lines.push(format!("{path}:{}", format_ranges(&coalesce(ranges))));
+    }
+    if !found {
+        lines.push(format!(
+            "{path}:{}",
+            format_ranges(&coalesce(vec![(start, end)]))
+        ));
+    }
+    lines.join("\n")
+}
+
+fn parse_ranges(spec: &str) -> Vec<(i64, i64)> {
+    spec.split(',')
+        .filter_map(|token| {
+            let token = token.trim();
+            if token.is_empty() {
+                return None;
+            }
+            if let Some((start, end)) = token.split_once('-') {
+                Some((start.parse().ok()?, end.parse().ok()?))
+            } else {
+                let rev = token.parse().ok()?;
+                Some((rev, rev))
+            }
+        })
+        .collect()
+}
+
+fn coalesce(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+    ranges.sort();
+    let mut out = vec![ranges[0]];
+    for (start, end) in ranges.into_iter().skip(1) {
+        let last = out.last_mut().expect("range");
+        if start <= last.1 + 1 {
+            last.1 = last.1.max(end);
+        } else {
+            out.push((start, end));
+        }
+    }
+    out
+}
+
+fn format_ranges(ranges: &[(i64, i64)]) -> String {
+    ranges
+        .iter()
+        .map(|(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn svn_props(target: &str, revision: Option<&str>) -> Result<BTreeMap<String, String>> {
+    let xml = if let Some(revision) = revision {
+        let pegged = format!("{target}@{revision}");
+        svn(&["proplist", "-v", "--xml", "-r", revision, &pegged])?
+    } else {
+        svn(&["proplist", "-v", "--xml", target])?
+    };
+    Ok(parse_svn_proplist(&xml))
+}
+
+fn parse_svn_proplist(xml: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<property") {
+        rest = &rest[start..];
+        let Some(name_at) = rest.find("name=\"") else {
+            break;
+        };
+        let name_start = name_at + "name=\"".len();
+        let Some(name_end) = rest[name_start..].find('"') else {
+            break;
+        };
+        let name = xml_unescape(&rest[name_start..name_start + name_end]);
+        let Some(body_at) = rest.find('>') else {
+            break;
+        };
+        let Some(close) = rest.find("</property>") else {
+            break;
+        };
+        let value = xml_unescape(&rest[body_at + 1..close]).trim().to_string();
+        out.insert(name, value);
+        rest = &rest[close + "</property>".len()..];
+    }
+    out
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 fn hash(parts: &[&str]) -> String {
@@ -2218,7 +2622,7 @@ token_env = ""
                 "local-session",
                 "rs69-guard-child",
                 call(
-                    "publish",
+                    "drift",
                     &digest,
                     LocalOperation::Update,
                     false,
@@ -2244,7 +2648,7 @@ token_env = ""
         let space = root
             .join("pair-refresh-local")
             .join(hash(&["rs69-guard-child"]))
-            .join(hash(&["publish"]));
+            .join(hash(&["drift"]));
         let outside = root.join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("sentinel"), "keep").unwrap();
@@ -2253,7 +2657,7 @@ token_env = ""
             .run_admitted_local(
                 "local-session",
                 "rs69-guard-child",
-                call("publish", &digest, LocalOperation::Update, false, None),
+                call("drift", &digest, LocalOperation::Update, false, None),
             )
             .await
             .unwrap_err();
@@ -2283,7 +2687,7 @@ token_env = ""
             .run_admitted_local(
                 "local-session",
                 "rs69-guard-child",
-                call("publish", &digest, LocalOperation::Update, false, None),
+                call("drift", &digest, LocalOperation::Update, false, None),
             )
             .await
             .unwrap_err();
@@ -2294,6 +2698,480 @@ token_env = ""
             "{resumed}"
         );
         assert_eq!(svnlook_youngest(&svn_url).unwrap(), hidden);
+    }
+
+    #[test]
+    fn parent_fetch_uses_the_admitted_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let pair = temp.path().join("pair");
+        command("git", &["init", "-b", "main", parent.to_str().unwrap()]);
+        command("git", &["init", "-b", "feature", pair.to_str().unwrap()]);
+        let admitted = git_commit(&parent, "readme.txt", "admitted\n");
+        let _moved = git_commit(&parent, "readme.txt", "moved\n");
+        pin_parent_commit(&pair, &parent, &admitted).unwrap();
+        let fetched = run(&mut Command::new("git").args([
+            "-C",
+            pair.to_str().unwrap(),
+            "rev-parse",
+            "refs/reposync/pair-refresh/parent",
+        ]))
+        .unwrap();
+        assert_eq!(fetched, admitted);
+    }
+
+    #[tokio::test]
+    async fn local_refresh_reconciles_its_own_commit_and_keeps_the_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let engine = Arc::new(engine_for(&root));
+        let svn_dir = root.join("svn");
+        command("svnadmin", &["create", svn_dir.to_str().unwrap()]);
+        let svn_url = format!("file://{}", svn_dir.display());
+        command(
+            "svn",
+            &[
+                "mkdir",
+                &format!("{svn_url}/trunk"),
+                &format!("{svn_url}/branches"),
+                "-m",
+                "layout",
+                "--non-interactive",
+            ],
+        );
+        let parent_wc = root.join("parent-wc");
+        command(
+            "svn",
+            &[
+                "checkout",
+                &format!("{svn_url}/trunk"),
+                parent_wc.to_str().unwrap(),
+                "--non-interactive",
+            ],
+        );
+        std::fs::write(parent_wc.join("readme.txt"), "origin\n").unwrap();
+        command_in(&parent_wc, &["add", "readme.txt"]);
+        command_in(&parent_wc, &["commit", "-m", "origin"]);
+        command(
+            "svn",
+            &[
+                "copy",
+                &format!("{svn_url}/trunk"),
+                &format!("{svn_url}/branches/feature"),
+                "-m",
+                "pair",
+                "--non-interactive",
+            ],
+        );
+        let feature_base = svn_revision(&format!("{svn_url}/branches/feature")).unwrap();
+        std::fs::write(parent_wc.join("readme.txt"), "parent\n").unwrap();
+        command_in(&parent_wc, &["commit", "-m", "parent advance"]);
+        let parent_git = root.join("repos/rs69-receipt-parent/git-repo");
+        let pair_git = root.join("repos/rs69-receipt-child/git-repo");
+        std::fs::create_dir_all(&parent_git).unwrap();
+        std::fs::create_dir_all(&pair_git).unwrap();
+        command("git", &["init", "-b", "main", parent_git.to_str().unwrap()]);
+        command(
+            "git",
+            &["init", "-b", "feature", pair_git.to_str().unwrap()],
+        );
+        let origin = git_commit(&parent_git, "readme.txt", "origin\n");
+        let pair_sha = git_commit(&pair_git, "readme.txt", "origin\n");
+        let parent_tip = git_commit(&parent_git, "readme.txt", "parent\n");
+        engine
+            .db()
+            .insert_repository(&repo(
+                "rs69-receipt-parent",
+                None,
+                &svn_url,
+                "trunk",
+                feature_base,
+                &origin,
+            ))
+            .unwrap();
+        engine
+            .db()
+            .insert_repository(&repo(
+                "rs69-receipt-child",
+                Some("rs69-receipt-parent"),
+                &svn_url,
+                "branches/feature",
+                feature_base,
+                &pair_sha,
+            ))
+            .unwrap();
+        let mut child = engine
+            .db()
+            .get_repository("rs69-receipt-child")
+            .unwrap()
+            .unwrap();
+        child.last_svn_rev = svn_revision(&format!("{svn_url}/branches/feature")).unwrap();
+        engine.db().update_repository(&child).unwrap();
+        let mut parent = engine
+            .db()
+            .get_repository("rs69-receipt-parent")
+            .unwrap()
+            .unwrap();
+        parent.last_git_sha = parent_tip;
+        engine.db().update_repository(&parent).unwrap();
+        let service = RefreshService::new(engine.clone());
+        let digest = current_digest(
+            &engine,
+            "rs69-receipt-child",
+            LocalOperation::Update,
+            false,
+            false,
+        )
+        .unwrap();
+        let intent = service
+            .run_admitted_local(
+                "local-session",
+                "rs69-receipt-child",
+                call(
+                    "publish",
+                    &digest,
+                    LocalOperation::Update,
+                    false,
+                    Some("svn_intent"),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(intent.to_string().contains("svn_intent"), "{intent}");
+        assert_reservation_blocks(&engine, &service).await;
+        let committed = service
+            .run_admitted_local(
+                "local-session",
+                "rs69-receipt-child",
+                call(
+                    "publish",
+                    &digest,
+                    LocalOperation::Update,
+                    false,
+                    Some("svn_committed"),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            committed.to_string().contains("journal receipt"),
+            "{committed}"
+        );
+        let own = svnlook_youngest(&svn_url).unwrap();
+        let log = run(Command::new("svnlook")
+            .arg("log")
+            .arg("-r")
+            .arg(own.to_string())
+            .arg(&svn_dir))
+        .unwrap();
+        assert!(log.contains("reposync-pair-refresh"), "{log}");
+        let stored = engine
+            .db()
+            .get_state(&format!("{JOURNAL_PREFIX}rs69-receipt-child:publish"))
+            .unwrap()
+            .unwrap();
+        assert!(stored.contains("\"new_svn\":null"), "{stored}");
+        assert_reservation_blocks(&engine, &service).await;
+        std::fs::write(parent_wc.join("other.txt"), "later\n").unwrap();
+        command_in(&parent_wc, &["add", "other.txt"]);
+        command_in(&parent_wc, &["commit", "-m", "unrelated other path"]);
+        let hidden = svnlook_youngest(&svn_url).unwrap();
+        assert!(hidden > own);
+        let git_boundary = service
+            .run_admitted_local(
+                "local-session",
+                "rs69-receipt-child",
+                call(
+                    "publish",
+                    &digest,
+                    LocalOperation::Update,
+                    false,
+                    Some("git_intent"),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            git_boundary.to_string().contains("git_intent"),
+            "{git_boundary}"
+        );
+        assert_eq!(svnlook_youngest(&svn_url).unwrap(), hidden);
+        assert_reservation_blocks(&engine, &service).await;
+        let done = service
+            .run_admitted_local(
+                "local-session",
+                "rs69-receipt-child",
+                call("publish", &digest, LocalOperation::Update, false, None),
+            )
+            .await
+            .unwrap();
+        assert!(!done.noop);
+        assert_eq!(svnlook_youngest(&svn_url).unwrap(), hidden);
+        assert_eq!(done.svn_revision, Some(own));
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(
+            &engine.db().conn(),
+            Some("rs69-receipt-child"),
+        )
+        .unwrap();
+        let integrated = run(&mut Command::new("git").args([
+            "-C",
+            pair_git.to_str().unwrap(),
+            "show",
+            "HEAD:readme.txt",
+        ]))
+        .unwrap();
+        assert_eq!(integrated, "parent");
+    }
+
+    async fn assert_reservation_blocks(engine: &SyncEngine, service: &RefreshService) {
+        let sync = engine
+            .db()
+            .update_repo_watermark("rs69-receipt-child", 1, "abc");
+        let message = sync.unwrap_err().to_string();
+        assert!(message.contains("durable pair refresh"), "{message}");
+        let competing = service
+            .run_admitted_local(
+                "local-session",
+                "rs69-receipt-child",
+                call("other", "", LocalOperation::Update, true, None),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            competing.to_string().contains("durable pair refresh"),
+            "{competing}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_refresh_preserves_properties_directories_and_mergeinfo() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let engine = Arc::new(engine_for(&root));
+        let svn_dir = root.join("svn");
+        command("svnadmin", &["create", svn_dir.to_str().unwrap()]);
+        let svn_url = format!("file://{}", svn_dir.display());
+        command(
+            "svn",
+            &[
+                "mkdir",
+                &format!("{svn_url}/trunk"),
+                &format!("{svn_url}/branches"),
+                "-m",
+                "layout",
+                "--non-interactive",
+            ],
+        );
+        let parent_wc = root.join("parent-wc");
+        command(
+            "svn",
+            &[
+                "checkout",
+                &format!("{svn_url}/trunk"),
+                parent_wc.to_str().unwrap(),
+                "--non-interactive",
+            ],
+        );
+        std::fs::write(parent_wc.join("readme.txt"), "origin\n").unwrap();
+        std::fs::create_dir(parent_wc.join("slot")).unwrap();
+        std::fs::write(parent_wc.join("slot/inside.txt"), "dir\n").unwrap();
+        command_in(&parent_wc, &["add", "readme.txt", "slot"]);
+        command_in(&parent_wc, &["commit", "-m", "origin"]);
+        command(
+            "svn",
+            &[
+                "copy",
+                &format!("{svn_url}/trunk"),
+                &format!("{svn_url}/branches/feature"),
+                "-m",
+                "pair",
+                "--non-interactive",
+            ],
+        );
+        let mapped_parent = svn_revision(&format!("{svn_url}/trunk")).unwrap();
+        let feature_wc = root.join("feature-wc");
+        command(
+            "svn",
+            &[
+                "checkout",
+                &format!("{svn_url}/branches/feature"),
+                feature_wc.to_str().unwrap(),
+                "--non-interactive",
+            ],
+        );
+        command_in(
+            &feature_wc,
+            &["propset", "custom:side", "child", "readme.txt"],
+        );
+        command_in(&feature_wc, &["commit", "-m", "child prop"]);
+        command_in(
+            &parent_wc,
+            &["propset", "custom:side", "parent", "readme.txt"],
+        );
+        command_in(&parent_wc, &["commit", "-m", "parent prop"]);
+        let parent_git = root.join("repos/rs69-prop-parent/git-repo");
+        let pair_git = root.join("repos/rs69-prop-child/git-repo");
+        std::fs::create_dir_all(&parent_git).unwrap();
+        std::fs::create_dir_all(&pair_git).unwrap();
+        command("git", &["init", "-b", "main", parent_git.to_str().unwrap()]);
+        command(
+            "git",
+            &["init", "-b", "feature", pair_git.to_str().unwrap()],
+        );
+        let parent_sha = git_commit(&parent_git, "readme.txt", "origin\n");
+        let pair_sha = git_commit(&pair_git, "readme.txt", "origin\n");
+        engine
+            .db()
+            .insert_repository(&repo(
+                "rs69-prop-parent",
+                None,
+                &svn_url,
+                "trunk",
+                mapped_parent,
+                &parent_sha,
+            ))
+            .unwrap();
+        engine
+            .db()
+            .insert_repository(&repo(
+                "rs69-prop-child",
+                Some("rs69-prop-parent"),
+                &svn_url,
+                "branches/feature",
+                svn_revision(&format!("{svn_url}/branches/feature")).unwrap(),
+                &pair_sha,
+            ))
+            .unwrap();
+        let service = RefreshService::new(engine.clone());
+        let before = svnlook_youngest(&svn_url).unwrap();
+        let overlap = current_digest(
+            &engine,
+            "rs69-prop-child",
+            LocalOperation::Update,
+            false,
+            false,
+        )
+        .unwrap();
+        let refused = service
+            .run_admitted_local(
+                "local-session",
+                "rs69-prop-child",
+                call(
+                    "prop-overlap",
+                    &overlap,
+                    LocalOperation::Update,
+                    false,
+                    None,
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("resolution required"),
+            "{refused}"
+        );
+        assert_eq!(svnlook_youngest(&svn_url).unwrap(), before);
+
+        command_in(&feature_wc, &["update"]);
+        command_in(&feature_wc, &["propdel", "custom:side", "readme.txt"]);
+        command_in(
+            &feature_wc,
+            &["propset", "custom:note", "keep", "readme.txt"],
+        );
+        command_in(
+            &feature_wc,
+            &["propset", "svn:mergeinfo", "/trunk:2-3", "."],
+        );
+        command_in(&feature_wc, &["commit", "-m", "child retained"]);
+        command_in(&parent_wc, &["update"]);
+        command_in(&parent_wc, &["propdel", "custom:side", "readme.txt"]);
+        command_in(
+            &parent_wc,
+            &["propset", "svn:executable", "*", "readme.txt"],
+        );
+        std::fs::create_dir(parent_wc.join("emptydir")).unwrap();
+        command_in(&parent_wc, &["add", "emptydir"]);
+        command_in(&parent_wc, &["delete", "slot"]);
+        std::fs::write(parent_wc.join("slot"), "file\n").unwrap();
+        command_in(&parent_wc, &["add", "slot"]);
+        command_in(&parent_wc, &["commit", "-m", "parent structure"]);
+        let mut child = engine
+            .db()
+            .get_repository("rs69-prop-child")
+            .unwrap()
+            .unwrap();
+        child.last_svn_rev = svn_revision(&format!("{svn_url}/branches/feature")).unwrap();
+        engine.db().update_repository(&child).unwrap();
+        let digest = current_digest(
+            &engine,
+            "rs69-prop-child",
+            LocalOperation::Update,
+            false,
+            false,
+        )
+        .unwrap();
+        let receipt = service
+            .run_admitted_local(
+                "local-session",
+                "rs69-prop-child",
+                call("projection", &digest, LocalOperation::Update, false, None),
+            )
+            .await
+            .unwrap();
+        let published = receipt.svn_revision.unwrap();
+        let executable = run(&mut Command::new("svn").args([
+            "propget",
+            "svn:executable",
+            "-r",
+            &published.to_string(),
+            &format!("{svn_url}/branches/feature/readme.txt"),
+            "--non-interactive",
+        ]))
+        .unwrap();
+        assert_eq!(executable, "*");
+        let note = run(&mut Command::new("svn").args([
+            "propget",
+            "custom:note",
+            "-r",
+            &published.to_string(),
+            &format!("{svn_url}/branches/feature/readme.txt"),
+            "--non-interactive",
+        ]))
+        .unwrap();
+        assert_eq!(note, "keep");
+        let listed = run(&mut Command::new("svn").args([
+            "list",
+            "-r",
+            &published.to_string(),
+            &format!("{svn_url}/branches/feature"),
+            "--non-interactive",
+        ]))
+        .unwrap();
+        assert!(listed.contains("emptydir/"), "{listed}");
+        let slot = run(&mut Command::new("svn").args([
+            "cat",
+            "-r",
+            &published.to_string(),
+            &format!("{svn_url}/branches/feature/slot"),
+            "--non-interactive",
+        ]))
+        .unwrap();
+        assert_eq!(slot, "file");
+        let mergeinfo = run(&mut Command::new("svn").args([
+            "propget",
+            "svn:mergeinfo",
+            "-r",
+            &published.to_string(),
+            &format!("{svn_url}/branches/feature"),
+            "--non-interactive",
+        ]))
+        .unwrap();
+        assert!(
+            mergeinfo.contains("2-3") || mergeinfo.contains('2'),
+            "{mergeinfo}"
+        );
+        assert!(mergeinfo.contains("trunk:"), "{mergeinfo}");
+        assert_ne!(mergeinfo.trim(), format!("/trunk:{published}"));
     }
 
     fn command_in(dir: &Path, args: &[&str]) {

@@ -27,6 +27,7 @@ use crate::pair_refresh::svn_preparation::PreparedCleanChildSvn;
 
 const PREFIX: &str = "pair_refresh_execution_v2:";
 const FAMILY: &str = "pair_refresh_execution_";
+const LOCAL_HOLD_PREFIX: &str = "pair_refresh_local_hold:";
 
 #[path = "pair_refresh_authenticated.rs"]
 mod authenticated;
@@ -578,7 +579,7 @@ fn journal(tx: &Connection) -> Result<Vec<PairRefreshOperation>, DatabaseError> 
 
 /// Shared guard for all production writer entrances. A global writer without a
 /// registered repository ID refuses while any refresh owns either scope.
-pub fn require_no_pair_refresh_hold(
+pub(crate) fn require_no_versioned_pair_refresh_hold(
     tx: &Connection,
     repo_id: Option<&str>,
 ) -> Result<(), DatabaseError> {
@@ -590,6 +591,71 @@ pub fn require_no_pair_refresh_hold(
     });
     if held {
         return Err(refused("a durable pair refresh owns this writer scope"));
+    }
+    Ok(())
+}
+
+pub fn require_no_pair_refresh_hold(
+    tx: &Connection,
+    repo_id: Option<&str>,
+) -> Result<(), DatabaseError> {
+    require_no_versioned_pair_refresh_hold(tx, repo_id)?;
+    if local_hold_blocks(tx, repo_id)? {
+        return Err(refused("a durable pair refresh owns this writer scope"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalHold {
+    child: String,
+    parent: String,
+    request_id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    operation_id: String,
+}
+
+fn local_holds(tx: &Connection) -> Result<Vec<LocalHold>, DatabaseError> {
+    let mut stmt =
+        tx.prepare("SELECT value FROM kv_state WHERE substr(key, 1, ?1) = ?2 ORDER BY key")?;
+    let rows = stmt.query_map(params![LOCAL_HOLD_PREFIX.len(), LOCAL_HOLD_PREFIX], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut holds = Vec::new();
+    for row in rows {
+        let raw = row?;
+        let hold: LocalHold = serde_json::from_str(&raw)
+            .map_err(|_| refused("durable local reservation is unreadable"))?;
+        holds.push(hold);
+    }
+    Ok(holds)
+}
+
+fn local_hold_blocks(tx: &Connection, repo_id: Option<&str>) -> Result<bool, DatabaseError> {
+    Ok(local_holds(tx)?
+        .into_iter()
+        .any(|hold| repo_id.is_none_or(|id| id == hold.child || id == hold.parent)))
+}
+
+/// The request that owns the local reservation may continue. Every other
+/// request that overlaps either repository is refused.
+pub(crate) fn require_no_foreign_local_hold(
+    tx: &Connection,
+    child: &str,
+    parent: &str,
+    request_id: &str,
+) -> Result<(), DatabaseError> {
+    for hold in local_holds(tx)? {
+        let same_owner =
+            hold.request_id == request_id && hold.child == child && hold.parent == parent;
+        let overlaps = hold.child == child
+            || hold.parent == child
+            || hold.child == parent
+            || hold.parent == parent;
+        if overlaps && !same_owner {
+            return Err(refused("a durable pair refresh owns this writer scope"));
+        }
     }
     Ok(())
 }
