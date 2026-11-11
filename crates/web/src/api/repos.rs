@@ -3715,6 +3715,9 @@ struct RefreshPreviewRequest {
     /// `false` is an execute attempt and is refused. Omitted means preview.
     #[serde(default)]
     dry_run: Option<bool>,
+    /// Re-anchor execution requires this digest. Preview never approves the current plan.
+    #[serde(default)]
+    approval_digest: String,
 }
 
 async fn preview_pair_refresh(
@@ -3738,7 +3741,13 @@ async fn preview_pair_refresh(
             "unknown_refresh_operation: '{other}' is not a refresh mode. Supported operations are update_pair_from_parent and reanchor."
         ))
     })?;
-    if operation == RefreshOperation::Reanchor || execution_requested(body.execute, body.dry_run) {
+    let publish = body.dry_run != Some(true) && execution_requested(body.execute, body.dry_run);
+    if publish {
+        if operation == RefreshOperation::Reanchor && body.approval_digest.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "reanchor requires an explicit approval digest".into(),
+            ));
+        }
         let Some(Extension(service)) = extension else {
             return Err(AppError::BadRequest(
                 "refresh service is not attached".into(),
@@ -3760,11 +3769,11 @@ async fn preview_pair_refresh(
                 &id,
                 reposync_core::pair_refresh::local_operations::LocalRequest {
                     request_id: format!("v1:{id}:{}", body.operation),
-                    approval_digest: String::new(),
+                    approval_digest: body.approval_digest.clone(),
                     operation: local_operation,
                     same_name: false,
                     retire: false,
-                    approve_current: true,
+                    approve_current: operation != RefreshOperation::Reanchor,
                     stop_after: None,
                 },
             )

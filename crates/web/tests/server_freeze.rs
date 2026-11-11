@@ -7539,7 +7539,7 @@ async fn candidate_r13_execute_refused() {
     server.abort();
 }
 
-/// R13: re-anchor enters RefreshService and does not publish without a database session.
+/// R13: re-anchor preview is read-only, and execution without a digest does not approve the current plan.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r13_reanchor_not_implemented() {
     let (addr, state, server, tmp, parent_id, pair_id, bare) = refresh_pair_fixture().await;
@@ -7557,11 +7557,35 @@ async fn candidate_r13_reanchor_not_implemented() {
         let payload: serde_json::Value = response.json().await.unwrap();
         assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{payload}");
         let error = payload["error"].as_str().unwrap_or("");
-        assert!(
-            error.contains("administrator session") || error.contains("database admin"),
-            "{payload}"
-        );
+        assert!(error.contains("explicit approval digest"), "{payload}");
         assert!(!error.contains("not_implemented"), "{payload}");
+        for body in [
+            serde_json::json!({"operation": operation}),
+            serde_json::json!({"operation": operation, "dry_run": true}),
+            serde_json::json!({"operation": operation, "execute": true, "dry_run": true}),
+        ] {
+            let response = client
+                .post(format!("http://{addr}/api/repos/{pair_id}/refresh"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let payload: serde_json::Value = response.json().await.unwrap();
+            assert!(
+                status == reqwest::StatusCode::OK || status == reqwest::StatusCode::BAD_REQUEST,
+                "{payload}"
+            );
+            if status == reqwest::StatusCode::OK {
+                assert_eq!(payload["executed"], false, "{payload}");
+                assert!(payload.get("svn_revision").is_none(), "{payload}");
+            }
+            assert_eq!(
+                refresh_unchanged(&state, &parent_id, &pair_id, &bare, &svn_repo),
+                before,
+                "{payload}"
+            );
+        }
     }
     assert_eq!(
         refresh_unchanged(&state, &parent_id, &pair_id, &bare, &svn_repo),
