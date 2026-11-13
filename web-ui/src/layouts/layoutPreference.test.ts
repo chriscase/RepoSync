@@ -3,10 +3,12 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import {
   LAYOUT_PREFERENCE_PREFIX, MAX_ACCOUNT_IDENTITY_LENGTH, MAX_PREFERENCE_RECORD_LENGTH,
-  browserPreferenceEnvironment, parseLayoutPreference, preferenceKey, preferenceScope, readLayoutPreference,
+  browserPreferenceEnvironment, isWellFormedText, parseLayoutPreference, preferenceKey, preferenceScope, readLayoutPreference,
   readNotice, scopeIdentity, serializeLayoutPreference, stableAccountIdentity, useLayoutPreference,
   writeLayoutPreference, writeNotice, type PreferenceEnvironment, type PreferenceScope,
 } from './layoutPreference';
+import { LAYOUT_IDS } from './layoutCatalog';
+import LayoutChooser from './LayoutChooser';
 
 const ORIGIN = 'https://ui.example';
 const OTHER_ORIGIN = 'http://127.0.0.1:5173';
@@ -32,6 +34,40 @@ function accountScope(identity: string, storage = new MemoryStorage(), origin = 
 }
 
 function record(fields: Record<string, unknown>) { return JSON.stringify(fields); }
+
+function keyFor(identity: string, origin = ORIGIN): string {
+  const key = preferenceKey(origin, identity);
+  if (key === null) throw new Error(`expected an encodable preference key for ${JSON.stringify(identity)}`);
+  return key;
+}
+
+function Probe({ user, env }: { user: unknown; env: PreferenceEnvironment }) {
+  const preference = useLayoutPreference(user, () => env);
+  return createElement('output', null, `${preference.layout}|${preference.notice?.short ?? ''}`);
+}
+const render = (user: unknown, env: PreferenceEnvironment) => renderToStaticMarkup(createElement(Probe, { user, env }));
+
+/** The hook with its default browser environment, rendered through the real chooser. */
+function DefaultChooserProbe({ user }: { user: unknown }) {
+  const preference = useLayoutPreference(user);
+  return createElement(LayoutChooser, { value: preference.layout, onChange: preference.choose, notice: preference.notice });
+}
+
+/** Ids whose `individual` record is exactly `target` code units (quotation marks escape to two). */
+function identityForRecordLength(target: number, origin = ORIGIN): string {
+  const added = target - record({ version: 1, layout: 'individual', identity: '', origin }).length;
+  const quotes = Math.max(0, added - MAX_ACCOUNT_IDENTITY_LENGTH);
+  return '"'.repeat(quotes) + 'a'.repeat(added - 2 * quotes);
+}
+
+/** Replaces the global localStorage getter with one that throws, as a browser blocking storage does. */
+function withRefusedStorage(run: () => void) {
+  const saved = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, get() { throw new Error('Synthetic SecurityError'); } });
+  try { run(); } finally {
+    if (saved) Object.defineProperty(globalThis, 'localStorage', saved); else Reflect.deleteProperty(globalThis, 'localStorage');
+  }
+}
 
 afterEach(() => { vi.unstubAllGlobals(); });
 
@@ -72,16 +108,16 @@ describe('#262 preference scope', () => {
     }
   });
 
-  it('treats a browser that throws on storage or location access as having neither', () => {
+  it('records a browser that throws on storage access as refused storage, without throwing', () => {
     vi.stubGlobal('location', { origin: ORIGIN });
     const storage = new MemoryStorage();
     vi.stubGlobal('localStorage', storage);
-    expect(browserPreferenceEnvironment()).toEqual({ storage, origin: ORIGIN });
+    expect(browserPreferenceEnvironment()).toEqual({ storage, origin: ORIGIN, storageRefused: false });
     const saved = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
     Object.defineProperty(globalThis, 'localStorage', { configurable: true, get() { throw new Error('Synthetic SecurityError'); } });
     try {
       expect(() => browserPreferenceEnvironment()).not.toThrow();
-      expect(browserPreferenceEnvironment()).toEqual({ storage: null, origin: ORIGIN });
+      expect(browserPreferenceEnvironment()).toEqual({ storage: null, origin: ORIGIN, storageRefused: true });
     } finally {
       if (saved) Object.defineProperty(globalThis, 'localStorage', saved); else Reflect.deleteProperty(globalThis, 'localStorage');
     }
@@ -220,12 +256,6 @@ describe('#262 preference notices', () => {
 });
 
 describe('#262 useLayoutPreference initial state', () => {
-  function Probe({ user, env }: { user: unknown; env: PreferenceEnvironment }) {
-    const preference = useLayoutPreference(user, () => env);
-    return createElement('output', null, `${preference.layout}|${preference.notice?.short ?? ''}`);
-  }
-  const render = (user: unknown, env: PreferenceEnvironment) => renderToStaticMarkup(createElement(Probe, { user, env }));
-
   it('starts from the account preference, or Classic with a notice when it cannot be used', () => {
     const storage = new MemoryStorage();
     const scope: PreferenceScope = accountScope('A', storage);
@@ -233,7 +263,7 @@ describe('#262 useLayoutPreference initial state', () => {
     writeLayoutPreference(scope, 'team');
     expect(render({ id: 'A' }, environment(storage))).toBe('<output>team|</output>');
     expect(render({ id: 'B' }, environment(storage))).toBe('<output>classic|</output>');
-    storage.values.set(preferenceKey(ORIGIN, 'A'), '{broken');
+    storage.values.set(keyFor('A'), '{broken');
     expect(render({ id: 'A' }, environment(storage))).toBe('<output>classic|Using Classic</output>');
     storage.failReads = true;
     expect(render({ id: 'A' }, environment(storage))).toBe('<output>classic|Using Classic</output>');
@@ -241,9 +271,178 @@ describe('#262 useLayoutPreference initial state', () => {
 
   it('does not touch storage for a sign-in without a stable account identity', () => {
     const storage = new MemoryStorage();
-    storage.values.set(preferenceKey(ORIGIN, 'A'), record({ version: 1, layout: 'team', identity: 'A', origin: ORIGIN }));
+    storage.values.set(keyFor('A'), record({ version: 1, layout: 'team', identity: 'A', origin: ORIGIN }));
     expect(render(null, environment(storage))).toBe('<output>classic|</output>');
     expect(render({ username: 'legacy-login' }, environment(storage))).toBe('<output>classic|</output>');
     expect(storage.reads).toEqual([]);
+  });
+});
+
+// ---- Retained-review corrections (RS262-1, RS262-2, RS262-3) ----
+
+const LONE_SURROGATE_IDS: readonly string[] = ['\ud800', '\udbff', '\udc00', '\udfff', 'a\ud800b', 'account-\udc00', '\udc00\ud800', '\ud83d', 'end\ud83d'];
+const UNICODE_IDS: readonly string[] = ['😀', 'ü-账户-😀', '𝒜𝒸𝒸𝑜𝓊𝓃𝓉'];
+
+describe('#262 RS262-1 lone surrogates', () => {
+  it('rejects lone high and low surrogates in an identity or origin without throwing or altering the id', () => {
+    for (const id of LONE_SURROGATE_IDS) {
+      const label = JSON.stringify(id);
+      expect(isWellFormedText(id), label).toBe(false);
+      expect(() => stableAccountIdentity({ id }), label).not.toThrow();
+      expect(stableAccountIdentity({ id }), label).toBeNull();
+      expect(() => preferenceKey(ORIGIN, id), label).not.toThrow();
+      expect(preferenceKey(ORIGIN, id), label).toBeNull();
+      expect(preferenceKey(`${ORIGIN}${id}`, 'A'), label).toBeNull();
+      expect(preferenceScope({ id }, environment()), label).toEqual({ kind: 'unscoped', reason: 'no-account-identity' });
+      expect(preferenceScope({ id: 'A' }, environment(new MemoryStorage(), `${ORIGIN}${id}`)), label).toEqual({ kind: 'unscoped', reason: 'no-origin' });
+    }
+  });
+
+  it('renders Classic through the hook for lone high and low surrogate ids with no preference read or write', () => {
+    for (const id of ['\ud800', '\udc00']) {
+      const storage = new MemoryStorage();
+      storage.values.set(keyFor('A'), serializeLayoutPreference(accountScope('A', storage), 'team'));
+      let html = '';
+      expect(() => { html = render({ id, role: 'admin' }, environment(storage)); }).not.toThrow();
+      expect(html).toBe('<output>classic|</output>');
+      expect(writeLayoutPreference(preferenceScope({ id }, environment(storage)), 'team')).toEqual({ status: 'not-saved', reason: 'no-account-identity' });
+      expect(storage.reads).toEqual([]);
+      expect(storage.writes).toEqual([]);
+    }
+  });
+
+  it('keeps valid surrogate pairs and other Unicode ids, which save and re-read exactly', () => {
+    for (const id of UNICODE_IDS) {
+      expect(isWellFormedText(id)).toBe(true);
+      expect(stableAccountIdentity({ id })).toBe(id);
+      expect(keyFor(id)).toBe(`${LAYOUT_PREFERENCE_PREFIX}:${encodeURIComponent(ORIGIN)}:${encodeURIComponent(id)}`);
+      for (const layout of LAYOUT_IDS) {
+        const storage = new MemoryStorage();
+        const scope = accountScope(id, storage);
+        expect(writeLayoutPreference(scope, layout)).toEqual({ status: 'saved' });
+        expect(readLayoutPreference(scope)).toEqual({ status: 'stored', layout });
+        expect(render({ id }, environment(storage))).toBe(`<output>${layout}|</output>`);
+      }
+    }
+  });
+});
+
+describe('#262 RS262-2 record size', () => {
+  it('does not persist an accepted id of 256 quotation marks whose record the reader would reject', () => {
+    const quotes = '"'.repeat(MAX_ACCOUNT_IDENTITY_LENGTH);
+    expect(stableAccountIdentity({ id: quotes })).toBe(quotes);
+    expect(record({ version: 1, layout: 'team', identity: quotes, origin: ORIGIN }).length).toBeGreaterThan(MAX_PREFERENCE_RECORD_LENGTH);
+    const storage = new MemoryStorage();
+    const scope = preferenceScope({ id: quotes }, environment(storage));
+    expect(scope).toEqual({ kind: 'unscoped', reason: 'record-too-large' });
+    for (const layout of LAYOUT_IDS) expect(writeLayoutPreference(scope, layout)).toEqual({ status: 'not-saved', reason: 'record-too-large' });
+    expect(readLayoutPreference(scope)).toEqual({ status: 'unscoped', layout: 'classic' });
+    expect(render({ id: quotes }, environment(storage))).toBe('<output>classic|</output>');
+    expect(storage.reads).toEqual([]);
+    expect(storage.writes).toEqual([]);
+    const notice = writeNotice('team', { status: 'not-saved', reason: 'record-too-large' });
+    expect(notice?.detail).toBe('Team applies in this tab until you reload; this account identity and site address are too long to store a layout preference for.');
+    expect(notice?.detail).not.toContain('browser');
+  });
+
+  it('saves every layout at exactly the record limit and refuses the whole scope one code unit beyond it', () => {
+    const exact = identityForRecordLength(MAX_PREFERENCE_RECORD_LENGTH);
+    const beyond = identityForRecordLength(MAX_PREFERENCE_RECORD_LENGTH + 1);
+    for (const id of [exact, beyond]) {
+      expect(id.length).toBeLessThanOrEqual(MAX_ACCOUNT_IDENTITY_LENGTH);
+      expect(stableAccountIdentity({ id })).toBe(id);
+    }
+    const storage = new MemoryStorage();
+    const scope = accountScope(exact, storage);
+    const lengths: Record<string, number> = {};
+    for (const layout of LAYOUT_IDS) {
+      expect(writeLayoutPreference(scope, layout)).toEqual({ status: 'saved' });
+      lengths[layout] = (storage.values.get(scope.key) ?? '').length;
+      expect(readLayoutPreference(scope)).toEqual({ status: 'stored', layout });
+    }
+    expect(lengths).toEqual({ classic: MAX_PREFERENCE_RECORD_LENGTH - 3, individual: MAX_PREFERENCE_RECORD_LENGTH, team: MAX_PREFERENCE_RECORD_LENGTH - 6 });
+    // Team alone would still fit one unit beyond, but whether a scope persists does not depend on the layout chosen.
+    expect(record({ version: 1, layout: 'team', identity: beyond, origin: ORIGIN }).length).toBeLessThan(MAX_PREFERENCE_RECORD_LENGTH);
+    const refusedStorage = new MemoryStorage();
+    const refused = preferenceScope({ id: beyond }, environment(refusedStorage));
+    expect(refused).toEqual({ kind: 'unscoped', reason: 'record-too-large' });
+    for (const layout of LAYOUT_IDS) expect(writeLayoutPreference(refused, layout)).toEqual({ status: 'not-saved', reason: 'record-too-large' });
+    expect(refusedStorage.reads).toEqual([]);
+    expect(refusedStorage.writes).toEqual([]);
+  });
+
+  it('refuses an oversized record in the writer itself before setItem, keeping the earlier preference', () => {
+    const identity = identityForRecordLength(MAX_PREFERENCE_RECORD_LENGTH + 1);
+    const storage = new MemoryStorage();
+    const key = keyFor(identity);
+    const earlier = 'earlier synthetic preference';
+    storage.values.set(key, earlier);
+    // A hand-built scope bypasses preferenceScope's bound, so only the writer's own guard applies here.
+    const constructed: PreferenceScope = { kind: 'account', key, identity, origin: ORIGIN, storage };
+    expect(writeLayoutPreference(constructed, 'individual')).toEqual({ status: 'not-saved', reason: 'record-too-large' });
+    expect(storage.writes).toEqual([]);
+    expect(storage.values.get(key)).toBe(earlier);
+    // Whatever the writer does save re-reads as the same stored layout.
+    expect(writeLayoutPreference(constructed, 'team')).toEqual({ status: 'saved' });
+    expect(readLayoutPreference(constructed)).toEqual({ status: 'stored', layout: 'team' });
+  });
+
+  it('round-trips every layout for accepted ordinary, escaped and Unicode ids', () => {
+    for (const id of ['fixture-admin', 'user 1', 'quote"and\\backslash', '"'.repeat(100), ...UNICODE_IDS]) {
+      for (const layout of LAYOUT_IDS) {
+        const storage = new MemoryStorage();
+        const scope = accountScope(id, storage);
+        expect(writeLayoutPreference(scope, layout), id).toEqual({ status: 'saved' });
+        expect((storage.values.get(scope.key) ?? '').length).toBeLessThanOrEqual(MAX_PREFERENCE_RECORD_LENGTH);
+        expect(readLayoutPreference(scope), id).toEqual({ status: 'stored', layout });
+      }
+    }
+  });
+});
+
+describe('#262 RS262-3 refused storage access', () => {
+  it('carries a refused storage getter through scope, read, write and notices for a genuine account', () => {
+    vi.stubGlobal('location', { origin: ORIGIN });
+    vi.stubGlobal('localStorage', new MemoryStorage());
+    withRefusedStorage(() => {
+      const env = browserPreferenceEnvironment();
+      expect(env).toEqual({ storage: null, origin: ORIGIN, storageRefused: true });
+      const scope = preferenceScope({ id: 'A' }, env);
+      expect(scope).toEqual({ kind: 'unscoped', reason: 'storage-refused' });
+      const read = readLayoutPreference(scope);
+      expect(read).toEqual({ status: 'unavailable', layout: 'classic' });
+      expect(readNotice(read)?.short).toBe('Using Classic');
+      expect(writeLayoutPreference(scope, 'team')).toEqual({ status: 'not-saved', reason: 'storage-refused' });
+      expect(writeNotice('team', { status: 'not-saved', reason: 'storage-refused' })?.detail).toBe('Team applies in this tab until you reload; this browser did not allow the layout preference to be saved.');
+    });
+  });
+
+  it('renders Classic with the visible Using Classic notice through the default-environment hook and the chooser', () => {
+    vi.stubGlobal('location', { origin: ORIGIN });
+    vi.stubGlobal('localStorage', new MemoryStorage());
+    withRefusedStorage(() => {
+      let html = '';
+      expect(() => { html = renderToStaticMarkup(createElement(DefaultChooserProbe, { user: { id: 'A', role: 'viewer' } })); }).not.toThrow();
+      expect(html).toContain('<option value="classic" selected="">Classic</option>');
+      expect(html).toMatch(/role="status"[^>]*title="This browser did not allow the saved layout preference to be read, so Classic is shown\.">Using Classic<span class="sr-only">/);
+    });
+  });
+
+  it('keeps missing identity, origin or storage quiet and distinct from refused storage, and restores the global', () => {
+    const storage = new MemoryStorage();
+    vi.stubGlobal('location', { origin: ORIGIN });
+    vi.stubGlobal('localStorage', storage);
+    withRefusedStorage(() => {
+      expect(renderToStaticMarkup(createElement(DefaultChooserProbe, { user: { username: 'legacy-login' } }))).not.toContain('Using Classic');
+    });
+    expect(preferenceScope({ username: 'legacy-login' }, { storage: null, origin: ORIGIN, storageRefused: true })).toEqual({ kind: 'unscoped', reason: 'no-account-identity' });
+    expect(preferenceScope({ id: 'A' }, { storage: null, origin: null, storageRefused: true })).toEqual({ kind: 'unscoped', reason: 'no-origin' });
+    const absent = preferenceScope({ id: 'A' }, { storage: null, origin: ORIGIN });
+    expect(absent).toEqual({ kind: 'unscoped', reason: 'no-storage' });
+    expect(readLayoutPreference(absent)).toEqual({ status: 'unscoped', layout: 'classic' });
+    expect(readNotice(readLayoutPreference(absent))).toBeNull();
+    expect(browserPreferenceEnvironment()).toEqual({ storage, origin: ORIGIN, storageRefused: false });
+    expect(storage.reads).toEqual([]);
+    expect(storage.writes).toEqual([]);
   });
 });

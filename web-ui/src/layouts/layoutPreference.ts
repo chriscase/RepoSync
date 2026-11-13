@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { DEFAULT_LAYOUT, LAYOUT_CATALOG, isLayoutId, type LayoutId } from './layoutCatalog';
+import { DEFAULT_LAYOUT, LAYOUT_CATALOG, LAYOUT_IDS, isLayoutId, type LayoutId } from './layoutCatalog';
 
 /**
  * #262 local presentation preference.
@@ -11,17 +11,23 @@ import { DEFAULT_LAYOUT, LAYOUT_CATALOG, isLayoutId, type LayoutId } from './lay
  */
 export const LAYOUT_PREFERENCE_VERSION = 1;
 export const LAYOUT_PREFERENCE_PREFIX = 'reposync.layout-preference.v1';
+/** Longest stored record, in UTF-16 code units, that the reader accepts and the writer may produce. */
 export const MAX_PREFERENCE_RECORD_LENGTH = 512;
 export const MAX_ACCOUNT_IDENTITY_LENGTH = 256;
 const MAX_ORIGIN_LENGTH = 512;
+/** A scope persists only if its record fits for every layout, so no layout id is special. */
+const LONGEST_LAYOUT_ID: LayoutId = LAYOUT_IDS.reduce((longest, id) => (id.length > longest.length ? id : longest), DEFAULT_LAYOUT);
 
 export type PreferenceStorage = Pick<Storage, 'getItem' | 'setItem'>;
 export interface PreferenceEnvironment {
+  /** null when this runtime has no localStorage at all (for example server rendering). */
   readonly storage: PreferenceStorage | null;
   readonly origin: string | null;
+  /** true when the browser refused access to localStorage itself; reported, never treated as absent. */
+  readonly storageRefused?: boolean;
 }
 
-export type UnscopedReason = 'no-account-identity' | 'no-origin' | 'no-storage';
+export type UnscopedReason = 'no-account-identity' | 'no-origin' | 'record-too-large' | 'storage-refused' | 'no-storage';
 export type PreferenceScope =
   | { readonly kind: 'account'; readonly key: string; readonly identity: string; readonly origin: string; readonly storage: PreferenceStorage }
   | { readonly kind: 'unscoped'; readonly reason: UnscopedReason };
@@ -41,32 +47,68 @@ export interface LayoutPreferenceNotice {
   readonly detail: string;
 }
 
-/** The server user id, only when it is a usable non-empty string. */
+/**
+ * True when every UTF-16 surrogate belongs to a valid pair, which is what
+ * encodeURIComponent needs. ES5 string APIs only, so no lib/target change.
+ */
+export function isWellFormedText(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xdc00 && unit <= 0xdfff) return false;
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index++;
+    }
+  }
+  return true;
+}
+
+/**
+ * The server user id, only when it is a usable non-empty string. An id is
+ * rejected, never trimmed, replaced or normalized into a different scope.
+ */
 export function stableAccountIdentity(user: unknown): string | null {
   if (!user || typeof user !== 'object') return null;
   const id = (user as { id?: unknown }).id;
   if (typeof id !== 'string' || id.trim() === '' || id.length > MAX_ACCOUNT_IDENTITY_LENGTH) return null;
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f\u007f]/.test(id)) return null;
+  if (!isWellFormedText(id)) return null;
   return id;
 }
 
 function usableOrigin(origin: string | null): string | null {
   if (typeof origin !== 'string' || origin === '' || origin === 'null' || origin.length > MAX_ORIGIN_LENGTH) return null;
+  if (!isWellFormedText(origin)) return null;
   return origin;
 }
 
-/** Reading the browser can itself throw (blocked storage); that is "no storage", never a crash. */
+/**
+ * Reading the browser can itself throw (blocked storage). That is recorded as
+ * storageRefused, so it is reported later, and is never a crash.
+ */
 export function browserPreferenceEnvironment(): PreferenceEnvironment {
   let storage: PreferenceStorage | null = null;
+  let storageRefused = false;
   let origin: string | null = null;
-  try { storage = typeof localStorage === 'undefined' ? null : localStorage; } catch { storage = null; }
+  try { storage = typeof localStorage === 'undefined' ? null : localStorage; } catch { storage = null; storageRefused = true; }
   try { origin = typeof location === 'undefined' ? null : location.origin; } catch { origin = null; }
-  return { storage, origin };
+  return { storage, origin, storageRefused };
 }
 
-export function preferenceKey(origin: string, identity: string): string {
-  return `${LAYOUT_PREFERENCE_PREFIX}:${encodeURIComponent(origin)}:${encodeURIComponent(identity)}`;
+/** Never throws: null when either part cannot be encoded into a storage key. */
+export function preferenceKey(origin: string, identity: string): string | null {
+  if (!isWellFormedText(origin) || !isWellFormedText(identity)) return null;
+  try {
+    return `${LAYOUT_PREFERENCE_PREFIX}:${encodeURIComponent(origin)}:${encodeURIComponent(identity)}`;
+  } catch {
+    return null;
+  }
+}
+
+function recordText(identity: string, origin: string, layout: LayoutId): string {
+  return JSON.stringify({ version: LAYOUT_PREFERENCE_VERSION, layout, identity, origin });
 }
 
 export function preferenceScope(user: unknown, environment: PreferenceEnvironment): PreferenceScope {
@@ -74,8 +116,13 @@ export function preferenceScope(user: unknown, environment: PreferenceEnvironmen
   if (identity === null) return { kind: 'unscoped', reason: 'no-account-identity' };
   const origin = usableOrigin(environment.origin);
   if (origin === null) return { kind: 'unscoped', reason: 'no-origin' };
+  // JSON escaping can lengthen an accepted id; a scope whose record could not be re-read never persists.
+  if (recordText(identity, origin, LONGEST_LAYOUT_ID).length > MAX_PREFERENCE_RECORD_LENGTH) return { kind: 'unscoped', reason: 'record-too-large' };
+  if (environment.storageRefused) return { kind: 'unscoped', reason: 'storage-refused' };
   if (!environment.storage) return { kind: 'unscoped', reason: 'no-storage' };
-  return { kind: 'account', key: preferenceKey(origin, identity), identity, origin, storage: environment.storage };
+  const key = preferenceKey(origin, identity);
+  if (key === null) return { kind: 'unscoped', reason: 'no-account-identity' };
+  return { kind: 'account', key, identity, origin, storage: environment.storage };
 }
 
 /** Stable comparison key for a scope, so an account change re-reads its own preference. */
@@ -103,7 +150,10 @@ export function parseLayoutPreference(raw: string, scope: Extract<PreferenceScop
 }
 
 export function readLayoutPreference(scope: PreferenceScope): PreferenceRead {
-  if (scope.kind !== 'account') return { status: 'unscoped', layout: DEFAULT_LAYOUT };
+  if (scope.kind !== 'account') {
+    // A refused storage surface is a failed read for a genuine account, not an absent preference.
+    return scope.reason === 'storage-refused' ? { status: 'unavailable', layout: DEFAULT_LAYOUT } : { status: 'unscoped', layout: DEFAULT_LAYOUT };
+  }
   let raw: string | null;
   try { raw = scope.storage.getItem(scope.key); } catch { return { status: 'unavailable', layout: DEFAULT_LAYOUT }; }
   if (raw === null) return { status: 'absent', layout: DEFAULT_LAYOUT };
@@ -112,15 +162,21 @@ export function readLayoutPreference(scope: PreferenceScope): PreferenceRead {
 }
 
 export function serializeLayoutPreference(scope: Extract<PreferenceScope, { kind: 'account' }>, layout: LayoutId): string {
-  return JSON.stringify({ version: LAYOUT_PREFERENCE_VERSION, layout, identity: scope.identity, origin: scope.origin });
+  return recordText(scope.identity, scope.origin, layout);
 }
 
-/** Never throws. Only an enum id is written, and only for a genuine account scope. */
+/**
+ * Never throws. Only an enum id is written, only for a genuine account scope,
+ * and never a record parseLayoutPreference would reject: "saved" always re-reads.
+ */
 export function writeLayoutPreference(scope: PreferenceScope, layout: unknown): PreferenceWrite {
   if (!isLayoutId(layout)) return { status: 'not-saved', reason: 'invalid-layout' };
   if (scope.kind !== 'account') return { status: 'not-saved', reason: scope.reason };
+  const record = serializeLayoutPreference(scope, layout);
+  // Refused before setItem, so an earlier stored preference is kept.
+  if (record.length > MAX_PREFERENCE_RECORD_LENGTH) return { status: 'not-saved', reason: 'record-too-large' };
   try {
-    scope.storage.setItem(scope.key, serializeLayoutPreference(scope, layout));
+    scope.storage.setItem(scope.key, record);
     return { status: 'saved' };
   } catch {
     return { status: 'not-saved', reason: 'storage-error' };
@@ -147,6 +203,8 @@ export function writeNotice(layout: LayoutId, write: PreferenceWrite): LayoutPre
       return { short: 'Not saved', detail: `${applies}; this sign-in has no stable account identity to save it under.` };
     case 'no-origin':
       return { short: 'Not saved', detail: `${applies}; this page has no stable origin to save it under.` };
+    case 'record-too-large':
+      return { short: 'Not saved', detail: `${applies}; this account identity and site address are too long to store a layout preference for.` };
     case 'invalid-layout':
       return { short: 'Not saved', detail: 'That layout is not available in this build.' };
     default:

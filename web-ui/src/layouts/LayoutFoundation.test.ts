@@ -24,20 +24,23 @@ const MEMBER_NAV = ORIGINAL_NAV.slice(0, 5);
 class MemoryStorage {
   values = new Map<string, string>();
   reads: string[] = [];
+  writes: string[] = [];
   failPreferenceReads = false;
   getItem(key: string) {
     this.reads.push(key);
     if (this.failPreferenceReads && key.startsWith(LAYOUT_PREFERENCE_PREFIX)) throw new Error('Synthetic storage read refused');
     return this.values.get(key) ?? null;
   }
-  setItem(key: string, value: string) { this.values.set(key, value); }
+  setItem(key: string, value: string) { this.writes.push(key); this.values.set(key, value); }
   removeItem(key: string) { this.values.delete(key); }
   get length() { return this.values.size; }
   key(index: number) { return [...this.values.keys()][index] ?? null; }
 }
 
 function storedPreference(identity: string, layout: unknown): [string, string] {
-  return [preferenceKey(ORIGIN, identity), JSON.stringify({ version: 1, layout, identity, origin: ORIGIN })];
+  const key = preferenceKey(ORIGIN, identity);
+  if (key === null) throw new Error(`expected an encodable preference key for ${JSON.stringify(identity)}`);
+  return [key, JSON.stringify({ version: 1, layout, identity, origin: ORIGIN })];
 }
 
 function signIn(user: object | null, entries: ReadonlyArray<[string, string]> = []): MemoryStorage {
@@ -356,6 +359,59 @@ describe('#262 preference in the shell', () => {
       expect(html).toMatch(new RegExp(`<p id="${noticeId}" role="status"`));
       expect([...(options ?? '').matchAll(/<option value="([^"]+)"( selected="")?>([^<]+)<\/option>/g)].map(match => [match[1], match[3], Boolean(match[2])]))
         .toEqual(LAYOUT_IDS.map(id => [id, { classic: 'Classic', individual: 'Individual', team: 'Team' }[id], id === layout]));
+    }
+  });
+});
+
+describe('#262 retained-review corrections in the shell', () => {
+  const preferenceReads = (storage: MemoryStorage) => storage.reads.filter(key => key.startsWith(LAYOUT_PREFERENCE_PREFIX));
+
+  it('renders Classic for a stored account id with a lone high or low surrogate, with no preference read or write (RS262-1)', () => {
+    for (const id of ['\ud800', '\udc00']) {
+      const storage = signIn({ id, username: 'surrogate-account', role: 'admin' }, [storedPreference(admin.id, 'team')]);
+      // The unchanged session reader really hands Layout the lone surrogate.
+      expect(JSON.parse(storage.values.get('user') ?? '{}').id).toBe(id);
+      let html = '';
+      expect(() => { html = renderShell().html; }).not.toThrow();
+      expect(layoutOf(html)).toBe('classic');
+      expect(html).not.toContain('Using Classic');
+      expect(navLinks(html).map(link => link.href)).toEqual(ORIGINAL_NAV.map(([href]) => href));
+      expect(preferenceReads(storage)).toEqual([]);
+      expect(storage.writes).toEqual([]);
+    }
+  });
+
+  it('applies a valid surrogate-pair account\'s own stored preference (RS262-1)', () => {
+    const id = '😀';
+    const storage = signIn({ id, username: 'pair-account', role: 'viewer' }, [storedPreference(id, 'team')]);
+    expect(layoutOf(renderShell().html)).toBe('team');
+    expect(preferenceReads(storage)).toEqual([storedPreference(id, 'team')[0]]);
+    expect(storage.writes).toEqual([]);
+  });
+
+  it('shows Classic quietly and touches no preference for an id whose record would be too long (RS262-2)', () => {
+    const storage = signIn({ id: '"'.repeat(256), username: 'quoted-account', role: 'viewer' });
+    const html = renderShell().html;
+    expect(layoutOf(html)).toBe('classic');
+    expect(html).not.toContain('Using Classic');
+    expect(preferenceReads(storage)).toEqual([]);
+    expect(storage.writes).toEqual([]);
+  });
+
+  it('keeps existing auth-storage behavior when the browser refuses localStorage entirely (RS262-3)', () => {
+    signIn(admin, [storedPreference(admin.id, 'team')]);
+    const saved = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, get() { throw new Error('Synthetic SecurityError'); } });
+    try {
+      let html = '';
+      expect(() => { html = renderShell().html; }).not.toThrow();
+      // The unchanged session reader cannot read an account either, so there is no account preference to report.
+      expect(layoutOf(html)).toBe('classic');
+      expect(html).not.toContain('Using Classic');
+      expect(html).not.toContain('Synthetic administrator');
+      expect(navLinks(html).map(link => [link.href, link.label])).toEqual(MEMBER_NAV);
+    } finally {
+      if (saved) Object.defineProperty(globalThis, 'localStorage', saved); else Reflect.deleteProperty(globalThis, 'localStorage');
     }
   });
 });

@@ -77,16 +77,38 @@ origin's `localStorage`:
 Rules:
 
 - **Stable identity only.** The identity must be the server user id: a
-  non-empty string of at most 256 characters with no control characters. A
-  sign-in without one, such as a legacy login with no user object, is not
-  persisted and does not read stored preferences. The role, display name,
-  token and credentials are never stored.
+  non-empty string of at most 256 UTF-16 code units, with no control
+  characters and no lone surrogate. Valid surrogate pairs and other Unicode
+  are kept. An unusable id is rejected, never trimmed, replaced or
+  normalized into a different scope. A sign-in without a usable id, such as a
+  legacy login with no user object, is not persisted and does not read stored
+  preferences. The role, display name, token and credentials are never stored.
+- **No throwing key construction.** `preferenceKey` returns `null` instead of
+  throwing for text it cannot encode, and the origin gets the same
+  well-formedness check as the identity.
+- **Every saved record re-reads.** A stored record may be at most 512 UTF-16
+  code units. JSON escaping can lengthen an accepted id: 256 quotation marks
+  become 512 code units. So a scope persists only if its record fits for the
+  longest layout id. Otherwise it is unscoped (`record-too-large`) for every
+  layout: nothing is read or written, and Classic shows without a notice. A
+  choice still applies, with a "Not saved" notice that names the length, not
+  the browser. The writer also refuses an oversized record before `setItem`,
+  so an earlier stored value is kept, and "saved" always re-reads as the same
+  layout.
 - **Strict reading.** Extra or missing fields, another version, another
   identity or origin, an unknown layout, an over-long value and invalid JSON
   are all ignored. The shell then shows Classic with a visible status, "Using
   Classic", and the stored value is not deleted.
 - **Unreadable storage.** If storage cannot be read, or accessing it throws,
-  the shell shows Classic with the same notice. It does not crash.
+  the preference shows Classic with the same notice. It does not crash.
+  - A throwing `localStorage` getter is kept as `storageRefused`. For a
+    genuine account and origin it reads as unavailable and shows "Using
+    Classic".
+  - Missing identity, origin or storage API stays quiet and distinct.
+  - In the full shell, the unchanged session reader also cannot read the
+    signed-in account when the getter throws. That is existing auth-storage
+    behavior, left as is, so the shell shows Classic with member navigation
+    and no preference notice.
 - **Unsaved choices still apply.** A choice that cannot be saved — because
   storage refuses, or the sign-in has no identity or origin — still applies
   in that tab, with a "Not saved" status explaining why. Storage failure
@@ -145,12 +167,22 @@ owned page work, and this foundation does not choose a theme for the person.
     narrow-screen classes and the theme default.
   - `src/layouts/layoutPreference.test.ts`: identity and origin scoping,
     strict parsing, unreadable or unwritable storage, account isolation,
-    notices and the hook's initial state.
+    notices and the hook's initial state. Also:
+    - lone high and low surrogates, and valid pairs (RS262-1);
+    - escaped ids, records exactly at and one beyond 512, layout-length
+      differences, writer refusal before `setItem`, and save→read round trips
+      (RS262-2);
+    - refused storage carried through scope, read, write, hook and the
+      chooser notice (RS262-3).
   - `src/layouts/LayoutFoundation.test.ts`: element-path identity of
     `main`/`Outlet`, the chooser and status slots in every layout; rendered
     navigation targets, labels, order, active state and admin visibility per
     layout; the same queries and no mutations; per-account preference and
-    visible fallback; and the chooser markup.
+    visible fallback; and the chooser markup. Also the shell path for:
+    - lone-surrogate and surrogate-pair account ids (RS262-1);
+    - an over-long escaped id (RS262-2);
+    - a refused `localStorage` getter alongside existing auth-storage
+      behavior (RS262-3).
 - **Browser** (`web-ui/tests/layout-foundation.e2e.mjs`): runs against the
   existing synthetic fixture with an admitted Chromium. It checks:
   - Classic default colors and axe on the shell nav in every layout;
