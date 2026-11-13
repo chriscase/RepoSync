@@ -406,7 +406,10 @@ classify_inspect_presence() {
         printf 'unknown %s\n' "$class"
         return 1
     fi
-    if [[ -z "$trimmed" ]] && confirmed_absence "$kind" "$name" "$err"; then
+    trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    # docker network inspect prints [] when the network is missing.
+    if [[ -z "$trimmed" || "$trimmed" == "[]" ]] && confirmed_absence "$kind" "$name" "$err"; then
         printf 'absent\n'
         return 0
     fi
