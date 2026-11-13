@@ -50,8 +50,10 @@ describe('#56 PathPolicyEditor56 static rendering', () => {
     const html = renderToStaticMarkup(createElement(PathPolicyEditor56, { draft: editing, onChange: noop }));
     const invalid = html.match(/<input[^>]*aria-invalid="true"[^>]*>/g) || [];
     expect(invalid).toHaveLength(1);
-    const inputId = attribute(invalid[0], 'id');
-    const errorId = attribute(invalid[0], 'aria-describedby');
+    const invalidInput = invalid[0];
+    if (invalidInput === undefined) throw new Error('expected one rendered input with aria-invalid="true"');
+    const inputId = attribute(invalidInput, 'id');
+    const errorId = attribute(invalidInput, 'aria-describedby');
     expect(errorId).toBe(`${inputId}-error`);
     expect(html).toContain(`id="${errorId}" role="alert"`);
     expect(html).toContain('Enter a path, or remove this entry.');
