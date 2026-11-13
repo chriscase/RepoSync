@@ -235,32 +235,28 @@ config_streams_qualify() {
     fi
     case "$kind" in
         missing_file)
+            if [[ "$logs_stdout" != *"configuration file not found:"* && "$logs_stderr" != *"configuration file not found:"* ]]; then
+                printf 'refuse missing_file_diagnostic\n'
+                return 1
+            fi
             if [[ "$logs_stdout" == *"poll interval must be > 0"* || "$logs_stderr" == *"poll interval must be > 0"* ]]; then
                 printf 'refuse unexpected_poll_diagnostic\n'
                 return 1
             fi
-            if [[ "$logs_stdout" == *"configuration file not found:"* || "$logs_stderr" == *"configuration file not found:"* ]]; then
-                printf 'qualify\n'
-                return 0
-            fi
-            printf 'refuse missing_file_diagnostic\n'
-            return 1
+            printf 'qualify\n'
+            return 0
             ;;
         zero_poll)
+            if [[ ! ( "$logs_stdout" == *"daemon.poll_interval_secs"* && "$logs_stdout" == *"poll interval must be > 0"* ) && ! ( "$logs_stderr" == *"daemon.poll_interval_secs"* && "$logs_stderr" == *"poll interval must be > 0"* ) ]]; then
+                printf 'refuse zero_poll_diagnostic\n'
+                return 1
+            fi
             if [[ "$logs_stdout" == *"configuration file not found:"* || "$logs_stderr" == *"configuration file not found:"* ]]; then
                 printf 'refuse unexpected_missing_file_diagnostic\n'
                 return 1
             fi
-            if [[ "$logs_stdout" == *"daemon.poll_interval_secs"* && "$logs_stdout" == *"poll interval must be > 0"* ]]; then
-                printf 'qualify\n'
-                return 0
-            fi
-            if [[ "$logs_stderr" == *"daemon.poll_interval_secs"* && "$logs_stderr" == *"poll interval must be > 0"* ]]; then
-                printf 'qualify\n'
-                return 0
-            fi
-            printf 'refuse zero_poll_diagnostic\n'
-            return 1
+            printf 'qualify\n'
+            return 0
             ;;
         *)
             printf 'refuse unknown_kind\n'
