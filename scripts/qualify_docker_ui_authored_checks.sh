@@ -126,6 +126,7 @@ expect_text 'unknown failed' classify_inspect_presence 1 '' 'error: no such obje
 expect_text 'unknown failed' classify_inspect_presence 1 '' 'error: no such object: rs118ui-2498-missing' network rs118ui-2498-missing
 expect_text 'unknown failed' classify_inspect_presence 1 '' 'Error response from daemon: network rs118ui-2498-net not found' network other-net
 expect_text 'unknown failed' classify_inspect_presence 1 '' 'Error response from daemon: network rs118ui-2498-net not found' container rs118ui-2498-net
+expect_text 'unknown failed' classify_inspect_presence 1 '[]' 'Error response from daemon: network rs118ui-2498-net not found' network rs118ui-2498-net
 expect_text 'unknown failed' classify_inspect_presence 1 'leftover' 'error: no such object: rs118ui-2498-missing' container rs118ui-2498-missing
 expect_text 'unknown failed' classify_inspect_presence 1 '' $'error: no such object: rs118ui-2498-missing\nextra' container rs118ui-2498-missing
 expect_text 'unknown failed' classify_inspect_presence 1 '' 'not found' container rs118ui-2498-missing

@@ -149,7 +149,11 @@ cleanup() {
         if [[ -n "$net_err" ]]; then
             receipt "cleanup_network_rm_err ${NET} ${net_err}"
         fi
-        run_bounded "$CLEANUP_INSPECT_TIMEOUT" net_out net_err docker network inspect "$NET"
+        # Default network inspect prints "[]" when the network is gone. That
+        # nonempty stdout is not absence. The id format leaves stdout empty
+        # and keeps the not-found line on stderr.
+        run_bounded "$CLEANUP_INSPECT_TIMEOUT" net_out net_err \
+            docker network inspect --format '{{.Id}}' "$NET"
         net_rc=$?
         network_fold="$(classify_inspect_presence "$net_rc" "$net_out" "$net_err" network "$NET" || true)"
         network_fold="${network_fold%$'\n'}"
