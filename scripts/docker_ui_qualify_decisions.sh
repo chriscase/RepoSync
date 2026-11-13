@@ -408,8 +408,9 @@ classify_inspect_presence() {
     fi
     trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
     trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
-    # docker network inspect prints [] when the network is missing.
-    if [[ -z "$trimmed" || "$trimmed" == "[]" ]] && confirmed_absence "$kind" "$name" "$err"; then
+    # Only unformatted network inspect prints [] for a missing network.
+    # Formatted container inspect does not, so [] stays unknown for a container.
+    if [[ -z "$trimmed" || ( "$kind" == "network" && "$trimmed" == "[]" ) ]] && confirmed_absence "$kind" "$name" "$err"; then
         printf 'absent\n'
         return 0
     fi
