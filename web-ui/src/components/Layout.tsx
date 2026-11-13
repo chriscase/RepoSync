@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { Outlet, NavLink } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api';
@@ -5,87 +6,84 @@ import { errorStatusQuery } from '../errorStatus';
 import SyncStatus from './SyncStatus';
 import { getStoredUser } from '../utils/auth';
 import { LogoSvg } from './Logo';
+import LayoutChooser from '../layouts/LayoutChooser';
+import { LAYOUT_CATALOG, NAV_GROUP_IDS, NAV_GROUP_LABELS, PRIMARY_NAVIGATION, resolveTheme, type LayoutId, type PrimaryNavItem } from '../layouts/layoutCatalog';
+import { useLayoutPreference } from '../layouts/layoutPreference';
+import '../layouts/layoutTokens.css';
 
-export default function Layout() {
-  const statusQuery = useQuery({...errorStatusQuery(),refetchInterval:15000});
-  const status=statusQuery.isError ? undefined:statusQuery.data;
 
-  const user = getStoredUser();
-  const isAdmin = user?.role === 'admin';
+export interface LayoutFrameProps {
+  readonly layout: LayoutId;
+  readonly isAdmin: boolean;
+  readonly activeConflicts: number;
+  readonly accountName: string | null;
+  readonly syncStatus: ReactNode;
+  readonly chooser: ReactNode;
+  readonly onLogout: () => void;
+}
 
-  const handleLogout = () => {
-    // ProtectedRoute reacts to synchronous retirement, even if server revocation is unavailable.
-    void api.logout().catch(() => {});
-  };
+/**
+ * #262: one fixed shell tree for every layout. A layout changes classes, data
+ * attributes and how the navigation entries are grouped, never the element
+ * types or keys on the path to <main>/<Outlet>, so switching keeps the routed
+ * page, its queries, drafts, focus and scroll.
+ */
+export function LayoutFrame({ layout, isAdmin, activeConflicts, accountName, syncStatus, chooser, onLogout }: LayoutFrameProps) {
+  const presentation = LAYOUT_CATALOG[layout];
+  const classes = presentation.classes;
+  const visible = PRIMARY_NAVIGATION.filter(item => !item.adminOnly || isAdmin);
 
   const navLinkClass = ({ isActive }: { isActive: boolean }) =>
-    `px-3 py-2 rounded-md text-sm font-medium transition-colors ${
-      isActive
-        ? 'bg-blue-600 text-white'
-        : 'text-gray-400 hover:bg-gray-700 hover:text-white'
-    }`;
+    `rs-shell-link ${classes.link}${isActive ? ' rs-shell-link--active' : ''}`;
+
+  const renderLink = (item: PrimaryNavItem) => (
+    <NavLink key={item.to} to={item.to} end={item.end} className={navLinkClass}>
+      {item.label}
+      {item.conflictCount && activeConflicts > 0 && (
+        <span className="ml-2 inline-flex items-center justify-center px-2 py-1 text-xs font-bold leading-none rs-shell-alert rounded-full">
+          {activeConflicts}
+        </span>
+      )}
+    </NavLink>
+  );
+
+  const links = presentation.navPresentation === 'grouped'
+    ? NAV_GROUP_IDS.map(groupId => {
+      const entries = visible.filter(item => item.group === groupId);
+      if (entries.length === 0) return null;
+      const labelId = `rs-shell-nav-group-${groupId}`;
+      return (
+        <div key={groupId} role="group" aria-labelledby={labelId} className={classes.group}>
+          <p id={labelId} className={classes.groupLabel}>{NAV_GROUP_LABELS[groupId]}</p>
+          <div className={classes.groupLinks}>{entries.map(renderLink)}</div>
+        </div>
+      );
+    })
+    : visible.map(renderLink);
 
   return (
-    <div className="min-h-screen bg-gray-900">
-      <nav className="bg-gray-950 border-b border-gray-800">
-        <div className="px-6 sm:px-8 lg:px-12">
-          <div className="flex items-center justify-between h-16">
-            <div className="flex items-center">
+    <div className={`rs-layout-shell ${classes.root}`} data-rs-layout={presentation.id} data-rs-theme={resolveTheme(presentation)}>
+      <nav aria-label="Primary" className={classes.nav}>
+        <div className={classes.navInner}>
+          <div className={classes.navRow}>
+            <div className={classes.brand}>
               <LogoSvg size={32} />
-              <span className="text-white font-bold text-lg font-display tracking-wider">RepoSync</span>
-              <div className="ml-10 flex items-baseline space-x-4">
-                <NavLink to="/" end className={navLinkClass}>
-                  Dashboard
-                </NavLink>
-                <NavLink to="/repos" className={navLinkClass}>
-                  Repositories
-                </NavLink>
-                <NavLink to="/conflicts" className={navLinkClass}>
-                  Conflicts
-                  {status && status.active_conflicts > 0 && (
-                    <span className="ml-2 inline-flex items-center justify-center px-2 py-1 text-xs font-bold leading-none text-red-100 bg-red-600 rounded-full">
-                      {status.active_conflicts}
-                    </span>
-                  )}
-                </NavLink>
-                <NavLink to="/audit" className={navLinkClass}>
-                  Audit Log
-                </NavLink>
-                <NavLink to="/settings" className={navLinkClass}>
-                  Settings
-                </NavLink>
-                {isAdmin && (
-                  <NavLink to="/users" className={navLinkClass}>
-                    Users
-                  </NavLink>
-                )}
-                {isAdmin && (
-                  <NavLink to="/ldap" className={navLinkClass}>
-                    LDAP
-                  </NavLink>
-                )}
-                {isAdmin && (
-                  <NavLink to="/config" className={navLinkClass}>
-                    Config
-                  </NavLink>
-                )}
-                {isAdmin && (
-                  <NavLink to="/setup" className={navLinkClass}>
-                    Setup
-                  </NavLink>
-                )}
+              <span className={classes.brandName}>RepoSync</span>
+              <div className={classes.links}>
+                {links}
               </div>
             </div>
-            <div className="flex items-center space-x-4">
-              <SyncStatus query={statusQuery} />
-              {user && (
-                <span className="text-sm text-gray-400">
-                  {user.display_name || user.username}
+            <div className={classes.account}>
+              {syncStatus}
+              {accountName !== null && (
+                <span className="rs-shell-muted text-sm">
+                  {accountName}
                 </span>
               )}
+              {chooser}
               <button
-                onClick={handleLogout}
-                className="text-gray-400 hover:text-white text-sm"
+                onClick={onLogout}
+                className="rs-shell-action text-sm"
               >
                 Logout
               </button>
@@ -94,9 +92,36 @@ export default function Layout() {
         </div>
       </nav>
 
-      <main tabIndex={-1} className="py-6 px-6 sm:px-8 lg:px-12">
+      <main tabIndex={-1} className={classes.main}>
         <Outlet />
       </main>
     </div>
+  );
+}
+
+export default function Layout() {
+  const statusQuery = useQuery({...errorStatusQuery(),refetchInterval:15000});
+  const status=statusQuery.isError ? undefined:statusQuery.data;
+
+  const user = getStoredUser();
+  const isAdmin = user?.role === 'admin';
+  // #262: presentation only. It never feeds isAdmin, routes, queries, actions or server mode.
+  const presentation = useLayoutPreference(user);
+
+  const handleLogout = () => {
+    // ProtectedRoute reacts to synchronous retirement, even if server revocation is unavailable.
+    void api.logout().catch(() => {});
+  };
+
+  return (
+    <LayoutFrame
+      layout={presentation.layout}
+      isAdmin={isAdmin}
+      activeConflicts={status?.active_conflicts ?? 0}
+      accountName={user ? user.display_name || user.username : null}
+      syncStatus={<SyncStatus query={statusQuery} />}
+      chooser={<LayoutChooser value={presentation.layout} onChange={presentation.choose} notice={presentation.notice} />}
+      onLogout={handleLogout}
+    />
   );
 }
