@@ -49,8 +49,11 @@ The existing semantics are unchanged: an absent field keeps the stored value, `n
 clears it, and a string replaces it. Save receipts, `expected_updated_at` CAS and
 same-request replay are all unchanged.
 
-**New:** a field that is present as a string is validated before any receipt lookup, CAS
-or write. Any failure answers `400` with
+**New:** a field that is present as a string is validated after the existing durable
+receipt recovery and before any CAS or write. An exact replay of an already-accepted
+request (same actor, request ID and payload bytes) therefore still returns its original
+receipt, even if a later rule would refuse its value. A reused request ID with different
+content stays `409`. A novel invalid request answers `400` with
 `{"error":"<field>[<index>] <code>: <message>; nothing was saved"}`; the index is omitted
 for whole-list errors. The whole request is refused, including its unrelated fields.
 
@@ -121,6 +124,11 @@ It uses the lists as they will be after saving.
   it. This is the same order as `path_is_projected` and `exclusion_message`.
 - **No preview:** a kept malformed field means the scheduler refuses to sync, so the
   preview shows that instead of results.
+- **Sample paths are verbatim.** Each line of the sample textarea is one path exactly as
+  typed; only empty lines are ignored. Leading and trailing whitespace is part of a
+  filename (the engine never trims it), so ` src/a.rs` is not under `src` and
+  `tool.exe ` does not match `*.exe`. Such paths are rendered with whitespace preserved and
+  marked "Includes leading or trailing whitespace".
 
 `PREVIEW_VECTORS` is kept identical in `crates/web/tests/repo_path_policy_56.rs` and
 `web-ui/src/pathPolicy56.test.ts`. The Rust side evaluates the table with
@@ -143,28 +151,26 @@ with both sides passing would be the parity evidence; neither side has been run.
    lands, re-verify `PREVIEW_VECTORS` and the port.
 5. **Whitespace.** Only U+0020 counts as surrounding whitespace. Other Unicode spaces are
    accepted on both sides.
-6. **Harness wiring.** `PathPolicyEditor56.test.tsx` is type-checked by `tsc` (via
-   `include: ["src"]`), but the current vitest `include` (`src/**/*.test.ts`) does not
-   collect it. Running it needs a `vite.config.ts` include amendment, which is outside
-   this allocation. `tests/path-policy-56.e2e.mjs` is not wired into `package.json`
-   scripts. The `contracts/README.md` index is not updated.
+6. **Harness wiring.** The component test is `PathPolicyEditor56.test.ts` (no JSX), so
+   the existing vitest `include` (`src/**/*.test.ts`) collects it without any
+   `vite.config.ts` change. `tests/path-policy-56.e2e.mjs` is not wired into
+   `package.json` scripts. The `contracts/README.md` index is not updated.
 
 ## Evidence (authored, NOT RUN)
 
 | Source | What it would prove |
 | --- | --- |
 | `crates/web/src/api/repo_path_policy_56.rs` unit tests | Entry rule table (shared with the UI); absent/null/string forms; error text; unset vs `[]` vs malformed reads |
-| `crates/web/tests/repo_path_policy_56.rs` (real router, SQLite file, loopback HTTP) | Read states with no raw columns. GET→edit→PUT→GET preserves, replaces one or both, and explicitly clears. A malformed value survives unrelated saves. All 13 invalid forms give 400 under a `BEFORE UPDATE` abort trigger, with no receipt and the unrelated name unapplied, plus a positive lookup control. Credentials, runtime progress and unrelated settings are preserved. Receipt replay is stable, a reused ID with a different payload gives 409, and a stale editor gives 409. Preview vectors run against the engine functions |
-| `web-ui/src/pathPolicy56.test.ts` (vitest, node) | Read classification, including unavailable for absent or legacy `null`. PUT body only for explicit changes. Malformed fields kept until Replace or Clear. Shared allowlist passthrough. Recovered-draft rules. Server-parity entry rules and UTF-8 length. Submit-only blocking. Warnings. Preview vectors, the after-save effective lists, and the hook-link rule |
-| `web-ui/src/components/PathPolicyEditor56.test.tsx` (static render) | Collapsed disclosure wiring; read-only mode; error/label/describedby binding with a disabled hide button while invalid; explicit actions for malformed; no controls when unavailable; preview table and status; notices |
-| `web-ui/tests/path-policy-56.e2e.mjs` (Vite plus an existing admitted Chromium, loopback fixtures only) | Exact PUT bodies: unrelated save omits both fields; an inline invalid entry sends no PUT; replacement; explicit clear; malformed kept, then cleared; no `path_policy` means no controls and fields omitted. Keyboard disclosure and preview. Axe (WCAG 2.x A/AA) on the policy section |
+| `crates/web/tests/repo_path_policy_56.rs` (real router, SQLite file, loopback HTTP) | Read states with no raw columns. GET→edit→PUT→GET preserves, replaces one or both, and explicitly clears. A malformed value survives unrelated saves. All 13 invalid forms give 400 under a `BEFORE UPDATE` abort trigger, with no receipt and the unrelated name unapplied, plus a positive lookup control. Credentials, runtime progress and unrelated settings are preserved. Receipt replay is stable, a reused ID with a different payload gives 409, and a stale editor gives 409. Validation order: an exact replay of a durably accepted legacy request whose value is now invalid returns its original receipt after a later edit without re-applying it; the same ID with a different invalid payload gives 409; a novel invalid request gives 400 with no write or receipt. Preview vectors, including leading and trailing whitespace, run against the engine functions |
+| `web-ui/src/pathPolicy56.test.ts` (vitest, node) | Read classification, including unavailable for absent or legacy `null`. PUT body only for explicit changes. Malformed fields kept until Replace or Clear. Shared allowlist passthrough. Recovered-draft rules. Server-parity entry rules and UTF-8 length. Submit-only blocking. Warnings. Preview vectors, verbatim sample lines and the whitespace-preserving textarea-to-preview pipeline, the after-save effective lists, and the hook-link rule |
+| `web-ui/src/components/PathPolicyEditor56.test.ts` (static render, collected by the existing vitest include) | Collapsed disclosure wiring; read-only mode; error/label/describedby binding with a disabled hide button while invalid; explicit actions for malformed; no controls when unavailable; preview table and status; notices; whitespace-preserving preview cells |
+| `web-ui/tests/path-policy-56.e2e.mjs` (Vite plus an existing admitted Chromium, loopback fixtures only) | Exact PUT bodies: unrelated save omits both fields; an inline invalid entry sends no PUT; replacement; explicit clear; malformed kept, then cleared; no `path_policy` means no controls and fields omitted. Keyboard Remove moves focus to the previous entry (or to Add for the last one), Undo restores keep, and Save sends only that field, with unrelated form fields unchanged and an actual API reread that preserves them. Keyboard disclosure and a preview that keeps typed whitespace. Axe (WCAG 2.x A/AA) on the policy section |
 
 Commands a later admitted executor would run:
 
 - `cargo test -p reposync-web repo_path_policy_56`
 - `cargo test -p reposync-web --test repo_path_policy_56`
-- `cd web-ui && npm run typecheck && npm run lint && npx vitest run src/pathPolicy56.test.ts`
-- The `.tsx` component test, after an include amendment.
+- `cd web-ui && npm run typecheck && npm run lint && npx vitest run src/pathPolicy56.test.ts src/components/PathPolicyEditor56.test.ts`
 - `REPOSYNC_A11Y_BROWSER=<admitted chromium> node --test --test-concurrency=1 tests/path-policy-56.e2e.mjs`
 
 ## Scope

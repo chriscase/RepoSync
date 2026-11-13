@@ -232,6 +232,49 @@ test('rs56 server without path_policy: policy controls are unavailable and saves
   } finally { await close(); }
 });
 
+test('rs56 keyboard Remove moves focus, saves only that change, and the actual reread preserves unrelated fields', { timeout: 60000 }, async () => {
+  const before = policy.detail();
+  const formFields = ['name', 'svn_url', 'svn_branch', 'svn_username', 'git_provider', 'git_api_url', 'git_repo', 'git_branch', 'sync_mode', 'poll_interval_secs', 'lfs_threshold_mb', 'auto_merge'];
+  const { page, close } = await open(); try {
+    await startEditing(page);
+    const allowed = field(page, 'allowed_paths');
+    await press(page, allowed.getByRole('button', { name: 'Edit allowed path prefixes', exact: true }));
+    await press(page, allowed.getByRole('button', { name: 'Remove allowed path prefix 2', exact: true }));
+    const first = allowed.getByLabel('Allowed path prefix 1', { exact: true });
+    assert.ok(await first.evaluate(el => el === document.activeElement), 'Remove must move focus to the previous entry');
+    assert.equal(await first.inputValue(), 'src/');
+    assert.equal(await allowed.getByLabel('Allowed path prefix 2', { exact: true }).count(), 0);
+    await allowed.getByText('1 allowed path prefix — will replace the stored value on save', { exact: true }).waitFor();
+
+    // Removing the only blocked pattern moves focus to Add; Undo returns the field to keep.
+    const blocked = field(page, 'blocked_patterns');
+    await press(page, blocked.getByRole('button', { name: 'Edit blocked patterns', exact: true }));
+    await press(page, blocked.getByRole('button', { name: 'Remove blocked pattern 1', exact: true }));
+    assert.ok(await blocked.getByRole('button', { name: 'Add blocked pattern', exact: true }).evaluate(el => el === document.activeElement),
+      'removing the last entry must move focus to Add');
+    await blocked.getByText('No entries — will be cleared on save', { exact: true }).waitFor();
+    await press(page, blocked.getByRole('button', { name: 'Undo blocked patterns changes', exact: true }));
+    await blocked.getByText('1 blocked pattern', { exact: true }).waitFor();
+
+    await save(page, 1);
+    const body = policy.puts()[0].body;
+    assert.equal(body.allowed_paths, '["src/"]');
+    assert.equal('blocked_patterns' in body, false, 'an undone field must not be submitted');
+    for (const key of formFields) assert.deepEqual(body[key], before[key], `submitted ${key} unchanged`);
+
+    // Actual reread of the stored repository, then the page's own refetch.
+    const response = await fetch(policy.origin + '/api/repos/P', { headers: { authorization: TOKEN } });
+    assert.equal(response.status, 200);
+    const reread = await response.json();
+    assert.deepEqual(reread.path_policy.allowed_paths, { state: 'list', entries: ['src/'] });
+    assert.deepEqual(reread.path_policy.blocked_patterns, { state: 'list', entries: ['*.exe'] });
+    for (const key of [...formFields, 'enabled', 'parent_id', 'created_at']) assert.deepEqual(reread[key], before[key], `reread ${key} preserved`);
+    assert.notEqual(reread.updated_at, before.updated_at);
+    await allowed.getByText('1 allowed path prefix', { exact: true }).waitFor();
+    await blocked.getByText('1 blocked pattern', { exact: true }).waitFor();
+  } finally { await close(); }
+});
+
 test('rs56 collapsed lists and Git→SVN preview are keyboard operable and match engine semantics', { timeout: 45000 }, async () => {
   const { page, close } = await open(); try {
     const toggle = field(page, 'allowed_paths').getByRole('button', { name: 'Show allowed path prefixes', exact: true });
@@ -242,15 +285,22 @@ test('rs56 collapsed lists and Git→SVN preview are keyboard operable and match
     assert.equal(await page.locator(`[id="${await shown.getAttribute('aria-controls')}"]`).isVisible(), true);
     const samples = section(page).getByLabel('Sample Git paths (one per line)', { exact: true });
     await reach(page, samples);
-    await page.keyboard.type('src/main.rs\nsrc/tool.exe\nsrc-other/a.txt\nconfig\\app.toml');
+    // The last two lines differ from earlier ones only by whitespace, which is part of a filename.
+    const typed = 'src/main.rs\nsrc/tool.exe\nsrc-other/a.txt\nconfig\\app.toml\n src/lead.rs\nsrc/tool.exe ';
+    await page.keyboard.type(typed);
+    assert.equal(await samples.inputValue(), typed);
     const rows = section(page).getByTestId('path-policy-preview').locator('tbody tr');
-    assert.deepEqual(await rows.evaluateAll(trs => trs.map(tr => [...tr.cells].map(td => td.textContent))), [
-      ['src/main.rs', 'Included in Git→SVN'],
-      ['src/tool.exe', 'Excluded: matches blocked pattern *.exe'],
-      ['src-other/a.txt', 'Excluded: not under an allowed path prefix'],
-      ['config\\app.toml', 'Included in Git→SVN'],
+    const marked = 'Includes leading or trailing whitespace';
+    assert.deepEqual(await rows.evaluateAll(trs => trs.map(tr => [
+      tr.cells[0].querySelector('code').textContent, tr.cells[1].textContent, tr.cells[0].querySelector('span')?.textContent ?? null])), [
+      ['src/main.rs', 'Included in Git→SVN', null],
+      ['src/tool.exe', 'Excluded: matches blocked pattern *.exe', null],
+      ['src-other/a.txt', 'Excluded: not under an allowed path prefix', null],
+      ['config\\app.toml', 'Included in Git→SVN', null],
+      [' src/lead.rs', 'Excluded: not under an allowed path prefix', marked],
+      ['src/tool.exe ', 'Included in Git→SVN', marked],
     ]);
-    await section(page).getByRole('status').filter({ hasText: '2 of 4 sample paths included in Git→SVN. SVN→Git is not filtered in this build.' }).waitFor();
+    await section(page).getByRole('status').filter({ hasText: '3 of 6 sample paths included in Git→SVN. SVN→Git is not filtered in this build.' }).waitFor();
     await section(page).getByText(/SVN→Git imports every path on the SVN branch in this build/).waitFor();
     assert.equal(policy.puts().length, 0, 'preview must not write');
     await audit(page, 'path policy read-only preview');

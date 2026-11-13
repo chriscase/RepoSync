@@ -1,7 +1,7 @@
 import { useId, useRef, useState } from 'react';
 import {
   POLICY_FIELDS, PATH_POLICY_LIMITATIONS, type PathPolicyDraft, type PolicyFieldKey,
-  addPolicyEntry, beginPolicyEdit, clearPolicyField, effectivePathPolicy, parsePreviewPaths,
+  addPolicyEntry, beginPolicyEdit, clearPolicyField, effectivePathPolicy, hasSurroundingWhitespace, parsePreviewPaths,
   policyEntryNoun, policyFieldIssues, policyFieldLabel, policyFieldSummary, policyFieldWarnings,
   previewPath, previewReasonText, removePolicyEntry, undoPolicyField, updatePolicyEntry,
 } from '../pathPolicy56';
@@ -167,7 +167,10 @@ export default function PathPolicyEditor56({ draft, onChange, initialPreview = '
             <tbody>
               {outcomes.map((outcome, index) => (
                 <tr key={index} className="border-t border-gray-700">
-                  <td className="py-1 pr-2"><code className="text-gray-100">{outcome.path}</code></td>
+                  <td className="py-1 pr-2">
+                    <code className="text-gray-100 whitespace-pre">{outcome.path}</code>
+                    {hasSurroundingWhitespace(outcome.path) && <span className="block text-gray-300">Includes leading or trailing whitespace</span>}
+                  </td>
                   <td className={`py-1 ${outcome.included ? 'text-green-300' : 'text-amber-200'}`}>{previewReasonText(outcome.reason)}</td>
                 </tr>
               ))}

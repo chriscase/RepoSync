@@ -591,9 +591,6 @@ async fn update_repo(
     if role != "admin" {
         return Err(AppError::Forbidden("admin access required".into()));
     }
-    // #56: present policy fields are validated before any receipt, CAS or write.
-    repo_path_policy_56::validate_update(&body.allowed_paths, &body.blocked_patterns)
-        .map_err(|error| AppError::BadRequest(error.to_string()))?;
 
     let payload = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.to_string()))?;
     let request_id = body.save_request_id.clone();
@@ -619,6 +616,10 @@ async fn update_repo(
             return Ok(Json(result));
         }
     }
+    // #56: after durable receipt recovery (an exact replay keeps its receipt) and
+    // before any CAS or write, present policy fields must be valid.
+    repo_path_policy_56::validate_update(&body.allowed_paths, &body.blocked_patterns)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
     reject_held_import(db, &id)?;
     if db
         .managed_remove_blocks_new_work(&id)

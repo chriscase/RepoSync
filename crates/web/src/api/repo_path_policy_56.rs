@@ -209,7 +209,9 @@ pub(crate) fn validate_supplied(
     Ok(())
 }
 
-/// Checked before any receipt lookup, CAS or repository write.
+/// Checked after durable receipt recovery and before any CAS or repository
+/// write: an exact replay of an already-accepted request keeps its receipt,
+/// while a novel request with an invalid field is refused unwritten.
 pub(crate) fn validate_update(
     allowed: &Option<Option<String>>,
     blocked: &Option<Option<String>>,

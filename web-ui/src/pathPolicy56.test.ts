@@ -3,7 +3,7 @@ import type { Repository, RepositoryPathPolicyRead } from './api';
 import { publicConfiguration } from './repositorySave';
 import {
   MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_BYTES, type PathPolicyDraft, type PolicyFieldKey,
-  addPolicyEntry, beginPolicyEdit, clearPolicyField, effectivePathPolicy, parsePreviewPaths, pathPolicyConfiguration,
+  addPolicyEntry, beginPolicyEdit, clearPolicyField, effectivePathPolicy, hasSurroundingWhitespace, parsePreviewPaths, pathPolicyConfiguration,
   pathPolicyDraft, pathPolicyHasRules, pathPolicyIssues, pathPolicyIssueSummary, policyEntryIssue, policyFieldIssues,
   policyFieldSummary, policyFieldWarnings, previewPath, readRepositoryPathPolicy, removePolicyEntry, undoPolicyField,
   updatePolicyEntry,
@@ -74,6 +74,9 @@ const PREVIEW_VECTORS: Array<[string[], string[], string, string | null]> = [
   [['src'], ['src/gen'], 'docs/a.md', ''],
   [['src'], ['*.exe'], 'docs/x.exe', ''],
   [[], ['*.log', 'logs'], 'logs/a.log', '*.log'],
+  // Whitespace is part of a filename; neither the engine nor the preview trims it.
+  [['src'], [], ' src/main.rs', ''],
+  [[], ['*.exe'], 'bin/tool.exe ', null],
 ];
 
 describe('#56 path-policy read: missing or malformed data is never a clear', () => {
@@ -222,9 +225,27 @@ describe('#56 preview matches the engine projection', () => {
     expect(effectivePathPolicy(clearPolicyField(bad, 'blocked_patterns'))).toEqual({ ok: true, allowed: [], blocked: [] });
     expect(effectivePathPolicy(pathPolicyDraft(repo(undefined)))).toMatchObject({ ok: false });
   });
-  it('trims sample lines, drops blank ones and bounds the list', () => {
-    expect(parsePreviewPaths(' src/a \n\n docs/b\r\n')).toEqual(['src/a', 'docs/b']);
+  it('keeps sample lines verbatim, drops only empty lines and bounds the list', () => {
+    expect(parsePreviewPaths(' src/a \n\n docs/b\n')).toEqual([' src/a ', ' docs/b']);
+    expect(parsePreviewPaths('a\n \n\nb')).toEqual(['a', ' ', 'b']);
     expect(parsePreviewPaths(Array.from({ length: 80 }, (_, i) => `p${i}`).join('\n'))).toHaveLength(50);
+  });
+  it('preserves leading and trailing whitespace through the textarea-to-preview pipeline', () => {
+    // A trimming parser would turn both lines into different files and flip both results.
+    const typed = ' src/main.rs\nbin/tool.exe \n';
+    const policy = effectivePathPolicy(pathPolicyDraft(lists(['src'], ['*.exe'])));
+    if (!policy.ok) throw new Error('fixture policy must be previewable');
+    const outcomes = parsePreviewPaths(typed).map(path => previewPath(path, policy.allowed, policy.blocked));
+    expect(outcomes).toEqual([
+      { path: ' src/main.rs', included: false, reason: { kind: 'not_allowed' } },
+      { path: 'bin/tool.exe ', included: false, reason: { kind: 'not_allowed' } },
+    ]);
+    const blockedOnly = parsePreviewPaths(typed).map(path => previewPath(path, [], ['*.exe']));
+    expect(blockedOnly.map(outcome => outcome.included)).toEqual([true, true]);
+    expect(previewPath('bin/tool.exe', [], ['*.exe']).included).toBe(false);
+    expect(hasSurroundingWhitespace(' src/main.rs')).toBe(true);
+    expect(hasSurroundingWhitespace('bin/tool.exe ')).toBe(true);
+    expect(hasSurroundingWhitespace('src/main.rs')).toBe(false);
   });
   it('offers the hook link only for known non-empty rules', () => {
     expect(pathPolicyHasRules(lists(['src'], []))).toBe(true);

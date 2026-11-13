@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { RepositoryPathPolicyRead } from '../api';
 import PathPolicyEditor56 from './PathPolicyEditor56';
@@ -19,7 +20,7 @@ function attribute(tag: string, name: string): string | undefined {
 
 describe('#56 PathPolicyEditor56 static rendering', () => {
   it('starts collapsed with controlled disclosure buttons and a visible limitation note', () => {
-    const html = renderToStaticMarkup(<PathPolicyEditor56 draft={stored} onChange={noop} />);
+    const html = renderToStaticMarkup(createElement(PathPolicyEditor56, { draft: stored, onChange: noop }));
     const toggles = [...html.matchAll(/<button[^>]*aria-expanded="(true|false)"[^>]*>/g)];
     expect(toggles.map(match => match[1])).toEqual(['false', 'false']);
     for (const [tag] of toggles) {
@@ -35,7 +36,7 @@ describe('#56 PathPolicyEditor56 static rendering', () => {
   });
 
   it('is read-only without onChange: stored entries, no inputs and no edit actions', () => {
-    const html = renderToStaticMarkup(<PathPolicyEditor56 draft={stored} initiallyExpanded />);
+    const html = renderToStaticMarkup(createElement(PathPolicyEditor56, { draft: stored, initiallyExpanded: true }));
     expect(html).toContain('<code class="rounded bg-gray-800 px-1.5 py-0.5 text-xs text-gray-100">src/</code>');
     expect(html).toContain('<code class="rounded bg-gray-800 px-1.5 py-0.5 text-xs text-gray-100">*.exe</code>');
     expect(html).not.toMatch(/<input/);
@@ -46,7 +47,7 @@ describe('#56 PathPolicyEditor56 static rendering', () => {
 
   it('binds an inline error to its labelled input and keeps the invalid list open', () => {
     const editing = addPolicyEntry(beginPolicyEdit(stored, 'allowed_paths'), 'allowed_paths');
-    const html = renderToStaticMarkup(<PathPolicyEditor56 draft={editing} onChange={noop} />);
+    const html = renderToStaticMarkup(createElement(PathPolicyEditor56, { draft: editing, onChange: noop }));
     const invalid = html.match(/<input[^>]*aria-invalid="true"[^>]*>/g) || [];
     expect(invalid).toHaveLength(1);
     const inputId = attribute(invalid[0], 'id');
@@ -65,7 +66,7 @@ describe('#56 PathPolicyEditor56 static rendering', () => {
 
   it('offers only explicit Replace or Clear for a malformed stored value', () => {
     const malformed = draftFor({ version: 1, ...LIMITS, allowed_paths: { state: 'malformed', stored_bytes: 4, reason: 'Synthetic malformed reason' }, blocked_patterns: { state: 'unset' } });
-    const html = renderToStaticMarkup(<PathPolicyEditor56 draft={malformed} onChange={noop} />);
+    const html = renderToStaticMarkup(createElement(PathPolicyEditor56, { draft: malformed, onChange: noop }));
     expect(html).toContain('Stored value is malformed — unchanged on save');
     expect(html).toContain('Synthetic malformed reason');
     expect(html).toMatch(/Replace with a new list<span class="sr-only"> allowed path prefixes<\/span>/);
@@ -75,7 +76,7 @@ describe('#56 PathPolicyEditor56 static rendering', () => {
   });
 
   it('disables every policy control when the server did not report the policy', () => {
-    const html = renderToStaticMarkup(<PathPolicyEditor56 draft={draftFor(undefined)} onChange={noop} />);
+    const html = renderToStaticMarkup(createElement(PathPolicyEditor56, { draft: draftFor(undefined), onChange: noop }));
     expect(html).not.toMatch(/aria-expanded=/);
     expect(html).not.toMatch(/>(Edit|Clear|Add|Undo)</);
     expect((html.match(/Not available from this server — unchanged on save/g) || [])).toHaveLength(2);
@@ -84,7 +85,7 @@ describe('#56 PathPolicyEditor56 static rendering', () => {
 
   it('renders preview outcomes with the engine reasons and a status summary', () => {
     const preview = 'src/main.rs\nsrc/tool.exe\ndocs/readme.md';
-    const html = renderToStaticMarkup(<PathPolicyEditor56 draft={stored} initialPreview={preview} />);
+    const html = renderToStaticMarkup(createElement(PathPolicyEditor56, { draft: stored, initialPreview: preview }));
     expect(html).toContain('<caption class="sr-only">Git→SVN preview results</caption>');
     expect(html).toContain('<th scope="col"');
     expect(html).toContain('Included in Git→SVN');
@@ -97,6 +98,18 @@ describe('#56 PathPolicyEditor56 static rendering', () => {
   it('shows recovered-draft notices and only those', () => {
     expect(stored.notices).toEqual([]);
     const withNotice: PathPolicyDraft = { ...stored, notices: ['Synthetic recovered notice'] };
-    expect(renderToStaticMarkup(<PathPolicyEditor56 draft={withNotice} />)).toContain('<p class="text-xs text-amber-200">Synthetic recovered notice</p>');
+    expect(renderToStaticMarkup(createElement(PathPolicyEditor56, { draft: withNotice }))).toContain('<p class="text-xs text-amber-200">Synthetic recovered notice</p>');
+  });
+
+  it('previews typed paths verbatim, keeping and visibly marking surrounding whitespace', () => {
+    const blockedOnly = draftFor({ version: 1, ...LIMITS, allowed_paths: { state: 'unset' }, blocked_patterns: { state: 'list', entries: ['*.exe'] } });
+    const html = renderToStaticMarkup(createElement(PathPolicyEditor56, { draft: blockedOnly, initialPreview: ' src/main.rs\nbin/tool.exe \nbin/tool.exe' }));
+    expect(html).toContain('<code class="text-gray-100 whitespace-pre"> src/main.rs</code>');
+    expect(html).toContain('<code class="text-gray-100 whitespace-pre">bin/tool.exe </code>');
+    expect(html).toContain('<code class="text-gray-100 whitespace-pre">bin/tool.exe</code>');
+    expect((html.match(/Includes leading or trailing whitespace/g) || [])).toHaveLength(2);
+    // A trimming pipeline would block the second line too and report 1 of 3.
+    expect(html).toContain('2 of 3 sample paths included in Git→SVN.');
+    expect((html.match(/Excluded: matches blocked pattern \*\.exe/g) || [])).toHaveLength(1);
   });
 });

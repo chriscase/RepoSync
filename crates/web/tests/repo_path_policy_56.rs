@@ -394,7 +394,7 @@ async fn rs56_malformed_stored_policy_is_not_cleared_by_unrelated_saves() {
 }
 
 #[tokio::test]
-async fn rs56_invalid_supplied_lists_are_rejected_before_receipt_cas_or_write() {
+async fn rs56_invalid_supplied_lists_are_rejected_before_cas_or_write() {
     let allowed = r#"["src/"]"#;
     let blocked = r#"["*.exe"]"#;
     let (addr, state, server, _tmp) =
@@ -627,6 +627,167 @@ async fn rs56_policy_save_receipt_is_stable_and_stale_editor_cannot_overwrite() 
     server.abort();
 }
 
+/// The exact bytes `update_repo` derives from a request (`UpdateRepoRequest`
+/// re-serialized in declaration order). Sent verbatim, the server recomputes the
+/// same bytes, so a seeded receipt and an HTTP replay share one payload MAC.
+fn canonical_update_payload(request: &str, expected: &str, name: &str, allowed: &str) -> String {
+    let text = |value: &str| serde_json::to_string(value).unwrap();
+    format!(
+        concat!(
+            "{{\"save_request_id\":{},\"expected_updated_at\":{},\"name\":{},",
+            "\"svn_url\":null,\"svn_branch\":null,\"svn_username\":null,\"git_provider\":null,",
+            "\"git_api_url\":null,\"git_repo\":null,\"git_branch\":null,\"sync_mode\":null,",
+            "\"poll_interval_secs\":null,\"lfs_threshold_mb\":null,\"auto_merge\":null,",
+            "\"enabled\":null,\"allowed_paths\":{}}}"
+        ),
+        text(request),
+        text(expected),
+        text(name),
+        text(allowed)
+    )
+}
+
+async fn put_raw(client: &reqwest::Client, addr: SocketAddr, id: &str, body: &str) -> (u16, Value) {
+    let response = client
+        .put(format!("http://{addr}/api/repos/{id}"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn rs56_validation_runs_after_durable_receipt_recovery_and_before_mutation() {
+    let (addr, state, server, _tmp) =
+        policy_fixture(vec![policy_repo("L", Some(r#"["src"]"#), None)]).await;
+    let client = authed_client();
+    let original = state.db.get_repository("L").unwrap().unwrap();
+
+    // A request durably accepted before #56 validation existed (in-memory test
+    // sessions act as "legacy"). Its stored value is now refused for new requests.
+    let request = uuid::Uuid::new_v4().to_string();
+    let legacy_value = r#"["src/*"]"#;
+    let payload = canonical_update_payload(
+        &request,
+        &original.updated_at,
+        "Legacy accepted",
+        legacy_value,
+    );
+    let mut accepted = original.clone();
+    accepted.name = "Legacy accepted".into();
+    accepted.allowed_paths = Some(legacy_value.into());
+    accepted.updated_at = chrono::Utc::now().to_rfc3339();
+    let receipt = state
+        .db
+        .update_repository_once(
+            &accepted,
+            "legacy",
+            &request,
+            Some(&original.updated_at),
+            payload.as_bytes(),
+        )
+        .unwrap();
+
+    // A later repository edit by another administrator.
+    let mut later = state.db.get_repository("L").unwrap().unwrap();
+    later.name = "Later administrator edit".into();
+    later.allowed_paths = Some(r#"["later"]"#.into());
+    later.updated_at = (chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+    state.db.update_repository(&later).unwrap();
+    let after_later = |state: &AppState| {
+        let repo = state.db.get_repository("L").unwrap().unwrap();
+        (repo.name, repo.allowed_paths, repo.blocked_patterns)
+    };
+    let expected_state = (
+        "Later administrator edit".to_string(),
+        Some(r#"["later"]"#.to_string()),
+        None,
+    );
+
+    // Exact replay after the later edit: the durable receipt is recovered (not a 400)
+    // and nothing is re-applied over the newer settings.
+    let (status, replay) = put_raw(&client, addr, "L", &payload).await;
+    assert_eq!(
+        status, 200,
+        "exact replay must recover its receipt: {replay}"
+    );
+    assert_eq!(
+        replay["save_receipt"],
+        serde_json::to_value(&receipt).unwrap()
+    );
+    assert_eq!(replay["name"], "Later administrator edit");
+    assert_eq!(after_later(&state), expected_state);
+
+    // Every write attempt below would now surface as 500 instead of a refusal.
+    state
+        .db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER rs56_order_no_write BEFORE UPDATE ON repositories \
+             BEGIN SELECT RAISE(ABORT,'rs56 write attempted'); END;",
+        )
+        .unwrap();
+
+    // Same request ID, different (also invalid) payload: a receipt conflict, not a
+    // validation error, and no write.
+    let conflicting = canonical_update_payload(
+        &request,
+        &original.updated_at,
+        "Legacy accepted",
+        r#"["../x"]"#,
+    );
+    let (status, error) = put_raw(&client, addr, "L", &conflicting).await;
+    assert_eq!(status, 409, "{error}");
+
+    // A novel request with the same now-invalid value is refused before any write.
+    let novel = uuid::Uuid::new_v4().to_string();
+    let novel_body =
+        canonical_update_payload(&novel, &later.updated_at, "Novel invalid", legacy_value);
+    let (status, error) = put_raw(&client, addr, "L", &novel_body).await;
+    assert_eq!(status, 400, "{error}");
+    let message = error["error"].as_str().unwrap();
+    assert!(
+        message.starts_with("allowed_paths[0] wildcard_in_allowed"),
+        "{message}"
+    );
+    assert!(message.contains("nothing was saved"), "{message}");
+
+    state
+        .db
+        .conn()
+        .execute_batch("DROP TRIGGER rs56_order_no_write")
+        .unwrap();
+    assert_eq!(after_later(&state), expected_state);
+    let lookup = client
+        .get(format!(
+            "http://{addr}/api/repository-save-requests/{novel}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        lookup.status(),
+        404,
+        "a refused novel request has no receipt"
+    );
+    let original_receipt = client
+        .get(format!(
+            "http://{addr}/api/repository-save-requests/{request}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(original_receipt.status(), 200);
+    assert_eq!(
+        original_receipt.json::<Value>().await.unwrap(),
+        serde_json::to_value(&receipt).unwrap()
+    );
+    server.abort();
+}
+
 /// (allowed, blocked, path, expected). `None` = included in Git→SVN;
 /// `Some("")` = excluded because not under an allowed prefix;
 /// `Some(pattern)` = excluded by that first matching blocked pattern.
@@ -671,6 +832,9 @@ const PREVIEW_VECTORS: &[Vector] = &[
     (&["src"], &["src/gen"], "docs/a.md", Some("")),
     (&["src"], &["*.exe"], "docs/x.exe", Some("")),
     (&[], &["*.log", "logs"], "logs/a.log", Some("*.log")),
+    // Whitespace is part of a filename; neither the engine nor the preview trims it.
+    (&["src"], &[], " src/main.rs", Some("")),
+    (&[], &["*.exe"], "bin/tool.exe ", None),
 ];
 
 #[test]

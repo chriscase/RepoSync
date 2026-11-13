@@ -317,8 +317,18 @@ export function effectivePathPolicy(draft: PathPolicyDraft): EffectivePathPolicy
   return { ok: true, allowed: lists.allowed_paths, blocked: lists.blocked_patterns };
 }
 
+/**
+ * Sample paths exactly as typed, one per line. Leading/trailing whitespace is part
+ * of a filename (the engine never trims), so only empty lines are dropped. A
+ * textarea's value already normalizes line breaks to "\n".
+ */
 export function parsePreviewPaths(text: string): string[] {
-  return text.split('\n').map(line => line.trim()).filter(Boolean).slice(0, MAX_PREVIEW_PATHS);
+  return text.split('\n').filter(line => line !== '').slice(0, MAX_PREVIEW_PATHS);
+}
+
+/** Whether a path starts or ends with whitespace, so the preview can say so visibly. */
+export function hasSurroundingWhitespace(path: string): boolean {
+  return /^\s|\s$/.test(path);
 }
 
 export function previewReasonText(reason: PreviewReason | null): string {
