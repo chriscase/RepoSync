@@ -130,11 +130,7 @@ impl Merger {
         }
 
         let patch_ours = diffy::create_patch(base, ours);
-        if diffy::apply(theirs, &patch_ours).is_ok() {
-            return true;
-        }
-
-        false
+        diffy::apply(theirs, &patch_ours).is_ok()
     }
 }
 
