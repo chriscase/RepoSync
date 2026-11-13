@@ -72,6 +72,56 @@ if cleanup_may_wait_after_stop 1; then
     failures=$((failures + 1))
 fi
 
+# Caller-level observation controls. These exercise accept_config_observations,
+# not only the semantic helper. A valid diagnostic cannot outvote a failed read.
+VALID_STATE='"exited" 1 false ""'
+expect_text qualify accept_config_observations missing_file 0 0 "$VALID_STATE" 0 "$MISSING_LOG" ''
+expect_text qualify accept_config_observations zero_poll 0 0 "$VALID_STATE" 0 "$ZERO_POLL_LOG" ''
+expect_text 'refuse logs_failed' accept_config_observations missing_file 0 0 "$VALID_STATE" 1 "$MISSING_LOG" ''
+expect_text 'refuse logs_timeout' accept_config_observations zero_poll 0 0 "$VALID_STATE" 124 "$ZERO_POLL_LOG" ''
+expect_text 'refuse observation_timeout' accept_config_observations missing_file 0 124 "$VALID_STATE" 0 "$MISSING_LOG" ''
+expect_text 'refuse observation_permission' accept_config_observations missing_file 0 1 "$VALID_STATE" 0 "$MISSING_LOG" 'permission denied'
+expect_text 'refuse observation_daemon' accept_config_observations zero_poll 0 1 "$VALID_STATE" 0 "$ZERO_POLL_LOG" 'Cannot connect to the Docker daemon'
+expect_text 'refuse observation_transport' accept_config_observations missing_file 0 1 "$VALID_STATE" 0 "$MISSING_LOG" 'error during connect: dial unix /var/run/docker.sock: connection refused'
+expect_text 'refuse observation_failed' accept_config_observations missing_file 0 1 "$VALID_STATE" 0 "$MISSING_LOG" 'inspect api failed'
+expect_text 'refuse observation_timeout logs_failed' accept_config_observations missing_file 0 124 "$VALID_STATE" 1 "$MISSING_LOG" ''
+expect_text 'refuse malformed_state' accept_config_observations missing_file 0 0 'not-json' 0 "$MISSING_LOG" ''
+expect_text 'refuse malformed_state' accept_config_observations zero_poll 0 0 '"exited"' 0 "$ZERO_POLL_LOG" ''
+expect_text 'refuse oom' accept_config_observations missing_file 0 0 '"exited" 137 true ""' 0 "$MISSING_LOG" ''
+expect_text 'refuse exit_7' accept_config_observations zero_poll 0 0 '"exited" 7 false ""' 0 "$ZERO_POLL_LOG" ''
+expect_text 'refuse panic' accept_config_observations zero_poll 0 0 "$VALID_STATE" 0 $'panicked at crates/daemon/src/main.rs:1:1\n'"$ZERO_POLL_LOG" ''
+expect_text 'refuse docker_error' accept_config_observations missing_file 0 0 '"exited" 1 false "OCI runtime create failed"' 0 "$MISSING_LOG" ''
+expect_text 'refuse missing_file_diagnostic' accept_config_observations missing_file 0 0 "$VALID_STATE" 0 "$ZERO_POLL_LOG" ''
+expect_text 'refuse zero_poll_diagnostic' accept_config_observations zero_poll 0 0 "$VALID_STATE" 0 "$MISSING_LOG" ''
+
+# Caller-level cleanup controls. Failed or empty inspect output is not absence.
+expect_text 'unknown daemon' classify_inspect_presence 1 '' 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?'
+expect_text 'unknown timeout' classify_inspect_presence 124 '' ''
+expect_text 'unknown empty_failure' classify_inspect_presence 1 '' ''
+expect_text 'unknown permission' classify_inspect_presence 1 '' 'permission denied while trying to connect to the Docker daemon socket'
+expect_text 'unknown permission' classify_inspect_presence 1 '' $'permission denied\nError: No such object: rs118ui-1'
+expect_text 'unknown transport' classify_inspect_presence 1 '' 'error during connect: dial unix /var/run/docker.sock: connect: connection refused'
+expect_text 'unknown malformed' classify_inspect_presence 0 '' ''
+expect_text 'unknown malformed' classify_inspect_presence 0 '   ' ''
+expect_text 'absent' classify_inspect_presence 1 '' 'Error: No such object: rs118ui-1'
+expect_text 'absent' classify_inspect_presence 1 '' 'Error: No such network: rs118ui-1-net'
+expect_text 'present' classify_inspect_presence 0 'abc123 "exited"' ''
+expect_text 'unresolved unknown daemon' cleanup_removal_result 1 'unknown daemon'
+expect_text 'unresolved unknown timeout' cleanup_removal_result 1 'unknown timeout'
+expect_text 'unresolved unknown empty_failure' cleanup_removal_result 1 'unknown empty_failure'
+expect_text 'unresolved unknown daemon' cleanup_removal_result 0 'unknown daemon'
+expect_text 'unresolved remains' cleanup_removal_result 1 'present'
+expect_text 'removed' cleanup_removal_result 0 'absent'
+expect_text 'removed' cleanup_removal_result 1 'absent'
+expect_text '0 cleanup_resolved' finalize_cleanup_result 0 absent absent
+expect_text '0 cleanup_resolved' finalize_cleanup_result 0 none not_created
+expect_text '1 cleanup_unresolved' finalize_cleanup_result 0 'unknown daemon' absent
+expect_text '1 cleanup_unresolved' finalize_cleanup_result 0 absent 'unknown timeout'
+expect_text '1 cleanup_unresolved' finalize_cleanup_result 0 absent 'unknown empty_failure'
+expect_text '1 cleanup_unresolved' finalize_cleanup_result 0 present absent
+expect_text '2 cleanup_unresolved' finalize_cleanup_result 2 'unknown daemon' 'unknown timeout'
+expect_text '2 cleanup_resolved' finalize_cleanup_result 2 none not_created
+
 if [[ "$failures" != "0" ]]; then
     printf 'authored_checks_failed count=%s\n' "$failures" >&2
     exit 1

@@ -24,25 +24,69 @@ FAIL_TIMEOUT="${FAIL_TIMEOUT:-20}"
 CLEANUP_STOP_TIMEOUT="${CLEANUP_STOP_TIMEOUT:-20}"
 CLEANUP_WAIT_TIMEOUT="${CLEANUP_WAIT_TIMEOUT:-15}"
 CLEANUP_RM_TIMEOUT="${CLEANUP_RM_TIMEOUT:-15}"
+CLEANUP_INSPECT_TIMEOUT="${CLEANUP_INSPECT_TIMEOUT:-15}"
 
 receipt() { printf '%s\n' "$*" | tee -a "$RECEIPT"; }
+
+# run_bounded SECONDS OUT_VAR ERR_VAR -- CMD...
+# Every cleanup and config observation goes through this bound.
+run_bounded() {
+    local seconds="$1"
+    local __out="$2"
+    local __err="$3"
+    shift 3
+    local out_file="" err_file="" rc=0 out_data="" err_data=""
+    out_file="$(mktemp "${WORKDIR}/obs.XXXXXX")" || return 125
+    err_file="$(mktemp "${WORKDIR}/obs.XXXXXX")" || {
+        rm -f "$out_file"
+        return 125
+    }
+    timeout "$seconds" "$@" >"$out_file" 2>"$err_file" || rc=$?
+    out_data="$(cat "$out_file" 2>/dev/null || true)"
+    err_data="$(cat "$err_file" 2>/dev/null || true)"
+    rm -f "$out_file" "$err_file"
+    printf -v "$__out" '%s' "$out_data"
+    printf -v "$__err" '%s' "$err_data"
+    return "$rc"
+}
 
 cleanup() {
     local prior=$?
     trap - EXIT
     set +e
-    local unresolved=0
-    local name state stop_rc wait_rc rm_rc net_rc final
+    local name cout="" cerr="" crc=0 class="" status_json="" state=""
+    local stop_rc=0 wait_rc=0 rm_out="" rm_err="" rm_rc=0
+    local post_out="" post_err="" post_rc=0 post_class="" removal=""
+    local container_fold="none" network_fold="not_created" saw_container=0
+    local net_out="" net_err="" net_rc=0 result="" final="" token=""
     for name in "${CONTAINERS[@]}"; do
-        if ! docker container inspect "$name" >/dev/null 2>&1; then
+        saw_container=1
+        cout=""
+        cerr=""
+        run_bounded "$CLEANUP_INSPECT_TIMEOUT" cout cerr \
+            docker inspect --format '{{.Id}} {{json .State.Status}}' "$name"
+        crc=$?
+        class="$(classify_inspect_presence "$crc" "$cout" "$cerr" || true)"
+        class="${class%$'\n'}"
+        receipt "cleanup_inspect ${name} rc=${crc} class=${class}"
+        if [[ -n "$cerr" ]]; then
+            receipt "cleanup_inspect_err ${name} ${cerr}"
+        fi
+        if [[ "$class" == "absent" ]]; then
             receipt "cleanup_container_absent ${name}"
             continue
         fi
-        state="$(docker inspect --format '{{.State.Status}}' "$name" 2>>"$RECEIPT")"
-        receipt "cleanup_container_before ${name} ${state}"
+        state=""
+        if [[ "$class" == "present" ]]; then
+            status_json="${cout#* }"
+            state="$(python3 -c 'import json,sys; sys.stdout.write(json.loads(sys.argv[1]))' "$status_json" || true)"
+            receipt "cleanup_container_before ${name} ${state:-unknown}"
+        else
+            receipt "cleanup_container_unknown ${name} ${class}"
+        fi
         stop_rc=0
-        if [[ "$state" == "running" || "$state" == "paused" || "$state" == "restarting" ]]; then
-            timeout "$CLEANUP_STOP_TIMEOUT" docker stop -t 10 "$name" >>"$RECEIPT" 2>&1
+        if [[ "$state" == "running" || "$state" == "paused" || "$state" == "restarting" || "$class" != "present" ]]; then
+            run_bounded "$CLEANUP_STOP_TIMEOUT" cout cerr docker stop -t 10 "$name"
             stop_rc=$?
             if [[ "$stop_rc" != "0" ]]; then
                 receipt "cleanup_stop_failed ${name} rc=${stop_rc}"
@@ -53,7 +97,7 @@ cleanup() {
             receipt "cleanup_stop_not_needed ${name} state=${state}"
         fi
         if cleanup_may_wait_after_stop "$stop_rc"; then
-            timeout "$CLEANUP_WAIT_TIMEOUT" docker wait "$name" >>"$RECEIPT" 2>&1
+            run_bounded "$CLEANUP_WAIT_TIMEOUT" cout cerr docker wait "$name"
             wait_rc=$?
             if [[ "$wait_rc" != "0" ]]; then
                 receipt "cleanup_wait_failed ${name} rc=${wait_rc}"
@@ -63,45 +107,79 @@ cleanup() {
         else
             receipt "cleanup_wait_skipped ${name} stop_rc=${stop_rc}"
         fi
-        timeout "$CLEANUP_RM_TIMEOUT" docker rm -f "$name" >>"$RECEIPT" 2>&1
+        run_bounded "$CLEANUP_RM_TIMEOUT" rm_out rm_err docker rm -f "$name"
         rm_rc=$?
         if [[ "$rm_rc" != "0" ]]; then
             receipt "cleanup_rm_failed ${name} rc=${rm_rc}"
+            if [[ -n "$rm_err" ]]; then
+                receipt "cleanup_rm_err ${name} ${rm_err}"
+            fi
         fi
-        if docker container inspect "$name" >/dev/null 2>&1; then
-            receipt "cleanup_container_remains ${name}"
-            unresolved=1
-        else
+        run_bounded "$CLEANUP_INSPECT_TIMEOUT" post_out post_err \
+            docker inspect --format '{{.Id}}' "$name"
+        post_rc=$?
+        post_class="$(classify_inspect_presence "$post_rc" "$post_out" "$post_err" || true)"
+        post_class="${post_class%$'\n'}"
+        removal="$(cleanup_removal_result "$rm_rc" "$post_class" || true)"
+        removal="${removal%$'\n'}"
+        receipt "cleanup_after ${name} inspect_rc=${post_rc} class=${post_class} removal=${removal}"
+        if [[ -n "$post_err" ]]; then
+            receipt "cleanup_after_err ${name} ${post_err}"
+        fi
+        if [[ "$removal" == "removed" ]]; then
             receipt "cleanup_container_removed ${name}"
+        else
+            receipt "cleanup_container_unresolved ${name} ${removal}"
+            if [[ "$post_class" == "present" ]]; then
+                container_fold="present"
+            elif [[ "$container_fold" != "present" ]]; then
+                container_fold="unknown"
+            fi
         fi
     done
+    if [[ "$saw_container" == "0" ]]; then
+        container_fold="none"
+    elif [[ "$container_fold" == "none" ]]; then
+        container_fold="absent"
+    fi
     if [[ "$NETWORK_CREATED" == "1" ]]; then
-        timeout "$CLEANUP_RM_TIMEOUT" docker network rm "$NET" >>"$RECEIPT" 2>&1
+        run_bounded "$CLEANUP_RM_TIMEOUT" net_out net_err docker network rm "$NET"
         net_rc=$?
-        if docker network inspect "$NET" >/dev/null 2>&1; then
-            receipt "cleanup_network_remains ${NET} rm_rc=${net_rc}"
-            unresolved=1
-        else
-            receipt "cleanup_network_removed ${NET} rm_rc=${net_rc}"
+        receipt "cleanup_network_rm ${NET} rc=${net_rc}"
+        if [[ -n "$net_err" ]]; then
+            receipt "cleanup_network_rm_err ${NET} ${net_err}"
+        fi
+        run_bounded "$CLEANUP_INSPECT_TIMEOUT" net_out net_err docker network inspect "$NET"
+        net_rc=$?
+        network_fold="$(classify_inspect_presence "$net_rc" "$net_out" "$net_err" || true)"
+        network_fold="${network_fold%$'\n'}"
+        receipt "cleanup_network_inspect ${NET} rc=${net_rc} class=${network_fold}"
+        if [[ -n "$net_err" ]]; then
+            receipt "cleanup_network_inspect_err ${NET} ${net_err}"
         fi
     else
+        network_fold="not_created"
         receipt "cleanup_network_not_created ${NET}"
     fi
-    final="$(cleanup_final_status "$prior" "$unresolved")"
-    if [[ "$unresolved" == "0" ]]; then
-        receipt "cleanup_resolved"
-    else
-        receipt "cleanup_unresolved"
-    fi
-    if [[ "$final" == "0" ]]; then
+    result="$(finalize_cleanup_result "$prior" "$container_fold" "$network_fold" || true)"
+    result="${result%$'\n'}"
+    final="${result%% *}"
+    token="${result#* }"
+    receipt "cleanup_classes container=${container_fold} network=${network_fold}"
+    receipt "${token}"
+    if [[ "$final" == "0" && "$token" == "cleanup_resolved" ]]; then
         receipt "RESULT pass image=${IMAGE_ID:-unset}"
     else
-        receipt "RESULT fail prior=${prior} exit=${final} cleanup_unresolved=${unresolved}"
+        receipt "RESULT fail prior=${prior} exit=${final} token=${token}"
     fi
     if [[ -f "$RECEIPT" ]]; then
         cat "$RECEIPT"
     fi
-    rm -rf "$WORKDIR"
+    if [[ "$token" == "cleanup_unresolved" ]]; then
+        printf 'cleanup_evidence_retained %s\n' "$WORKDIR" | tee -a "$RECEIPT"
+    else
+        rm -rf "$WORKDIR"
+    fi
     exit "$final"
 }
 trap cleanup EXIT
@@ -111,7 +189,7 @@ receipt "source ${SOURCE}"
 receipt "tree ${TREE}"
 receipt "slot ${SLOT}"
 receipt "host_arch $(uname -m)"
-receipt "limits cpus=1 memory=512m memory-swap=512m pids=128 data-tmpfs=64m build-timeout=${BUILD_TIMEOUT}s start-timeout=${START_TIMEOUT}s fail-timeout=${FAIL_TIMEOUT}s cleanup-stop=${CLEANUP_STOP_TIMEOUT}s cleanup-wait=${CLEANUP_WAIT_TIMEOUT}s cleanup-rm=${CLEANUP_RM_TIMEOUT}s"
+receipt "limits cpus=1 memory=512m memory-swap=512m pids=128 data-tmpfs=64m build-timeout=${BUILD_TIMEOUT}s start-timeout=${START_TIMEOUT}s fail-timeout=${FAIL_TIMEOUT}s cleanup-stop=${CLEANUP_STOP_TIMEOUT}s cleanup-wait=${CLEANUP_WAIT_TIMEOUT}s cleanup-rm=${CLEANUP_RM_TIMEOUT}s cleanup-inspect=${CLEANUP_INSPECT_TIMEOUT}s"
 receipt "platform_note aarch64 and Darwin are not accepted from this run"
 
 bash "${ROOT}/scripts/qualify_docker_ui_authored_checks.sh" >>"$RECEIPT" 2>&1
@@ -227,26 +305,27 @@ expect_config_failure() {
     set -e
     status="${status//$'\n'/}"
 
-    local inspect_rc=0
-    local state="" exit_code="" oom="" docker_error="" logs=""
+    local inspect_rc=0 logs_rc=0
+    local inspect_body="" inspect_err="" logs_body="" logs_err=""
     set +e
-    state="$(docker inspect --format '{{.State.Status}}' "$name" 2>>"$RECEIPT")"
+    run_bounded "$FAIL_TIMEOUT" inspect_body inspect_err \
+        docker inspect --format '{{json .State.Status}} {{json .State.ExitCode}} {{json .State.OOMKilled}} {{json .State.Error}}' "$name"
     inspect_rc=$?
-    exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$name" 2>>"$RECEIPT")"
-    oom="$(docker inspect --format '{{.State.OOMKilled}}' "$name" 2>>"$RECEIPT")"
-    docker_error="$(docker inspect --format '{{.State.Error}}' "$name" 2>>"$RECEIPT")"
-    logs="$(docker logs "$name" 2>&1)"
+    run_bounded "$FAIL_TIMEOUT" logs_body logs_err docker logs "$name"
+    logs_rc=$?
     set -e
-    printf '%s\n' "$logs" >>"$RECEIPT"
-    if [[ "$inspect_rc" != "0" ]]; then
-        receipt "FAIL ${name} docker_inspect_failed"
-        return 1
+    printf '%s\n' "$logs_body" >>"$RECEIPT"
+    if [[ -n "$logs_err" ]]; then
+        printf '%s\n' "$logs_err" >>"$RECEIPT"
+    fi
+    if [[ -n "$inspect_err" ]]; then
+        printf '%s\n' "$inspect_err" >>"$RECEIPT"
     fi
 
     local decision
-    decision="$(config_failure_qualifies "$kind" "$wait_rc" "$exit_code" "$state" "$oom" "$docker_error" "$logs" || true)"
+    decision="$(accept_config_observations "$kind" "$wait_rc" "$inspect_rc" "$inspect_body" "$logs_rc" "$logs_body" "$inspect_err" || true)"
     decision="${decision%$'\n'}"
-    receipt "fail_case ${name} kind=${kind} wait_rc=${wait_rc} wait_status=${status:-empty} exit=${exit_code:-empty} state=${state:-empty} oom=${oom:-empty} decision=${decision}"
+    receipt "fail_case ${name} kind=${kind} wait_rc=${wait_rc} wait_status=${status:-empty} inspect_rc=${inspect_rc} logs_rc=${logs_rc} decision=${decision}"
     if [[ "$decision" != "qualify" ]]; then
         receipt "FAIL ${name} ${decision}"
         return 1
