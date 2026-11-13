@@ -7,6 +7,8 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/.."
 ROOT="$(cd -- "$ROOT" && pwd)"
+# shellcheck source=docker_ui_qualify_decisions.sh
+source "${ROOT}/scripts/docker_ui_qualify_decisions.sh"
 SOURCE="$(git -C "$ROOT" rev-parse HEAD)"
 TREE="$(git -C "$ROOT" rev-parse 'HEAD^{tree}')"
 SLOT="rs118ui-$$"
@@ -15,26 +17,92 @@ IMAGE="reposync-ui-qualify:${SOURCE}"
 WORKDIR="$(mktemp -d /tmp/${SLOT}.XXXXXX)"
 RECEIPT="${WORKDIR}/receipt"
 CONTAINERS=()
+NETWORK_CREATED=0
 BUILD_TIMEOUT="${BUILD_TIMEOUT:-1800}"
 START_TIMEOUT="${START_TIMEOUT:-60}"
 FAIL_TIMEOUT="${FAIL_TIMEOUT:-20}"
+CLEANUP_STOP_TIMEOUT="${CLEANUP_STOP_TIMEOUT:-20}"
+CLEANUP_WAIT_TIMEOUT="${CLEANUP_WAIT_TIMEOUT:-15}"
+CLEANUP_RM_TIMEOUT="${CLEANUP_RM_TIMEOUT:-15}"
 
 receipt() { printf '%s\n' "$*" | tee -a "$RECEIPT"; }
 
 cleanup() {
-    local ec=$?
-    local name
+    local prior=$?
+    trap - EXIT
+    set +e
+    local unresolved=0
+    local name state stop_rc wait_rc rm_rc net_rc final
     for name in "${CONTAINERS[@]}"; do
-        docker stop -t 10 "$name" >>"$RECEIPT" 2>&1 || true
-        docker wait "$name" >>"$RECEIPT" 2>&1 || true
-        docker rm -f "$name" >>"$RECEIPT" 2>&1 || true
+        if ! docker container inspect "$name" >/dev/null 2>&1; then
+            receipt "cleanup_container_absent ${name}"
+            continue
+        fi
+        state="$(docker inspect --format '{{.State.Status}}' "$name" 2>>"$RECEIPT")"
+        receipt "cleanup_container_before ${name} ${state}"
+        stop_rc=0
+        if [[ "$state" == "running" || "$state" == "paused" || "$state" == "restarting" ]]; then
+            timeout "$CLEANUP_STOP_TIMEOUT" docker stop -t 10 "$name" >>"$RECEIPT" 2>&1
+            stop_rc=$?
+            if [[ "$stop_rc" != "0" ]]; then
+                receipt "cleanup_stop_failed ${name} rc=${stop_rc}"
+            else
+                receipt "cleanup_stop_ok ${name}"
+            fi
+        else
+            receipt "cleanup_stop_not_needed ${name} state=${state}"
+        fi
+        if cleanup_may_wait_after_stop "$stop_rc"; then
+            timeout "$CLEANUP_WAIT_TIMEOUT" docker wait "$name" >>"$RECEIPT" 2>&1
+            wait_rc=$?
+            if [[ "$wait_rc" != "0" ]]; then
+                receipt "cleanup_wait_failed ${name} rc=${wait_rc}"
+            else
+                receipt "cleanup_wait_ok ${name}"
+            fi
+        else
+            receipt "cleanup_wait_skipped ${name} stop_rc=${stop_rc}"
+        fi
+        timeout "$CLEANUP_RM_TIMEOUT" docker rm -f "$name" >>"$RECEIPT" 2>&1
+        rm_rc=$?
+        if [[ "$rm_rc" != "0" ]]; then
+            receipt "cleanup_rm_failed ${name} rc=${rm_rc}"
+        fi
+        if docker container inspect "$name" >/dev/null 2>&1; then
+            receipt "cleanup_container_remains ${name}"
+            unresolved=1
+        else
+            receipt "cleanup_container_removed ${name}"
+        fi
     done
-    docker network rm "$NET" >>"$RECEIPT" 2>&1 || true
+    if [[ "$NETWORK_CREATED" == "1" ]]; then
+        timeout "$CLEANUP_RM_TIMEOUT" docker network rm "$NET" >>"$RECEIPT" 2>&1
+        net_rc=$?
+        if docker network inspect "$NET" >/dev/null 2>&1; then
+            receipt "cleanup_network_remains ${NET} rm_rc=${net_rc}"
+            unresolved=1
+        else
+            receipt "cleanup_network_removed ${NET} rm_rc=${net_rc}"
+        fi
+    else
+        receipt "cleanup_network_not_created ${NET}"
+    fi
+    final="$(cleanup_final_status "$prior" "$unresolved")"
+    if [[ "$unresolved" == "0" ]]; then
+        receipt "cleanup_resolved"
+    else
+        receipt "cleanup_unresolved"
+    fi
+    if [[ "$final" == "0" ]]; then
+        receipt "RESULT pass image=${IMAGE_ID:-unset}"
+    else
+        receipt "RESULT fail prior=${prior} exit=${final} cleanup_unresolved=${unresolved}"
+    fi
     if [[ -f "$RECEIPT" ]]; then
         cat "$RECEIPT"
     fi
     rm -rf "$WORKDIR"
-    exit "$ec"
+    exit "$final"
 }
 trap cleanup EXIT
 
@@ -43,8 +111,11 @@ receipt "source ${SOURCE}"
 receipt "tree ${TREE}"
 receipt "slot ${SLOT}"
 receipt "host_arch $(uname -m)"
-receipt "limits cpus=1 memory=512m memory-swap=512m pids=128 data-tmpfs=64m build-timeout=${BUILD_TIMEOUT}s start-timeout=${START_TIMEOUT}s fail-timeout=${FAIL_TIMEOUT}s"
+receipt "limits cpus=1 memory=512m memory-swap=512m pids=128 data-tmpfs=64m build-timeout=${BUILD_TIMEOUT}s start-timeout=${START_TIMEOUT}s fail-timeout=${FAIL_TIMEOUT}s cleanup-stop=${CLEANUP_STOP_TIMEOUT}s cleanup-wait=${CLEANUP_WAIT_TIMEOUT}s cleanup-rm=${CLEANUP_RM_TIMEOUT}s"
 receipt "platform_note aarch64 and Darwin are not accepted from this run"
+
+bash "${ROOT}/scripts/qualify_docker_ui_authored_checks.sh" >>"$RECEIPT" 2>&1
+receipt "authored_checks_ok"
 
 if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     receipt "BLOCKER no-admitted-docker-daemon"
@@ -52,49 +123,11 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
 fi
 receipt "docker_server_arch $(docker version --format '{{.Server.Arch}}')"
 
-cat >"${WORKDIR}/synthetic.toml" <<'EOF'
-[daemon]
-poll_interval_secs = 3600
-log_level = "error"
-data_dir = "/var/lib/reposync"
-
-[svn]
-url = "file:///var/lib/reposync/no-such-repo"
-username = "synthetic"
-
-[github]
-api_url = "http://127.0.0.1:9"
-repo = "local/synthetic"
-
-[web]
-listen = "0.0.0.0:8080"
-auth_mode = "simple"
-
-[identity]
-email_domain = "example.invalid"
-
-[sync]
-mode = "direct"
-auto_merge = false
-sync_branches = false
-sync_tags = false
-EOF
-
-cat >"${WORKDIR}/invalid.toml" <<'EOF'
-[daemon]
-poll_interval_secs = 0
-log_level = "info"
-data_dir = "/var/lib/reposync"
-
-[svn]
-url = "file:///var/lib/reposync/no-such-repo"
-username = "synthetic"
-
-[github]
-repo = "local/synthetic"
-EOF
+cp "${ROOT}/scripts/fixtures/docker-ui-qualify-synthetic.toml" "${WORKDIR}/synthetic.toml"
+cp "${ROOT}/scripts/fixtures/docker-ui-qualify-invalid.toml" "${WORKDIR}/invalid.toml"
 
 docker network create --driver bridge "$NET" >>"$RECEIPT"
+NETWORK_CREATED=1
 timeout "$BUILD_TIMEOUT" docker build --pull=false -t "$IMAGE" "$ROOT" >>"$RECEIPT"
 IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$IMAGE")"
 receipt "image_id ${IMAGE_ID}"
@@ -152,7 +185,8 @@ wait_listen() {
 
 expect_config_failure() {
     local name="$1"
-    shift
+    local kind="$2"
+    shift 2
     local -a docker_opts=()
     local -a daemon_args=()
     local passed_separator=0
@@ -169,8 +203,8 @@ expect_config_failure() {
         fi
     done
     CONTAINERS+=("$name")
-    local cid
-    cid="$(docker run -d \
+    local cid=""
+    if ! cid="$(docker run -d \
         --name "$name" \
         --network "$NET" \
         --cpus=1 \
@@ -179,21 +213,51 @@ expect_config_failure() {
         --pids-limit=64 \
         "${docker_opts[@]}" \
         "$IMAGE_ID" \
-        "${daemon_args[@]}")"
-    local status
-    status="$(timeout "$FAIL_TIMEOUT" docker wait "$cid" || true)"
-    receipt "fail_case ${name} exit ${status:-timeout}"
-    docker logs --tail 80 "$name" >>"$RECEIPT" 2>&1 || true
-    if [[ -z "$status" || "$status" == "0" ]]; then
-        receipt "FAIL ${name} expected a non-zero config exit"
+        "${daemon_args[@]}")"; then
+        receipt "FAIL ${name} docker_run_failed"
         return 1
     fi
+    receipt "fail_case ${name} container ${cid}"
+
+    local wait_rc=0
+    local status=""
+    set +e
+    status="$(timeout "$FAIL_TIMEOUT" docker wait "$cid")"
+    wait_rc=$?
+    set -e
+    status="${status//$'\n'/}"
+
+    local inspect_rc=0
+    local state="" exit_code="" oom="" docker_error="" logs=""
+    set +e
+    state="$(docker inspect --format '{{.State.Status}}' "$name" 2>>"$RECEIPT")"
+    inspect_rc=$?
+    exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$name" 2>>"$RECEIPT")"
+    oom="$(docker inspect --format '{{.State.OOMKilled}}' "$name" 2>>"$RECEIPT")"
+    docker_error="$(docker inspect --format '{{.State.Error}}' "$name" 2>>"$RECEIPT")"
+    logs="$(docker logs "$name" 2>&1)"
+    set -e
+    printf '%s\n' "$logs" >>"$RECEIPT"
+    if [[ "$inspect_rc" != "0" ]]; then
+        receipt "FAIL ${name} docker_inspect_failed"
+        return 1
+    fi
+
+    local decision
+    decision="$(config_failure_qualifies "$kind" "$wait_rc" "$exit_code" "$state" "$oom" "$docker_error" "$logs" || true)"
+    decision="${decision%$'\n'}"
+    receipt "fail_case ${name} kind=${kind} wait_rc=${wait_rc} wait_status=${status:-empty} exit=${exit_code:-empty} state=${state:-empty} oom=${oom:-empty} decision=${decision}"
+    if [[ "$decision" != "qualify" ]]; then
+        receipt "FAIL ${name} ${decision}"
+        return 1
+    fi
+    receipt "fail_case ${name} qualified ${kind}"
 }
 
 # Missing file: load_from_file returns FileNotFound before listen.
-expect_config_failure "${SLOT}-missing" -- --config /etc/reposync/missing.toml
+expect_config_failure "${SLOT}-missing" missing_file -- --config /etc/reposync/missing.toml
 # poll_interval_secs = 0 fails validate before listen.
-expect_config_failure "${SLOT}-invalid" \
+expect_config_failure "${SLOT}-invalid" zero_poll \
     -v "${WORKDIR}/invalid.toml:/etc/reposync/invalid.toml:ro" \
     -- --config /etc/reposync/invalid.toml
 
@@ -253,12 +317,58 @@ run_container "${SLOT}-nostatic" \
     -- --config /etc/reposync/synthetic.toml
 NO_PORT="$(host_port "${SLOT}-nostatic")"
 wait_listen "$NO_PORT" || { receipt "FAIL no-static health did not listen"; exit 1; }
-NO_STATUS="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${NO_PORT}/" || true)"
-receipt "missing_static_index_status ${NO_STATUS}"
-if [[ "$NO_STATUS" == "200" ]]; then
-    receipt "FAIL missing static index was accepted as a page"
+
+index_body="${WORKDIR}/missing-static-index"
+health_body="${WORKDIR}/missing-static-health"
+index_rc=0
+index_code=""
+set +e
+index_code="$(curl -sS -o "$index_body" -w '%{http_code}' --max-time 5 "http://127.0.0.1:${NO_PORT}/")"
+index_rc=$?
+set -e
+index_transport=0
+if [[ "$index_rc" == "0" && "$index_code" =~ ^[0-9]{3}$ && "$index_code" != "000" ]]; then
+    index_transport=1
+fi
+
+health_rc=0
+health_code=""
+set +e
+health_code="$(curl -sS -o "$health_body" -w '%{http_code}' --max-time 5 "http://127.0.0.1:${NO_PORT}/api/status/health")"
+health_rc=$?
+set -e
+health_transport=0
+if [[ "$health_rc" == "0" && "$health_code" =~ ^[0-9]{3}$ && "$health_code" != "000" ]]; then
+    health_transport=1
+fi
+health_ok="false"
+if [[ "$health_transport" == "1" && "$health_code" == "200" ]]; then
+    health_ok="$(python3 - "$health_body" <<'PY'
+import json, sys
+try:
+    body = json.load(open(sys.argv[1]))
+except Exception:
+    print("false")
+    raise SystemExit(0)
+ok = (
+    body.get("ok") is True
+    and "version" in body
+    and "git_commit" in body
+    and "status" not in body
+)
+print("true" if ok else "false")
+PY
+)"
+fi
+static_decision="$(missing_static_qualifies "$index_transport" "$index_code" "$health_transport" "$health_code" "$health_ok" || true)"
+static_decision="${static_decision%$'\n'}"
+receipt "missing_static_index transport=${index_transport} rc=${index_rc} status=${index_code:-empty}"
+receipt "missing_static_health transport=${health_transport} rc=${health_rc} status=${health_code:-empty} ok=${health_ok}"
+receipt "missing_static_decision ${static_decision}"
+if [[ "$static_decision" != "qualify" ]]; then
+    receipt "FAIL missing static ${static_decision}"
     exit 1
 fi
 receipt "missing_static_rejected"
 
-receipt "RESULT pass image=${IMAGE_ID}"
+exit 0

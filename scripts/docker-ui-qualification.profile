@@ -22,12 +22,13 @@ candidate:
   scripts/qualify_docker_ui.sh is the unrun qualification.
 
 not_run_cases:
-  positive: one immutable image, synthetic file:// config, loopback ephemeral publish, health JSON ok/version/git_commit with status omitted, production index naming an asset, that asset containing "Welcome to RepoSync" and not the synthetic sentinel
-  negative_missing_config: --config path that load_from_file rejects as FileNotFound, non-zero exit before listen
-  negative_invalid_config: poll_interval_secs = 0, validate rejects, non-zero exit before listen
-  negative_missing_static: empty mount over /usr/local/bin/static; index handler returns 500; health HTTP 200 is not a pass
-  cleanup: docker stop, docker wait, docker rm, docker network rm for the slot
+  positive: one immutable image, scripts/fixtures/docker-ui-qualify-synthetic.toml (sync_branches = [] selects every branch; file:// SVN; loopback GitHub), health JSON ok/version/git_commit with status omitted, production index naming an asset, that asset containing "Welcome to RepoSync" and not the synthetic sentinel
+  negative_missing_config: --config path that load_from_file rejects as FileNotFound. Qualify only docker-wait rc 0, state exited, OOMKilled false, exit 1, and log "configuration file not found:". Timeout, Docker error, OOM, panic, and any other exit do not qualify.
+  negative_invalid_config: scripts/fixtures/docker-ui-qualify-invalid.toml. Qualify only the same container outcome plus "daemon.poll_interval_secs" and "poll interval must be > 0". A missing-file diagnostic does not qualify this case.
+  negative_missing_static: empty mount over /usr/local/bin/static. Qualify only completed transport, index HTTP 500, and a still-healthy API (HTTP 200, ok true, version, git_commit, status omitted). HTTP 000 and any other index status do not qualify.
+  authored_checks: scripts/qualify_docker_ui_authored_checks.sh exercises those decisions, including unrelated nonzero exits, before Docker is used.
+  cleanup: only the slot containers and the network this script created. Stop and wait are bounded. A failed stop skips wait. Removal is verified by inspect. Unresolved removal changes a pass into a failure and keeps an earlier failure status. The receipt is printed before the workdir is removed.
 
-limits_in_script: cpus=1 memory=512m memory-swap=512m pids=128 data-tmpfs=64m build-timeout=1800s start-timeout=60s fail-timeout=20s
+limits_in_script: cpus=1 memory=512m memory-swap=512m pids=128 data-tmpfs=64m build-timeout=1800s start-timeout=60s fail-timeout=20s cleanup-stop=20s cleanup-wait=15s cleanup-rm=15s
 platform: not executed. aarch64 and Darwin remain unresolved. One Linux run would not accept those platforms.
 admission_record: internal/issue-118-successor-freeze-2026-11-10.md records NOT_RUN docker and no docker daemon. No later admission covers this source.
