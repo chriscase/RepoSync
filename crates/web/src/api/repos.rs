@@ -92,6 +92,9 @@ fn chain_reports_as_set(db: &Database, repo_id: &str, key_prefix: &str) -> Resul
 #[path = "import_failure_persistence.rs"]
 mod import_failure_persistence;
 
+#[path = "repo_path_policy_56.rs"]
+mod repo_path_policy_56;
+
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
@@ -237,10 +240,16 @@ struct RepoDetail {
     history_boundary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot_pin: Option<SnapshotPin>,
+    /// #56 typed policy read. The raw columns remain write-only PUT fields.
+    path_policy: repo_path_policy_56::RepoPathPolicyRead,
 }
 
 impl From<reposync_core::models::Repository> for RepoDetail {
     fn from(r: reposync_core::models::Repository) -> Self {
+        let path_policy = repo_path_policy_56::read_policy(
+            r.allowed_paths.as_deref(),
+            r.blocked_patterns.as_deref(),
+        );
         Self {
             save_receipt: None,
             id: r.id,
@@ -271,6 +280,7 @@ impl From<reposync_core::models::Repository> for RepoDetail {
             starting_revision: None,
             history_boundary: None,
             snapshot_pin: None,
+            path_policy,
         }
     }
 }
@@ -606,6 +616,10 @@ async fn update_repo(
             return Ok(Json(result));
         }
     }
+    // #56: after durable receipt recovery (an exact replay keeps its receipt) and
+    // before any CAS or write, present policy fields must be valid.
+    repo_path_policy_56::validate_update(&body.allowed_paths, &body.blocked_patterns)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
     reject_held_import(db, &id)?;
     if db
         .managed_remove_blocks_new_work(&id)
