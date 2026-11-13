@@ -346,31 +346,50 @@ qualify_replayed_split_capture() {
     [[ "${decision%$'\n'}" == "qualify" ]]
 }
 
-# confirmed_not_found TEXT
-# Docker's completed not-found responses. Matching is case-insensitive and
-# does not treat an empty failure or a bare "not found" as absence.
-confirmed_not_found() {
-    local lower=""
-    lower="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-    if [[ "$lower" == *"no such object:"* || "$lower" == *"no such container:"* || "$lower" == *"no such network:"* ]]; then
-        return 0
+# confirmed_absence KIND NAME TEXT
+# KIND is container or network. TEXT must be exactly one completed Docker
+# not-found line for that object. A different object, the other kind, extra
+# text, or a generic daemon error is not absence.
+confirmed_absence() {
+    local kind="$1"
+    local name="$2"
+    local text="$3"
+    local line=""
+    if [[ -z "$name" ]]; then
+        return 1
     fi
-    if [[ "$lower" == *"error response from daemon: network "* && "$lower" == *" not found"* ]]; then
-        return 0
+    line="$text"
+    while [[ "$line" == *$'\n' || "$line" == *$'\r' ]]; do
+        line="${line%$'\n'}"
+        line="${line%$'\r'}"
+    done
+    if [[ -z "$line" || "$line" == *$'\n'* ]]; then
+        return 1
     fi
-    return 1
+    case "$kind" in
+        container)
+            [[ "$line" == "error: no such object: ${name}" || "$line" == "Error: No such object: ${name}" ]]
+            ;;
+        network)
+            [[ "$line" == "Error response from daemon: network ${name} not found" || "$line" == "Error: No such network: ${name}" ]]
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
-# classify_inspect_presence RC STDOUT STDERR
+# classify_inspect_presence RC STDOUT STDERR KIND NAME
 # "absent" is only a completed not-found response.
 # Empty failed output, timeout, permission, daemon, and transport are unknown.
 classify_inspect_presence() {
     local rc="$1"
     local out="$2"
     local err="$3"
+    local kind="${4:-}"
+    local name="${5:-}"
     local trimmed="$out"
     local class=""
-    local blob="${out}"$'\n'"${err}"
     if [[ "$rc" == "0" ]]; then
         trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
         trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
@@ -387,7 +406,7 @@ classify_inspect_presence() {
         printf 'unknown %s\n' "$class"
         return 1
     fi
-    if confirmed_not_found "$blob"; then
+    if [[ -z "$trimmed" ]] && confirmed_absence "$kind" "$name" "$err"; then
         printf 'absent\n'
         return 0
     fi

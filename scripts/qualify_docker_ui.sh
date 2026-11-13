@@ -66,7 +66,7 @@ cleanup() {
         run_bounded "$CLEANUP_INSPECT_TIMEOUT" cout cerr \
             docker inspect --format '{{.Id}} {{json .State.Status}}' "$name"
         crc=$?
-        class="$(classify_inspect_presence "$crc" "$cout" "$cerr" || true)"
+        class="$(classify_inspect_presence "$crc" "$cout" "$cerr" container "$name" || true)"
         class="${class%$'\n'}"
         receipt "cleanup_inspect ${name} rc=${crc} class=${class}"
         if [[ -n "$cerr" ]]; then
@@ -118,7 +118,7 @@ cleanup() {
         run_bounded "$CLEANUP_INSPECT_TIMEOUT" post_out post_err \
             docker inspect --format '{{.Id}}' "$name"
         post_rc=$?
-        post_class="$(classify_inspect_presence "$post_rc" "$post_out" "$post_err" || true)"
+        post_class="$(classify_inspect_presence "$post_rc" "$post_out" "$post_err" container "$name" || true)"
         post_class="${post_class%$'\n'}"
         removal="$(cleanup_removal_result "$rm_rc" "$post_class" || true)"
         removal="${removal%$'\n'}"
@@ -151,7 +151,7 @@ cleanup() {
         fi
         run_bounded "$CLEANUP_INSPECT_TIMEOUT" net_out net_err docker network inspect "$NET"
         net_rc=$?
-        network_fold="$(classify_inspect_presence "$net_rc" "$net_out" "$net_err" || true)"
+        network_fold="$(classify_inspect_presence "$net_rc" "$net_out" "$net_err" network "$NET" || true)"
         network_fold="${network_fold%$'\n'}"
         receipt "cleanup_network_inspect ${NET} rc=${net_rc} class=${network_fold}"
         if [[ -n "$net_err" ]]; then

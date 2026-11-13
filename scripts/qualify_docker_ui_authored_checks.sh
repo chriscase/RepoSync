@@ -118,12 +118,18 @@ expect_text 'unknown permission' classify_inspect_presence 1 '' $'permission den
 expect_text 'unknown transport' classify_inspect_presence 1 '' 'error during connect: dial unix /var/run/docker.sock: connect: connection refused'
 expect_text 'unknown malformed' classify_inspect_presence 0 '' ''
 expect_text 'unknown malformed' classify_inspect_presence 0 '   ' ''
-expect_text 'absent' classify_inspect_presence 1 '' 'Error: No such object: rs118ui-1'
-expect_text 'absent' classify_inspect_presence 1 '' 'Error: No such network: rs118ui-1-net'
-expect_text 'absent' classify_inspect_presence 1 '' 'error: no such object: rs118ui-1'
-expect_text 'absent' classify_inspect_presence 1 '' 'Error response from daemon: network rs118ui-1-net not found'
-expect_text 'unknown failed' classify_inspect_presence 1 '' 'not found'
-expect_text 'unknown failed' classify_inspect_presence 1 '' 'Error response from daemon: something else failed'
+expect_text 'absent' classify_inspect_presence 1 '' 'Error: No such object: rs118ui-1' container rs118ui-1
+expect_text 'absent' classify_inspect_presence 1 '' 'Error: No such network: rs118ui-1-net' network rs118ui-1-net
+expect_text 'absent' classify_inspect_presence 1 '' 'error: no such object: rs118ui-2498-missing' container rs118ui-2498-missing
+expect_text 'absent' classify_inspect_presence 1 '' 'Error response from daemon: network rs118ui-2498-net not found' network rs118ui-2498-net
+expect_text 'unknown failed' classify_inspect_presence 1 '' 'error: no such object: rs118ui-2498-missing' container other-name
+expect_text 'unknown failed' classify_inspect_presence 1 '' 'error: no such object: rs118ui-2498-missing' network rs118ui-2498-missing
+expect_text 'unknown failed' classify_inspect_presence 1 '' 'Error response from daemon: network rs118ui-2498-net not found' network other-net
+expect_text 'unknown failed' classify_inspect_presence 1 '' 'Error response from daemon: network rs118ui-2498-net not found' container rs118ui-2498-net
+expect_text 'unknown failed' classify_inspect_presence 1 'leftover' 'error: no such object: rs118ui-2498-missing' container rs118ui-2498-missing
+expect_text 'unknown failed' classify_inspect_presence 1 '' $'error: no such object: rs118ui-2498-missing\nextra' container rs118ui-2498-missing
+expect_text 'unknown failed' classify_inspect_presence 1 '' 'not found' container rs118ui-2498-missing
+expect_text 'unknown failed' classify_inspect_presence 1 '' 'Error response from daemon: something else failed' network rs118ui-2498-net
 expect_text 'present' classify_inspect_presence 0 'abc123 "exited"' ''
 expect_text 'unresolved unknown daemon' cleanup_removal_result 1 'unknown daemon'
 expect_text 'unresolved unknown timeout' cleanup_removal_result 1 'unknown timeout'
