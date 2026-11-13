@@ -14,7 +14,7 @@ source_gap:
   packaging/static/assets/app.js is the synthetic sentinel and is not the production UI.
   .github/workflows/ci.yml has no Docker build or startup step.
   The release archive assembler already builds web-ui and rejects the synthetic sentinel.
-  The builder image is already rust:stable-bookworm.
+  The builder image is rust:1-bookworm. rust:stable-bookworm is not a published library tag.
 
 candidate:
   Dockerfile node:22-bookworm stage runs npm ci and npm run build, refuses the synthetic sentinel, and copies dist to /usr/local/bin/static.
