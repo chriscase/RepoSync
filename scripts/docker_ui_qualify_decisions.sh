@@ -203,18 +203,86 @@ sys.stdout.write("%s\t%s\t%s\t%s" % (status, code, "true" if oom else "false", j
     printf '%s' "$parsed"
 }
 
-# accept_config_observations KIND WAIT_RC INSPECT_RC INSPECT_BODY LOGS_RC LOGS_BODY INSPECT_ERR
+# stream_panics TEXT
+stream_panics() {
+    local text="$1"
+    [[ "$text" == *"panicked at"* || "$text" == *"stack backtrace"* || "$text" == *"fatal runtime error"* ]]
+}
+
+# config_streams_qualify KIND WAIT_RC EXIT_CODE STATE OOM DOCKER_ERROR STDOUT STDERR
+# STDOUT and STDERR stay separate. A phrase split across them does not match.
+# Panic on either stream refuses. The expected diagnostic may be on either one.
+config_streams_qualify() {
+    local kind="$1"
+    local wait_rc="$2"
+    local exit_code="$3"
+    local state="$4"
+    local oom="$5"
+    local docker_error="$6"
+    local logs_stdout="$7"
+    local logs_stderr="$8"
+    local structural=""
+    structural="$(config_failure_qualifies "$kind" "$wait_rc" "$exit_code" "$state" "$oom" "$docker_error" ' ' || true)"
+    structural="${structural%$'\n'}"
+    if [[ "$structural" != "refuse missing_file_diagnostic" && "$structural" != "refuse zero_poll_diagnostic" ]]; then
+        printf '%s\n' "$structural"
+        [[ "$structural" == "qualify" ]] && return 0
+        return 1
+    fi
+    if stream_panics "$logs_stdout" || stream_panics "$logs_stderr"; then
+        printf 'refuse panic\n'
+        return 1
+    fi
+    case "$kind" in
+        missing_file)
+            if [[ "$logs_stdout" == *"poll interval must be > 0"* || "$logs_stderr" == *"poll interval must be > 0"* ]]; then
+                printf 'refuse unexpected_poll_diagnostic\n'
+                return 1
+            fi
+            if [[ "$logs_stdout" == *"configuration file not found:"* || "$logs_stderr" == *"configuration file not found:"* ]]; then
+                printf 'qualify\n'
+                return 0
+            fi
+            printf 'refuse missing_file_diagnostic\n'
+            return 1
+            ;;
+        zero_poll)
+            if [[ "$logs_stdout" == *"configuration file not found:"* || "$logs_stderr" == *"configuration file not found:"* ]]; then
+                printf 'refuse unexpected_missing_file_diagnostic\n'
+                return 1
+            fi
+            if [[ "$logs_stdout" == *"daemon.poll_interval_secs"* && "$logs_stdout" == *"poll interval must be > 0"* ]]; then
+                printf 'qualify\n'
+                return 0
+            fi
+            if [[ "$logs_stderr" == *"daemon.poll_interval_secs"* && "$logs_stderr" == *"poll interval must be > 0"* ]]; then
+                printf 'qualify\n'
+                return 0
+            fi
+            printf 'refuse zero_poll_diagnostic\n'
+            return 1
+            ;;
+        *)
+            printf 'refuse unknown_kind\n'
+            return 1
+            ;;
+    esac
+}
+
+# accept_config_observations KIND WAIT_RC INSPECT_RC INSPECT_BODY LOGS_RC LOGS_STDOUT LOGS_STDERR INSPECT_ERR
 # Caller gate for one complete state response and one log retrieval.
+# Both captured streams are scored only after that retrieval succeeds.
 # A failed, timed-out, permission, daemon, transport, or malformed observation
-# refuses even when the other observation already contains a valid diagnostic.
+# refuses even when a stream already contains a valid diagnostic.
 accept_config_observations() {
     local kind="$1"
     local wait_rc="$2"
     local inspect_rc="$3"
     local inspect_body="$4"
     local logs_rc="$5"
-    local logs_body="$6"
-    local inspect_err="${7:-}"
+    local logs_stdout="$6"
+    local logs_stderr="${7:-}"
+    local inspect_err="${8:-}"
     local -a problems=()
     local state="" exit_code="" oom="" docker_error="" parsed="" error_json="" rest="" why=""
 
@@ -247,7 +315,39 @@ accept_config_observations() {
         printf 'refuse %s\n' "${problems[*]}"
         return 1
     fi
-    config_failure_qualifies "$kind" "$wait_rc" "$exit_code" "$state" "$oom" "$docker_error" "$logs_body"
+    config_streams_qualify "$kind" "$wait_rc" "$exit_code" "$state" "$oom" "$docker_error" "$logs_stdout" "$logs_stderr"
+}
+
+# qualify_captured_config_logs KIND WAIT_RC INSPECT_RC INSPECT_BODY LOGS_RC LOGS_STDOUT LOGS_STDERR INSPECT_ERR
+# Entry used by the qualification script after it has captured the two streams.
+qualify_captured_config_logs() {
+    accept_config_observations "$@"
+}
+
+# qualify_replayed_split_capture KIND WAIT_RC INSPECT_RC INSPECT_BODY LOGS_RC STDOUT_TEXT STDERR_TEXT INSPECT_ERR
+# Writes each stream to its own file and reads those files back without joining them.
+# This is the capture path: empty stdout stays empty, and stderr is a separate stream.
+qualify_replayed_split_capture() {
+    local kind="$1"
+    local wait_rc="$2"
+    local inspect_rc="$3"
+    local inspect_body="$4"
+    local logs_rc="$5"
+    local stdout_text="$6"
+    local stderr_text="$7"
+    local inspect_err="${8:-}"
+    local dir="" out_file="" err_file="" logs_stdout="" logs_stderr="" decision=""
+    dir="$(mktemp -d)"
+    out_file="${dir}/stdout"
+    err_file="${dir}/stderr"
+    printf '%s' "$stdout_text" >"$out_file"
+    printf '%s' "$stderr_text" >"$err_file"
+    logs_stdout="$(cat "$out_file")"
+    logs_stderr="$(cat "$err_file")"
+    decision="$(qualify_captured_config_logs "$kind" "$wait_rc" "$inspect_rc" "$inspect_body" "$logs_rc" "$logs_stdout" "$logs_stderr" "$inspect_err" || true)"
+    rm -rf "$dir"
+    printf '%s\n' "${decision%$'\n'}"
+    [[ "${decision%$'\n'}" == "qualify" ]]
 }
 
 # classify_inspect_presence RC STDOUT STDERR

@@ -80,10 +80,10 @@ expect_text qualify accept_config_observations zero_poll 0 0 "$VALID_STATE" 0 "$
 expect_text 'refuse logs_failed' accept_config_observations missing_file 0 0 "$VALID_STATE" 1 "$MISSING_LOG" ''
 expect_text 'refuse logs_timeout' accept_config_observations zero_poll 0 0 "$VALID_STATE" 124 "$ZERO_POLL_LOG" ''
 expect_text 'refuse observation_timeout' accept_config_observations missing_file 0 124 "$VALID_STATE" 0 "$MISSING_LOG" ''
-expect_text 'refuse observation_permission' accept_config_observations missing_file 0 1 "$VALID_STATE" 0 "$MISSING_LOG" 'permission denied'
-expect_text 'refuse observation_daemon' accept_config_observations zero_poll 0 1 "$VALID_STATE" 0 "$ZERO_POLL_LOG" 'Cannot connect to the Docker daemon'
-expect_text 'refuse observation_transport' accept_config_observations missing_file 0 1 "$VALID_STATE" 0 "$MISSING_LOG" 'error during connect: dial unix /var/run/docker.sock: connection refused'
-expect_text 'refuse observation_failed' accept_config_observations missing_file 0 1 "$VALID_STATE" 0 "$MISSING_LOG" 'inspect api failed'
+expect_text 'refuse observation_permission' accept_config_observations missing_file 0 1 "$VALID_STATE" 0 "$MISSING_LOG" '' 'permission denied'
+expect_text 'refuse observation_daemon' accept_config_observations zero_poll 0 1 "$VALID_STATE" 0 "$ZERO_POLL_LOG" '' 'Cannot connect to the Docker daemon'
+expect_text 'refuse observation_transport' accept_config_observations missing_file 0 1 "$VALID_STATE" 0 "$MISSING_LOG" '' 'error during connect: dial unix /var/run/docker.sock: connection refused'
+expect_text 'refuse observation_failed' accept_config_observations missing_file 0 1 "$VALID_STATE" 0 "$MISSING_LOG" '' 'inspect api failed'
 expect_text 'refuse observation_timeout logs_failed' accept_config_observations missing_file 0 124 "$VALID_STATE" 1 "$MISSING_LOG" ''
 expect_text 'refuse malformed_state' accept_config_observations missing_file 0 0 'not-json' 0 "$MISSING_LOG" ''
 expect_text 'refuse malformed_state' accept_config_observations zero_poll 0 0 '"exited"' 0 "$ZERO_POLL_LOG" ''
@@ -93,6 +93,21 @@ expect_text 'refuse panic' accept_config_observations zero_poll 0 0 "$VALID_STAT
 expect_text 'refuse docker_error' accept_config_observations missing_file 0 0 '"exited" 1 false "OCI runtime create failed"' 0 "$MISSING_LOG" ''
 expect_text 'refuse missing_file_diagnostic' accept_config_observations missing_file 0 0 "$VALID_STATE" 0 "$ZERO_POLL_LOG" ''
 expect_text 'refuse zero_poll_diagnostic' accept_config_observations zero_poll 0 0 "$VALID_STATE" 0 "$MISSING_LOG" ''
+
+# Capture path. Stdout and stderr are separate files, then the same caller
+# entry the script uses. Empty stdout with the daemon diagnostic on stderr qualifies.
+# A nonzero retrieval still refuses when that diagnostic is present.
+expect_text qualify qualify_replayed_split_capture missing_file 0 0 "$VALID_STATE" 0 '' "$MISSING_LOG" ''
+expect_text qualify qualify_replayed_split_capture zero_poll 0 0 "$VALID_STATE" 0 '' "$ZERO_POLL_LOG" ''
+expect_text 'refuse logs_failed' qualify_replayed_split_capture missing_file 0 0 "$VALID_STATE" 1 '' "$MISSING_LOG" ''
+expect_text 'refuse logs_failed' qualify_replayed_split_capture zero_poll 0 0 "$VALID_STATE" 1 'configuration file' "$ZERO_POLL_LOG" ''
+expect_text 'refuse logs_timeout' qualify_replayed_split_capture missing_file 0 0 "$VALID_STATE" 124 '' "$MISSING_LOG" ''
+expect_text 'refuse panic' qualify_replayed_split_capture missing_file 0 0 "$VALID_STATE" 0 '' $'panicked at crates/daemon/src/main.rs:1:1\n'"$MISSING_LOG" ''
+expect_text 'refuse panic' qualify_replayed_split_capture zero_poll 0 0 "$VALID_STATE" 0 'fatal runtime error: aborted' "$ZERO_POLL_LOG" ''
+expect_text 'refuse missing_file_diagnostic' qualify_replayed_split_capture missing_file 0 0 "$VALID_STATE" 0 '' 'database is locked' ''
+expect_text 'refuse zero_poll_diagnostic' qualify_replayed_split_capture zero_poll 0 0 "$VALID_STATE" 0 '' 'unrelated startup failure' ''
+expect_text 'refuse missing_file_diagnostic' qualify_replayed_split_capture missing_file 0 0 "$VALID_STATE" 0 '' "$ZERO_POLL_LOG" ''
+expect_text 'refuse zero_poll_diagnostic' qualify_replayed_split_capture zero_poll 0 0 "$VALID_STATE" 0 '' "$MISSING_LOG" ''
 
 # Caller-level cleanup controls. Failed or empty inspect output is not absence.
 expect_text 'unknown daemon' classify_inspect_presence 1 '' 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?'

@@ -314,16 +314,21 @@ expect_config_failure() {
     run_bounded "$FAIL_TIMEOUT" logs_body logs_err docker logs "$name"
     logs_rc=$?
     set -e
-    printf '%s\n' "$logs_body" >>"$RECEIPT"
-    if [[ -n "$logs_err" ]]; then
-        printf '%s\n' "$logs_err" >>"$RECEIPT"
-    fi
+    # Keep each captured stream intact. The copy below is evidence only.
+    {
+        printf 'logs_stdout_begin\n'
+        printf '%s' "$logs_body"
+        printf '\nlogs_stdout_end\n'
+        printf 'logs_stderr_begin\n'
+        printf '%s' "$logs_err"
+        printf '\nlogs_stderr_end\n'
+    } | tee -a "$RECEIPT"
     if [[ -n "$inspect_err" ]]; then
         printf '%s\n' "$inspect_err" >>"$RECEIPT"
     fi
 
     local decision
-    decision="$(accept_config_observations "$kind" "$wait_rc" "$inspect_rc" "$inspect_body" "$logs_rc" "$logs_body" "$inspect_err" || true)"
+    decision="$(qualify_captured_config_logs "$kind" "$wait_rc" "$inspect_rc" "$inspect_body" "$logs_rc" "$logs_body" "$logs_err" "$inspect_err" || true)"
     decision="${decision%$'\n'}"
     receipt "fail_case ${name} kind=${kind} wait_rc=${wait_rc} wait_status=${status:-empty} inspect_rc=${inspect_rc} logs_rc=${logs_rc} decision=${decision}"
     if [[ "$decision" != "qualify" ]]; then
