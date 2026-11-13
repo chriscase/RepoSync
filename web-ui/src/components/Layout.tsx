@@ -7,31 +7,10 @@ import SyncStatus from './SyncStatus';
 import { getStoredUser } from '../utils/auth';
 import { LogoSvg } from './Logo';
 import LayoutChooser from '../layouts/LayoutChooser';
-import { LAYOUT_CATALOG, NAV_GROUP_IDS, NAV_GROUP_LABELS, resolveTheme, type LayoutId, type NavGroupId } from '../layouts/layoutCatalog';
+import { LAYOUT_CATALOG, NAV_GROUP_IDS, NAV_GROUP_LABELS, PRIMARY_NAVIGATION, resolveTheme, type LayoutId, type PrimaryNavItem } from '../layouts/layoutCatalog';
 import { useLayoutPreference } from '../layouts/layoutPreference';
 import '../layouts/layoutTokens.css';
 
-export interface PrimaryNavItem {
-  readonly to: string;
-  readonly label: string;
-  readonly group: NavGroupId;
-  readonly end?: boolean;
-  readonly adminOnly?: boolean;
-  readonly conflictCount?: boolean;
-}
-
-/** Targets, labels, order, active matching and admin-only visibility, shared by every layout. */
-export const PRIMARY_NAVIGATION: readonly PrimaryNavItem[] = [
-  { to: '/', label: 'Dashboard', group: 'workspace', end: true },
-  { to: '/repos', label: 'Repositories', group: 'workspace' },
-  { to: '/conflicts', label: 'Conflicts', group: 'workspace', conflictCount: true },
-  { to: '/audit', label: 'Audit Log', group: 'workspace' },
-  { to: '/settings', label: 'Settings', group: 'account' },
-  { to: '/users', label: 'Users', group: 'administration', adminOnly: true },
-  { to: '/ldap', label: 'LDAP', group: 'administration', adminOnly: true },
-  { to: '/config', label: 'Config', group: 'administration', adminOnly: true },
-  { to: '/setup', label: 'Setup', group: 'administration', adminOnly: true },
-];
 
 export interface LayoutFrameProps {
   readonly layout: LayoutId;

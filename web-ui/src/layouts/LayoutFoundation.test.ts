@@ -3,8 +3,8 @@ import { createElement, isValidElement, type ReactElement, type ReactNode } from
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter, Outlet, useRoutes } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import Layout, { LayoutFrame, PRIMARY_NAVIGATION, type LayoutFrameProps } from '../components/Layout';
-import { LAYOUT_IDS, type LayoutId } from './layoutCatalog';
+import Layout, { LayoutFrame, type LayoutFrameProps } from '../components/Layout';
+import { LAYOUT_IDS, PRIMARY_NAVIGATION, type LayoutId } from './layoutCatalog';
 import { LAYOUT_PREFERENCE_PREFIX, preferenceKey } from './layoutPreference';
 
 // #262 shell regressions without a DOM. Element-tree checks prove what React will

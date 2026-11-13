@@ -1,10 +1,11 @@
 /**
- * #262 presentation catalog.
+ * #262 presentation catalog and shared navigation metadata.
  *
  * A layout only arranges the one shared application shell. It never grants a
  * capability, changes server mode, adds or removes a route, or alters which
- * navigation entries an account may see: those stay in Layout.tsx and are
- * derived from the signed-in account exactly as before.
+ * navigation entries an account may see. PRIMARY_NAVIGATION below is shared
+ * metadata only: Layout.tsx still derives visibility from the signed-in
+ * account exactly as before.
  */
 export const LAYOUT_IDS = ['classic', 'individual', 'team'] as const;
 export type LayoutId = (typeof LAYOUT_IDS)[number];
@@ -30,6 +31,27 @@ export const NAV_GROUP_LABELS: Readonly<Record<NavGroupId, string>> = Object.fre
   administration: 'Administration',
 });
 
+export interface PrimaryNavItem {
+  readonly to: string;
+  readonly label: string;
+  readonly group: NavGroupId;
+  readonly end?: boolean;
+  readonly adminOnly?: boolean;
+  readonly conflictCount?: boolean;
+}
+
+/** Targets, labels, order, active matching and admin-only visibility, shared by every layout. */
+export const PRIMARY_NAVIGATION: readonly PrimaryNavItem[] = [
+  { to: '/', label: 'Dashboard', group: 'workspace', end: true },
+  { to: '/repos', label: 'Repositories', group: 'workspace' },
+  { to: '/conflicts', label: 'Conflicts', group: 'workspace', conflictCount: true },
+  { to: '/audit', label: 'Audit Log', group: 'workspace' },
+  { to: '/settings', label: 'Settings', group: 'account' },
+  { to: '/users', label: 'Users', group: 'administration', adminOnly: true },
+  { to: '/ldap', label: 'LDAP', group: 'administration', adminOnly: true },
+  { to: '/config', label: 'Config', group: 'administration', adminOnly: true },
+  { to: '/setup', label: 'Setup', group: 'administration', adminOnly: true },
+];
 /** Layout and spacing utilities for each fixed shell slot. Colors come from layoutTokens.css. */
 export interface ShellClasses {
   readonly root: string;
