@@ -1,0 +1,40 @@
+ServerRoot "/etc/apache2"
+PidFile /var/run/apache2/apache2.pid
+ServerName svn
+Listen 8443
+User www-data
+Group www-data
+TypesConfig /etc/mime.types
+Include mods-enabled/*.load
+Include mods-enabled/*.conf
+
+LogFormat "%h %l %u %t \"%r\" %>s %b" labcommon
+ErrorLog /proc/self/fd/2
+CustomLog /proc/self/fd/1 labcommon
+LogLevel warn
+
+LDAPVerifyServerCert on
+LDAPTrustedGlobalCert CA_BASE64 /certs/ca.crt
+
+<VirtualHost *:8443>
+  ServerName svn
+  SSLEngine on
+  SSLCertificateFile /certs/svn.crt
+  SSLCertificateKeyFile /certs/svn.key
+  SSLCertificateChainFile /certs/ca.crt
+
+  <Location /svn>
+    DAV svn
+    SVNParentPath /var/svn
+    SVNListParentPath On
+    AuthzSVNAccessFile /etc/reposync/svn-authz
+
+    AuthType Basic
+    AuthName "RepoSync lab SVN"
+    AuthBasicProvider ldap
+    AuthLDAPURL "ldaps://ldap:636/ou=people,dc=lab,dc=invalid?uid?sub?(objectClass=inetOrgPerson)"
+    AuthLDAPBindDN "@@LDAP_BIND_DN@@"
+    AuthLDAPBindPassword "@@LDAP_BIND_PASSWORD@@"
+    Require valid-user
+  </Location>
+</VirtualHost>

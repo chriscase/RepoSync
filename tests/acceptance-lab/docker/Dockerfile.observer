@@ -1,0 +1,10 @@
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+FROM ${DEBIAN_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git ldap-utils sqlite3 subversion util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --shell /bin/sh observer
+COPY observer-entrypoint.sh /usr/local/bin/observer-entrypoint.sh
+RUN chmod 755 /usr/local/bin/observer-entrypoint.sh
+USER root
+ENTRYPOINT ["/usr/local/bin/observer-entrypoint.sh"]
