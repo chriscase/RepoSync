@@ -1,4 +1,4 @@
-FROM rust:stable-bookworm AS builder
+FROM rust:1-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -18,6 +18,18 @@ RUN test -x /app/target/release/reposync-daemon \
     && test -x /app/target/release/reposync \
     && /app/target/release/reposync --version
 
+# Production UI. The daemon serves static/ next to its executable.
+# There is no Node pin in the repo; Node 22 matches the major used to
+# build this UI, and bookworm matches the runtime image.
+FROM node:22-bookworm AS ui
+WORKDIR /src/web-ui
+COPY web-ui/package.json web-ui/package-lock.json ./
+RUN npm ci
+COPY web-ui/ ./
+RUN npm run build \
+    && test -s dist/index.html \
+    && ! grep -R -q 'window.reposyncStatic = "synthetic"' dist
+
 # Runtime image
 FROM debian:bookworm-slim
 
@@ -35,6 +47,8 @@ RUN useradd -r -s /usr/sbin/nologin -m -d /var/lib/reposync reposync
 # Copy binaries
 COPY --from=builder /app/target/release/reposync-daemon /usr/local/bin/
 COPY --from=builder /app/target/release/reposync /usr/local/bin/
+COPY --from=ui /src/web-ui/dist /usr/local/bin/static
+RUN chmod -R a+rX /usr/local/bin/static
 
 # Copy default config (read-only for non-root)
 COPY config.example.toml /etc/reposync/config.toml

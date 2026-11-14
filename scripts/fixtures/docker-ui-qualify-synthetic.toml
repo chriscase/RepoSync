@@ -1,0 +1,27 @@
+# Synthetic qualification config. file:// and loopback only.
+# sync_branches = [] selects every branch. It does not disable synchronization.
+[daemon]
+poll_interval_secs = 3600
+log_level = "error"
+data_dir = "/var/lib/reposync"
+
+[svn]
+url = "file:///var/lib/reposync/no-such-repo"
+username = "synthetic"
+
+[github]
+api_url = "http://127.0.0.1:9"
+repo = "local/synthetic"
+
+[web]
+listen = "0.0.0.0:8080"
+auth_mode = "simple"
+
+[identity]
+email_domain = "example.invalid"
+
+[sync]
+mode = "direct"
+auto_merge = false
+sync_branches = []
+sync_tags = false
