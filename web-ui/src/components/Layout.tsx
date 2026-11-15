@@ -23,6 +23,25 @@ export interface LayoutFrameProps {
 }
 
 /**
+ * Brings a focused navigation link fully into view inside its horizontally scrolling
+ * link strip (Individual, and Team below md), if it sits in one. It only ever changes that
+ * strip's scrollLeft and never the page's scroll position, so focus restored by a dialog, a
+ * returning window or focus({ preventScroll: true }) cannot move the page.
+ */
+function revealInLinkStrip(link: HTMLElement) {
+  for (let strip = link.parentElement; strip && strip.tagName !== 'NAV'; strip = strip.parentElement) {
+    const overflowX = getComputedStyle(strip).overflowX;
+    if (overflowX !== 'auto' && overflowX !== 'scroll') continue;
+    const left = strip.getBoundingClientRect().left + strip.clientLeft;
+    const right = left + strip.clientWidth;
+    const target = link.getBoundingClientRect();
+    if (target.left < left) strip.scrollLeft -= Math.ceil(left - target.left);
+    else if (target.right > right) strip.scrollLeft += Math.ceil(target.right - right);
+    return;
+  }
+}
+
+/**
  * #262: one fixed shell tree for every layout. A layout changes classes, data
  * attributes and how the navigation entries are grouped, never the element
  * types or keys on the path to <main>/<Outlet>, so switching keeps the routed
@@ -37,10 +56,10 @@ export function LayoutFrame({ layout, isAdmin, activeConflicts, accountName, syn
     `rs-shell-link ${classes.link}${isActive ? ' rs-shell-link--active' : ''}`;
 
   const renderLink = (item: PrimaryNavItem) => (
-    // A horizontally scrolling link strip leaves a partly hidden link partly hidden on
-    // focus, so bring the focused link fully into view (a no-op when it already is).
+    // Focus leaves a partly hidden link in a scrolling strip partly hidden, so reveal it
+    // within the strip only (a no-op outside a strip or when it is already fully visible).
     <NavLink key={item.to} to={item.to} end={item.end} className={navLinkClass}
-      onFocus={event => event.currentTarget.scrollIntoView({ block: 'nearest', inline: 'nearest' })}>
+      onFocus={event => revealInLinkStrip(event.currentTarget)}>
       {item.label}
       {item.conflictCount && activeConflicts > 0 && (
         <span className="ml-2 inline-flex items-center justify-center px-2 py-1 text-xs font-bold leading-none rs-shell-alert rounded-full">

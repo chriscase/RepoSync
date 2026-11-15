@@ -132,6 +132,18 @@ async function auditShell(page, label) {
   assert.deepEqual(result.violations.map(v => ({ id: v.id, impact: v.impact, nodes: v.nodes.map(n => n.target) })), [], label + ' axe violations');
 }
 
+/** Focusing navigation links, however the focus arrives, never moves the page. */
+async function assertNavFocusKeepsPageScroll(page, label) {
+  await page.evaluate(() => window.scrollTo(0, 300));
+  const before = await page.evaluate(() => window.scrollY);
+  assert.ok(before > 0, `${label}: the page must be scrolled first`);
+  const after = await page.evaluate(() => {
+    for (const link of document.querySelectorAll('[data-rs-layout] > nav a')) link.focus({ preventScroll: true });
+    return window.scrollY;
+  });
+  assert.equal(after, before, `${label}: focusing navigation links kept the page scroll`);
+}
+
 test('rs262 Classic is the default, keeps the original dark shell colors and navigation, and every layout passes axe', { timeout: 60000 }, async () => {
   // 1600px fits the administrator's whole Classic bar on its original single 64px row.
   const { page, close } = await open('/repos', { viewport: { width: 1600, height: 900 } });
@@ -178,6 +190,10 @@ test('rs262 Classic is the default, keeps the original dark shell colors and nav
     });
     assert.deepEqual(fit, { rowFits: true, logoutOnScreen: true }, 'classic at 1280px');
     await auditShell(page, 'classic at 1280px');
+    for (const layout of ['individual', 'team']) {
+      await chooseWithoutFocus(page, layout);
+      await auditShell(page, `${layout} at 1280px`);
+    }
   } finally { await close(); }
 });
 
@@ -222,6 +238,12 @@ test('rs262 a dirty repository edit draft keeps its text, selection, scroll and 
     const edit = page.getByRole('button', { name: 'Edit', exact: true });
     await reach(page, edit);
     await page.keyboard.press('Enter');
+    // A saved field made dirty: the unsaved Poll Interval must survive every switch.
+    const poll = page.getByLabel('Poll Interval (s)', { exact: true });
+    await poll.waitFor();
+    const savedPoll = await poll.inputValue();
+    await poll.fill('47');
+    assert.notEqual(savedPoll, '47', 'the Poll Interval edit must differ from the saved value');
     // #56 replaced the free-text path fields; its preview sample box is the edit form's textarea.
     const paths = page.getByLabel('Sample Git paths (one per line)', { exact: true });
     await paths.waitFor();
@@ -242,6 +264,7 @@ test('rs262 a dirty repository edit draft keeps its text, selection, scroll and 
         value: element.value, focused: element === document.activeElement, start: element.selectionStart, end: element.selectionEnd, scrollTop: element.scrollTop,
       }));
       assert.deepEqual(state, { value: text, focused: true, start: 5, end: 9, scrollTop: 120 }, layout);
+      assert.equal(await poll.inputValue(), '47', `${layout} kept the unsaved Poll Interval`);
       assert.ok(await page.evaluate(() => window.scrollY) > 0, `${layout} did not reset page scroll to the top`);
     }
     assert.deepEqual(mutationsSince(mark), [], 'switching sent no save, retry or other mutation');
@@ -263,8 +286,17 @@ test('rs262 Individual and Team keep navigation reachable at phone width; Team i
       for (const [href] of ADMIN_NAV) {
         const link = nav.locator(`a[href="${href}"]`);
         await reach(page, link);
-        const rect = await link.evaluate(element => element.getBoundingClientRect().toJSON());
-        assert.ok(rect.left >= 0 && rect.right <= 390, `${layout} ${href} is visible when focused: ${JSON.stringify(rect)}`);
+        const seen = await link.evaluate(element => {
+          let strip = element.parentElement;
+          while (strip && strip.tagName !== 'NAV' && !['auto', 'scroll'].includes(getComputedStyle(strip).overflowX)) strip = strip.parentElement;
+          const inStrip = strip && strip.tagName !== 'NAV';
+          const left = inStrip ? strip.getBoundingClientRect().left + strip.clientLeft : 0;
+          const right = inStrip ? left + strip.clientWidth : innerWidth;
+          const rect = element.getBoundingClientRect();
+          return { left: rect.left, right: rect.right, clipLeft: left, clipRight: right, inStrip };
+        });
+        assert.ok(seen.left >= seen.clipLeft - 0.5 && seen.right <= seen.clipRight + 0.5 && seen.left >= 0 && seen.right <= 390,
+          `${layout} ${href} is fully visible inside its strip when focused: ${JSON.stringify(seen)}`);
       }
       for (const control of [chooser(page), page.getByRole('button', { name: 'Logout', exact: true })]) {
         await reach(page, control);
@@ -273,6 +305,14 @@ test('rs262 Individual and Team keep navigation reachable at phone width; Team i
       }
     }
   } finally { await narrow.close(); }
+
+  const narrowDetail = await open('/repos/A', { viewport: { width: 390, height: 844 } });
+  try {
+    for (const layout of ['individual', 'team']) {
+      await chooseWithoutFocus(narrowDetail.page, layout);
+      await assertNavFocusKeepsPageScroll(narrowDetail.page, `${layout} at 390px`);
+    }
+  } finally { await narrowDetail.close(); }
 
   const wide = await open('/repos/A', { viewport: { width: 1280, height: 640 } });
   try {
@@ -286,6 +326,10 @@ test('rs262 Individual and Team keep navigation reachable at phone width; Team i
     });
     assert.deepEqual(team, { navLeft: 0, navTop: 0, navWidth: 256, navHeight: 640, mainLeft: 256, scrolled: true });
     assert.equal(await page.getByText('Administration', { exact: true }).isVisible(), true);
+    for (const layout of ['team', 'individual', 'classic']) {
+      await chooseWithoutFocus(page, layout);
+      await assertNavFocusKeepsPageScroll(page, `${layout} at 1280px`);
+    }
   } finally { await wide.close(); }
 });
 

@@ -41,8 +41,10 @@ unchanged in every layout, and the Dashboard link keeps `end`.
   appears only when an admin entry is visible.
 - The status query, the account name, the conflict badge and the Logout
   handler are unchanged.
-- A link that receives keyboard focus scrolls fully into view, so a partly
-  hidden link in a horizontally scrolling strip is never left partly hidden.
+- A focused link inside a horizontally scrolling link strip (Individual, and
+  Team below `md`) is scrolled fully into view within that strip. Only the strip
+  scrolls, never the page, so focus restored by a dialog, a returning window or
+  `focus({ preventScroll: true })` cannot move the page.
 
 ## Stable content boundary
 
@@ -134,8 +136,10 @@ slot.
   That header was already slightly wider than common laptop widths for
   administrators before #262, and with the chooser it pushed Logout off screen
   at 1280px. Classic's row now wraps the account controls to a second,
-  right-aligned line only when they cannot fit even with their text wrapped, and
-  keeps its single 64px row otherwise.
+  right-aligned line only when they cannot fit even with their text wrapped.
+  Measured with the synthetic fixture's administrator: one 64px row from 1536px
+  up; one row of 76px at 1500 to 1520px, where the status text takes three lines;
+  two rows of 87px at 1490px and below, with Logout on screen at every width.
 
 ## Theme seam
 
@@ -190,14 +194,17 @@ owned page work, and this foundation does not choose a theme for the person.
       behavior (RS262-3).
 - **Browser** (`web-ui/tests/layout-foundation.e2e.mjs`): runs against the
   existing synthetic fixture with an admitted Chromium. It checks:
-  - Classic default colors and axe on the shell nav in every layout, and a
-    Classic bar at 1280px that keeps Logout on screen;
+  - Classic default colors and its single 64px row at 1600px, axe on the shell
+    nav in every layout at 1600px and 1280px, and a Classic bar at 1280px that
+    keeps Logout on screen;
   - keyboard switching that keeps the same page, draft input, focus, URL and
     history, with no mutation;
-  - a dirty repository edit draft, in #56's preview sample box, keeping its
-    text, selection, inner scroll, focus and page scroll;
-  - phone-width reachability for Individual and Team, and the Team sidebar
-    when wide;
+  - a dirty repository edit draft keeping a changed Poll Interval, plus the
+    text, selection, inner scroll, focus and page scroll of #56's preview sample
+    box;
+  - phone-width reachability for Individual and Team, with each focused link
+    fully inside its strip, and the Team sidebar when wide;
+  - focusing navigation links never moving the page, at 390px and 1280px;
   - persistence, account scoping, and corrupt, foreign and blocked storage;
   - member visibility in every layout.
 
@@ -212,7 +219,8 @@ document.
 
 ## Out of scope
 
-- **Classic at phone width:** it keeps its existing behavior.
+- **Classic at phone width:** its links still overflow horizontally as before;
+  the account controls now wrap to their own line.
 - **Not changed:** routes, pages, the API, auth/session code, the engine or
   schema, dependencies, workflows and the Vite or Tailwind configuration.
 - **Not implemented:** the November 12 design review's global Operations
