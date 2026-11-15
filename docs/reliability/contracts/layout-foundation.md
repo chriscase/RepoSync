@@ -25,7 +25,7 @@ Each entry carries only presentation fields:
 
 | Layout | Arrangement |
 | --- | --- |
-| Classic | The pre-#262 top bar, with the same slots and spacing. When the bar no longer fits, the account controls wrap to a second line instead of going off screen. |
+| Classic | The pre-#262 top bar, with the same slots and spacing. At desktop widths (measured from 1280px up), when the bar no longer fits, the account controls wrap to a second line instead of going off screen. |
 | Individual | Centred content (`max-w-7xl`) and tab-style links. On narrow screens the bar wraps and the links scroll horizontally. |
 | Team | From `md` up, a 16rem sticky sidebar that groups navigation under Workspace, Account and Administration. Below `md` it becomes a top bar whose groups scroll horizontally, and the group headings stay available to screen readers. |
 
@@ -42,9 +42,10 @@ unchanged in every layout, and the Dashboard link keeps `end`.
 - The status query, the account name, the conflict badge and the Logout
   handler are unchanged.
 - A focused link inside a horizontally scrolling link strip (Individual, and
-  Team below `md`) is scrolled fully into view within that strip. Only the strip
-  scrolls, never the page, so focus restored by a dialog, a returning window or
-  `focus({ preventScroll: true })` cannot move the page.
+  Team below `md`) is scrolled fully into view within that strip. The handler
+  scrolls only that strip, never the page. The browser's own focus scrolling
+  still applies, for example when a dialog restores focus with a plain `focus()`
+  to a link that is off screen.
 
 ## Stable content boundary
 
@@ -133,13 +134,15 @@ slot.
 - Tab reaches it, arrow keys change the value, and focus stays on the same
   node while the layout changes.
 - It is kept compact so it adds as little as possible to the Classic header.
-  That header was already slightly wider than common laptop widths for
-  administrators before #262, and with the chooser it pushed Logout off screen
-  at 1280px. Classic's row now wraps the account controls to a second,
+  By estimate (its measured width minus the chooser), that header was already
+  slightly wider than a 1280px screen for administrators before #262, with
+  Logout still on screen; with the chooser it pushed Logout off screen at
+  1280px. Classic's row now wraps the account controls to a second,
   right-aligned line only when they cannot fit even with their text wrapped.
   Measured with the synthetic fixture's administrator: one 64px row from 1536px
   up; one row of 76px at 1500 to 1520px, where the status text takes three lines;
-  two rows of 87px at 1490px and below, with Logout on screen at every width.
+  two rows of 87px at 1280 to 1490px. Logout was on screen at each measured
+  width (1280 to 1920px). Narrower widths were not measured.
 
 ## Theme seam
 
@@ -168,7 +171,7 @@ A later design adds a theme by:
 their existing dark Tailwind classes. A light theme for pages needs separate,
 owned page work, and this foundation does not choose a theme for the person.
 
-## Evidence (authored; execution not yet admitted)
+## Evidence
 
 - **Vitest, existing configuration** (`src/**/*.test.ts`, node environment):
   - `src/layouts/layoutCatalog.test.ts`: the strict enum, the Classic
@@ -200,11 +203,12 @@ owned page work, and this foundation does not choose a theme for the person.
   - keyboard switching that keeps the same page, draft input, focus, URL and
     history, with no mutation;
   - a dirty repository edit draft keeping a changed Poll Interval, plus the
-    text, selection, inner scroll, focus and page scroll of #56's preview sample
-    box;
+    text, selection, inner scroll and focus of #56's preview sample box, and a
+    page scroll that is not reset to the top;
   - phone-width reachability for Individual and Team, with each focused link
     fully inside its strip, and the Team sidebar when wide;
-  - focusing navigation links never moving the page, at 390px and 1280px;
+  - focusing navigation links with `preventScroll` never moving the page, at
+    390px and 1280px;
   - persistence, account scoping, and corrupt, foreign and blocked storage;
   - member visibility in every layout.
 
@@ -219,8 +223,10 @@ document.
 
 ## Out of scope
 
-- **Classic at phone width:** its links still overflow horizontally as before;
-  the account controls now wrap to their own line.
+- **Classic at phone width:** its links still overflow horizontally as before.
+  The account controls now wrap to their own line, which is estimated, not
+  measured, to be wider than a 390px screen, so Logout may still be off screen
+  there.
 - **Not changed:** routes, pages, the API, auth/session code, the engine or
   schema, dependencies, workflows and the Vite or Tailwind configuration.
 - **Not implemented:** the November 12 design review's global Operations
