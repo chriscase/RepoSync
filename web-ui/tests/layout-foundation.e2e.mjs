@@ -133,7 +133,8 @@ async function auditShell(page, label) {
 }
 
 test('rs262 Classic is the default, keeps the original dark shell colors and navigation, and every layout passes axe', { timeout: 60000 }, async () => {
-  const { page, close } = await open('/repos');
+  // 1600px fits the administrator's whole Classic bar on its original single 64px row.
+  const { page, close } = await open('/repos', { viewport: { width: 1600, height: 900 } });
   try {
     assert.equal(await layoutOf(page), 'classic');
     assert.equal(await page.locator('[data-rs-layout]').getAttribute('data-rs-theme'), 'dark');
@@ -166,6 +167,17 @@ test('rs262 Classic is the default, keeps the original dark shell colors and nav
       assert.deepEqual(await navLinks(page), ADMIN_NAV, layout);
       await auditShell(page, layout);
     }
+    // At a common laptop width the Classic bar wraps instead of pushing Logout off screen.
+    await chooseWithoutFocus(page, 'classic');
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const fit = await page.evaluate(() => {
+      const nav = document.querySelector('[data-rs-layout] > nav');
+      const row = nav.firstElementChild.firstElementChild;
+      const logout = [...nav.querySelectorAll('button')].find(button => button.textContent === 'Logout').getBoundingClientRect();
+      return { rowFits: row.scrollWidth <= row.clientWidth, logoutOnScreen: logout.left >= 0 && logout.right <= innerWidth };
+    });
+    assert.deepEqual(fit, { rowFits: true, logoutOnScreen: true }, 'classic at 1280px');
+    await auditShell(page, 'classic at 1280px');
   } finally { await close(); }
 });
 
@@ -210,7 +222,8 @@ test('rs262 a dirty repository edit draft keeps its text, selection, scroll and 
     const edit = page.getByRole('button', { name: 'Edit', exact: true });
     await reach(page, edit);
     await page.keyboard.press('Enter');
-    const paths = page.getByLabel(/Allowed SVN Paths/);
+    // #56 replaced the free-text path fields; its preview sample box is the edit form's textarea.
+    const paths = page.getByLabel('Sample Git paths (one per line)', { exact: true });
     await paths.waitFor();
     const text = Array.from({ length: 40 }, (_, i) => `synthetic/path-${i}/`).join('\n');
     await paths.fill(text);

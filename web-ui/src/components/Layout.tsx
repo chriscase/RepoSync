@@ -37,7 +37,10 @@ export function LayoutFrame({ layout, isAdmin, activeConflicts, accountName, syn
     `rs-shell-link ${classes.link}${isActive ? ' rs-shell-link--active' : ''}`;
 
   const renderLink = (item: PrimaryNavItem) => (
-    <NavLink key={item.to} to={item.to} end={item.end} className={navLinkClass}>
+    // A horizontally scrolling link strip leaves a partly hidden link partly hidden on
+    // focus, so bring the focused link fully into view (a no-op when it already is).
+    <NavLink key={item.to} to={item.to} end={item.end} className={navLinkClass}
+      onFocus={event => event.currentTarget.scrollIntoView({ block: 'nearest', inline: 'nearest' })}>
       {item.label}
       {item.conflictCount && activeConflicts > 0 && (
         <span className="ml-2 inline-flex items-center justify-center px-2 py-1 text-xs font-bold leading-none rs-shell-alert rounded-full">

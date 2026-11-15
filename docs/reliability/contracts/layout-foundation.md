@@ -25,7 +25,7 @@ Each entry carries only presentation fields:
 
 | Layout | Arrangement |
 | --- | --- |
-| Classic | The pre-#262 top bar, with the same slots and spacing. |
+| Classic | The pre-#262 top bar, with the same slots and spacing. When the bar no longer fits, the account controls wrap to a second line instead of going off screen. |
 | Individual | Centred content (`max-w-7xl`) and tab-style links. On narrow screens the bar wraps and the links scroll horizontally. |
 | Team | From `md` up, a 16rem sticky sidebar that groups navigation under Workspace, Account and Administration. Below `md` it becomes a top bar whose groups scroll horizontally, and the group headings stay available to screen readers. |
 
@@ -41,6 +41,8 @@ unchanged in every layout, and the Dashboard link keeps `end`.
   appears only when an admin entry is visible.
 - The status query, the account name, the conflict badge and the Logout
   handler are unchanged.
+- A link that receives keyboard focus scrolls fully into view, so a partly
+  hidden link in a horizontally scrolling strip is never left partly hidden.
 
 ## Stable content boundary
 
@@ -129,8 +131,10 @@ slot.
 - Tab reaches it, arrow keys change the value, and focus stays on the same
   node while the layout changes.
 - It is kept compact so it adds as little as possible to the Classic header.
-  That header was already wider than common laptop widths for administrators
-  before #262, and Classic keeps that existing behavior.
+  That header was already slightly wider than common laptop widths for
+  administrators before #262, and with the chooser it pushed Logout off screen
+  at 1280px. Classic's row now wraps the account controls to a second line only
+  when it no longer fits, and keeps its single 64px row otherwise.
 
 ## Theme seam
 
@@ -185,11 +189,12 @@ owned page work, and this foundation does not choose a theme for the person.
       behavior (RS262-3).
 - **Browser** (`web-ui/tests/layout-foundation.e2e.mjs`): runs against the
   existing synthetic fixture with an admitted Chromium. It checks:
-  - Classic default colors and axe on the shell nav in every layout;
+  - Classic default colors and axe on the shell nav in every layout, and a
+    Classic bar at 1280px that keeps Logout on screen;
   - keyboard switching that keeps the same page, draft input, focus, URL and
     history, with no mutation;
-  - a dirty repository edit draft keeping its text, selection, inner scroll,
-    focus and page scroll;
+  - a dirty repository edit draft, in #56's preview sample box, keeping its
+    text, selection, inner scroll, focus and page scroll;
   - phone-width reachability for Individual and Team, and the Team sidebar
     when wide;
   - persistence, account scoping, and corrupt, foreign and blocked storage;
@@ -201,8 +206,8 @@ owned page work, and this foundation does not choose a theme for the person.
   REPOSYNC_A11Y_BROWSER=/path/to/chromium node --test --test-concurrency=1 tests/layout-foundation.e2e.mjs
   ```
 
-None of these has been executed for this source. Typecheck, Vitest, build and
-browser results need their own admission.
+Results for a given source are recorded with its qualification, not in this
+document.
 
 ## Out of scope
 

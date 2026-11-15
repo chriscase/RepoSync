@@ -60,14 +60,15 @@ describe('#262 layout catalog', () => {
     expect(Object.isFrozen(NAV_GROUP_LABELS)).toBe(true);
   });
 
-  it('keeps Classic on the original shell slots and spacing', () => {
-    // Spacing utilities from the pre-#262 Layout.tsx; colors moved to scoped tokens.
+  it('keeps Classic on the original shell slots and spacing, wrapping only when it no longer fits', () => {
+    // Spacing utilities from the pre-#262 Layout.tsx; colors moved to scoped tokens. The row
+    // keeps its 64px (min-h-16) height when it fits and wraps the account controls otherwise.
     expect(LAYOUT_CATALOG.classic.navPresentation).toBe('inline');
     expect(LAYOUT_CATALOG.classic.classes).toEqual({
       root: 'min-h-screen',
       nav: 'rs-shell-chrome border-b',
       navInner: 'px-6 sm:px-8 lg:px-12',
-      navRow: 'flex items-center justify-between h-16',
+      navRow: 'flex flex-wrap items-center justify-between gap-y-2 min-h-16 py-2',
       brand: 'flex items-center',
       brandName: 'rs-shell-brand font-bold text-lg font-display tracking-wider',
       links: 'ml-10 flex items-baseline space-x-4',
@@ -75,7 +76,7 @@ describe('#262 layout catalog', () => {
       groupLabel: '',
       groupLinks: '',
       link: 'px-3 py-2 rounded-md text-sm font-medium transition-colors',
-      account: 'flex items-center space-x-4',
+      account: 'ml-auto flex items-center space-x-4',
       main: 'py-6 px-6 sm:px-8 lg:px-12',
     });
   });
