@@ -1,0 +1,123 @@
+/*
+ * #262 scoped shell color tokens.
+ *
+ * Only the application shell (navigation chrome, links, chooser) reads these.
+ * Page content keeps its existing classes and is not themed here. The values
+ * are the Classic dark palette the shell used before #262 (Tailwind gray-900,
+ * gray-950, gray-800, gray-700, gray-400, blue-600, red-600, red-100), so the
+ * Classic default renders the same colors.
+ *
+ * Theme seam: a later design adds a block such as
+ *   .rs-layout-shell[data-rs-theme='light'] { --rs-shell-canvas: ...; }
+ * plus the id in layoutCatalog.ts THEME_IDS and each supporting layout.
+ * A shell without a theme attribute uses the dark defaults below.
+ */
+.rs-layout-shell,
+.rs-layout-shell[data-rs-theme='dark'] {
+  --rs-shell-canvas: #111827;
+  --rs-shell-chrome: #030712;
+  --rs-shell-border: #1f2937;
+  --rs-shell-hover: #374151;
+  --rs-shell-text-strong: #ffffff;
+  --rs-shell-text-muted: #9ca3af;
+  --rs-shell-accent: #2563eb;
+  --rs-shell-accent-text: #ffffff;
+  --rs-shell-alert: #dc2626;
+  --rs-shell-alert-text: #fee2e2;
+  --rs-shell-notice-text: #fde68a;
+  --rs-shell-focus: #93c5fd;
+}
+
+.rs-layout-shell {
+  background-color: var(--rs-shell-canvas);
+}
+
+.rs-layout-shell .rs-shell-chrome {
+  background-color: var(--rs-shell-chrome);
+  border-color: var(--rs-shell-border);
+}
+
+.rs-layout-shell .rs-shell-brand {
+  color: var(--rs-shell-text-strong);
+}
+
+.rs-layout-shell .rs-shell-muted {
+  color: var(--rs-shell-text-muted);
+}
+
+.rs-layout-shell .rs-shell-action {
+  color: var(--rs-shell-text-muted);
+}
+
+.rs-layout-shell .rs-shell-action:hover {
+  color: var(--rs-shell-text-strong);
+}
+
+/* Filled links (Classic, Team). Active is declared after hover so it wins. */
+.rs-layout-shell .rs-shell-link {
+  color: var(--rs-shell-text-muted);
+}
+
+.rs-layout-shell .rs-shell-link:hover {
+  background-color: var(--rs-shell-hover);
+  color: var(--rs-shell-text-strong);
+}
+
+.rs-layout-shell .rs-shell-link.rs-shell-link--active,
+.rs-layout-shell .rs-shell-link.rs-shell-link--active:hover {
+  background-color: var(--rs-shell-accent);
+  color: var(--rs-shell-accent-text);
+}
+
+/* Tab links (Individual): an accent underline instead of a filled pill. */
+.rs-layout-shell .rs-shell-link.rs-shell-link--tab {
+  border-color: transparent;
+}
+
+.rs-layout-shell .rs-shell-link.rs-shell-link--tab:hover {
+  background-color: transparent;
+  border-color: var(--rs-shell-hover);
+}
+
+.rs-layout-shell .rs-shell-link.rs-shell-link--tab.rs-shell-link--active,
+.rs-layout-shell .rs-shell-link.rs-shell-link--tab.rs-shell-link--active:hover {
+  background-color: transparent;
+  border-color: var(--rs-shell-accent);
+  color: var(--rs-shell-text-strong);
+}
+
+.rs-layout-shell .rs-shell-alert {
+  background-color: var(--rs-shell-alert);
+  color: var(--rs-shell-alert-text);
+}
+
+.rs-layout-shell .rs-layout-chooser__select,
+.rs-layout-shell .rs-layout-chooser__select option {
+  background-color: var(--rs-shell-chrome);
+  color: var(--rs-shell-text-strong);
+}
+
+.rs-layout-shell .rs-layout-chooser__select {
+  border-color: var(--rs-shell-border);
+}
+
+.rs-layout-shell .rs-layout-chooser__select:hover {
+  border-color: var(--rs-shell-text-muted);
+}
+
+.rs-layout-shell .rs-layout-chooser__select:focus-visible {
+  outline: 2px solid var(--rs-shell-focus);
+  outline-offset: 2px;
+}
+
+.rs-layout-shell .rs-layout-chooser__notice {
+  color: var(--rs-shell-notice-text);
+}
+
+/* Forced colors: keep the current tab distinguishable without background color. */
+@media (forced-colors: active) {
+  .rs-layout-shell .rs-shell-link.rs-shell-link--active {
+    text-decoration: underline;
+    text-decoration-thickness: 2px;
+  }
+}
