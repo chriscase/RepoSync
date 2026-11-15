@@ -83,9 +83,10 @@ function presentation(value: LayoutPresentation): LayoutPresentation {
 }
 
 export const LAYOUT_CATALOG: Readonly<Record<LayoutId, LayoutPresentation>> = Object.freeze({
-  // The single shell as it was before #262: same slots and spacing. The row wraps only
-  // when it no longer fits, so the account controls move to a second line instead of
-  // off screen (the chooser made the administrator bar wider than common laptop widths).
+  // The single shell as it was before #262: same slots and spacing. The account group
+  // fills the rest of the row (flex-1, right-aligned), so it wraps to a second line only
+  // when it cannot fit even with its text wrapped, instead of pushing Logout off screen
+  // (the chooser made the administrator bar wider than common laptop widths).
   classic: presentation({
     id: 'classic',
     label: 'Classic',
@@ -104,7 +105,7 @@ export const LAYOUT_CATALOG: Readonly<Record<LayoutId, LayoutPresentation>> = Ob
       groupLabel: '',
       groupLinks: '',
       link: 'px-3 py-2 rounded-md text-sm font-medium transition-colors',
-      account: 'ml-auto flex items-center space-x-4',
+      account: 'flex flex-1 items-center justify-end space-x-4',
       main: 'py-6 px-6 sm:px-8 lg:px-12',
     },
   }),

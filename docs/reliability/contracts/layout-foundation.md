@@ -133,8 +133,9 @@ slot.
 - It is kept compact so it adds as little as possible to the Classic header.
   That header was already slightly wider than common laptop widths for
   administrators before #262, and with the chooser it pushed Logout off screen
-  at 1280px. Classic's row now wraps the account controls to a second line only
-  when it no longer fits, and keeps its single 64px row otherwise.
+  at 1280px. Classic's row now wraps the account controls to a second,
+  right-aligned line only when they cannot fit even with their text wrapped, and
+  keeps its single 64px row otherwise.
 
 ## Theme seam
 

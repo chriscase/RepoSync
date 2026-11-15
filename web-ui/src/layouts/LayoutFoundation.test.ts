@@ -269,7 +269,7 @@ describe('#262 rendered shell', () => {
     expect(layoutOf(html)).toBe('classic');
     expect(html).toContain('<div class="rs-layout-shell min-h-screen" data-rs-layout="classic" data-rs-theme="dark"><nav aria-label="Primary" class="rs-shell-chrome border-b"><div class="px-6 sm:px-8 lg:px-12"><div class="flex flex-wrap items-center justify-between gap-y-2 min-h-16 py-2"><div class="flex items-center">');
     expect(html).toContain('<div class="ml-10 flex items-baseline space-x-4"><a');
-    expect(html).toContain('<div class="ml-auto flex items-center space-x-4">');
+    expect(html).toContain('<div class="flex flex-1 items-center justify-end space-x-4">');
     expect(html).toContain('<main tabindex="-1" class="py-6 px-6 sm:px-8 lg:px-12">');
   });
 

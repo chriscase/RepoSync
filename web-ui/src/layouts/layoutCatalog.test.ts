@@ -62,7 +62,8 @@ describe('#262 layout catalog', () => {
 
   it('keeps Classic on the original shell slots and spacing, wrapping only when it no longer fits', () => {
     // Spacing utilities from the pre-#262 Layout.tsx; colors moved to scoped tokens. The row
-    // keeps its 64px (min-h-16) height when it fits and wraps the account controls otherwise.
+    // keeps its 64px (min-h-16) height while the account group fits, even with its text
+    // wrapped, and wraps that group to a second, right-aligned line otherwise.
     expect(LAYOUT_CATALOG.classic.navPresentation).toBe('inline');
     expect(LAYOUT_CATALOG.classic.classes).toEqual({
       root: 'min-h-screen',
@@ -76,7 +77,7 @@ describe('#262 layout catalog', () => {
       groupLabel: '',
       groupLinks: '',
       link: 'px-3 py-2 rounded-md text-sm font-medium transition-colors',
-      account: 'ml-auto flex items-center space-x-4',
+      account: 'flex flex-1 items-center justify-end space-x-4',
       main: 'py-6 px-6 sm:px-8 lg:px-12',
     });
   });
