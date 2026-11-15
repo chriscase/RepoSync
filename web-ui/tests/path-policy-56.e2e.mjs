@@ -12,9 +12,10 @@
 //
 // Run from web-ui/: REPOSYNC_A11Y_BROWSER=/path/to/chromium node --test --test-concurrency=1 tests/path-policy-56.e2e.mjs
 //
-// Cleanup qualification only: REPOSYNC_E2E_FAULT=case-timeout or =teardown-failure registers
-// one extra "rs56 fault:" case. Select it with --test-name-pattern="^rs56 fault:". With the
-// variable unset, the file registers exactly the six cases below.
+// Cleanup qualification only: REPOSYNC_E2E_FAULT=case-timeout, =teardown-failure or
+// =setup-timeout registers one extra "rs56 fault:" case. Select it with
+// --test-name-pattern="^rs56 fault:". With the variable unset, the file registers exactly the
+// six cases below.
 import test, { before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, request as httpRequest } from 'node:http';
@@ -98,27 +99,40 @@ async function startPolicyApi(fixtureOrigin) {
   return api;
 }
 
-before(async () => {
-  const executablePath = process.env.REPOSYNC_A11Y_BROWSER;
-  assert.ok(executablePath, 'Set REPOSYNC_A11Y_BROWSER to an existing admitted Chromium executable. This test never installs a browser.');
-  fixture = await startFixture();
-  policy = await startPolicyApi(fixture.origin);
-  vite = await createViteServer({ root, server: { host: '127.0.0.1', port: 0, proxy: {
-    '/api': policy.origin,
-    '/ws': { target: fixture.origin, ws: false },
-  } } });
-  await vite.listen();
-  origin = Object.values(vite.resolvedUrls.local)[0];
-  browser = await chromium.launch({ executablePath, headless: true, chromiumSandbox: true, timeout: 15000 });
-}, { timeout: 30000 });
-// Test-only fault injection for cleanup qualification; unset in normal runs.
+// Test-only fault injection for cleanup qualification; unset in normal runs. It is checked
+// before any hook is registered, so an unknown value fails the file before anything starts.
 const FAULT = process.env.REPOSYNC_E2E_FAULT ?? '';
-assert.ok(['', 'case-timeout', 'teardown-failure'].includes(FAULT), `Unknown REPOSYNC_E2E_FAULT ${JSON.stringify(FAULT)}`);
+assert.ok(['', 'case-timeout', 'teardown-failure', 'setup-timeout'].includes(FAULT), `Unknown REPOSYNC_E2E_FAULT ${JSON.stringify(FAULT)}`);
+
+// Setup is one promise that teardown waits for, so a resource created after the before hook has
+// timed out (for example a browser whose launch finishes late) is still closed.
+let setup;
+before(() => {
+  setup = (async () => {
+    const executablePath = process.env.REPOSYNC_A11Y_BROWSER;
+    assert.ok(executablePath, 'Set REPOSYNC_A11Y_BROWSER to an existing admitted Chromium executable. This test never installs a browser.');
+    fixture = await startFixture();
+    policy = await startPolicyApi(fixture.origin);
+    vite = await createViteServer({ root, server: { host: '127.0.0.1', port: 0, proxy: {
+      '/api': policy.origin,
+      '/ws': { target: fixture.origin, ws: false },
+    } } });
+    await vite.listen();
+    origin = Object.values(vite.resolvedUrls.local)[0];
+    if (FAULT === 'setup-timeout') await new Promise(resolve => setTimeout(resolve, 3000));
+    browser = await chromium.launch({ executablePath, headless: true, chromiumSandbox: true, timeout: 15000 });
+  })();
+  return setup;
+}, { timeout: FAULT === 'setup-timeout' ? 1000 : 30000 });
 
 // Close every owned resource, in order, even when an earlier step fails; then report every failure.
 after(async () => {
+  await setup?.catch(() => {});
   const steps = [
-    ...(FAULT === 'teardown-failure' ? [['injected fault', async () => { throw new Error('Injected teardown failure (REPOSYNC_E2E_FAULT=teardown-failure)'); }]] : []),
+    ...(FAULT === 'teardown-failure' ? [
+      ['injected fault', async () => { throw new Error('Injected teardown failure (REPOSYNC_E2E_FAULT=teardown-failure)'); }],
+      ['injected non-Error fault', async () => { throw undefined; }],
+    ] : []),
     ['browser', () => browser?.close()],
     ['vite', () => vite?.close()],
     ['policy API', () => policy?.close()],
@@ -126,9 +140,12 @@ after(async () => {
   ];
   const failures = [];
   for (const [name, step] of steps) {
-    try { await step(); } catch (error) { failures.push(`${name}: ${error.message}`); }
+    try { await step(); } catch (error) { failures.push({ name, error }); }
   }
-  if (failures.length) throw new Error(`Teardown failed: ${failures.join('; ')}`);
+  if (failures.length) {
+    const summary = failures.map(({ name, error }) => `${name}: ${String(error?.message ?? error)}`).join('; ');
+    throw new AggregateError(failures.map(({ error }) => error), `Teardown failed: ${summary}`);
+  }
 });
 beforeEach(() => { policy.reset('["src/","config/"]', '["*.exe"]'); });
 
@@ -342,5 +359,12 @@ if (FAULT === 'teardown-failure') {
   test('rs56 fault: a failing teardown step still closes every other owned resource', { timeout: 45000 }, async () => {
     const { page, close } = await open();
     try { await section(page).waitFor(); } finally { await close(); }
+  });
+}
+if (FAULT === 'setup-timeout') {
+  // The before hook times out at 1 s while setup is still pending; the browser launches about
+  // 3 s later, and teardown must still close it.
+  test('rs56 fault: a setup that times out still has every resource it creates closed', { timeout: 45000 }, async () => {
+    assert.fail('unreachable: the before hook times out first');
   });
 }
