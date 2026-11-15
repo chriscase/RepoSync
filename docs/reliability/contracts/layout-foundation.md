@@ -203,7 +203,7 @@ owned page work, and this foundation does not choose a theme for the person.
   - keyboard switching that keeps the same page, draft input, focus, URL and
     history, with no mutation;
   - a dirty repository edit draft keeping a changed Poll Interval, plus the
-    text, selection, inner scroll and focus of #56's preview sample box, and a
+    text, selection, inner scroll and focus of the Allowed SVN Paths field, and a
     page scroll that is not reset to the top;
   - phone-width reachability for Individual and Team, with each focused link
     fully inside its strip, and the Team sidebar when wide;

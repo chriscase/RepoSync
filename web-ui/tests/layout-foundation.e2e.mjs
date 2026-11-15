@@ -244,8 +244,8 @@ test('rs262 a dirty repository edit draft keeps its text, selection, scroll and 
     const savedPoll = await poll.inputValue();
     await poll.fill('47');
     assert.notEqual(savedPoll, '47', 'the Poll Interval edit must differ from the saved value');
-    // #56 replaced the free-text path fields; its preview sample box is the edit form's textarea.
-    const paths = page.getByLabel('Sample Git paths (one per line)', { exact: true });
+    // On this branch the edit form keeps the free-text Allowed SVN Paths field (a saved field).
+    const paths = page.getByLabel(/Allowed SVN Paths/);
     await paths.waitFor();
     const text = Array.from({ length: 40 }, (_, i) => `synthetic/path-${i}/`).join('\n');
     await paths.fill(text);
