@@ -11,6 +11,10 @@
 // this file proves what the browser sends and shows.
 //
 // Run from web-ui/: REPOSYNC_A11Y_BROWSER=/path/to/chromium node --test --test-concurrency=1 tests/path-policy-56.e2e.mjs
+//
+// Cleanup qualification only: REPOSYNC_E2E_FAULT=case-timeout or =teardown-failure registers
+// one extra "rs56 fault:" case. Select it with --test-name-pattern="^rs56 fault:". With the
+// variable unset, the file registers exactly the six cases below.
 import test, { before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, request as httpRequest } from 'node:http';
@@ -107,7 +111,25 @@ before(async () => {
   origin = Object.values(vite.resolvedUrls.local)[0];
   browser = await chromium.launch({ executablePath, headless: true, chromiumSandbox: true, timeout: 15000 });
 }, { timeout: 30000 });
-after(async () => { await browser?.close(); await vite?.close(); await policy?.close(); await fixture?.close(); });
+// Test-only fault injection for cleanup qualification; unset in normal runs.
+const FAULT = process.env.REPOSYNC_E2E_FAULT ?? '';
+assert.ok(['', 'case-timeout', 'teardown-failure'].includes(FAULT), `Unknown REPOSYNC_E2E_FAULT ${JSON.stringify(FAULT)}`);
+
+// Close every owned resource, in order, even when an earlier step fails; then report every failure.
+after(async () => {
+  const steps = [
+    ...(FAULT === 'teardown-failure' ? [['injected fault', async () => { throw new Error('Injected teardown failure (REPOSYNC_E2E_FAULT=teardown-failure)'); }]] : []),
+    ['browser', () => browser?.close()],
+    ['vite', () => vite?.close()],
+    ['policy API', () => policy?.close()],
+    ['fixture', () => fixture?.close()],
+  ];
+  const failures = [];
+  for (const [name, step] of steps) {
+    try { await step(); } catch (error) { failures.push(`${name}: ${error.message}`); }
+  }
+  if (failures.length) throw new Error(`Teardown failed: ${failures.join('; ')}`);
+});
 beforeEach(() => { policy.reset('["src/","config/"]', '["*.exe"]'); });
 
 async function open(path = '/repos/P') {
@@ -307,3 +329,18 @@ test('rs56 collapsed lists and Git→SVN preview are keyboard operable and match
     assert.deepEqual(pageErrors, []);
   } finally { await close(); }
 });
+
+// Cleanup qualification cases, registered only under REPOSYNC_E2E_FAULT. Each is expected
+// to fail; the evidence is that teardown still closes every owned browser and server.
+if (FAULT === 'case-timeout') {
+  test('rs56 fault: a case times out while a browser operation is pending', { timeout: 10000 }, async () => {
+    const { page } = await open();
+    await page.waitForFunction(() => false, null, { timeout: 0, polling: 100 });
+  });
+}
+if (FAULT === 'teardown-failure') {
+  test('rs56 fault: a failing teardown step still closes every other owned resource', { timeout: 45000 }, async () => {
+    const { page, close } = await open();
+    try { await section(page).waitFor(); } finally { await close(); }
+  });
+}
