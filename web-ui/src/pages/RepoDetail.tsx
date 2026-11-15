@@ -52,6 +52,11 @@ import {
   clearManagedRemovalReceipt,
 } from '../managedRemoval';
 import ServerMonitor from '../components/ServerMonitor';
+import PathPolicyEditor56 from '../components/PathPolicyEditor56';
+import {
+  pathPolicyConfiguration, pathPolicyDraft, pathPolicyHasRules, pathPolicyIssues, pathPolicyIssueSummary,
+  type PathPolicyDraft,
+} from '../pathPolicy56';
 import {
   ArrowLeft, RefreshCw, Settings, Database, GitBranch, Clock,
   Activity, Zap, Save, X, Trash2, Power, AlertTriangle, CheckCircle,
@@ -76,11 +81,11 @@ type EditForm = {
   poll_interval_secs: number;
   lfs_threshold_mb: number;
   auto_merge: boolean;
-  allowed_paths: string;
-  blocked_patterns: string;
+  /** #56: typed draft; only explicitly edited or cleared fields are submitted. */
+  path_policy: PathPolicyDraft;
 };
 
-function repoToForm(repo: Repository): EditForm {
+function repoToForm(repo: Repository, recovered?: PublicConfiguration): EditForm {
   return {
     name: repo.name,
     svn_url: repo.svn_url,
@@ -96,8 +101,8 @@ function repoToForm(repo: Repository): EditForm {
     poll_interval_secs: repo.poll_interval_secs,
     lfs_threshold_mb: repo.lfs_threshold_mb,
     auto_merge: repo.auto_merge,
-    allowed_paths: repo.allowed_paths ? JSON.parse(repo.allowed_paths).join('\n') : '',
-    blocked_patterns: repo.blocked_patterns ? JSON.parse(repo.blocked_patterns).join('\n') : '',
+    // Read only from `path_policy`; never from the write-only raw fields.
+    path_policy: pathPolicyDraft(repo, recovered),
   };
 }
 
@@ -751,7 +756,7 @@ function RepositoryDetailEditor() {
   useEffect(()=>{
     const previous=saveFlow.initial;
     if(editing && previous && repo && restoredSave.current!==previous.configRequestId) {
-      try {setForm(repoToForm({...repo,...(previous.draftConfiguration ?? previous.configuration)}));restoredSave.current=previous.configRequestId;}
+      try {const recovered=previous.draftConfiguration ?? previous.configuration;setForm(repoToForm({...repo,...recovered},recovered));restoredSave.current=previous.configRequestId;}
       catch {setSaveError('The recovery draft could not be read. Keep the existing repository ID and review its settings.');}
     }
   },[editing,saveFlow.initial,repo]);
@@ -763,11 +768,10 @@ function RepositoryDetailEditor() {
   },[saveFlow.attempt?.configurationReceipt,id,queryClient]);
 
   function editConfiguration(value: EditForm): PublicConfiguration {
-    const {svn_password,git_token,allowed_paths,blocked_patterns,...data}=value;
+    const {svn_password,git_token,path_policy,...data}=value;
     void svn_password;void git_token;
-    return {...data,
-      allowed_paths:allowed_paths.trim() ? JSON.stringify(allowed_paths.split('\n').map(v=>v.trim()).filter(Boolean)) : null,
-      blocked_patterns:blocked_patterns.trim() ? JSON.stringify(blocked_patterns.split('\n').map(v=>v.trim()).filter(Boolean)) : null};
+    // Untouched, malformed and unavailable policy fields are omitted, so the server keeps them.
+    return {...data,...pathPolicyConfiguration(path_policy)};
   }
   function startEdit() {
     if(!repo)return;editVersion.current++;restoredSave.current=null;
@@ -795,6 +799,8 @@ function RepositoryDetailEditor() {
     if(!currentForm.current || !repo)return;
     const generation=editVersion.current;
     const submitted={...currentForm.current};setSaveError(null);setSaveMessage(null);
+    const policyIssues=pathPolicyIssues(submitted.path_policy);
+    if(policyIssues.length){setSaveError(pathPolicyIssueSummary(policyIssues));return;}
     try {
       const result=await saveFlow.save(editConfiguration(submitted),{svn_password:submitted.svn_password || undefined,git_token:submitted.git_token || undefined},repo.updated_at);
       if(!result.viewActive || editVersion.current!==generation)return;
@@ -1059,7 +1065,7 @@ function RepositoryDetailEditor() {
               </button>
             </>
           )}
-          {(repo?.allowed_paths || repo?.blocked_patterns) && (
+          {pathPolicyHasRules(repo) && (
             <a
               href={`/api/repos/${id}/hooks/pre-commit`}
               download="pre-commit"
@@ -1219,32 +1225,10 @@ function RepositoryDetailEditor() {
             <FieldNumber label="Poll Interval (s)" value={form.poll_interval_secs} onChange={(v) => setField('poll_interval_secs', v)} min={10} />
             <FieldNumber label="LFS Threshold (MB)" value={form.lfs_threshold_mb} onChange={(v) => setField('lfs_threshold_mb', v)} min={0} />
             <FieldToggle label="Auto Merge" checked={form.auto_merge} onChange={(v) => setField('auto_merge', v)} />
-            <div className="col-span-full grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-3`}>Allowed SVN Paths <span className="text-gray-600">(one per line)</span></label>
-                <textarea
-                  className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 font-mono placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  rows={3}
-                  value={form.allowed_paths}
-                  onChange={(e) => setField('allowed_paths', e.target.value)}
-                  placeholder={"source/\nconfig/"} id={`${fieldId}-3`}
-                />
-                <p className="text-xs text-gray-300 mt-1">Files must be under these path prefixes. Leave empty for no restriction.</p>
-              </div>
-              <div>
-                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-4`}>Blocked Patterns <span className="text-gray-600">(one per line)</span></label>
-                <textarea
-                  className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 font-mono placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  rows={3}
-                  value={form.blocked_patterns}
-                  onChange={(e) => setField('blocked_patterns', e.target.value)}
-                  placeholder={"*.exe\ntemp/"} id={`${fieldId}-4`}
-                />
-                <p className="text-xs text-gray-300 mt-1">Files matching these patterns will be excluded from SVN sync.</p>
-              </div>
-            </div>
+            <PathPolicyEditor56 draft={form.path_policy} onChange={(next) => setField('path_policy', next)} />
           </div>
         ) : (
+          <>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div>
               <span className="text-sm text-gray-400">Sync Mode</span>
@@ -1263,6 +1247,10 @@ function RepositoryDetailEditor() {
               <p className="text-lg text-gray-100">{repo.auto_merge ? 'Yes' : 'No'}</p>
             </div>
           </div>
+          <div className="mt-4">
+            <PathPolicyEditor56 draft={pathPolicyDraft(repo)} />
+          </div>
+          </>
         )}
       </div>
 

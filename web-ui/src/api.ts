@@ -927,6 +927,22 @@ export interface WizardSetupConfig {
   admin_password_set: boolean;
 }
 
+/** #56 one stored policy column as read. `list` with no entries is a stored `[]`. */
+export type RepositoryPolicyFieldRead =
+  | { state: 'unset' }
+  | { state: 'list'; entries: string[] }
+  | { state: 'malformed'; stored_bytes: number; reason: string };
+
+/** #56 `path_policy` on repository reads; never inferred from the write-only raw fields. */
+export interface RepositoryPathPolicyRead {
+  version: 1;
+  allowed_paths: RepositoryPolicyFieldRead;
+  blocked_patterns: RepositoryPolicyFieldRead;
+  enforced_direction: 'git_to_svn';
+  svn_to_git_filtering: 'not_applied';
+  path_rewriting: 'none_read_only';
+}
+
 export interface Repository {
   save_receipt?: RepositorySaveReceipt;
   id: string;
@@ -947,8 +963,12 @@ export interface Repository {
   created_by: string | null;
   created_at: string;
   updated_at: string;
-  allowed_paths: string | null;
-  blocked_patterns: string | null;
+  /** Write-only PUT field: JSON array text, or null to clear. Reads use `path_policy`. */
+  allowed_paths?: string | null;
+  /** Write-only PUT field: JSON array text, or null to clear. Reads use `path_policy`. */
+  blocked_patterns?: string | null;
+  /** #56 typed policy read; absent from servers without #56. */
+  path_policy?: RepositoryPathPolicyRead;
   consecutive_errors: number;
   sync_status: string;
   initializing?: boolean;
