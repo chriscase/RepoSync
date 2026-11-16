@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Changes from v1.5, by item · RepoSync #263 design package v1.6</title>
+<style>
+:root{color-scheme:light dark;--bg:#fbfbf8;--fg:#16181d;--fg2:#4a4f59;--line:#d6d6cc;--soft:#efefe8;--link:#1a4fa3;--code:#f0f0e9}
+@media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e9e9e2;--fg2:#a9adb6;--line:#3a3e46;--soft:#1d2026;--link:#8fb4ff;--code:#1d2026}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+main{max-width:1180px;margin:0 auto;padding:24px max(16px,env(safe-area-inset-right,0px)) 64px max(16px,env(safe-area-inset-left,0px))}
+.top{font-size:.88em;color:var(--fg2);border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:18px;display:flex;flex-wrap:wrap;gap:6px 16px}
+h1{font:600 1.8rem/1.2 "Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;margin:0 0 .5em;text-wrap:balance}
+h2{font-size:1.2rem;margin:2em 0 .5em;padding-top:.7em;border-top:1px solid var(--fg)}
+h3{font-size:1rem;margin:1.5em 0 .4em}
+p,li{max-width:78ch;overflow-wrap:anywhere}
+h1,h2,h3{overflow-wrap:anywhere}
+a{color:var(--link)}
+a:focus-visible{outline:2px solid var(--link);outline-offset:2px}
+code{font:.88em ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;background:var(--code);padding:.08em .3em;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--code);padding:12px;overflow-x:auto;border:1px solid var(--line)}
+pre code{background:none;padding:0}
+.tw{overflow-x:auto;margin:1em 0}
+table{border-collapse:collapse;font-size:.88em;min-width:100%}
+th,td{border-bottom:1px solid var(--line);padding:6px 10px 6px 0;text-align:left;vertical-align:top}
+th{border-bottom-color:var(--fg);font-weight:650;white-space:nowrap}
+td{min-width:8ch}
+table.wide td{min-width:14ch}
+</style>
+</head>
+<body>
+<main>
+<p class="top"><a href="README.html">Package index</a><a href="DECISIONS.html">Decisions</a><a href="prototypes/index.html">Prototypes</a><a href="matrix/surface-state-matrix.html">Matrix</a><span>RepoSync #263 design package v1.6 · design only, not the implemented product</span></p>
+<h1 id="changes-from-v1-5-by-item">Changes from v1.5, by item</h1>
+<p>The final check of v1.5 (2026-11-16) verified M1 to M8 as fixed apart from two role statements, which are its one required change, K1. It listed five smaller items, K2 to K6. Every item is accepted and changed here. Nothing is disputed.</p>
+<div class="tw"><table><thead><tr><th>Item</th><th>What changed in v1.6</th><th>Where</th></tr></thead><tbody><tr><td>Publication</td><td>The public repository carries v1.6 and its captures. D23, the index, <code>history/README.md</code>, <code>CHANGES.md</code> and the cover name it. v1.5 joins the private earlier versions with its checksum. The repository path is <code>docs/design/263/v1.6/</code>, with captures at <code>docs/design/263/captures/v1.6/</code>. The publisher's v1.5 capture run is recorded beside the earlier runs.</td><td><code>DECISIONS.md</code> (D23); <code>README.md</code>; <code>history/README.md</code>; <code>CHANGES.md</code>; the Artifact cover</td></tr><tr><td>K1</td><td>(a) Row G04.30 says what the page does: every signed-in account sees the Errors card, and “Acknowledge” is shown to administrators (row G02.5). (b) The crosswalk's settings table no longer names a role beside a setting. Its column now gives the scope and the matrix rows that say who sees the setting, for every line of the table (decision D28). The whole column was checked against the rows it points to. Nothing is said about what the server checks.</td><td>row G04.30; <code>crosswalk/legacy-navigation-settings.md</code>; <code>tools/docs.py</code>; <code>DECISIONS.md</code> (D28)</td></tr><tr><td>K2</td><td>The render check's scope is stated exactly in the index: which elements, against which boxes, and what it does not measure. D27 and the option pages use the same wording. The script now measures against dialogs, includes third-level headings, and reads only its own user's browser processes, once, right after launch. The three older lines that said no browser could start are dated to their version. The screenshots the designer looked at are called a sample.</td><td><code>README.md</code>; <code>DECISIONS.md</code> (D27); <code>tools/render_check.js</code>; <code>tools/README.md</code>; <code>CHANGES.md</code>; <code>CHANGES-FROM-v1.md</code>; <code>CHANGES-FROM-v1.4.md</code></td></tr><tr><td>K3</td><td>The sentence about who else may stop an import is removed. The operations vocabulary, interaction contract §3 and §5 and row G04.13 say that the import controls are shown to administrators. D21 is unchanged and now literally true.</td><td><code>options/*/screens/s05-operations</code>; <code>contracts/interaction.md</code> §3, §5; row G04.13; <code>CHANGES-FROM-v1.3.md</code></td></tr><tr><td>K4</td><td>(a) The note beside the two tests in the edit view says only that the result appears as a message, as today. (b) “Credential save failed” shows the client's text as it renders it, with the reply's own body. (c) The stopped import was stopped by an administrator, on the operations page and on the dashboard. (d) The Git token field in the edit view says that no token is saved, matching the read view.</td><td><code>options/*/screens/g04-settings-edit</code>, <code>g08-account-states</code>, <code>g04-operations</code>, <code>g02-dashboard</code></td></tr><tr><td>K5</td><td>Tables inside a dialog cover their edge shadow with the dialog's own colour, so Ledger's dialogs show no shadow when nothing is hidden. A row of buttons that follows a form keeps a gap from the last field. An identifier may also break after a full stop, so a long host name wraps there and no slash is left alone on a line. The wording about tables is corrected in <code>CHANGES-FROM-v1.4.md</code>: inside a table a short identifier does not break, and a path may break after a slash.</td><td><code>prototypes/assets/base.css</code>; <code>options/ledger/option.css</code>; <code>tools/kit.py</code> (<code>_ident</code>); <code>CHANGES-FROM-v1.4.md</code></td></tr><tr><td>K6</td><td>Row G08.6 follows G08.5. The unused history code is removed from <code>tools/finish.py</code> and <code>tools/docs_text.py</code>. <code>CHANGES-FROM-v1.4.md</code> and <code>CHANGES-FROM-v1.3.md</code> say the markup is identical on 68 of 69 screens.</td><td><code>matrix/*</code>; <code>tools/finish.py</code>, <code>tools/docs_text.py</code>; <code>CHANGES-FROM-v1.4.md</code>, <code>CHANGES-FROM-v1.3.md</code></td></tr><tr><td>The 405 specimen</td><td>Kept. Its note adds that a proxy in front of the server may answer differently.</td><td><code>options/*/screens/g08-account-states</code></td></tr></tbody></table></div>
+<h2 id="checked-after-the-changes">Checked after the changes</h2>
+<ul><li><code>tools/build.py</code> and its checks pass: structure, links, tokens, evidence against badge, and markup inside <code>main</code> that is identical in all three options on 68 of the 69 screens.</li><li>Every source anchor resolves at both epic tips.</li><li>Every role statement in the matrix, the crosswalk and the interaction contract was read again against the page's own role conditions.</li><li>The tree was searched again for statements about access control. What remains is what issue #268 says, cited to it.</li><li>The render check was run again on this tree. Its results are in the package index.</li></ul>
+<h2 id="not-done">Not done</h2>
+<p>No visual review of every page, and no keyboard, screen-reader, zoom or accessibility check. The publisher captures this version after delivery.</p>
+</main>
+</body>
+</html>

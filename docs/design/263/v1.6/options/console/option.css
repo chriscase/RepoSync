@@ -1,0 +1,85 @@
+/* RepoSync #263 option "console": shell arrangement and component styling.
+   Concept: an operations console. A grouped sidebar, dense tables, a status inspector beside
+   the working area, and a bottom bar for the four workspace destinations and "More" on a phone.
+   Tab order equals reading order: workspace links, "More" (narrow only), then what it opens. */
+[data-rs-layout='console'].rs-layout-shell { display: grid; grid-template-columns: 244px minmax(0, 1fr); }
+[data-rs-layout='console'].rs-layout-shell.bare { display: block; }
+[data-rs-layout='console'].rs-layout-shell.bare .shell-main { max-width: 1100px; margin: 0 auto; }
+[data-rs-layout='console'] .shell-nav { position: sticky; top: 0; height: 100vh; overflow-y: auto; border-right-width: 1px; }
+[data-rs-layout='console'] .shell-nav-inner { padding: 14px 10px; min-height: 100%; display: flex; }
+[data-rs-layout='console'] .shell-nav-row { display: flex; flex-direction: column; gap: 14px; flex: 1 1 auto; min-width: 0; }
+[data-rs-layout='console'] .shell-brand { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+[data-rs-layout='console'] .shell-brand-name { font-size: 1.15em; }
+[data-rs-layout='console'] .shell-links { flex-basis: 100%; display: grid; gap: 16px; margin-top: 10px; }
+[data-rs-layout='console'] .shell-group { display: grid; gap: 4px; }
+[data-rs-layout='console'] .shell-group-label { padding: 0 8px; }
+[data-rs-layout='console'] .shell-group-links { display: grid; gap: 1px; }
+[data-rs-layout='console'] .rs-shell-link { padding: 0.45em 0.6em; border-radius: var(--rs-radius); border-left: 2px solid transparent; }
+[data-rs-layout='console'] .rs-shell-link .nav-ic { display: block; }
+[data-rs-layout='console'] .rs-shell-link:hover { background: var(--rs-shell-hover); }
+[data-rs-layout='console'] .rs-shell-link--active, [data-rs-layout='console'] .rs-shell-link--active:hover { background: var(--rs-shell-hover); border-left-color: var(--rs-shell-accent); }
+[data-rs-layout='console'] .shell-count { margin-left: auto; }
+[data-rs-layout='console'] .shell-account { margin-top: auto; display: grid; gap: 8px; padding: 12px 8px 0; border-top: 1px solid var(--rs-shell-border); justify-items: start; }
+[data-rs-layout='console'] .shell-main { padding: 18px 22px 48px; }
+@media (max-width: 900px) {
+  /* Top strip: logo, name, status; it stays at the top so the opened links are always in view.
+     Bottom bar: the four workspace links and "More". */
+  [data-rs-layout='console'].rs-layout-shell { display: block; }
+  [data-rs-layout='console'] .shell-nav { position: sticky; top: 0; z-index: 4; height: auto; overflow: visible; border-right-width: 0; border-bottom-width: 1px; }
+  [data-rs-layout='console'] .shell-nav-inner { display: block; min-height: 0; padding-block: 8px; padding-left: max(12px, env(safe-area-inset-left, 0px)); padding-right: max(12px, env(safe-area-inset-right, 0px)); }
+  [data-rs-layout='console'] .shell-nav-row { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; }
+  [data-rs-layout='console'] .shell-brand, [data-rs-layout='console'] .shell-links, [data-rs-layout='console'] .shell-account { display: contents; }
+  [data-rs-layout='console'] .shell-logo { order: 1; }
+  [data-rs-layout='console'] .shell-brand-name { order: 2; }
+  [data-rs-layout='console'] .shell-status { order: 3; margin-left: auto; }
+  [data-rs-layout='console'] .shell-group[data-group='workspace'] { position: fixed; left: 0; right: 0; bottom: 0; z-index: 5; margin: 0; background: var(--rs-shell-chrome); border-top: 1px solid var(--rs-shell-border); padding: 4px max(8px, env(safe-area-inset-right, 0px)) calc(4px + env(safe-area-inset-bottom, 0px)) max(8px, env(safe-area-inset-left, 0px)); }
+  [data-rs-layout='console'] .shell-group[data-group='workspace'] .shell-group-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  [data-rs-layout='console'] .shell-group[data-group='workspace'] .shell-group-links { display: flex; gap: 0; background: none; padding: 0; border-radius: 0; }
+  [data-rs-layout='console'] .shell-group[data-group='workspace'] .rs-shell-link, [data-rs-layout='console'] .shell-menu { position: relative; flex: 1 1 0; min-width: 0; display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-size: 0.8em; padding: 0.45em 0; }
+  [data-rs-layout='console'] .shell-menu { border-color: transparent; background: none; }
+  [data-rs-layout='console'] .shell-group[data-group='workspace'] .nav-ic, [data-rs-layout='console'] .shell-menu .ic { display: block; width: 1.5em; height: 1.5em; }
+  [data-rs-layout='console'] .shell-menu .lbl-long { display: none; }
+  [data-rs-layout='console'] .shell-menu .lbl-short { display: inline; }
+  [data-rs-layout='console'] .shell-group[data-group='workspace'] .shell-count { position: absolute; top: 1px; left: calc(50% + 0.5em); margin: 0; }
+  [data-rs-layout='console'] .shell-group[data-group='workspace'] .rs-shell-link, [data-rs-layout='console'] .shell-menu { border-left: 0; border-top: 2px solid transparent; border-radius: 0; background: none; }
+  [data-rs-layout='console'] .shell-group[data-group='workspace'] .rs-shell-link--active { border-top-color: var(--rs-shell-accent); background: none; }
+  [data-rs-layout='console'] .shell-group[data-group='account'], [data-rs-layout='console'] .shell-group[data-group='administration'],
+  [data-rs-layout='console'] .shell-user, [data-rs-layout='console'] .shell-chooser, [data-rs-layout='console'] .shell-logout { display: none; }
+  [data-rs-layout='console'][data-nav-open] .shell-group[data-group='account'] { display: grid; order: 6; flex-basis: 100%; padding-top: 8px; border-top: 1px solid var(--rs-shell-border); }
+  [data-rs-layout='console'][data-nav-open] .shell-group[data-group='administration'] { display: grid; order: 7; flex-basis: 100%; }
+  [data-rs-layout='console'][data-nav-open] .shell-user { display: block; order: 8; flex-basis: 100%; padding-top: 8px; border-top: 1px solid var(--rs-shell-border); }
+  [data-rs-layout='console'][data-nav-open] .shell-chooser { display: flex; order: 9; }
+  [data-rs-layout='console'][data-nav-open] .shell-logout { display: inline-block; order: 10; margin-left: auto; }
+  [data-rs-layout='console'] .shell-main { padding: 14px 12px 92px; }
+}
+
+/* components */
+[data-rs-layout='console'] .sec-h h2 { text-transform: uppercase; letter-spacing: 0.07em; font-size: 0.8rem; color: var(--rs-text-2); }
+[data-rs-layout='console'] .tbl tbody tr:nth-child(even) td { background: var(--rs-surface-2); }
+[data-rs-layout='console'] .pill { border-radius: var(--rs-radius); padding: 0.05em 0.5em 0.05em 0.4em; }
+[data-rs-layout='console'] .pill.big { padding: 0.2em 0.7em 0.2em 0.5em; }
+[data-rs-layout='console'] .bn { border-left: 3px solid var(--rs-text-3); }
+[data-rs-layout='console'] .bn.ok { border-left-color: var(--rs-ok); } [data-rs-layout='console'] .bn.warn { border-left-color: var(--rs-warn); }
+[data-rs-layout='console'] .bn.held { border-left-color: var(--rs-held); } [data-rs-layout='console'] .bn.err { border-left-color: var(--rs-danger); }
+[data-rs-layout='console'] .bn.run { border-left-color: var(--rs-run); }
+[data-rs-layout='console'] .pg-sections { border-bottom: 1px solid var(--rs-line); }
+[data-rs-layout='console'] .pg-sections a { border-bottom: 2px solid transparent; margin-bottom: -1px; }
+[data-rs-layout='console'] .pg-sections a[aria-current] { border-bottom-color: var(--rs-accent); }
+[data-rs-layout='console'] .pg-status { border: 1px solid var(--rs-line); border-radius: var(--rs-radius-lg); background: var(--rs-surface); padding: var(--rs-pad); }
+[data-rs-layout='console'] .statline .v { font-family: var(--rs-font-mono); }
+@media (min-width: 1101px) {
+  [data-rs-layout='console'] .pg.has-sections { grid-template-columns: minmax(0, 1fr) 300px; grid-template-areas: "head head" "nav nav" "body status"; }
+  [data-rs-layout='console'] .pg.has-sections > .pg-head { grid-area: head; }
+  [data-rs-layout='console'] .pg.has-sections > .pg-sections { grid-area: nav; }
+  [data-rs-layout='console'] .pg.has-sections > .pg-body { grid-area: body; }
+  [data-rs-layout='console'] .pg.has-sections > .pg-status { grid-area: status; position: sticky; top: 12px; align-self: start; }
+  [data-rs-layout='console'] .pg.has-sections > .pg-status .statline { display: grid; gap: 10px; }
+  /* "Needs attention" is first in the document and sits in the left column; the rest keeps today's order beside it. */
+  [data-rs-layout='console'] .dash { grid-template-columns: 330px minmax(0, 1fr); grid-template-areas: "attn flight" "attn repos" "attn health" "attn lower" "side side"; }
+  [data-rs-layout='console'] .dash > [data-b='attn'] { grid-area: attn; }
+  [data-rs-layout='console'] .dash > [data-b='flight'] { grid-area: flight; }
+  [data-rs-layout='console'] .dash > [data-b='repos'] { grid-area: repos; }
+  [data-rs-layout='console'] .dash > [data-b='health'] { grid-area: health; }
+  [data-rs-layout='console'] .dash > [data-b='lower'] { grid-area: lower; }
+  [data-rs-layout='console'] .dash > [data-b='side'] { grid-area: side; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
