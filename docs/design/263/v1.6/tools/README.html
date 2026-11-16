@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tools · RepoSync #263 design package v1.6</title>
+<style>
+:root{color-scheme:light dark;--bg:#fbfbf8;--fg:#16181d;--fg2:#4a4f59;--line:#d6d6cc;--soft:#efefe8;--link:#1a4fa3;--code:#f0f0e9}
+@media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e9e9e2;--fg2:#a9adb6;--line:#3a3e46;--soft:#1d2026;--link:#8fb4ff;--code:#1d2026}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+main{max-width:1180px;margin:0 auto;padding:24px max(16px,env(safe-area-inset-right,0px)) 64px max(16px,env(safe-area-inset-left,0px))}
+.top{font-size:.88em;color:var(--fg2);border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:18px;display:flex;flex-wrap:wrap;gap:6px 16px}
+h1{font:600 1.8rem/1.2 "Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;margin:0 0 .5em;text-wrap:balance}
+h2{font-size:1.2rem;margin:2em 0 .5em;padding-top:.7em;border-top:1px solid var(--fg)}
+h3{font-size:1rem;margin:1.5em 0 .4em}
+p,li{max-width:78ch;overflow-wrap:anywhere}
+h1,h2,h3{overflow-wrap:anywhere}
+a{color:var(--link)}
+a:focus-visible{outline:2px solid var(--link);outline-offset:2px}
+code{font:.88em ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;background:var(--code);padding:.08em .3em;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--code);padding:12px;overflow-x:auto;border:1px solid var(--line)}
+pre code{background:none;padding:0}
+.tw{overflow-x:auto;margin:1em 0}
+table{border-collapse:collapse;font-size:.88em;min-width:100%}
+th,td{border-bottom:1px solid var(--line);padding:6px 10px 6px 0;text-align:left;vertical-align:top}
+th{border-bottom-color:var(--fg);font-weight:650;white-space:nowrap}
+td{min-width:8ch}
+table.wide td{min-width:14ch}
+</style>
+</head>
+<body>
+<main>
+<p class="top"><a href="../README.html">Package index</a><a href="../DECISIONS.html">Decisions</a><a href="../prototypes/index.html">Prototypes</a><a href="../matrix/surface-state-matrix.html">Matrix</a><span>RepoSync #263 design package v1.6 · design only, not the implemented product</span></p>
+<h1 id="tools">Tools</h1>
+<p>The scripts that generated and checked this tree, as they were run. The generator and its checks need Python 3 and its standard library only. The render check needs Node with Playwright and its Chromium. Nothing is installed or fetched.</p>
+<div class="tw"><table><thead><tr><th>File</th><th>What it does</th></tr></thead><tbody><tr><td><code>kit.py</code></td><td>helpers that build the HTML pieces</td></tr><tr><td><code>tokens.py</code></td><td>every token value; writes <code>options/&lt;id&gt;/tokens.css</code>; computes contrast</td></tr><tr><td><code>base.css</code>, <code>opt_ledger.css</code>, <code>opt_console.css</code>, <code>opt_guide.css</code></td><td>sources of <code>prototypes/assets/base.css</code> and each <code>option.css</code></td></tr><tr><td><code>proto.js</code>, <code>icons.html</code></td><td>the prototype script and icon set</td></tr><tr><td><code>screens_a.py</code>, <code>screens_b.py</code></td><td>the content of every screen, written once for all options</td></tr><tr><td><code>build.py</code></td><td>renders every screen in every option, the index and the flows; validates structure, links, icons and tokens</td></tr><tr><td><code>matrix_data.py</code></td><td>the matrix rows</td></tr><tr><td><code>resolve.py</code></td><td>finds each row's source text at both epic revisions with <code>git show</code></td></tr><tr><td><code>mdhtml.py</code></td><td>renders the Markdown documents to HTML</td></tr><tr><td><code>docs.py</code>, <code>docs_text.py</code>, <code>v11.py</code></td><td>write the matrix, parity map, crosswalk, contracts, decisions and READMEs</td></tr><tr><td><code>bridge.py</code></td><td>lists the colour classes in the source and computes contrast for the colour bridge</td></tr><tr><td><code>finish.py</code>, <code>cover.py</code></td><td>finish the tree (index, checks, checksums) and write the Artifact cover page</td></tr><tr><td><code>render_check.js</code></td><td>the designer's render check: loads every page in a sandboxed Chromium and measures errors, outside requests and overflow</td></tr></tbody></table></div>
+<p>Run from the package root. <code>REPOSYNC_REPO</code> is the path of a clone of the repository; <code>resolve.py</code> and <code>bridge.py</code> read it with <code>git show</code>:</p>
+<pre><code>REPOSYNC_REPO=/path/to/RepoSync python3 tools/build.py out
+REPOSYNC_REPO=/path/to/RepoSync python3 tools/docs.py out
+REPOSYNC_REPO=/path/to/RepoSync python3 tools/finish.py out</code></pre>
+<p><code>render_check.js</code> needs Node with Playwright and its Chromium, both already present where it was run; nothing was installed. It was run as a non-root user so that the browser's sandbox is on, on a copy of the tree:</p>
+<pre><code>node tools/render_check.js &lt;copy of the tree&gt; &lt;output folder&gt;</code></pre>
+<p>It starts the browser with the sandbox enabled. Once, right after launch, it reads the browser processes of the user it runs as and reports how many carry a flag that turns the sandbox off; that number was 0.</p>
+<p><code>resolve.py</code> and <code>bridge.py</code> read the repository with <code>git show</code> only. They do not check out, build or run anything. <code>build.py</code> also checks that status evidence matches the status badge on each page and that the markup inside every page is the same in all three options.</p>
+</main>
+</body>
+</html>

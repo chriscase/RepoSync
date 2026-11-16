@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Option: Console · RepoSync #263 design package v1.6</title>
+<style>
+:root{color-scheme:light dark;--bg:#fbfbf8;--fg:#16181d;--fg2:#4a4f59;--line:#d6d6cc;--soft:#efefe8;--link:#1a4fa3;--code:#f0f0e9}
+@media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e9e9e2;--fg2:#a9adb6;--line:#3a3e46;--soft:#1d2026;--link:#8fb4ff;--code:#1d2026}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+main{max-width:1180px;margin:0 auto;padding:24px max(16px,env(safe-area-inset-right,0px)) 64px max(16px,env(safe-area-inset-left,0px))}
+.top{font-size:.88em;color:var(--fg2);border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:18px;display:flex;flex-wrap:wrap;gap:6px 16px}
+h1{font:600 1.8rem/1.2 "Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;margin:0 0 .5em;text-wrap:balance}
+h2{font-size:1.2rem;margin:2em 0 .5em;padding-top:.7em;border-top:1px solid var(--fg)}
+h3{font-size:1rem;margin:1.5em 0 .4em}
+p,li{max-width:78ch;overflow-wrap:anywhere}
+h1,h2,h3{overflow-wrap:anywhere}
+a{color:var(--link)}
+a:focus-visible{outline:2px solid var(--link);outline-offset:2px}
+code{font:.88em ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;background:var(--code);padding:.08em .3em;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--code);padding:12px;overflow-x:auto;border:1px solid var(--line)}
+pre code{background:none;padding:0}
+.tw{overflow-x:auto;margin:1em 0}
+table{border-collapse:collapse;font-size:.88em;min-width:100%}
+th,td{border-bottom:1px solid var(--line);padding:6px 10px 6px 0;text-align:left;vertical-align:top}
+th{border-bottom-color:var(--fg);font-weight:650;white-space:nowrap}
+td{min-width:8ch}
+table.wide td{min-width:14ch}
+</style>
+</head>
+<body>
+<main>
+<p class="top"><a href="../../README.html">Package index</a><a href="../../DECISIONS.html">Decisions</a><a href="../../prototypes/index.html">Prototypes</a><a href="../../matrix/surface-state-matrix.html">Matrix</a><span>RepoSync #263 design package v1.6 · design only, not the implemented product</span></p>
+<h1 id="option-console-console">Option: Console (<code>console</code>)</h1>
+<p>An operations console. Navigation in a grouped sidebar, dense tables, and a status inspector that stays beside the work.</p>
+<div class="tw"><table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td>For</td><td>Someone who watches several repositories through the day and acts on them: a team's sync operator or administrator.</td></tr><tr><td>Navigation</td><td>A 244 px sidebar with Workspace, Account and Administration groups; status, name, chooser and sign-out at its foot. Up to 900 px it becomes a top strip that stays in view, and the four workspace pages and “More” move to a bar fixed at the bottom.</td></tr><tr><td>Pages</td><td>13 px text, 28 px controls, striped tables. From 1101 px the dashboard puts the attention list in a left column, and a page with sections keeps its status in a panel at the right.</td></tr><tr><td>Trade-offs</td><td>Small text and small pointer targets by design. Closest to today's Team layout, so the least new. The right-hand status panel needs 1101 px.</td></tr><tr><td>Themes</td><td>dark by default; light when chosen. Designed first in dark</td></tr></tbody></table></div>
+<p>Accepted for #264 on 2026-11-16 (<a href="../../DECISIONS.html">decisions</a>).</p>
+<h2 id="files">Files</h2>
+<ul><li><a href="tokens.css">tokens.css</a>: every colour, type and spacing value, for light and dark. The first twelve per theme are the #262 shell tokens.</li><li><a href="option.css">option.css</a>: how the shell is arranged and how components look in this option.</li><li><code>screens/</code>: 69 prototype pages. Start at <a href="screens/g02-dashboard.html">screens/g02-dashboard.html</a> or use the <a href="../../prototypes/index.html">index of all screens</a>.</li><li><a href="flows/index.html">flows/index.html</a>: 16 task flows, each a sequence of the pages above.</li></ul>
+<h2 id="viewing">Viewing</h2>
+<p>Open any page from the file system; nothing is fetched. Add <code>#light</code> or <code>#dark</code> to the address to fix the theme, and <code>#light-nobar</code> or <code>#dark-nobar</code> to hide the grey prototype bar for captures. Without either, the page is dark unless Light was chosen with the bar's buttons. Sizes used in the matrix: 1440×900 and 390×844.</p>
+<h2 id="representative-pages">Representative pages</h2>
+<div class="tw"><table><thead><tr><th>Page</th><th>Light</th><th>Dark</th></tr></thead><tbody><tr><td>Dashboard</td><td><a href="screens/g02-dashboard.html#light">open</a></td><td><a href="screens/g02-dashboard.html#dark">open</a></td></tr><tr><td>Repositories</td><td><a href="screens/g03-repositories.html#light">open</a></td><td><a href="screens/g03-repositories.html#dark">open</a></td></tr><tr><td>Add repository</td><td><a href="screens/g03-add-repository.html#light">open</a></td><td><a href="screens/g03-add-repository.html#dark">open</a></td></tr><tr><td>Repository: overview</td><td><a href="screens/g04-overview.html#light">open</a></td><td><a href="screens/g04-overview.html#dark">open</a></td></tr><tr><td>Repository: operations and import</td><td><a href="screens/g04-operations.html#light">open</a></td><td><a href="screens/g04-operations.html#dark">open</a></td></tr><tr><td>Repository: settings</td><td><a href="screens/g04-settings.html#light">open</a></td><td><a href="screens/g04-settings.html#dark">open</a></td></tr><tr><td>Remove a branch pair</td><td><a href="screens/g04-remove-pair.html#light">open</a></td><td><a href="screens/g04-remove-pair.html#dark">open</a></td></tr><tr><td>Conflict</td><td><a href="screens/g06-conflict-diff.html#light">open</a></td><td><a href="screens/g06-conflict-diff.html#dark">open</a></td></tr><tr><td>Audit log</td><td><a href="screens/g07-audit.html#light">open</a></td><td><a href="screens/g07-audit.html#dark">open</a></td></tr><tr><td>My account</td><td><a href="screens/g08-account.html#light">open</a></td><td><a href="screens/g08-account.html#dark">open</a></td></tr><tr><td>Users</td><td><a href="screens/g09-users.html#light">open</a></td><td><a href="screens/g09-users.html#dark">open</a></td></tr><tr><td>Directory (LDAP)</td><td><a href="screens/g10-directory.html#light">open</a></td><td><a href="screens/g10-directory.html#dark">open</a></td></tr><tr><td>Identity &amp; notifications</td><td><a href="screens/g11-identity-notifications.html#light">open</a></td><td><a href="screens/g11-identity-notifications.html#dark">open</a></td></tr><tr><td>Server setup: import</td><td><a href="screens/g12-setup-8.html#light">open</a></td><td><a href="screens/g12-setup-8.html#dark">open</a></td></tr><tr><td>Help</td><td><a href="screens/g13-docs-overview.html#light">open</a></td><td><a href="screens/g13-docs-overview.html#dark">open</a></td></tr><tr><td>Sign in</td><td><a href="screens/g01-login.html#light">open</a></td><td><a href="screens/g01-login.html#dark">open</a></td></tr><tr><td>Shell and roles</td><td><a href="screens/s01-shell-roles.html#light">open</a></td><td><a href="screens/s01-shell-roles.html#dark">open</a></td></tr><tr><td>Layout and theme chooser</td><td><a href="screens/s02-chooser.html#light">open</a></td><td><a href="screens/s02-chooser.html#dark">open</a></td></tr></tbody></table></div>
+<h2 id="where-this-option-differs-from-the-other-two">Where this option differs from the other two</h2>
+<p>Navigation, density, type, section treatment, how a page's sections are reached, the dashboard arrangement, and what a phone shows. Page content, labels, controls and states are the same in all three, and so is the markup inside every page: the build checks it. No option offers a different page structure. See the <a href="../../matrix/capability-parity.html">capability parity map</a>.</p>
+<h2 id="not-verified">Not verified</h2>
+<p>The designer checked these pages as files (structure, links, token definitions, computed contrast) and, from v1.5, in a sandboxed browser for errors, for a page wider than the screen, and for selected elements that reach past the box that holds them. That is not a visual review. The publisher rendered v1 to v1.5 and captures this version after delivery; see the package index. No keyboard, screen-reader or accessibility check was made.</p>
+</main>
+</body>
+</html>
