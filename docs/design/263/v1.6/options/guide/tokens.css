@@ -1,0 +1,128 @@
+/* RepoSync #263 option "guide": tokens.
+ * The --rs-shell-* names are the existing #262 seam. The other names are the proposed
+ * extension of that seam to page content. In the product the selector is
+ * .rs-layout-shell[data-rs-layout='guide'][data-rs-theme='<theme>']; the html[...] form is for these prototypes only. */
+
+.rs-layout-shell[data-rs-layout='guide'], html[data-rs-layout='guide'] {
+  --rs-font-ui: ui-rounded, "SF Pro Rounded", "Hiragino Maru Gothic ProN", "Segoe UI", system-ui, sans-serif;
+  --rs-font-display: ui-rounded, "SF Pro Rounded", "Hiragino Maru Gothic ProN", "Segoe UI", system-ui, sans-serif;
+  --rs-font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --rs-display-weight: 700;
+  --rs-fs: 16px;
+  --rs-lh: 1.5;
+  --rs-h1: 1.7rem;
+  --rs-h2: 1.12rem;
+  --rs-radius: 10px;
+  --rs-radius-lg: 16px;
+  --rs-gap: 12px;
+  --rs-gap-lg: 20px;
+  --rs-pad: 20px;
+  --rs-pad-sm: 14px;
+  --rs-cell: 12px 14px;
+  --rs-control-h: 42px;
+  --rs-btn-pad: 18px;
+}
+
+.rs-layout-shell[data-rs-layout='guide'][data-rs-theme='light'],
+html[data-rs-layout='guide'][data-rs-theme='light'] {
+  --rs-shell-canvas: #f2f4f8;
+  --rs-shell-chrome: #ffffff;
+  --rs-shell-border: #dbe0ea;
+  --rs-shell-hover: #eaeef5;
+  --rs-shell-text-strong: #131722;
+  --rs-shell-text-muted: #4b556a;
+  --rs-shell-accent: #2456e6;
+  --rs-shell-accent-text: #ffffff;
+  --rs-shell-alert: #b42318;
+  --rs-shell-alert-text: #ffffff;
+  --rs-shell-notice-text: #7a4f00;
+  --rs-shell-focus: #2456e6;
+  --rs-bg: #f2f4f8;
+  --rs-surface: #ffffff;
+  --rs-surface-2: #f6f8fb;
+  --rs-surface-3: #e6eaf2;
+  --rs-line: #dbe0ea;
+  --rs-line-strong: #8792a6;
+  --rs-text: #131722;
+  --rs-text-2: #3b4354;
+  --rs-text-3: #586176;
+  --rs-accent: #2456e6;
+  --rs-accent-text: #ffffff;
+  --rs-accent-soft: #e3ebff;
+  --rs-link: #1f4fd6;
+  --rs-focus: #2456e6;
+  --rs-ok: #157040;
+  --rs-run: #1f4fd6;
+  --rs-warn: #855600;
+  --rs-held: #a3460a;
+  --rs-danger: #b42318;
+  --rs-off: #586176;
+  --rs-ok-soft: #e0f3e7;
+  --rs-run-soft: #e3ebff;
+  --rs-warn-soft: #f8eed0;
+  --rs-held-soft: #fbe6d6;
+  --rs-danger-soft: #fbe3e0;
+  --rs-svn: #1b66ab;
+  --rs-git: #7438c9;
+  --rs-code-bg: #eef1f6;
+  --rs-code-text: #131722;
+  --rs-add-bg: #dcf2e3;
+  --rs-del-bg: #fbe0dd;
+  --rs-scrim: rgba(19,23,34,.45);
+  --rs-shadow: 0 12px 34px rgba(19,23,34,.16);
+  --rs-danger-solid: #b42318;
+  --rs-danger-solid-text: #ffffff;
+  color-scheme: light;
+}
+
+.rs-layout-shell[data-rs-layout='guide'][data-rs-theme='dark'],
+html[data-rs-layout='guide'][data-rs-theme='dark'] {
+  --rs-shell-canvas: #12151c;
+  --rs-shell-chrome: #171b24;
+  --rs-shell-border: #313848;
+  --rs-shell-hover: #252b3a;
+  --rs-shell-text-strong: #eef1f7;
+  --rs-shell-text-muted: #a6afc0;
+  --rs-shell-accent: #7da2ff;
+  --rs-shell-accent-text: #0b1020;
+  --rs-shell-alert: #ff8f85;
+  --rs-shell-alert-text: #2a0806;
+  --rs-shell-notice-text: #e8b84e;
+  --rs-shell-focus: #9bb8ff;
+  --rs-bg: #12151c;
+  --rs-surface: #1a1e28;
+  --rs-surface-2: #212634;
+  --rs-surface-3: #2b3142;
+  --rs-line: #313848;
+  --rs-line-strong: #66708a;
+  --rs-text: #eef1f7;
+  --rs-text-2: #c3c9d6;
+  --rs-text-3: #9aa3b5;
+  --rs-accent: #7da2ff;
+  --rs-accent-text: #0b1020;
+  --rs-accent-soft: #1c2747;
+  --rs-link: #9bb8ff;
+  --rs-focus: #9bb8ff;
+  --rs-ok: #63d19a;
+  --rs-run: #7da2ff;
+  --rs-warn: #e8b84e;
+  --rs-held: #f29a62;
+  --rs-danger: #ff8f85;
+  --rs-off: #9aa3b5;
+  --rs-ok-soft: #143023;
+  --rs-run-soft: #1c2747;
+  --rs-warn-soft: #3a2e0d;
+  --rs-held-soft: #3e2413;
+  --rs-danger-soft: #431b18;
+  --rs-svn: #79b8f7;
+  --rs-git: #c7a4ff;
+  --rs-code-bg: #0d1016;
+  --rs-code-text: #eef1f7;
+  --rs-add-bg: #143023;
+  --rs-del-bg: #431b18;
+  --rs-scrim: rgba(0,0,0,.6);
+  --rs-shadow: 0 14px 36px rgba(0,0,0,.55);
+  --rs-danger-solid: #c93c37;
+  --rs-danger-solid-text: #ffffff;
+  color-scheme: dark;
+}

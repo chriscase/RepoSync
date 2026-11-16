@@ -1,0 +1,68 @@
+/* RepoSync #263 option "ledger": shell arrangement and component styling.
+   Concept: the product as a ledger of what moved between SVN and Git. A two-tier masthead,
+   ruled sections instead of boxes, stamps for state, ink as the only accent.
+   Tab order equals reading order at every width: the four workspace links, then the "More" control
+   (narrow only), then account links, administration links, chooser and sign-out. */
+[data-rs-layout='ledger'] .shell-nav { border-bottom-width: 3px; border-bottom-style: double; }
+[data-rs-layout='ledger'] .shell-nav-inner { max-width: 1180px; margin: 0 auto; padding-block: 12px 8px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+[data-rs-layout='ledger'] .shell-nav-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; }
+[data-rs-layout='ledger'] .shell-nav-row::after { content: ""; flex-basis: 100%; height: 0; order: 5; }
+[data-rs-layout='ledger'] .shell-brand, [data-rs-layout='ledger'] .shell-links, [data-rs-layout='ledger'] .shell-account { display: contents; }
+[data-rs-layout='ledger'] .shell-logo { order: 1; }
+[data-rs-layout='ledger'] .shell-brand-name { order: 2; font-family: var(--rs-font-display); font-size: 1.35em; letter-spacing: 0.01em; }
+[data-rs-layout='ledger'] .shell-group { display: flex; align-items: baseline; gap: 10px; }
+[data-rs-layout='ledger'] .shell-group-links { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 18px; }
+[data-rs-layout='ledger'] .shell-group[data-group='workspace'] { order: 3; margin-left: 14px; }
+[data-rs-layout='ledger'] .shell-group[data-group='workspace'] .shell-group-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+[data-rs-layout='ledger'] .shell-status { order: 4; margin-left: auto; }
+[data-rs-layout='ledger'] .shell-group[data-group='account'] { order: 6; font-size: 0.9em; }
+[data-rs-layout='ledger'] .shell-group[data-group='administration'] { order: 7; font-size: 0.9em; padding-left: 16px; border-left: 1px solid var(--rs-shell-hover); }
+[data-rs-layout='ledger'] .shell-user { order: 8; margin-left: auto; }
+[data-rs-layout='ledger'] .shell-chooser { order: 9; }
+[data-rs-layout='ledger'] .shell-logout { order: 10; }
+[data-rs-layout='ledger'] .rs-shell-link { padding: 0.25em 0; border-bottom: 2px solid transparent; }
+[data-rs-layout='ledger'] .rs-shell-link:hover { border-bottom-color: var(--rs-shell-hover); }
+[data-rs-layout='ledger'] .rs-shell-link--active, [data-rs-layout='ledger'] .rs-shell-link--active:hover { border-bottom-color: var(--rs-shell-accent); }
+[data-rs-layout='ledger'] .shell-main { max-width: 1180px; margin: 0 auto; padding-block: 26px 64px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+@media (max-width: 860px) {
+  /* Row one: logo, name, status. Row two: the four workspace links and "More". The rest opens below. */
+  [data-rs-layout='ledger'] .shell-group[data-group='workspace'] { order: 6; flex-basis: 100%; margin-left: 0; }
+  [data-rs-layout='ledger'] .shell-menu { display: inline-flex; padding: 0.15em 0.6em; }
+  [data-rs-layout='ledger'] .shell-group[data-group='account'], [data-rs-layout='ledger'] .shell-group[data-group='administration'],
+  [data-rs-layout='ledger'] .shell-user, [data-rs-layout='ledger'] .shell-chooser, [data-rs-layout='ledger'] .shell-logout { display: none; }
+  [data-rs-layout='ledger'][data-nav-open] .shell-group[data-group='account'], [data-rs-layout='ledger'][data-nav-open] .shell-group[data-group='administration'] { display: grid; flex-basis: 100%; gap: 4px; margin: 0; padding: 10px 0 0; border: 0; border-top: 1px solid var(--rs-shell-hover); font-size: 1em; }
+  [data-rs-layout='ledger'][data-nav-open] .shell-group[data-group='account'] { order: 7; }
+  [data-rs-layout='ledger'][data-nav-open] .shell-group[data-group='administration'] { order: 8; }
+  [data-rs-layout='ledger'][data-nav-open] .shell-group[data-group='account'] .shell-group-links, [data-rs-layout='ledger'][data-nav-open] .shell-group[data-group='administration'] .shell-group-links { display: grid; gap: 0; }
+  [data-rs-layout='ledger'][data-nav-open] .shell-group[data-group='account'] .rs-shell-link, [data-rs-layout='ledger'][data-nav-open] .shell-group[data-group='administration'] .rs-shell-link { padding: 0.6em 0; }
+  [data-rs-layout='ledger'][data-nav-open] .shell-user { display: block; order: 9; flex-basis: 100%; margin: 0; padding-top: 10px; border-top: 1px solid var(--rs-shell-hover); }
+  [data-rs-layout='ledger'][data-nav-open] .shell-chooser { display: flex; order: 10; }
+  [data-rs-layout='ledger'][data-nav-open] .shell-logout { display: inline-block; order: 11; margin-left: auto; }
+}
+
+/* components */
+[data-rs-layout='ledger'] .pg-head h1 { letter-spacing: -0.01em; }
+[data-rs-layout='ledger'] .sec { background: transparent; border: 0; border-top: 1px solid var(--rs-text); border-radius: 0; padding: 14px 0 0; }
+[data-rs-layout='ledger'] .sec > .tw { margin-inline: 0; }
+[data-rs-layout='ledger'] .sec > .tw .tbl th:first-child, [data-rs-layout='ledger'] .sec > .tw .tbl td:first-child { padding-left: 0; }
+[data-rs-layout='ledger'] .sec > .tw .tbl th:last-child, [data-rs-layout='ledger'] .sec > .tw .tbl td:last-child { padding-right: 0; }
+[data-rs-layout='ledger'] .tbl th { border-bottom-color: var(--rs-text); }
+[data-rs-layout='ledger'] .pill { border-radius: 2px; text-transform: uppercase; font-size: 0.72em; letter-spacing: 0.07em; padding: 0.22em 0.65em 0.22em 0.5em; }
+[data-rs-layout='ledger'] .pill.big { font-size: 0.86em; }
+[data-rs-layout='ledger'] .bn { border-width: 1px 0; border-color: var(--rs-line-strong); border-radius: 0; padding-inline: 14px; }
+[data-rs-layout='ledger'] .card, [data-rs-layout='ledger'] .op, [data-rs-layout='ledger'] .dlg { border-color: var(--rs-text); }
+[data-rs-layout='ledger'] .pg-status { border-top: 1px solid var(--rs-text); border-bottom: 1px solid var(--rs-line); padding: 12px 0; }
+[data-rs-layout='ledger'] .pg-sections { border-bottom: 1px solid var(--rs-line); }
+[data-rs-layout='ledger'] .pg-sections a[aria-current] { box-shadow: inset 0 -2px 0 var(--rs-accent); }
+[data-rs-layout='ledger'] .statline .v { font-family: var(--rs-font-display); font-size: 1.12em; }
+@media (min-width: 861px) {
+  [data-rs-layout='ledger'] .pg.has-sections { grid-template-columns: 200px minmax(0, 1fr); grid-template-areas: "head head" "status status" "nav body"; }
+  [data-rs-layout='ledger'] .pg.has-sections > .pg-head { grid-area: head; }
+  [data-rs-layout='ledger'] .pg.has-sections > .pg-status { grid-area: status; }
+  [data-rs-layout='ledger'] .pg.has-sections > .pg-body { grid-area: body; }
+  [data-rs-layout='ledger'] .pg.has-sections > .pg-sections { grid-area: nav; flex-direction: column; gap: 0; overflow: visible; position: sticky; top: 12px; align-self: start; border-bottom: 0; border-left: 1px solid var(--rs-line); }
+  [data-rs-layout='ledger'] .pg.has-sections > .pg-sections a { padding: 0.4em 0.9em; margin-left: -1px; border-left: 2px solid transparent; }
+  [data-rs-layout='ledger'] .pg.has-sections > .pg-sections a[aria-current] { border-left-color: var(--rs-accent); box-shadow: none; font-weight: 750; }
+}
+[data-rs-layout='ledger'] .tw { --tw-cover: var(--rs-bg); }
+[data-rs-layout='ledger'] .dlg .tw { --tw-cover: var(--rs-surface); }

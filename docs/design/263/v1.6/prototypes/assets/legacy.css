@@ -1,0 +1,132 @@
+/* RepoSync #263: palette of the existing three layouts (Classic, Individual, Team).
+ * Dark approximates today's colours and is for drawing only. Light is the proposed light theme.
+ * The sign-in page uses the dark set whatever theme is chosen: it has one appearance for everyone. */
+html[data-rs-layout='legacy'], .rs-layout-shell[data-rs-layout='legacy'], .legacy-scope {
+  --rs-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --rs-font-display: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --rs-font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --rs-display-weight: 700;
+  --rs-fs: 14px;
+  --rs-lh: 1.5;
+  --rs-h1: 1.5rem;
+  --rs-h2: 1.125rem;
+  --rs-radius: 6px;
+  --rs-radius-lg: 8px;
+  --rs-gap: 10px;
+  --rs-gap-lg: 18px;
+  --rs-pad: 16px;
+  --rs-pad-sm: 12px;
+  --rs-cell: 8px 12px;
+  --rs-control-h: 36px;
+  --rs-btn-pad: 14px;
+}
+
+html[data-rs-layout='legacy'], .rs-layout-shell[data-rs-layout='legacy'], .legacy-scope[data-scope='dark'] {
+  --rs-shell-canvas: #111827;
+  --rs-shell-chrome: #030712;
+  --rs-shell-border: #1f2937;
+  --rs-shell-hover: #374151;
+  --rs-shell-text-strong: #ffffff;
+  --rs-shell-text-muted: #9ca3af;
+  --rs-shell-accent: #2563eb;
+  --rs-shell-accent-text: #ffffff;
+  --rs-shell-alert: #dc2626;
+  --rs-shell-alert-text: #fee2e2;
+  --rs-shell-notice-text: #fde68a;
+  --rs-shell-focus: #93c5fd;
+  --rs-bg: #111827;
+  --rs-surface: #1f2937;
+  --rs-surface-2: #374151;
+  --rs-surface-3: #4b5563;
+  --rs-line: #374151;
+  --rs-line-strong: #4b5563;
+  --rs-text: #f3f4f6;
+  --rs-text-2: #d1d5db;
+  --rs-text-3: #9ca3af;
+  --rs-accent: #2563eb;
+  --rs-accent-text: #ffffff;
+  --rs-accent-soft: #1e3a8a;
+  --rs-link: #60a5fa;
+  --rs-focus: #93c5fd;
+  --rs-ok: #4ade80;
+  --rs-run: #60a5fa;
+  --rs-warn: #facc15;
+  --rs-held: #fb923c;
+  --rs-danger: #f87171;
+  --rs-off: #9ca3af;
+  --rs-ok-soft: #173b2a;
+  --rs-run-soft: #1e2f57;
+  --rs-warn-soft: #3b3413;
+  --rs-held-soft: #3f2a17;
+  --rs-danger-soft: #4a1f24;
+  --rs-svn: #60a5fa;
+  --rs-git: #c084fc;
+  --rs-code-bg: #030712;
+  --rs-code-text: #e5e7eb;
+  --rs-add-bg: #173b2a;
+  --rs-del-bg: #4a1f24;
+  --rs-scrim: rgba(0,0,0,.65);
+  --rs-shadow: 0 14px 36px rgba(0,0,0,.5);
+  --rs-danger-solid: #dc2626;
+  --rs-danger-solid-text: #ffffff;
+  color-scheme: dark;
+}
+
+.legacy-scope[data-scope='light'] {
+  --rs-shell-canvas: #f3f4f6;
+  --rs-shell-chrome: #ffffff;
+  --rs-shell-border: #d1d5db;
+  --rs-shell-hover: #e5e7eb;
+  --rs-shell-text-strong: #111827;
+  --rs-shell-text-muted: #4b5563;
+  --rs-shell-accent: #2563eb;
+  --rs-shell-accent-text: #ffffff;
+  --rs-shell-alert: #b91c1c;
+  --rs-shell-alert-text: #ffffff;
+  --rs-shell-notice-text: #92400e;
+  --rs-shell-focus: #1d4ed8;
+  --rs-bg: #f3f4f6;
+  --rs-surface: #ffffff;
+  --rs-surface-2: #f3f4f6;
+  --rs-surface-3: #e5e7eb;
+  --rs-line: #e5e7eb;
+  --rs-line-strong: #7f8a9a;
+  --rs-text: #111827;
+  --rs-text-2: #374151;
+  --rs-text-3: #4b5563;
+  --rs-accent: #2563eb;
+  --rs-accent-text: #ffffff;
+  --rs-accent-soft: #dbeafe;
+  --rs-link: #1d4ed8;
+  --rs-focus: #1d4ed8;
+  --rs-ok: #15803d;
+  --rs-run: #1d4ed8;
+  --rs-warn: #925207;
+  --rs-held: #b93c0c;
+  --rs-danger: #b91c1c;
+  --rs-off: #4b5563;
+  --rs-ok-soft: #dcfce7;
+  --rs-run-soft: #dbeafe;
+  --rs-warn-soft: #fef9c3;
+  --rs-held-soft: #ffedd5;
+  --rs-danger-soft: #fee2e2;
+  --rs-svn: #1d4ed8;
+  --rs-git: #7e22ce;
+  --rs-code-bg: #f3f4f6;
+  --rs-code-text: #111827;
+  --rs-add-bg: #dcfce7;
+  --rs-del-bg: #fee2e2;
+  --rs-scrim: rgba(17,24,39,.5);
+  --rs-shadow: 0 10px 30px rgba(17,24,39,.18);
+  --rs-danger-solid: #b91c1c;
+  --rs-danger-solid-text: #ffffff;
+  color-scheme: light;
+}
+
+.legacy-scope { background: var(--rs-bg); color: var(--rs-text); font: var(--rs-fs)/var(--rs-lh) var(--rs-font-ui); border: 1px solid var(--rs-line-strong); border-radius: var(--rs-radius-lg); min-width: 0; overflow: hidden; }
+.legacy-bar { background: var(--rs-shell-chrome); border-bottom: 1px solid var(--rs-shell-border); color: var(--rs-shell-text-muted); display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; padding: 10px 14px; font-weight: 600; }
+.legacy-bar b { color: var(--rs-shell-text-strong); letter-spacing: 0.05em; }
+.legacy-bar .on { background: var(--rs-shell-accent); color: var(--rs-shell-accent-text); padding: 2px 10px; border-radius: 6px; }
+.legacy-bar .count { background: var(--rs-shell-alert); color: var(--rs-shell-alert-text); border-radius: 999px; padding: 0 0.5em; font-size: 0.8em; }
+.legacy-body { padding: var(--rs-pad); display: grid; gap: var(--rs-gap-lg); min-width: 0; }
+.legacy-body > * { min-width: 0; }

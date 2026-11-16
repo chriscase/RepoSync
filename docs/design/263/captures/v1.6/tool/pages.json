@@ -1,0 +1,2957 @@
+[
+ {
+  "id": "ledger/g01-login-states",
+  "path": "options/ledger/screens/g01-login-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "ledger/g01-login",
+  "path": "options/ledger/screens/g01-login.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "ledger/g02-dashboard-single",
+  "path": "options/ledger/screens/g02-dashboard-single.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g02-dashboard-states",
+  "path": "options/ledger/screens/g02-dashboard-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g02-dashboard",
+  "path": "options/ledger/screens/g02-dashboard.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g03-add-repository",
+  "path": "options/ledger/screens/g03-add-repository.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g03-repositories",
+  "path": "options/ledger/screens/g03-repositories.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g03-save-recovery",
+  "path": "options/ledger/screens/g03-save-recovery.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g03-states",
+  "path": "options/ledger/screens/g03-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-activity",
+  "path": "options/ledger/screens/g04-activity.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-branches",
+  "path": "options/ledger/screens/g04-branches.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-operations",
+  "path": "options/ledger/screens/g04-operations.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-overview",
+  "path": "options/ledger/screens/g04-overview.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-pairing",
+  "path": "options/ledger/screens/g04-pairing.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-pause",
+  "path": "options/ledger/screens/g04-pause.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-policy",
+  "path": "options/ledger/screens/g04-policy.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-refresh-preview",
+  "path": "options/ledger/screens/g04-refresh-preview.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-removal-recovery",
+  "path": "options/ledger/screens/g04-removal-recovery.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-remove-pair",
+  "path": "options/ledger/screens/g04-remove-pair.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-remove-root",
+  "path": "options/ledger/screens/g04-remove-root.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-settings-edit",
+  "path": "options/ledger/screens/g04-settings-edit.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-settings",
+  "path": "options/ledger/screens/g04-settings.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-skip",
+  "path": "options/ledger/screens/g04-skip.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g04-states",
+  "path": "options/ledger/screens/g04-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g05-conflicts-states",
+  "path": "options/ledger/screens/g05-conflicts-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g05-conflicts",
+  "path": "options/ledger/screens/g05-conflicts.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g06-conflict-diff",
+  "path": "options/ledger/screens/g06-conflict-diff.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g06-conflict-edit",
+  "path": "options/ledger/screens/g06-conflict-edit.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g06-conflict-states",
+  "path": "options/ledger/screens/g06-conflict-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g07-audit-states",
+  "path": "options/ledger/screens/g07-audit-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g07-audit-table",
+  "path": "options/ledger/screens/g07-audit-table.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g07-audit",
+  "path": "options/ledger/screens/g07-audit.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g08-account-states",
+  "path": "options/ledger/screens/g08-account-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g08-account",
+  "path": "options/ledger/screens/g08-account.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g09-user-dialogs",
+  "path": "options/ledger/screens/g09-user-dialogs.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g09-users-states",
+  "path": "options/ledger/screens/g09-users-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g09-users",
+  "path": "options/ledger/screens/g09-users.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g10-directory-states",
+  "path": "options/ledger/screens/g10-directory-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g10-directory",
+  "path": "options/ledger/screens/g10-directory.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g11-identity-notifications",
+  "path": "options/ledger/screens/g11-identity-notifications.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g11-states",
+  "path": "options/ledger/screens/g11-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g12-setup-1",
+  "path": "options/ledger/screens/g12-setup-1.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g12-setup-2",
+  "path": "options/ledger/screens/g12-setup-2.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g12-setup-3",
+  "path": "options/ledger/screens/g12-setup-3.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g12-setup-4",
+  "path": "options/ledger/screens/g12-setup-4.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g12-setup-5",
+  "path": "options/ledger/screens/g12-setup-5.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g12-setup-6",
+  "path": "options/ledger/screens/g12-setup-6.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g12-setup-7",
+  "path": "options/ledger/screens/g12-setup-7.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g12-setup-8",
+  "path": "options/ledger/screens/g12-setup-8.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g12-setup-states",
+  "path": "options/ledger/screens/g12-setup-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g13-docs-configuration",
+  "path": "options/ledger/screens/g13-docs-configuration.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g13-docs-conflict-resolution",
+  "path": "options/ledger/screens/g13-docs-conflict-resolution.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g13-docs-dashboard",
+  "path": "options/ledger/screens/g13-docs-dashboard.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g13-docs-deployment",
+  "path": "options/ledger/screens/g13-docs-deployment.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g13-docs-getting-started",
+  "path": "options/ledger/screens/g13-docs-getting-started.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g13-docs-identity-mapping",
+  "path": "options/ledger/screens/g13-docs-identity-mapping.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g13-docs-overview",
+  "path": "options/ledger/screens/g13-docs-overview.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g13-docs-personal-mode",
+  "path": "options/ledger/screens/g13-docs-personal-mode.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g13-docs-repositories",
+  "path": "options/ledger/screens/g13-docs-repositories.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/g13-docs-troubleshooting",
+  "path": "options/ledger/screens/g13-docs-troubleshooting.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/s01-shell-member",
+  "path": "options/ledger/screens/s01-shell-member.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/s01-shell-roles",
+  "path": "options/ledger/screens/s01-shell-roles.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/s02-chooser",
+  "path": "options/ledger/screens/s02-chooser.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/s03-dialogs-transient",
+  "path": "options/ledger/screens/s03-dialogs-transient.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/s04-recoverable-saves",
+  "path": "options/ledger/screens/s04-recoverable-saves.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/s05-operations",
+  "path": "options/ledger/screens/s05-operations.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/s06-credentials-identity",
+  "path": "options/ledger/screens/s06-credentials-identity.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/s07-exceptional",
+  "path": "options/ledger/screens/s07-exceptional.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/s08-existing-layouts-light",
+  "path": "options/ledger/screens/s08-existing-layouts-light.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "ledger/s01-shell-roles-menu",
+  "path": "options/ledger/screens/s01-shell-roles.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar-menu"
+   },
+   "dark": {
+    "hash": "dark-nobar-menu"
+   }
+  }
+ },
+ {
+  "id": "ledger/s01-shell-member-menu",
+  "path": "options/ledger/screens/s01-shell-member.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar-menu"
+   },
+   "dark": {
+    "hash": "dark-nobar-menu"
+   }
+  }
+ },
+ {
+  "id": "ledger/g02-dashboard-menu",
+  "path": "options/ledger/screens/g02-dashboard.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar-menu"
+   },
+   "dark": {
+    "hash": "dark-nobar-menu"
+   }
+  }
+ },
+ {
+  "id": "ledger/g09-users-menu",
+  "path": "options/ledger/screens/g09-users.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar-menu"
+   },
+   "dark": {
+    "hash": "dark-nobar-menu"
+   }
+  }
+ },
+ {
+  "id": "ledger/flows",
+  "path": "options/ledger/flows/index.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g01-login-states",
+  "path": "options/console/screens/g01-login-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "console/g01-login",
+  "path": "options/console/screens/g01-login.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "console/g02-dashboard-single",
+  "path": "options/console/screens/g02-dashboard-single.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g02-dashboard-states",
+  "path": "options/console/screens/g02-dashboard-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g02-dashboard",
+  "path": "options/console/screens/g02-dashboard.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g03-add-repository",
+  "path": "options/console/screens/g03-add-repository.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g03-repositories",
+  "path": "options/console/screens/g03-repositories.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g03-save-recovery",
+  "path": "options/console/screens/g03-save-recovery.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g03-states",
+  "path": "options/console/screens/g03-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-activity",
+  "path": "options/console/screens/g04-activity.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-branches",
+  "path": "options/console/screens/g04-branches.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-operations",
+  "path": "options/console/screens/g04-operations.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-overview",
+  "path": "options/console/screens/g04-overview.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-pairing",
+  "path": "options/console/screens/g04-pairing.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-pause",
+  "path": "options/console/screens/g04-pause.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-policy",
+  "path": "options/console/screens/g04-policy.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-refresh-preview",
+  "path": "options/console/screens/g04-refresh-preview.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-removal-recovery",
+  "path": "options/console/screens/g04-removal-recovery.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-remove-pair",
+  "path": "options/console/screens/g04-remove-pair.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-remove-root",
+  "path": "options/console/screens/g04-remove-root.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-settings-edit",
+  "path": "options/console/screens/g04-settings-edit.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-settings",
+  "path": "options/console/screens/g04-settings.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-skip",
+  "path": "options/console/screens/g04-skip.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g04-states",
+  "path": "options/console/screens/g04-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g05-conflicts-states",
+  "path": "options/console/screens/g05-conflicts-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g05-conflicts",
+  "path": "options/console/screens/g05-conflicts.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g06-conflict-diff",
+  "path": "options/console/screens/g06-conflict-diff.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g06-conflict-edit",
+  "path": "options/console/screens/g06-conflict-edit.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g06-conflict-states",
+  "path": "options/console/screens/g06-conflict-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g07-audit-states",
+  "path": "options/console/screens/g07-audit-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g07-audit-table",
+  "path": "options/console/screens/g07-audit-table.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g07-audit",
+  "path": "options/console/screens/g07-audit.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g08-account-states",
+  "path": "options/console/screens/g08-account-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g08-account",
+  "path": "options/console/screens/g08-account.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g09-user-dialogs",
+  "path": "options/console/screens/g09-user-dialogs.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g09-users-states",
+  "path": "options/console/screens/g09-users-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g09-users",
+  "path": "options/console/screens/g09-users.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g10-directory-states",
+  "path": "options/console/screens/g10-directory-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g10-directory",
+  "path": "options/console/screens/g10-directory.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g11-identity-notifications",
+  "path": "options/console/screens/g11-identity-notifications.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g11-states",
+  "path": "options/console/screens/g11-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g12-setup-1",
+  "path": "options/console/screens/g12-setup-1.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g12-setup-2",
+  "path": "options/console/screens/g12-setup-2.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g12-setup-3",
+  "path": "options/console/screens/g12-setup-3.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g12-setup-4",
+  "path": "options/console/screens/g12-setup-4.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g12-setup-5",
+  "path": "options/console/screens/g12-setup-5.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g12-setup-6",
+  "path": "options/console/screens/g12-setup-6.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g12-setup-7",
+  "path": "options/console/screens/g12-setup-7.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g12-setup-8",
+  "path": "options/console/screens/g12-setup-8.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g12-setup-states",
+  "path": "options/console/screens/g12-setup-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g13-docs-configuration",
+  "path": "options/console/screens/g13-docs-configuration.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g13-docs-conflict-resolution",
+  "path": "options/console/screens/g13-docs-conflict-resolution.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g13-docs-dashboard",
+  "path": "options/console/screens/g13-docs-dashboard.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g13-docs-deployment",
+  "path": "options/console/screens/g13-docs-deployment.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g13-docs-getting-started",
+  "path": "options/console/screens/g13-docs-getting-started.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g13-docs-identity-mapping",
+  "path": "options/console/screens/g13-docs-identity-mapping.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g13-docs-overview",
+  "path": "options/console/screens/g13-docs-overview.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g13-docs-personal-mode",
+  "path": "options/console/screens/g13-docs-personal-mode.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g13-docs-repositories",
+  "path": "options/console/screens/g13-docs-repositories.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/g13-docs-troubleshooting",
+  "path": "options/console/screens/g13-docs-troubleshooting.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/s01-shell-member",
+  "path": "options/console/screens/s01-shell-member.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/s01-shell-roles",
+  "path": "options/console/screens/s01-shell-roles.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/s02-chooser",
+  "path": "options/console/screens/s02-chooser.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/s03-dialogs-transient",
+  "path": "options/console/screens/s03-dialogs-transient.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/s04-recoverable-saves",
+  "path": "options/console/screens/s04-recoverable-saves.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/s05-operations",
+  "path": "options/console/screens/s05-operations.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/s06-credentials-identity",
+  "path": "options/console/screens/s06-credentials-identity.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/s07-exceptional",
+  "path": "options/console/screens/s07-exceptional.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/s08-existing-layouts-light",
+  "path": "options/console/screens/s08-existing-layouts-light.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "console/s01-shell-roles-menu",
+  "path": "options/console/screens/s01-shell-roles.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar-menu"
+   },
+   "dark": {
+    "hash": "dark-nobar-menu"
+   }
+  }
+ },
+ {
+  "id": "console/s01-shell-member-menu",
+  "path": "options/console/screens/s01-shell-member.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar-menu"
+   },
+   "dark": {
+    "hash": "dark-nobar-menu"
+   }
+  }
+ },
+ {
+  "id": "console/g02-dashboard-menu",
+  "path": "options/console/screens/g02-dashboard.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar-menu"
+   },
+   "dark": {
+    "hash": "dark-nobar-menu"
+   }
+  }
+ },
+ {
+  "id": "console/g09-users-menu",
+  "path": "options/console/screens/g09-users.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar-menu"
+   },
+   "dark": {
+    "hash": "dark-nobar-menu"
+   }
+  }
+ },
+ {
+  "id": "console/flows",
+  "path": "options/console/flows/index.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g01-login-states",
+  "path": "options/guide/screens/g01-login-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "guide/g01-login",
+  "path": "options/guide/screens/g01-login.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "guide/g02-dashboard-single",
+  "path": "options/guide/screens/g02-dashboard-single.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g02-dashboard-states",
+  "path": "options/guide/screens/g02-dashboard-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g02-dashboard",
+  "path": "options/guide/screens/g02-dashboard.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g03-add-repository",
+  "path": "options/guide/screens/g03-add-repository.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g03-repositories",
+  "path": "options/guide/screens/g03-repositories.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g03-save-recovery",
+  "path": "options/guide/screens/g03-save-recovery.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g03-states",
+  "path": "options/guide/screens/g03-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-activity",
+  "path": "options/guide/screens/g04-activity.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-branches",
+  "path": "options/guide/screens/g04-branches.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-operations",
+  "path": "options/guide/screens/g04-operations.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-overview",
+  "path": "options/guide/screens/g04-overview.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-pairing",
+  "path": "options/guide/screens/g04-pairing.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-pause",
+  "path": "options/guide/screens/g04-pause.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-policy",
+  "path": "options/guide/screens/g04-policy.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-refresh-preview",
+  "path": "options/guide/screens/g04-refresh-preview.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-removal-recovery",
+  "path": "options/guide/screens/g04-removal-recovery.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-remove-pair",
+  "path": "options/guide/screens/g04-remove-pair.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-remove-root",
+  "path": "options/guide/screens/g04-remove-root.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-settings-edit",
+  "path": "options/guide/screens/g04-settings-edit.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-settings",
+  "path": "options/guide/screens/g04-settings.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-skip",
+  "path": "options/guide/screens/g04-skip.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g04-states",
+  "path": "options/guide/screens/g04-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g05-conflicts-states",
+  "path": "options/guide/screens/g05-conflicts-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g05-conflicts",
+  "path": "options/guide/screens/g05-conflicts.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g06-conflict-diff",
+  "path": "options/guide/screens/g06-conflict-diff.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g06-conflict-edit",
+  "path": "options/guide/screens/g06-conflict-edit.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g06-conflict-states",
+  "path": "options/guide/screens/g06-conflict-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g07-audit-states",
+  "path": "options/guide/screens/g07-audit-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g07-audit-table",
+  "path": "options/guide/screens/g07-audit-table.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g07-audit",
+  "path": "options/guide/screens/g07-audit.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g08-account-states",
+  "path": "options/guide/screens/g08-account-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g08-account",
+  "path": "options/guide/screens/g08-account.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g09-user-dialogs",
+  "path": "options/guide/screens/g09-user-dialogs.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g09-users-states",
+  "path": "options/guide/screens/g09-users-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g09-users",
+  "path": "options/guide/screens/g09-users.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g10-directory-states",
+  "path": "options/guide/screens/g10-directory-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g10-directory",
+  "path": "options/guide/screens/g10-directory.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g11-identity-notifications",
+  "path": "options/guide/screens/g11-identity-notifications.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g11-states",
+  "path": "options/guide/screens/g11-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g12-setup-1",
+  "path": "options/guide/screens/g12-setup-1.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g12-setup-2",
+  "path": "options/guide/screens/g12-setup-2.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g12-setup-3",
+  "path": "options/guide/screens/g12-setup-3.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g12-setup-4",
+  "path": "options/guide/screens/g12-setup-4.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g12-setup-5",
+  "path": "options/guide/screens/g12-setup-5.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g12-setup-6",
+  "path": "options/guide/screens/g12-setup-6.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g12-setup-7",
+  "path": "options/guide/screens/g12-setup-7.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g12-setup-8",
+  "path": "options/guide/screens/g12-setup-8.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g12-setup-states",
+  "path": "options/guide/screens/g12-setup-states.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g13-docs-configuration",
+  "path": "options/guide/screens/g13-docs-configuration.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g13-docs-conflict-resolution",
+  "path": "options/guide/screens/g13-docs-conflict-resolution.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g13-docs-dashboard",
+  "path": "options/guide/screens/g13-docs-dashboard.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g13-docs-deployment",
+  "path": "options/guide/screens/g13-docs-deployment.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g13-docs-getting-started",
+  "path": "options/guide/screens/g13-docs-getting-started.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g13-docs-identity-mapping",
+  "path": "options/guide/screens/g13-docs-identity-mapping.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g13-docs-overview",
+  "path": "options/guide/screens/g13-docs-overview.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g13-docs-personal-mode",
+  "path": "options/guide/screens/g13-docs-personal-mode.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g13-docs-repositories",
+  "path": "options/guide/screens/g13-docs-repositories.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/g13-docs-troubleshooting",
+  "path": "options/guide/screens/g13-docs-troubleshooting.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/s01-shell-member",
+  "path": "options/guide/screens/s01-shell-member.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/s01-shell-roles",
+  "path": "options/guide/screens/s01-shell-roles.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/s02-chooser",
+  "path": "options/guide/screens/s02-chooser.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/s03-dialogs-transient",
+  "path": "options/guide/screens/s03-dialogs-transient.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/s04-recoverable-saves",
+  "path": "options/guide/screens/s04-recoverable-saves.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/s05-operations",
+  "path": "options/guide/screens/s05-operations.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/s06-credentials-identity",
+  "path": "options/guide/screens/s06-credentials-identity.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/s07-exceptional",
+  "path": "options/guide/screens/s07-exceptional.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/s08-existing-layouts-light",
+  "path": "options/guide/screens/s08-existing-layouts-light.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "guide/s01-shell-roles-menu",
+  "path": "options/guide/screens/s01-shell-roles.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar-menu"
+   },
+   "dark": {
+    "hash": "dark-nobar-menu"
+   }
+  }
+ },
+ {
+  "id": "guide/s01-shell-member-menu",
+  "path": "options/guide/screens/s01-shell-member.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar-menu"
+   },
+   "dark": {
+    "hash": "dark-nobar-menu"
+   }
+  }
+ },
+ {
+  "id": "guide/g02-dashboard-menu",
+  "path": "options/guide/screens/g02-dashboard.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar-menu"
+   },
+   "dark": {
+    "hash": "dark-nobar-menu"
+   }
+  }
+ },
+ {
+  "id": "guide/g09-users-menu",
+  "path": "options/guide/screens/g09-users.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar-menu"
+   },
+   "dark": {
+    "hash": "dark-nobar-menu"
+   }
+  }
+ },
+ {
+  "id": "guide/flows",
+  "path": "options/guide/flows/index.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "prototypes/index",
+  "path": "prototypes/index.html",
+  "themes": {
+   "light": {
+    "hash": "light-nobar"
+   },
+   "dark": {
+    "hash": "dark-nobar"
+   }
+  }
+ },
+ {
+  "id": "doc/CHANGES-FROM-v1.3",
+  "path": "CHANGES-FROM-v1.3.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/CHANGES-FROM-v1.4",
+  "path": "CHANGES-FROM-v1.4.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/CHANGES-FROM-v1.5",
+  "path": "CHANGES-FROM-v1.5.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/CHANGES-FROM-v1",
+  "path": "CHANGES-FROM-v1.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/CHANGES",
+  "path": "CHANGES.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/DECISIONS",
+  "path": "DECISIONS.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/README",
+  "path": "README.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/index",
+  "path": "index.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/crosswalk/legacy-navigation-settings",
+  "path": "crosswalk/legacy-navigation-settings.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/options/ledger/README",
+  "path": "options/ledger/README.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/options/guide/README",
+  "path": "options/guide/README.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/options/console/README",
+  "path": "options/console/README.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/history/README",
+  "path": "history/README.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/matrix/capability-parity",
+  "path": "matrix/capability-parity.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/matrix/surface-state-matrix",
+  "path": "matrix/surface-state-matrix.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/tools/README",
+  "path": "tools/README.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/contracts/colour-bridge",
+  "path": "contracts/colour-bridge.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/contracts/design-system",
+  "path": "contracts/design-system.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/contracts/implementation-map",
+  "path": "contracts/implementation-map.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/contracts/interaction",
+  "path": "contracts/interaction.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ },
+ {
+  "id": "doc/contracts/page-regions",
+  "path": "contracts/page-regions.html",
+  "themes": {
+   "light": {
+    "colorScheme": "light"
+   },
+   "dark": {
+    "colorScheme": "dark"
+   }
+  },
+  "expectTheme": false
+ }
+]
