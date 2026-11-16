@@ -1,0 +1,128 @@
+/* RepoSync #263 option "console": tokens.
+ * The --rs-shell-* names are the existing #262 seam. The other names are the proposed
+ * extension of that seam to page content. In the product the selector is
+ * .rs-layout-shell[data-rs-layout='console'][data-rs-theme='<theme>']; the html[...] form is for these prototypes only. */
+
+.rs-layout-shell[data-rs-layout='console'], html[data-rs-layout='console'] {
+  --rs-font-ui: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --rs-font-display: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --rs-font-mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+  --rs-display-weight: 650;
+  --rs-fs: 13px;
+  --rs-lh: 1.45;
+  --rs-h1: 1.35rem;
+  --rs-h2: 0.98rem;
+  --rs-radius: 4px;
+  --rs-radius-lg: 6px;
+  --rs-gap: 8px;
+  --rs-gap-lg: 14px;
+  --rs-pad: 12px;
+  --rs-pad-sm: 9px;
+  --rs-cell: 5px 9px;
+  --rs-control-h: 28px;
+  --rs-btn-pad: 10px;
+}
+
+.rs-layout-shell[data-rs-layout='console'][data-rs-theme='light'],
+html[data-rs-layout='console'][data-rs-theme='light'] {
+  --rs-shell-canvas: #f4f6f8;
+  --rs-shell-chrome: #e9edf1;
+  --rs-shell-border: #c5ced6;
+  --rs-shell-hover: #dde3e9;
+  --rs-shell-text-strong: #111820;
+  --rs-shell-text-muted: #4a5764;
+  --rs-shell-accent: #0b6f7c;
+  --rs-shell-accent-text: #ffffff;
+  --rs-shell-alert: #b42318;
+  --rs-shell-alert-text: #ffffff;
+  --rs-shell-notice-text: #7a4f00;
+  --rs-shell-focus: #0b6f7c;
+  --rs-bg: #f4f6f8;
+  --rs-surface: #ffffff;
+  --rs-surface-2: #eef1f4;
+  --rs-surface-3: #e2e7ec;
+  --rs-line: #cfd6dd;
+  --rs-line-strong: #7f8c99;
+  --rs-text: #111820;
+  --rs-text-2: #36424e;
+  --rs-text-3: #566371;
+  --rs-accent: #0b6f7c;
+  --rs-accent-text: #ffffff;
+  --rs-accent-soft: #d9eef1;
+  --rs-link: #0b6370;
+  --rs-focus: #0b6f7c;
+  --rs-ok: #1a7446;
+  --rs-run: #1766b3;
+  --rs-warn: #855600;
+  --rs-held: #a3460a;
+  --rs-danger: #b42318;
+  --rs-off: #566371;
+  --rs-ok-soft: #dff2e6;
+  --rs-run-soft: #e0ecf8;
+  --rs-warn-soft: #f7edcf;
+  --rs-held-soft: #fbe5d5;
+  --rs-danger-soft: #fbe3e0;
+  --rs-svn: #1766b3;
+  --rs-git: #6f42c1;
+  --rs-code-bg: #eaeef2;
+  --rs-code-text: #111820;
+  --rs-add-bg: #dbf1e2;
+  --rs-del-bg: #fbe0dd;
+  --rs-scrim: rgba(17,24,32,.45);
+  --rs-shadow: 0 8px 26px rgba(17,24,32,.2);
+  --rs-danger-solid: #b42318;
+  --rs-danger-solid-text: #ffffff;
+  color-scheme: light;
+}
+
+.rs-layout-shell[data-rs-layout='console'][data-rs-theme='dark'],
+html[data-rs-layout='console'][data-rs-theme='dark'] {
+  --rs-shell-canvas: #0f141a;
+  --rs-shell-chrome: #0a0e13;
+  --rs-shell-border: #2a3644;
+  --rs-shell-hover: #1b242e;
+  --rs-shell-text-strong: #e6edf3;
+  --rs-shell-text-muted: #9aa7b4;
+  --rs-shell-accent: #2fb7c6;
+  --rs-shell-accent-text: #04161a;
+  --rs-shell-alert: #f47067;
+  --rs-shell-alert-text: #1a0605;
+  --rs-shell-notice-text: #e3b341;
+  --rs-shell-focus: #6fd3de;
+  --rs-bg: #0f141a;
+  --rs-surface: #151c24;
+  --rs-surface-2: #1b242e;
+  --rs-surface-3: #24303c;
+  --rs-line: #2a3644;
+  --rs-line-strong: #5a6b7d;
+  --rs-text: #e6edf3;
+  --rs-text-2: #b7c2cd;
+  --rs-text-3: #8f9caa;
+  --rs-accent: #2fb7c6;
+  --rs-accent-text: #04161a;
+  --rs-accent-soft: #0f3038;
+  --rs-link: #6fd3de;
+  --rs-focus: #6fd3de;
+  --rs-ok: #4cc38a;
+  --rs-run: #5bb8f0;
+  --rs-warn: #e3b341;
+  --rs-held: #f0883e;
+  --rs-danger: #f47067;
+  --rs-off: #8f9caa;
+  --rs-ok-soft: #12301f;
+  --rs-run-soft: #10283b;
+  --rs-warn-soft: #3b2f0b;
+  --rs-held-soft: #3d230f;
+  --rs-danger-soft: #46191a;
+  --rs-svn: #6cb6ff;
+  --rs-git: #c297ff;
+  --rs-code-bg: #0a0e13;
+  --rs-code-text: #e6edf3;
+  --rs-add-bg: #12301f;
+  --rs-del-bg: #46191a;
+  --rs-scrim: rgba(0,0,0,.62);
+  --rs-shadow: 0 10px 30px rgba(0,0,0,.6);
+  --rs-danger-solid: #c93c37;
+  --rs-danger-solid-text: #ffffff;
+  color-scheme: dark;
+}

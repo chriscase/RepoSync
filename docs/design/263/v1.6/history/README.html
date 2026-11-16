@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>History · RepoSync #263 design package v1.6</title>
+<style>
+:root{color-scheme:light dark;--bg:#fbfbf8;--fg:#16181d;--fg2:#4a4f59;--line:#d6d6cc;--soft:#efefe8;--link:#1a4fa3;--code:#f0f0e9}
+@media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e9e9e2;--fg2:#a9adb6;--line:#3a3e46;--soft:#1d2026;--link:#8fb4ff;--code:#1d2026}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+main{max-width:1180px;margin:0 auto;padding:24px max(16px,env(safe-area-inset-right,0px)) 64px max(16px,env(safe-area-inset-left,0px))}
+.top{font-size:.88em;color:var(--fg2);border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:18px;display:flex;flex-wrap:wrap;gap:6px 16px}
+h1{font:600 1.8rem/1.2 "Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;margin:0 0 .5em;text-wrap:balance}
+h2{font-size:1.2rem;margin:2em 0 .5em;padding-top:.7em;border-top:1px solid var(--fg)}
+h3{font-size:1rem;margin:1.5em 0 .4em}
+p,li{max-width:78ch;overflow-wrap:anywhere}
+h1,h2,h3{overflow-wrap:anywhere}
+a{color:var(--link)}
+a:focus-visible{outline:2px solid var(--link);outline-offset:2px}
+code{font:.88em ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;background:var(--code);padding:.08em .3em;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--code);padding:12px;overflow-x:auto;border:1px solid var(--line)}
+pre code{background:none;padding:0}
+.tw{overflow-x:auto;margin:1em 0}
+table{border-collapse:collapse;font-size:.88em;min-width:100%}
+th,td{border-bottom:1px solid var(--line);padding:6px 10px 6px 0;text-align:left;vertical-align:top}
+th{border-bottom-color:var(--fg);font-weight:650;white-space:nowrap}
+td{min-width:8ch}
+table.wide td{min-width:14ch}
+</style>
+</head>
+<body>
+<main>
+<p class="top"><a href="../README.html">Package index</a><a href="../DECISIONS.html">Decisions</a><a href="../prototypes/index.html">Prototypes</a><a href="../matrix/surface-state-matrix.html">Matrix</a><span>RepoSync #263 design package v1.6 · design only, not the implemented product</span></p>
+<h1 id="history">History</h1>
+<p>The public repository carries one version of this package: <strong>v1.6</strong>, this one, with the publisher's captures beside it. That is the owner's decision.</p>
+<p>Everything earlier stays a private Artifact. The links below open only for their owner. The SHA-256 of each <code>SHA256SUMS</code> is what identifies a version.</p>
+<p>This version carries no copy of the 2026-11-12 design review. That packet is inside v1, unpacked and unchanged, in v1's folder <code>history/2026-11-12/</code> (41 files). The archive delivered on 2026-11-12 has SHA-256 <code>6b63b9dc4b0667a86bf1accd4b2f62034655952eca6b04ee8858843dee5df6de</code>.</p>
+<div class="tw"><table><thead><tr><th>Version</th><th>Date</th><th>What it is</th><th>Identified by</th></tr></thead><tbody><tr><td>2026-11-12 review</td><td>2026-11-12</td><td>A design review of the reliability epic at <code>acf027bec8b6c9c0ceb3f53fe5a9e794d40a2b81</code>, before #262. Superseded where it differs.</td><td>inside v1; SHA-256 of the archive delivered that day: <code>6b63b9dc4b0667a86bf1accd4b2f62034655952eca6b04ee8858843dee5df6de</code></td></tr><tr><td>v1</td><td>2026-11-16</td><td>Three options, the matrix, crosswalk and contracts, with nine decisions open. Rendered and independently reviewed.</td><td>SHA-256 of its <code>SHA256SUMS</code>: <code>5eb5812a4548774f9c33103c8a3b3521d0df434c397537cfad538649f8f8d814</code>. Private Artifact: https://claude.ai/artifact/U4qoeNzph9x32eey55Hjg1</td></tr><tr><td>v1.1</td><td>2026-11-16</td><td>The first round of decisions applied.</td><td>SHA-256 <code>46d58debfd6b453bf184233ceea3daeb4679d6d20370cae718119ef17742ff65</code>. Private Artifact: https://claude.ai/artifact/5aKdwSu3jSJgBQ1LYZ59RA</td></tr><tr><td>v1.2</td><td>2026-11-16</td><td>All decisions applied. Rendered.</td><td>SHA-256 <code>e1085be16de128e4ce376edac0da62996a4505077d8cb0103eabc5580fff2c45</code>. Private Artifact: https://claude.ai/artifact/H4hqT7suswfojB3jk3ke5A</td></tr><tr><td>v1.3</td><td>2026-11-16</td><td>The first review's fourteen changes. Rendered and reviewed a second time.</td><td>SHA-256 <code>3c0ea6696929d637cd53af41466833ad3645cfb17debc1f11533f8d103625127</code>. Private Artifact: https://claude.ai/artifact/522LiBWfRtC2X8b16azYBd. An earlier issue, SHA-256 <code>e5432433b808dbeda75319eccf443558cca97a116efd4b13c081887c2810c921</code>, was withdrawn before use</td></tr><tr><td>v1.4</td><td>2026-11-16</td><td>The second review's changes. Rendered and reviewed a third time.</td><td>SHA-256 <code>671a9cbf59a8e90e800339607524d07831004d85864794c2d818df8b38dbd769</code>. Private Artifact: https://claude.ai/artifact/GVVT4zmw43gCmDiiwLEqiB</td></tr><tr><td>v1.5</td><td>2026-11-16</td><td>The third review's changes. Rendered and reviewed a fourth time.</td><td>SHA-256 <code>3d4562774d3a19365982def3042dc3b336273ffee73d22f8d39b663e103cf37f</code>. Private Artifact: https://claude.ai/artifact/4aJnJVnfadwoLUhL5Vov9p</td></tr><tr><td>v1.6</td><td>2026-11-16</td><td>This version: the accepted design. See <a href="../CHANGES-FROM-v1.5.html">../CHANGES-FROM-v1.5.md</a>.</td><td>this tree</td></tr></tbody></table></div>
+</main>
+</body>
+</html>

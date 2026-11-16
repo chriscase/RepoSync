@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>What changed · RepoSync #263 design package v1.6</title>
+<style>
+:root{color-scheme:light dark;--bg:#fbfbf8;--fg:#16181d;--fg2:#4a4f59;--line:#d6d6cc;--soft:#efefe8;--link:#1a4fa3;--code:#f0f0e9}
+@media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e9e9e2;--fg2:#a9adb6;--line:#3a3e46;--soft:#1d2026;--link:#8fb4ff;--code:#1d2026}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+main{max-width:1180px;margin:0 auto;padding:24px max(16px,env(safe-area-inset-right,0px)) 64px max(16px,env(safe-area-inset-left,0px))}
+.top{font-size:.88em;color:var(--fg2);border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:18px;display:flex;flex-wrap:wrap;gap:6px 16px}
+h1{font:600 1.8rem/1.2 "Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;margin:0 0 .5em;text-wrap:balance}
+h2{font-size:1.2rem;margin:2em 0 .5em;padding-top:.7em;border-top:1px solid var(--fg)}
+h3{font-size:1rem;margin:1.5em 0 .4em}
+p,li{max-width:78ch;overflow-wrap:anywhere}
+h1,h2,h3{overflow-wrap:anywhere}
+a{color:var(--link)}
+a:focus-visible{outline:2px solid var(--link);outline-offset:2px}
+code{font:.88em ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;background:var(--code);padding:.08em .3em;border-radius:3px;overflow-wrap:anywhere}
+pre{background:var(--code);padding:12px;overflow-x:auto;border:1px solid var(--line)}
+pre code{background:none;padding:0}
+.tw{overflow-x:auto;margin:1em 0}
+table{border-collapse:collapse;font-size:.88em;min-width:100%}
+th,td{border-bottom:1px solid var(--line);padding:6px 10px 6px 0;text-align:left;vertical-align:top}
+th{border-bottom-color:var(--fg);font-weight:650;white-space:nowrap}
+td{min-width:8ch}
+table.wide td{min-width:14ch}
+</style>
+</head>
+<body>
+<main>
+<p class="top"><a href="README.html">Package index</a><a href="DECISIONS.html">Decisions</a><a href="prototypes/index.html">Prototypes</a><a href="matrix/surface-state-matrix.html">Matrix</a><span>RepoSync #263 design package v1.6 · design only, not the implemented product</span></p>
+<h1 id="what-changed">What changed</h1>
+<p>Earlier versions are unchanged and none of them is in the repository. They are private Artifacts: the links open only for their owner, and the SHA-256 of each <code>SHA256SUMS</code> is what identifies them.</p>
+<ul><li>v1: SHA-256 <code>5eb5812a4548774f9c33103c8a3b3521d0df434c397537cfad538649f8f8d814</code> (private Artifact: https://claude.ai/artifact/U4qoeNzph9x32eey55Hjg1)</li><li>v1.1: SHA-256 <code>46d58debfd6b453bf184233ceea3daeb4679d6d20370cae718119ef17742ff65</code> (private Artifact: https://claude.ai/artifact/5aKdwSu3jSJgBQ1LYZ59RA)</li><li>v1.2: SHA-256 <code>e1085be16de128e4ce376edac0da62996a4505077d8cb0103eabc5580fff2c45</code> (private Artifact: https://claude.ai/artifact/H4hqT7suswfojB3jk3ke5A)</li><li>v1.3: SHA-256 <code>3c0ea6696929d637cd53af41466833ad3645cfb17debc1f11533f8d103625127</code> (private Artifact: https://claude.ai/artifact/522LiBWfRtC2X8b16azYBd). An earlier issue of v1.3, SHA-256 <code>e5432433b808dbeda75319eccf443558cca97a116efd4b13c081887c2810c921</code>, was withdrawn before use.</li><li>v1.4: SHA-256 <code>671a9cbf59a8e90e800339607524d07831004d85864794c2d818df8b38dbd769</code> (private Artifact: https://claude.ai/artifact/GVVT4zmw43gCmDiiwLEqiB)</li><li>v1.5: SHA-256 <code>3d4562774d3a19365982def3042dc3b336273ffee73d22f8d39b663e103cf37f</code> (private Artifact: https://claude.ai/artifact/4aJnJVnfadwoLUhL5Vov9p)</li></ul>
+<p>By review: <a href="CHANGES-FROM-v1.5.html">CHANGES-FROM-v1.5.md</a> answers the final check of v1.5, <a href="CHANGES-FROM-v1.4.html">CHANGES-FROM-v1.4.md</a> the closing check of v1.4, <a href="CHANGES-FROM-v1.3.html">CHANGES-FROM-v1.3.md</a> the follow-up review of v1.3, and <a href="CHANGES-FROM-v1.html">CHANGES-FROM-v1.md</a> the first review of v1.</p>
+<p>The sections below were each written for their own version. A statement in them about what had or had not been rendered is true as of that version; the package index says how things stand now.</p>
+<h2 id="from-v1-5-to-v1-6">From v1.5 to v1.6</h2>
+<p>This version answers the final check of v1.5.</p>
+<ul><li><strong>The last role statements.</strong> The Errors card row says the card is shown to everyone and only “Acknowledge” to administrators. The crosswalk no longer names a role beside a setting; it points to the matrix rows (decision D28).</li><li><strong>One sentence removed.</strong> The places that describe stopping an import say only who the page shows the control to.</li><li><strong>Specimens.</strong> The credential save failure shows the client's text as it is. The stopped import was stopped by an administrator. The Git token field in the edit view shows whether a token is saved. The test result note says only that a message appears.</li><li><strong>Layout.</strong> Tables in Ledger's dialogs no longer show a shadow when nothing is hidden. A row of buttons keeps its distance from the field above. A long host name breaks after a full stop, not before its slash.</li><li><strong>Records.</strong> The render check's scope is stated exactly. The publisher's v1.5 capture run is recorded. The repository carries v1.6 (decision D23).</li></ul>
+<p>The matrix still has 140 rows.</p>
+<h2 id="from-v1-4-to-v1-5">From v1.4 to v1.5</h2>
+<p>This version answers the closing check of v1.4.</p>
+<ul><li><strong>Role cells.</strong> Each was checked again against the page's own role conditions. Where the page has none, the cell says so in page terms and the design adds none (decision D24).</li><li><strong>Connection tests.</strong> The repository tests are in the edit view only, as today. Test results use the source's own messages.</li><li><strong>Personal credentials.</strong> “Test Connection” is drawn with the error it shows today, because the route it calls is not registered. A test that works is a new feature-work row, G08.6.</li><li><strong>Truthful status.</strong> The held status line shows the recorded position alone.</li><li><strong>Wording.</strong> Two sentences about the server are put in page terms, and decision D21 says what the package does state.</li><li><strong>Layout.</strong> An identifier stays whole while its container can hold it and wraps inside it when it cannot. Three tables that were cut off at 1440 px now fit. A label column is only as wide as its longest label.</li><li><strong>Records.</strong> The publisher's v1.4 capture run is recorded. The public repository carries only this version and its captures (decision D23), so every path into v1 is gone.</li><li><strong>Checking.</strong> The designer now runs a sandboxed render check before delivery (decision D27).</li></ul>
+<p>The matrix has 140 rows, up from 139.</p>
+<h2 id="from-v1-3-to-v1-4">From v1.3 to v1.4</h2>
+<p>This version answers the follow-up review of v1.3.</p>
+<ul><li><strong>Statements about the server.</strong> The package describes what the page does and leaves server enforcement out, except where issue #268 states it (decision D21).</li><li><strong>Setup.</strong> The secrets table and two setup specimens are corrected to match the page and the source.</li><li><strong>Conflict page.</strong> The diff now compares SVN with Git, as the page does today, and the confirmation says “Not chosen”.</li><li><strong>Truthful status.</strong> A non-administrator's shell shows the same health as an administrator's. The unknown evidence specimen reports the configuration as unknown. The held repository has one set of positions everywhere.</li><li><strong>Skipping commits.</strong> The dialog opens with nothing selected.</li><li><strong>No resume control</strong> is listed anywhere, and Stop is described as shown to administrators.</li><li><strong>Layout.</strong> Review notes wrap, long addresses in documents wrap, a long label no longer squeezes its value, names in tables stay whole, and long paths break after a slash.</li><li><strong>Records.</strong> Contradictions between documents are removed, and the links to earlier versions are labelled private.</li></ul>
+<p>The matrix still has 139 rows.</p>
+<h2 id="from-v1-2-to-v1-3">From v1.2 to v1.3</h2>
+<p>This version answers the independent review of v1 (findings F1 to F14 and the optional items).</p>
+<p>Corrections of fact:</p>
+<ul><li>Server setup and Identity &amp; notifications are no longer described as checked by the server for the administrator role. The rows link issue #268, and two explicit-gap rows are added.</li><li>The Sign-in column and the Local and Directory account distinction are removed. The server reports no sign-in source.</li><li>Status evidence is written for each health. A held, paused or unknown page no longer shows idle evidence, and the build checks that.</li><li>The shell shows the health word only. v1 showed a count the read does not return.</li></ul>
+<p>Wording put back as the source has it: the save-recovery sentences and buttons, “Cancellation after intent retains the hold…”, “Sync configured enabled”, and “Corporate login enabled” on sign-in.</p>
+<p>Behaviour kept as today where v1 changed it without saying so: binary conflicts, the second pairing mode, no preselected conflict resolution, the diff comparing SVN with Git, no control for resuming an import, the one-click sync switch on branch pairs.</p>
+<p>Structure:</p>
+<ul><li>The markup inside every page is now identical in all three options. Guide's cards and step header are gone. The build checks it.</li><li>The chooser specimens are visible in every option and width.</li><li>Adding <code>-menu</code> to the address fragment opens the “More” control for captures.</li><li>The dashboard names the repository in the commit map and the sync records.</li></ul>
+<p>Layout faults reported from the captures are corrected in the stylesheets: long buttons wrap, identifiers do not break inside tables, credentials are a list that wraps, State is the second column of the repositories table, Help has spacing and its section links wrap.</p>
+<p>The matrix has 139 rows, up from 136.</p>
+<h2 id="from-v1-1-to-v1-2">From v1.1 to v1.2</h2>
+<p>Decisions:</p>
+<ul><li>D10 to D12 are added to <a href="DECISIONS.html">DECISIONS.md</a>: light stays offered in the existing three layouts; three misleading labels are corrected in every layout; pages keep today's order of regions.</li><li>D12 reverses a recommendation made in v1.1. That version proposed a new document order for the dashboard and the repository page. It would have changed keyboard and screen-reader order in Classic.</li></ul>
+<p>Prototypes:</p>
+<ul><li><strong>Dashboard.</strong> “Needs attention” is still first, now as a read-only region with the count and the observed time. After it the regions follow today's order: in flight, repositories, sync health with the acknowledgement, recent sync records, commit map, recent activity, server. In v1.1 the health counts and the acknowledgement were in the first block.</li><li><strong>Repository page.</strong> The status line at the top of every section is read-only and links to the evidence. “What this status proves” and “Errors” are the first parts of Overview, followed by operations, recent sync records, branch pairs and the server monitor.</li><li><strong>Branch pairs section.</strong> The update preview and the held re-anchor notice come before the table, as in the page today.</li><li><strong>Console.</strong> From 1101 px the dashboard's left column is “Needs attention” and the right column is everything else in order.</li></ul>
+<p>Documents:</p>
+<ul><li><code>contracts/page-regions.md</code> is rewritten for D12.</li><li>The matrix has 136 rows, up from 134: “Needs attention” (G02.11) and the status line (G04.32).</li><li>The implementation map, the crosswalk and the index follow the three decisions.</li></ul>
+<p>Not changed from v1.1: the tokens, the shell and the “More” control, the colour bridge, the plain vocabulary, the existing layouts' light palette.</p>
+<h2 id="from-v1-to-v1-1">From v1 to v1.1</h2>
+<ul><li>The nine open decisions were settled.</li><li>Dark became the default; the “Device” option was removed.</li><li>The “More” control moved to follow the last workspace link, and opening it moves focus.</li><li>Sign-in was given one appearance, dark, in every option.</li><li>The existing layouts' light palette, the colour bridge and the page regions were added.</li><li>The repository overview kept the server monitor, collapsed.</li><li>69 screens per option, up from 68.</li></ul>
+<h2 id="still-not-done">Still not done</h2>
+<p>As of that version: no page had been opened in a browser by the designer, on the belief that no sandboxed browser could start in the container. Two versions had by then changed arrangement without a rendered check. The belief was wrong for a non-root user; see the package index.</p>
+</main>
+</body>
+</html>
