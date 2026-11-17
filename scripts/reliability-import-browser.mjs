@@ -51,6 +51,12 @@ try {
   };
   const body = () => evaluate('document.body?.innerText || ""');
   const button = (label) => evaluate(`Array.from(document.querySelectorAll('button')).some(b => b.textContent.trim() === ${JSON.stringify(label)})`);
+  // #264 G04.13: "Stop import" opens a confirmation whose confirm button carries this test id.
+  const confirmStop = async () => {
+    await until(() => evaluate(`!!document.querySelector('[data-testid="confirm-stop-import"]')`), 'stop confirmation');
+    const clicked = await evaluate(`(() => { const b = document.querySelector('[data-testid="confirm-stop-import"]'); if (!b || b.disabled) return false; b.click(); return true; })()`);
+    if (!clicked) throw new Error('stop confirmation button was not clickable');
+  };
   const click = async (label) => {
     const clicked = await evaluate(`(() => { const b = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === ${JSON.stringify(label)}); if (!b) return false; b.click(); return true; })()`);
     if (!clicked) throw new Error(`Button missing: ${label}; ${await body()}`);
@@ -203,6 +209,7 @@ try {
     await until(() => existsSync(join(barrier, 'failure_ready')), 'durable write fault installed');
     await until(() => button('Stop import'), 'stop action');
     await click('Stop import');
+    await confirmStop();
     const failed = await until(async () => (await calls()).find(c => c.method === 'POST' && c.path.endsWith(`/${operation}/cancel`) && c.status === 500), 'failed durable cancel response');
     result.failed_cancel = failed.status;
     const feedback = failed.payload?.error || 'Cancellation failed (500)';
@@ -212,6 +219,7 @@ try {
     await writeFile(join(barrier, 'failure_seen'), 'seen');
     await until(() => existsSync(join(barrier, 'failure_release')), 'failed-write inspection');
     await click('Stop import');
+    await confirmStop();
     const accepted = await until(async () => (await calls()).find(c => c.method === 'POST' && c.path.endsWith(`/${operation}/cancel`) && c.status === 200), 'exact ID accepted cancel');
     if (accepted.payload?.lifecycle !== 'cancel_requested') throw new Error(`Wrong cancel receipt: ${JSON.stringify(accepted)}`);
     result.accepted_cancel = accepted.payload.lifecycle;

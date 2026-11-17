@@ -46,8 +46,10 @@ function preferenceKey(identity) {
   return `${PREFIX}:${encodeURIComponent(appOrigin)}:${encodeURIComponent(identity)}`;
 }
 
+// #264 E2: a choice is written as version 2, with the theme (dark unless chosen). Version-1
+// records are still read; tests/gui-variations-264.e2e.mjs covers that migration.
 function preferenceRecord(identity, layout) {
-  return JSON.stringify({ version: 1, layout, identity, origin: appOrigin });
+  return JSON.stringify({ version: 2, layout, theme: 'dark', identity, origin: appOrigin });
 }
 
 /** Signs in as the synthetic administrator in a fresh context. `init` runs before every page load. */
@@ -90,7 +92,8 @@ async function chooseWithoutFocus(page, layout) {
 }
 
 async function navLinks(page) {
-  return page.locator('[data-rs-layout] > nav').evaluate(nav => [...nav.querySelectorAll('a')].map(a => [a.getAttribute('href'), a.firstChild?.textContent ?? '']));
+  // #264: each link starts with an aria-hidden icon (E6), so the label is the link's own text node.
+  return page.locator('[data-rs-layout] > nav').evaluate(nav => [...nav.querySelectorAll('a')].map(a => [a.getAttribute('href'), [...a.childNodes].filter(node => node.nodeType === Node.TEXT_NODE).map(node => node.textContent).join('')]));
 }
 
 /** Remembers the live shell, routed page and an optional extra node before a switch. */
@@ -145,8 +148,10 @@ async function assertNavFocusKeepsPageScroll(page, label) {
 }
 
 test('rs262 Classic is the default, keeps the original dark shell colors and navigation, and every layout passes axe', { timeout: 60000 }, async () => {
-  // 1600px fits the administrator's whole Classic bar on its original single 64px row.
-  const { page, close } = await open('/repos', { viewport: { width: 1600, height: 900 } });
+  // #264: the theme select (E2) and the status mark (S03) widen the account slot, so the
+  // administrator's whole Classic bar now fits its original single 64px row from 1800px
+  // (it fitted at 1600px before). Where it wraps is the accepted effect of E2.
+  const { page, close } = await open('/repos', { viewport: { width: 1800, height: 900 } });
   try {
     assert.equal(await layoutOf(page), 'classic');
     assert.equal(await page.locator('[data-rs-layout]').getAttribute('data-rs-theme'), 'dark');

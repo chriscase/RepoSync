@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { ChevronDown, ChevronRight, HardDrive, Wifi, Cpu, MemoryStick } from 'lucide-react';
 import { api, type SystemMetrics } from '../api';
+import { useText } from '../layouts/vocabulary';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -55,7 +56,7 @@ function MetricCard({
   barColorClass: string;
 }) {
   return (
-    <div className="bg-gray-800/60 border border-gray-700 rounded-lg p-4">
+    <div className="rs-sec bg-gray-800/60 border border-gray-700 rounded-lg p-4">
       <div className="flex items-center space-x-2 mb-2">
         {icon}
         <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">{label}</span>
@@ -76,10 +77,18 @@ function MetricCard({
 // ServerMonitor
 // ---------------------------------------------------------------------------
 
-export default function ServerMonitor() {
-  const [open, setOpen] = useState(true);
+/** #264 page regions: the page names the region this panel is (dashboard `server`; repository `server`, Overview). */
+interface RegionAttributes {
+  'data-rs-region'?: string;
+  'data-rs-sections'?: string;
+}
 
-  const { data: metrics } = useQuery<SystemMetrics>({
+export default function ServerMonitor({ 'data-rs-region': region, 'data-rs-sections': sections }: RegionAttributes) {
+  const t = useText();
+  const [open, setOpen] = useState(true);
+  const regionAttributes = { 'data-rs-region': region, 'data-rs-sections': sections };
+
+  const { data: metrics, isError, error } = useQuery<SystemMetrics>({
     queryKey: ['system-metrics'],
     queryFn: api.getSystemMetrics,
     refetchInterval: 15000,
@@ -94,18 +103,23 @@ export default function ServerMonitor() {
 
   if (!metrics) {
     return (
-      <div className="bg-gray-900 border border-gray-700 rounded-lg">
+      <div className="bg-gray-900 border border-gray-700 rounded-lg" {...regionAttributes}>
         <button
           aria-expanded={open}
           onClick={() => setOpen(o => !o)}
           className="w-full flex items-center justify-between px-4 py-3 text-sm font-semibold text-gray-300 hover:text-gray-100 transition-colors"
         >
-          <span>Server Monitor</span>
+          <span>{t('server.title')}</span>
           {open ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
         </button>
-        {open && (
+        {open && (isError ? (
+          // #264 truthful status: a failed read is shown as failed, not as loading for ever.
+          <div role="status" className="px-4 pb-4 text-sm text-gray-300">
+            Server metrics are unavailable.{error instanceof Error && error.message ? ` ${error.message}` : ''}
+          </div>
+        ) : (
           <div className="px-4 pb-4 text-sm text-gray-300 italic">Loading metrics...</div>
-        )}
+        ))}
       </div>
     );
   }
@@ -119,14 +133,14 @@ export default function ServerMonitor() {
   const cpuBarPercent = Math.min(100, (metrics.cpu_load_1m / Math.max(cpuMaxLoad, 4)) * 100);
 
   return (
-    <div className="bg-gray-900 border border-gray-700 rounded-lg">
+    <div className="bg-gray-900 border border-gray-700 rounded-lg" {...regionAttributes}>
       <button
         aria-expanded={open}
           onClick={() => setOpen(o => !o)}
         className="w-full flex items-center justify-between px-4 py-3 text-sm font-semibold text-gray-300 hover:text-gray-100 transition-colors"
       >
         <div className="flex items-center space-x-2">
-          <span>Server Monitor</span>
+          <span>{t('server.title')}</span>
           {metrics.git_push_active && (
             <span className="flex items-center space-x-1.5 text-xs text-emerald-400 font-normal">
               <span className="relative flex h-2 w-2">

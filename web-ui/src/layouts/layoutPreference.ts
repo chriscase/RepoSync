@@ -1,15 +1,20 @@
 import { useState } from 'react';
-import { DEFAULT_LAYOUT, LAYOUT_CATALOG, LAYOUT_IDS, isLayoutId, type LayoutId } from './layoutCatalog';
+import { DEFAULT_LAYOUT, DEFAULT_THEME, LAYOUT_CATALOG, LAYOUT_IDS, THEME_IDS, THEME_LABELS, isLayoutId, isThemeId, type LayoutId, type ThemeId } from './layoutCatalog';
 
 /**
- * #262 local presentation preference.
+ * #262 local presentation preference, extended by #264 (E2).
  *
- * Only a layout id is stored, in this browser origin's localStorage, under one
- * genuine stable account identity (the server user id). It holds no credential,
- * token, role or server setting, is never sent to the server and never decides
- * what an account may see or do. Anything unexpected falls back to Classic.
+ * Only a layout id and a theme id are stored, in this browser origin's localStorage,
+ * under one genuine stable account identity (the server user id). It holds no
+ * credential, token, role or server setting, is never sent to the server and never
+ * decides what an account may see or do. Anything unexpected falls back to Classic
+ * and dark. A record saved before E2 (version 1, layout only) still selects its
+ * layout, with the dark theme; the next choice rewrites it as version 2. The storage
+ * key is unchanged, so no saved layout is lost.
  */
-export const LAYOUT_PREFERENCE_VERSION = 1;
+export const LAYOUT_PREFERENCE_VERSION = 2;
+/** The #262 record shape, still read: {version: 1, layout, identity, origin}. */
+export const LEGACY_LAYOUT_PREFERENCE_VERSION = 1;
 export const LAYOUT_PREFERENCE_PREFIX = 'reposync.layout-preference.v1';
 /** Longest stored record, in UTF-16 code units, that the reader accepts and the writer may produce. */
 export const MAX_PREFERENCE_RECORD_LENGTH = 512;
@@ -17,6 +22,7 @@ export const MAX_ACCOUNT_IDENTITY_LENGTH = 256;
 const MAX_ORIGIN_LENGTH = 512;
 /** A scope persists only if its record fits for every layout, so no layout id is special. */
 const LONGEST_LAYOUT_ID: LayoutId = LAYOUT_IDS.reduce((longest, id) => (id.length > longest.length ? id : longest), DEFAULT_LAYOUT);
+const LONGEST_THEME_ID: ThemeId = THEME_IDS.reduce((longest, id) => (id.length > longest.length ? id : longest), DEFAULT_THEME);
 
 export type PreferenceStorage = Pick<Storage, 'getItem' | 'setItem'>;
 export interface PreferenceEnvironment {
@@ -33,14 +39,15 @@ export type PreferenceScope =
   | { readonly kind: 'unscoped'; readonly reason: UnscopedReason };
 
 export type InvalidReason = 'corrupt' | 'unsupported-version' | 'other-scope' | 'unknown-layout';
+export type InvalidThemeReason = 'unknown-theme';
 export type PreferenceRead =
-  | { readonly status: 'stored'; readonly layout: LayoutId }
-  | { readonly status: 'absent' | 'unscoped' | 'unavailable'; readonly layout: LayoutId }
-  | { readonly status: 'invalid'; readonly layout: LayoutId; readonly reason: InvalidReason };
+  | { readonly status: 'stored'; readonly layout: LayoutId; readonly theme: ThemeId }
+  | { readonly status: 'absent' | 'unscoped' | 'unavailable'; readonly layout: LayoutId; readonly theme: ThemeId }
+  | { readonly status: 'invalid'; readonly layout: LayoutId; readonly theme: ThemeId; readonly reason: InvalidReason | InvalidThemeReason };
 
 export type PreferenceWrite =
   | { readonly status: 'saved' }
-  | { readonly status: 'not-saved'; readonly reason: UnscopedReason | 'storage-error' | 'invalid-layout' };
+  | { readonly status: 'not-saved'; readonly reason: UnscopedReason | 'storage-error' | 'invalid-layout' | 'invalid-theme' };
 
 export interface LayoutPreferenceNotice {
   readonly short: string;
@@ -107,8 +114,8 @@ export function preferenceKey(origin: string, identity: string): string | null {
   }
 }
 
-function recordText(identity: string, origin: string, layout: LayoutId): string {
-  return JSON.stringify({ version: LAYOUT_PREFERENCE_VERSION, layout, identity, origin });
+function recordText(identity: string, origin: string, layout: LayoutId, theme: ThemeId): string {
+  return JSON.stringify({ version: LAYOUT_PREFERENCE_VERSION, layout, theme, identity, origin });
 }
 
 export function preferenceScope(user: unknown, environment: PreferenceEnvironment): PreferenceScope {
@@ -117,7 +124,7 @@ export function preferenceScope(user: unknown, environment: PreferenceEnvironmen
   const origin = usableOrigin(environment.origin);
   if (origin === null) return { kind: 'unscoped', reason: 'no-origin' };
   // JSON escaping can lengthen an accepted id; a scope whose record could not be re-read never persists.
-  if (recordText(identity, origin, LONGEST_LAYOUT_ID).length > MAX_PREFERENCE_RECORD_LENGTH) return { kind: 'unscoped', reason: 'record-too-large' };
+  if (recordText(identity, origin, LONGEST_LAYOUT_ID, LONGEST_THEME_ID).length > MAX_PREFERENCE_RECORD_LENGTH) return { kind: 'unscoped', reason: 'record-too-large' };
   if (environment.storageRefused) return { kind: 'unscoped', reason: 'storage-refused' };
   if (!environment.storage) return { kind: 'unscoped', reason: 'no-storage' };
   const key = preferenceKey(origin, identity);
@@ -130,49 +137,59 @@ export function scopeIdentity(scope: PreferenceScope): string {
   return scope.kind === 'account' ? `account:${scope.key}` : `unscoped:${scope.reason}`;
 }
 
-const RECORD_KEYS = ['identity', 'layout', 'origin', 'version'].join(',');
+const LEGACY_RECORD_KEYS = ['identity', 'layout', 'origin', 'version'].join(',');
+const RECORD_KEYS = ['identity', 'layout', 'origin', 'theme', 'version'].join(',');
 
-/** Exactly {version, layout, identity, origin} for this scope; anything else is not used. */
+/**
+ * Exactly {version: 2, layout, theme, identity, origin}, or the #262 record
+ * {version: 1, layout, identity, origin} read as dark, for this scope; anything else
+ * is not used and falls back to Classic and dark.
+ */
 export function parseLayoutPreference(raw: string, scope: Extract<PreferenceScope, { kind: 'account' }>): PreferenceRead {
-  const invalid = (reason: InvalidReason): PreferenceRead => ({ status: 'invalid', layout: DEFAULT_LAYOUT, reason });
+  const invalid = (reason: InvalidReason | InvalidThemeReason): PreferenceRead => ({ status: 'invalid', layout: DEFAULT_LAYOUT, theme: DEFAULT_THEME, reason });
   if (raw.length > MAX_PREFERENCE_RECORD_LENGTH) return invalid('corrupt');
   let value: unknown;
   try { value = JSON.parse(raw); } catch { return invalid('corrupt'); }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return invalid('corrupt');
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).sort().join(',') !== RECORD_KEYS) {
-    return 'version' in record && record.version !== LAYOUT_PREFERENCE_VERSION ? invalid('unsupported-version') : invalid('corrupt');
-  }
-  if (record.version !== LAYOUT_PREFERENCE_VERSION) return invalid('unsupported-version');
+  const keys = Object.keys(record).sort().join(',');
+  const legacy = record.version === LEGACY_LAYOUT_PREFERENCE_VERSION;
+  if (!legacy && record.version !== LAYOUT_PREFERENCE_VERSION) return 'version' in record ? invalid('unsupported-version') : invalid('corrupt');
+  if (keys !== (legacy ? LEGACY_RECORD_KEYS : RECORD_KEYS)) return invalid('corrupt');
   if (record.identity !== scope.identity || record.origin !== scope.origin) return invalid('other-scope');
   if (!isLayoutId(record.layout)) return invalid('unknown-layout');
-  return { status: 'stored', layout: record.layout };
+  if (legacy) return { status: 'stored', layout: record.layout, theme: DEFAULT_THEME };
+  if (!isThemeId(record.theme)) return invalid('unknown-theme');
+  return { status: 'stored', layout: record.layout, theme: record.theme };
 }
 
 export function readLayoutPreference(scope: PreferenceScope): PreferenceRead {
   if (scope.kind !== 'account') {
     // A refused storage surface is a failed read for a genuine account, not an absent preference.
-    return scope.reason === 'storage-refused' ? { status: 'unavailable', layout: DEFAULT_LAYOUT } : { status: 'unscoped', layout: DEFAULT_LAYOUT };
+    return scope.reason === 'storage-refused'
+      ? { status: 'unavailable', layout: DEFAULT_LAYOUT, theme: DEFAULT_THEME }
+      : { status: 'unscoped', layout: DEFAULT_LAYOUT, theme: DEFAULT_THEME };
   }
   let raw: string | null;
-  try { raw = scope.storage.getItem(scope.key); } catch { return { status: 'unavailable', layout: DEFAULT_LAYOUT }; }
-  if (raw === null) return { status: 'absent', layout: DEFAULT_LAYOUT };
-  if (typeof raw !== 'string') return { status: 'invalid', layout: DEFAULT_LAYOUT, reason: 'corrupt' };
+  try { raw = scope.storage.getItem(scope.key); } catch { return { status: 'unavailable', layout: DEFAULT_LAYOUT, theme: DEFAULT_THEME }; }
+  if (raw === null) return { status: 'absent', layout: DEFAULT_LAYOUT, theme: DEFAULT_THEME };
+  if (typeof raw !== 'string') return { status: 'invalid', layout: DEFAULT_LAYOUT, theme: DEFAULT_THEME, reason: 'corrupt' };
   return parseLayoutPreference(raw, scope);
 }
 
-export function serializeLayoutPreference(scope: Extract<PreferenceScope, { kind: 'account' }>, layout: LayoutId): string {
-  return recordText(scope.identity, scope.origin, layout);
+export function serializeLayoutPreference(scope: Extract<PreferenceScope, { kind: 'account' }>, layout: LayoutId, theme: ThemeId = DEFAULT_THEME): string {
+  return recordText(scope.identity, scope.origin, layout, theme);
 }
 
 /**
- * Never throws. Only an enum id is written, only for a genuine account scope,
+ * Never throws. Only enum ids are written, only for a genuine account scope,
  * and never a record parseLayoutPreference would reject: "saved" always re-reads.
  */
-export function writeLayoutPreference(scope: PreferenceScope, layout: unknown): PreferenceWrite {
+export function writeLayoutPreference(scope: PreferenceScope, layout: unknown, theme: unknown = DEFAULT_THEME): PreferenceWrite {
   if (!isLayoutId(layout)) return { status: 'not-saved', reason: 'invalid-layout' };
+  if (!isThemeId(theme)) return { status: 'not-saved', reason: 'invalid-theme' };
   if (scope.kind !== 'account') return { status: 'not-saved', reason: scope.reason };
-  const record = serializeLayoutPreference(scope, layout);
+  const record = serializeLayoutPreference(scope, layout, theme);
   // Refused before setItem, so an earlier stored preference is kept.
   if (record.length > MAX_PREFERENCE_RECORD_LENGTH) return { status: 'not-saved', reason: 'record-too-large' };
   try {
@@ -194,10 +211,14 @@ export function readNotice(read: PreferenceRead): LayoutPreferenceNotice | null 
   return null;
 }
 
-/** A chosen layout still applies when it cannot be saved; the person is told why. */
-export function writeNotice(layout: LayoutId, write: PreferenceWrite): LayoutPreferenceNotice | null {
+/**
+ * A chosen layout or theme still applies when it cannot be saved; the person is told why.
+ * `changed` names what was just chosen, so a theme choice is described as a theme.
+ */
+export function writeNotice(layout: LayoutId, write: PreferenceWrite, changed: { readonly theme: ThemeId } | null = null): LayoutPreferenceNotice | null {
   if (write.status === 'saved') return null;
-  const applies = `${LAYOUT_CATALOG[layout].label} applies in this tab until you reload`;
+  const chosen = changed ? `The ${THEME_LABELS[changed.theme]} theme` : LAYOUT_CATALOG[layout].label;
+  const applies = `${chosen} applies in this tab until you reload`;
   switch (write.reason) {
     case 'no-account-identity':
       return { short: 'Not saved', detail: `${applies}; this sign-in has no stable account identity to save it under.` };
@@ -207,6 +228,8 @@ export function writeNotice(layout: LayoutId, write: PreferenceWrite): LayoutPre
       return { short: 'Not saved', detail: `${applies}; this account identity and site address are too long to store a layout preference for.` };
     case 'invalid-layout':
       return { short: 'Not saved', detail: 'That layout is not available in this build.' };
+    case 'invalid-theme':
+      return { short: 'Not saved', detail: 'That theme is not available in this build.' };
     default:
       return { short: 'Not saved', detail: `${applies}; this browser did not allow the layout preference to be saved.` };
   }
@@ -215,18 +238,21 @@ export function writeNotice(layout: LayoutId, write: PreferenceWrite): LayoutPre
 interface PreferenceState {
   readonly scopeKey: string;
   readonly layout: LayoutId;
+  readonly theme: ThemeId;
   readonly notice: LayoutPreferenceNotice | null;
 }
 
 function initialState(scope: PreferenceScope): PreferenceState {
   const read = readLayoutPreference(scope);
-  return { scopeKey: scopeIdentity(scope), layout: read.layout, notice: readNotice(read) };
+  return { scopeKey: scopeIdentity(scope), layout: read.layout, theme: read.theme, notice: readNotice(read) };
 }
 
 export interface LayoutPreferenceControl {
   readonly layout: LayoutId;
+  readonly theme: ThemeId;
   readonly notice: LayoutPreferenceNotice | null;
   readonly choose: (layout: LayoutId) => void;
+  readonly chooseTheme: (theme: ThemeId) => void;
 }
 
 /**
@@ -245,8 +271,13 @@ export function useLayoutPreference(user: unknown, environment: () => Preference
   }
   const choose = (layout: LayoutId) => {
     if (!isLayoutId(layout)) return;
-    const write = writeLayoutPreference(scope, layout);
-    setState({ scopeKey, layout, notice: writeNotice(layout, write) });
+    const write = writeLayoutPreference(scope, layout, current.theme);
+    setState({ scopeKey, layout, theme: current.theme, notice: writeNotice(layout, write) });
   };
-  return { layout: current.layout, notice: current.notice, choose };
+  const chooseTheme = (theme: ThemeId) => {
+    if (!isThemeId(theme)) return;
+    const write = writeLayoutPreference(scope, current.layout, theme);
+    setState({ scopeKey, layout: current.layout, theme, notice: writeNotice(current.layout, write, { theme }) });
+  };
+  return { layout: current.layout, theme: current.theme, notice: current.notice, choose, chooseTheme };
 }
