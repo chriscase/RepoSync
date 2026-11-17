@@ -86,6 +86,11 @@ catalogue with two vocabularies (E3). A layout names its vocabulary:
 `existing` for Classic, Individual and Team, `plain` for Ledger, Console and
 Guide. The existing vocabulary is the text those layouts showed before #264,
 byte for byte. Safety and truthful-status sentences are the same in both.
+Two sentences on the repository page name a catalogued control: the header
+switch's title names the Stop or remove section, and the pause note in that
+section names the header pause control. Each is a whole-sentence catalogue
+entry. In the plain vocabulary it names the control's plain label, "Stop or
+remove" or "Pause sync…", and is otherwise the same sentence.
 Switching layout changes the text in place and remounts nothing.
 
 Labels in Classic, Individual and Team are unchanged, apart from these

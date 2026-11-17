@@ -1165,7 +1165,7 @@ function RepositoryDetailEditor() {
             disabled={toggleMutation.isPending || (syncSwitch === 'explicit-pause' && disableMutation.isPending)}
             title={syncSwitch === 'explicit-pause'
               ? 'Opens Pause / disable sync, which uses the explicit disable API.'
-              : 'Quick sync on/off via registration update. Use Pause / disable in Danger Zone for the explicit disable API.'}
+              : t('repo.header.switchTitle')}
             className={`rs-btn rs-btn--quiet inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
               repo.enabled
                 ? 'border border-yellow-600 text-yellow-300 hover:bg-yellow-900/30'
@@ -2135,8 +2135,7 @@ function RepositoryDetailEditor() {
                   <p className="text-sm text-gray-300 font-medium">Pause / disable sync (explicit API)</p>
                   <p className="text-sm text-gray-300 mt-0.5">
                     Calls POST /disable (same contract as legacy DELETE). Stops scheduling; registration,
-                    mappings, secrets, local files, and remotes stay. The header “Turn sync off” opens
-                    this same dialog; “Turn sync on” only updates enabled on the registration.
+                    mappings, secrets, local files, and remotes stay. {t('repo.stopRemove.pauseNote')}
                   </p>
                 </div>
                 <button
