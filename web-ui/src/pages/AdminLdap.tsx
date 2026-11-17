@@ -3,6 +3,69 @@ import { LoadingSpinner } from '../components/LoadingSpinner';
 import { useState, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, type SaveLdapConfigRequest } from '../api';
+import { CheckCircle2, CircleHelp, KeyRound, Minus, RefreshCw } from 'lucide-react';
+
+/** Whether the page holds a current read of the directory settings. */
+export type BindPasswordRead = 'read' | 'checking' | 'unreadable';
+
+type BindPasswordState = 'saved' | 'replacing' | 'not-saved' | 'checking' | 'unknown';
+
+function bindPasswordState(read: BindPasswordRead, saved: boolean, typed: boolean): BindPasswordState {
+  if (read === 'unreadable') return 'unknown';
+  if (read === 'checking') return 'checking';
+  if (!saved) return 'not-saved';
+  return typed ? 'replacing' : 'saved';
+}
+
+const BIND_PASSWORD_VIEW: Record<BindPasswordState, { word: string; sentence: string; tone: string; Icon: typeof Minus }> = {
+  saved: {
+    word: 'Saved',
+    sentence: 'A password is saved.',
+    tone: 'bg-green-900/50 text-green-300',
+    Icon: CheckCircle2,
+  },
+  replacing: {
+    word: 'Replacing',
+    sentence: 'A password is saved. A new one is typed in the field.',
+    tone: 'bg-yellow-900/50 text-yellow-300',
+    Icon: KeyRound,
+  },
+  'not-saved': {
+    word: 'Not saved',
+    sentence: 'No password is saved.',
+    tone: 'bg-gray-700 text-gray-300',
+    Icon: Minus,
+  },
+  checking: {
+    word: 'Checking',
+    sentence: 'Reading whether a password is saved…',
+    tone: 'bg-gray-700 text-gray-300',
+    Icon: RefreshCw,
+  },
+  unknown: {
+    word: 'Not known',
+    sentence: 'Whether a password is saved could not be read.',
+    tone: 'bg-yellow-900/50 text-yellow-300',
+    Icon: CircleHelp,
+  },
+};
+
+/** The bind password's state as a word and a mark, never only a placeholder. */
+export function BindPasswordStatus({ id, read, saved, typed }: { id: string; read: BindPasswordRead; saved: boolean; typed: boolean }) {
+  const state = bindPasswordState(read, saved, typed);
+  const { word, sentence, tone, Icon } = BIND_PASSWORD_VIEW[state];
+  return (
+    <p id={id} aria-live="polite" data-secret-state={state} className="mt-1 flex flex-wrap items-center gap-2 text-xs text-gray-300">
+      <span className={`rs-mark inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium ${tone}`}>
+        <Icon className="w-3 h-3 flex-shrink-0" aria-hidden="true" />
+        {word}
+      </span>
+      <span>{sentence}</span>
+    </p>
+  );
+}
+
+const derivedHeadingClass = 'rs-heading text-sm font-semibold text-gray-300';
 
 export default function AdminLdap() {
   const fieldId = useId();
@@ -18,7 +81,7 @@ export default function AdminLdap() {
     }
   })();
 
-  const { data: ldapConfig, isLoading } = useQuery({
+  const { data: ldapConfig, isLoading, isError, dataUpdatedAt } = useQuery({
     queryKey: ['ldap-config'],
     queryFn: api.getLdapConfig,
     retry: false,
@@ -38,6 +101,7 @@ export default function AdminLdap() {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [savedAt, setSavedAt] = useState(0);
 
   // Populate form from loaded config
   useEffect(() => {
@@ -57,7 +121,7 @@ export default function AdminLdap() {
   if (currentUser && currentUser.role !== 'admin') {
     return (
       <div className="text-center py-12">
-        <h2 className="text-xl font-semibold text-gray-100 mb-2">Access Denied</h2>
+        <h2 className="rs-heading text-xl font-semibold text-gray-100 mb-2">Access Denied</h2>
         <p className="text-gray-400">You need admin privileges to view this page.</p>
       </div>
     );
@@ -86,6 +150,7 @@ export default function AdminLdap() {
       const result = await api.saveLdapConfig(buildRequest());
       setMessage({ type: 'success', text: result.message || 'LDAP configuration saved' });
       setBindPassword('');
+      setSavedAt(Date.now());
       queryClient.invalidateQueries({ queryKey: ['ldap-config'] });
     } catch (err) {
       setMessage({
@@ -116,13 +181,16 @@ export default function AdminLdap() {
     }
   };
 
+  const bindPasswordRead: BindPasswordRead =
+    !ldapConfig || isError ? 'unreadable' : dataUpdatedAt < savedAt ? 'checking' : 'read';
+
   const inputClass =
-    'w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm';
+    'rs-in w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm';
 
   return (
     <div className="max-w-3xl mx-auto space-y-6">
       <div>
-        <h1 className="text-2xl font-bold text-gray-100">LDAP Configuration</h1>
+        <h1 className="rs-title text-2xl font-bold text-gray-100">LDAP Configuration</h1>
         <p className="mt-1 text-gray-400">
           Configure LDAP/Active Directory authentication. When enabled, users can log in with
           their corporate credentials. New accounts are auto-provisioned on first login.
@@ -133,7 +201,7 @@ export default function AdminLdap() {
         <div
           id={`${fieldId}-feedback`}
           role={message.type === 'error' ? 'alert' : 'status'}
-          className={`px-4 py-3 rounded text-sm ${
+          className={`rs-bn ${message.type === 'success' ? 'rs-bn--ok' : 'rs-bn--danger'} px-4 py-3 rounded text-sm ${
             message.type === 'success'
               ? 'bg-green-900/40 border border-green-700 text-green-300'
               : 'bg-red-900/40 border border-red-700 text-red-300'
@@ -143,7 +211,8 @@ export default function AdminLdap() {
         </div>
       )}
 
-      <div role="group" aria-label="LDAP configuration settings" aria-describedby={message ? `${fieldId}-feedback` : undefined} className="bg-gray-800 rounded-lg border border-gray-700 p-6 space-y-6">
+      <div role="group" aria-label="LDAP configuration settings" aria-describedby={message ? `${fieldId}-feedback` : undefined} className="rs-sec bg-gray-800 rounded-lg border border-gray-700 p-6 space-y-6">
+        <h2 data-rs-derived="" className={`${derivedHeadingClass} mb-3 [&+*]:!mt-0`}>Directory sign-in</h2>
         {/* Enable/Disable */}
         <div className="flex items-center gap-3">
           <input
@@ -158,6 +227,7 @@ export default function AdminLdap() {
           </label>
         </div>
 
+        <h2 data-rs-derived="" className={`${derivedHeadingClass} !-mb-3`}>Connection</h2>
         {/* Server URL */}
         <div>
           <label className="block text-sm font-medium text-gray-400 mb-1" htmlFor={`${fieldId}-1`}>Server URL</label>
@@ -200,6 +270,7 @@ export default function AdminLdap() {
           </p>
         </div>
 
+        <h2 data-rs-derived="" className={`${derivedHeadingClass} !-mb-3`}>User mapping</h2>
         {/* Attribute Mappings */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
@@ -236,7 +307,7 @@ export default function AdminLdap() {
 
         {/* Service Account */}
         <div className="border-t border-gray-700 pt-6">
-          <h3 className="text-sm font-semibold text-gray-300 mb-3">
+          <h3 className="rs-heading text-sm font-semibold text-gray-300 mb-3">
             Service Account (Optional)
           </h3>
           <p className="text-xs text-gray-300 mb-4">
@@ -267,7 +338,9 @@ export default function AdminLdap() {
                 onChange={(e) => setBindPassword(e.target.value)}
                 className={inputClass}
                 placeholder={bindPasswordSet ? 'Leave blank to keep current' : 'Service account password'} id={`${fieldId}-8`}
+                aria-describedby={`${fieldId}-8-state`}
               />
+              <BindPasswordStatus id={`${fieldId}-8-state`} read={bindPasswordRead} saved={ldapConfig?.bind_password_set === true} typed={bindPassword !== ''} />
             </div>
           </div>
         </div>
@@ -278,7 +351,7 @@ export default function AdminLdap() {
             onClick={handleSave}
             aria-describedby={message ? `${fieldId}-feedback` : undefined}
             disabled={saving}
-            className="px-4 py-2 text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="rs-btn rs-btn--primary px-4 py-2 text-sm font-medium rounded-md rs-text-on-accent bg-blue-600 hover:bg-blue-700 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500"
           >
             {saving ? 'Saving...' : 'Save Configuration'}
           </button>

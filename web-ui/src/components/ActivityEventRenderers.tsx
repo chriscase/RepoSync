@@ -58,7 +58,13 @@ export function renderAuditEvent(event: ActivityEvent): React.ReactNode {
   return (
     <div className="flex items-center justify-between w-full gap-2 min-w-0">
       <div className="flex items-center gap-2 min-w-0 flex-1">
-        {success !== undefined && <SuccessIndicator success={success} />}
+        {success === true && <SuccessIndicator success />}
+        {success === false && (
+          <span className="inline-flex items-center gap-1 flex-shrink-0 text-xs font-medium text-red-300">
+            <span aria-hidden="true" className="inline-block w-2 h-2 rounded-full bg-red-400" />
+            Failed
+          </span>
+        )}
         {repoName && repoName !== 'default' && <RepoBadge name={repoName} />}
         {direction && <DirectionBadge direction={direction} />}
         {action && <ActionBadge action={action} />}
@@ -91,6 +97,7 @@ export function renderAuditEvent(event: ActivityEvent): React.ReactNode {
 function formatTimeAgo(dateStr: string): string {
   try {
     const date = new Date(dateStr);
+    if (Number.isNaN(date.getTime())) return dateStr;
     const now = new Date();
     const diffMs = now.getTime() - date.getTime();
     const diffSec = Math.floor(diffMs / 1000);

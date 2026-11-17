@@ -1,0 +1,432 @@
+/*
+ * #264 page and shell tokens for every layout and theme, from the accepted #263 design
+ * (docs/design/263/v1.6/options/<id>/tokens.css and contracts/design-system.md).
+ *
+ * Shell tokens (--rs-shell-*) keep #262's names and meaning. Page tokens (--rs-bg,
+ * --rs-surface, --rs-text and the rest) colour page content through colourBridge.css
+ * and pageClasses.css, which apply only when the shell carries data-rs-bridge: every
+ * layout in light, and Ledger, Console and Guide in dark. Classic, Individual and Team
+ * in dark declare no page tokens and render exactly as before #264.
+ */
+
+/* ledger */
+.rs-layout-shell[data-rs-layout='ledger'] {
+  --rs-font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --rs-font-display: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  --rs-font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --rs-display-weight: 600;
+  --rs-fs: 15px;
+  --rs-lh: 1.55;
+  --rs-h1: 1.85rem;
+  --rs-h2: 1.15rem;
+  --rs-radius: 2px;
+  --rs-radius-lg: 2px;
+  --rs-gap: 12px;
+  --rs-gap-lg: 22px;
+  --rs-pad: 18px;
+  --rs-pad-sm: 12px;
+  --rs-cell: 9px 10px;
+  --rs-control-h: 34px;
+  --rs-btn-pad: 14px;
+}
+
+.rs-layout-shell[data-rs-layout='ledger'][data-rs-theme='light'] {
+  --rs-shell-canvas: #fbfbf8;
+  --rs-shell-chrome: #fbfbf8;
+  --rs-shell-border: #16181d;
+  --rs-shell-hover: #e7e7df;
+  --rs-shell-text-strong: #16181d;
+  --rs-shell-text-muted: #4a4f59;
+  --rs-shell-accent: #16181d;
+  --rs-shell-accent-text: #ffffff;
+  --rs-shell-alert: #b3261e;
+  --rs-shell-alert-text: #ffffff;
+  --rs-shell-notice-text: #7a4f00;
+  --rs-shell-focus: #1a4fa3;
+  --rs-bg: #fbfbf8;
+  --rs-surface: #ffffff;
+  --rs-surface-2: #f3f3ee;
+  --rs-surface-3: #e7e7df;
+  --rs-line: #d6d6cd;
+  --rs-line-strong: #8f8f85;
+  --rs-text: #16181d;
+  --rs-text-2: #3d424b;
+  --rs-text-3: #5a606b;
+  --rs-accent: #16181d;
+  --rs-accent-text: #ffffff;
+  --rs-accent-soft: #ecece5;
+  --rs-link: #1a4fa3;
+  --rs-focus: #1a4fa3;
+  --rs-ok: #17663c;
+  --rs-run: #1b5fa8;
+  --rs-warn: #855600;
+  --rs-held: #a3460a;
+  --rs-danger: #b3261e;
+  --rs-off: #5a606b;
+  --rs-ok-soft: #e3f1e7;
+  --rs-run-soft: #e3edf8;
+  --rs-warn-soft: #f8eed2;
+  --rs-held-soft: #fbe6d6;
+  --rs-danger-soft: #fbe4e1;
+  --rs-svn: #1b5fa8;
+  --rs-git: #6d3fc4;
+  --rs-code-bg: #f1f1ec;
+  --rs-code-text: #16181d;
+  --rs-add-bg: #dff3e4;
+  --rs-del-bg: #fbe1de;
+  --rs-scrim: rgba(22,24,29,.45);
+  --rs-shadow: 0 8px 28px rgba(22,24,29,.18);
+  --rs-danger-solid: #b3261e;
+  --rs-danger-solid-text: #ffffff;
+  color-scheme: light;
+}
+
+.rs-layout-shell[data-rs-layout='ledger'][data-rs-theme='dark'] {
+  --rs-shell-canvas: #131417;
+  --rs-shell-chrome: #131417;
+  --rs-shell-border: #7d7b76;
+  --rs-shell-hover: #2a2d34;
+  --rs-shell-text-strong: #eceae4;
+  --rs-shell-text-muted: #b4b2ab;
+  --rs-shell-accent: #eceae4;
+  --rs-shell-accent-text: #131417;
+  --rs-shell-alert: #ff8a80;
+  --rs-shell-alert-text: #2a0806;
+  --rs-shell-notice-text: #e6b450;
+  --rs-shell-focus: #8fb8ff;
+  --rs-bg: #131417;
+  --rs-surface: #1a1c20;
+  --rs-surface-2: #212329;
+  --rs-surface-3: #2a2d34;
+  --rs-line: #353841;
+  --rs-line-strong: #6b6f7a;
+  --rs-text: #eceae4;
+  --rs-text-2: #c5c3bc;
+  --rs-text-3: #a09f98;
+  --rs-accent: #eceae4;
+  --rs-accent-text: #131417;
+  --rs-accent-soft: #2a2d34;
+  --rs-link: #8fb8ff;
+  --rs-focus: #8fb8ff;
+  --rs-ok: #6fd39a;
+  --rs-run: #7fb4f5;
+  --rs-warn: #e6b450;
+  --rs-held: #f0935a;
+  --rs-danger: #ff8a80;
+  --rs-off: #a09f98;
+  --rs-ok-soft: #16301f;
+  --rs-run-soft: #152a44;
+  --rs-warn-soft: #3a2d0c;
+  --rs-held-soft: #3d2212;
+  --rs-danger-soft: #421a17;
+  --rs-svn: #7fb4f5;
+  --rs-git: #c3a2ff;
+  --rs-code-bg: #0e0f12;
+  --rs-code-text: #eceae4;
+  --rs-add-bg: #153220;
+  --rs-del-bg: #45201c;
+  --rs-scrim: rgba(0,0,0,.6);
+  --rs-shadow: 0 10px 32px rgba(0,0,0,.55);
+  --rs-danger-solid: #c9372c;
+  --rs-danger-solid-text: #ffffff;
+  color-scheme: dark;
+}
+
+/* console */
+.rs-layout-shell[data-rs-layout='console'] {
+  --rs-font-ui: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --rs-font-display: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --rs-font-mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+  --rs-display-weight: 650;
+  --rs-fs: 13px;
+  --rs-lh: 1.45;
+  --rs-h1: 1.35rem;
+  --rs-h2: 0.98rem;
+  --rs-radius: 4px;
+  --rs-radius-lg: 6px;
+  --rs-gap: 8px;
+  --rs-gap-lg: 14px;
+  --rs-pad: 12px;
+  --rs-pad-sm: 9px;
+  --rs-cell: 5px 9px;
+  --rs-control-h: 28px;
+  --rs-btn-pad: 10px;
+}
+
+.rs-layout-shell[data-rs-layout='console'][data-rs-theme='light'] {
+  --rs-shell-canvas: #f4f6f8;
+  --rs-shell-chrome: #e9edf1;
+  --rs-shell-border: #c5ced6;
+  --rs-shell-hover: #dde3e9;
+  --rs-shell-text-strong: #111820;
+  --rs-shell-text-muted: #4a5764;
+  --rs-shell-accent: #0b6f7c;
+  --rs-shell-accent-text: #ffffff;
+  --rs-shell-alert: #b42318;
+  --rs-shell-alert-text: #ffffff;
+  --rs-shell-notice-text: #7a4f00;
+  --rs-shell-focus: #0b6f7c;
+  --rs-bg: #f4f6f8;
+  --rs-surface: #ffffff;
+  --rs-surface-2: #eef1f4;
+  --rs-surface-3: #e2e7ec;
+  --rs-line: #cfd6dd;
+  --rs-line-strong: #7f8c99;
+  --rs-text: #111820;
+  --rs-text-2: #36424e;
+  --rs-text-3: #566371;
+  --rs-accent: #0b6f7c;
+  --rs-accent-text: #ffffff;
+  --rs-accent-soft: #d9eef1;
+  --rs-link: #0b6370;
+  --rs-focus: #0b6f7c;
+  --rs-ok: #1a7446;
+  --rs-run: #1766b3;
+  --rs-warn: #855600;
+  --rs-held: #a3460a;
+  --rs-danger: #b42318;
+  --rs-off: #566371;
+  --rs-ok-soft: #dff2e6;
+  --rs-run-soft: #e0ecf8;
+  --rs-warn-soft: #f7edcf;
+  --rs-held-soft: #fbe5d5;
+  --rs-danger-soft: #fbe3e0;
+  --rs-svn: #1766b3;
+  --rs-git: #6f42c1;
+  --rs-code-bg: #eaeef2;
+  --rs-code-text: #111820;
+  --rs-add-bg: #dbf1e2;
+  --rs-del-bg: #fbe0dd;
+  --rs-scrim: rgba(17,24,32,.45);
+  --rs-shadow: 0 8px 26px rgba(17,24,32,.2);
+  --rs-danger-solid: #b42318;
+  --rs-danger-solid-text: #ffffff;
+  color-scheme: light;
+}
+
+.rs-layout-shell[data-rs-layout='console'][data-rs-theme='dark'] {
+  --rs-shell-canvas: #0f141a;
+  --rs-shell-chrome: #0a0e13;
+  --rs-shell-border: #2a3644;
+  --rs-shell-hover: #1b242e;
+  --rs-shell-text-strong: #e6edf3;
+  --rs-shell-text-muted: #9aa7b4;
+  --rs-shell-accent: #2fb7c6;
+  --rs-shell-accent-text: #04161a;
+  --rs-shell-alert: #f47067;
+  --rs-shell-alert-text: #1a0605;
+  --rs-shell-notice-text: #e3b341;
+  --rs-shell-focus: #6fd3de;
+  --rs-bg: #0f141a;
+  --rs-surface: #151c24;
+  --rs-surface-2: #1b242e;
+  --rs-surface-3: #24303c;
+  --rs-line: #2a3644;
+  --rs-line-strong: #5a6b7d;
+  --rs-text: #e6edf3;
+  --rs-text-2: #b7c2cd;
+  --rs-text-3: #8f9caa;
+  --rs-accent: #2fb7c6;
+  --rs-accent-text: #04161a;
+  --rs-accent-soft: #0f3038;
+  --rs-link: #6fd3de;
+  --rs-focus: #6fd3de;
+  --rs-ok: #4cc38a;
+  --rs-run: #5bb8f0;
+  --rs-warn: #e3b341;
+  --rs-held: #f0883e;
+  --rs-danger: #f47067;
+  --rs-off: #8f9caa;
+  --rs-ok-soft: #12301f;
+  --rs-run-soft: #10283b;
+  --rs-warn-soft: #3b2f0b;
+  --rs-held-soft: #3d230f;
+  --rs-danger-soft: #46191a;
+  --rs-svn: #6cb6ff;
+  --rs-git: #c297ff;
+  --rs-code-bg: #0a0e13;
+  --rs-code-text: #e6edf3;
+  --rs-add-bg: #12301f;
+  --rs-del-bg: #46191a;
+  --rs-scrim: rgba(0,0,0,.62);
+  --rs-shadow: 0 10px 30px rgba(0,0,0,.6);
+  --rs-danger-solid: #c93c37;
+  --rs-danger-solid-text: #ffffff;
+  color-scheme: dark;
+}
+
+/* guide */
+.rs-layout-shell[data-rs-layout='guide'] {
+  --rs-font-ui: ui-rounded, "SF Pro Rounded", "Hiragino Maru Gothic ProN", "Segoe UI", system-ui, sans-serif;
+  --rs-font-display: ui-rounded, "SF Pro Rounded", "Hiragino Maru Gothic ProN", "Segoe UI", system-ui, sans-serif;
+  --rs-font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --rs-display-weight: 700;
+  --rs-fs: 16px;
+  --rs-lh: 1.5;
+  --rs-h1: 1.7rem;
+  --rs-h2: 1.12rem;
+  --rs-radius: 10px;
+  --rs-radius-lg: 16px;
+  --rs-gap: 12px;
+  --rs-gap-lg: 20px;
+  --rs-pad: 20px;
+  --rs-pad-sm: 14px;
+  --rs-cell: 12px 14px;
+  --rs-control-h: 42px;
+  --rs-btn-pad: 18px;
+}
+
+.rs-layout-shell[data-rs-layout='guide'][data-rs-theme='light'] {
+  --rs-shell-canvas: #f2f4f8;
+  --rs-shell-chrome: #ffffff;
+  --rs-shell-border: #dbe0ea;
+  --rs-shell-hover: #eaeef5;
+  --rs-shell-text-strong: #131722;
+  --rs-shell-text-muted: #4b556a;
+  --rs-shell-accent: #2456e6;
+  --rs-shell-accent-text: #ffffff;
+  --rs-shell-alert: #b42318;
+  --rs-shell-alert-text: #ffffff;
+  --rs-shell-notice-text: #7a4f00;
+  --rs-shell-focus: #2456e6;
+  --rs-bg: #f2f4f8;
+  --rs-surface: #ffffff;
+  --rs-surface-2: #f6f8fb;
+  --rs-surface-3: #e6eaf2;
+  --rs-line: #dbe0ea;
+  --rs-line-strong: #8792a6;
+  --rs-text: #131722;
+  --rs-text-2: #3b4354;
+  --rs-text-3: #586176;
+  --rs-accent: #2456e6;
+  --rs-accent-text: #ffffff;
+  --rs-accent-soft: #e3ebff;
+  --rs-link: #1f4fd6;
+  --rs-focus: #2456e6;
+  --rs-ok: #157040;
+  --rs-run: #1f4fd6;
+  --rs-warn: #855600;
+  --rs-held: #a3460a;
+  --rs-danger: #b42318;
+  --rs-off: #586176;
+  --rs-ok-soft: #e0f3e7;
+  --rs-run-soft: #e3ebff;
+  --rs-warn-soft: #f8eed0;
+  --rs-held-soft: #fbe6d6;
+  --rs-danger-soft: #fbe3e0;
+  --rs-svn: #1b66ab;
+  --rs-git: #7438c9;
+  --rs-code-bg: #eef1f6;
+  --rs-code-text: #131722;
+  --rs-add-bg: #dcf2e3;
+  --rs-del-bg: #fbe0dd;
+  --rs-scrim: rgba(19,23,34,.45);
+  --rs-shadow: 0 12px 34px rgba(19,23,34,.16);
+  --rs-danger-solid: #b42318;
+  --rs-danger-solid-text: #ffffff;
+  color-scheme: light;
+}
+
+.rs-layout-shell[data-rs-layout='guide'][data-rs-theme='dark'] {
+  --rs-shell-canvas: #12151c;
+  --rs-shell-chrome: #171b24;
+  --rs-shell-border: #313848;
+  --rs-shell-hover: #252b3a;
+  --rs-shell-text-strong: #eef1f7;
+  --rs-shell-text-muted: #a6afc0;
+  --rs-shell-accent: #7da2ff;
+  --rs-shell-accent-text: #0b1020;
+  --rs-shell-alert: #ff8f85;
+  --rs-shell-alert-text: #2a0806;
+  --rs-shell-notice-text: #e8b84e;
+  --rs-shell-focus: #9bb8ff;
+  --rs-bg: #12151c;
+  --rs-surface: #1a1e28;
+  --rs-surface-2: #212634;
+  --rs-surface-3: #2b3142;
+  --rs-line: #313848;
+  --rs-line-strong: #66708a;
+  --rs-text: #eef1f7;
+  --rs-text-2: #c3c9d6;
+  --rs-text-3: #9aa3b5;
+  --rs-accent: #7da2ff;
+  --rs-accent-text: #0b1020;
+  --rs-accent-soft: #1c2747;
+  --rs-link: #9bb8ff;
+  --rs-focus: #9bb8ff;
+  --rs-ok: #63d19a;
+  --rs-run: #7da2ff;
+  --rs-warn: #e8b84e;
+  --rs-held: #f29a62;
+  --rs-danger: #ff8f85;
+  --rs-off: #9aa3b5;
+  --rs-ok-soft: #143023;
+  --rs-run-soft: #1c2747;
+  --rs-warn-soft: #3a2e0d;
+  --rs-held-soft: #3e2413;
+  --rs-danger-soft: #431b18;
+  --rs-svn: #79b8f7;
+  --rs-git: #c7a4ff;
+  --rs-code-bg: #0d1016;
+  --rs-code-text: #eef1f7;
+  --rs-add-bg: #143023;
+  --rs-del-bg: #431b18;
+  --rs-scrim: rgba(0,0,0,.6);
+  --rs-shadow: 0 14px 36px rgba(0,0,0,.55);
+  --rs-danger-solid: #c93c37;
+  --rs-danger-solid-text: #ffffff;
+  color-scheme: dark;
+}
+
+/* Classic, Individual and Team in light (decision D10, row S32). Their dark theme
+   keeps today's page classes, so it declares no page tokens. */
+.rs-layout-shell[data-rs-theme='light']:is([data-rs-layout='classic'], [data-rs-layout='individual'], [data-rs-layout='team']) {
+  --rs-shell-canvas: #f3f4f6;
+  --rs-shell-chrome: #ffffff;
+  --rs-shell-border: #d1d5db;
+  --rs-shell-hover: #e5e7eb;
+  --rs-shell-text-strong: #111827;
+  --rs-shell-text-muted: #4b5563;
+  --rs-shell-accent: #2563eb;
+  --rs-shell-accent-text: #ffffff;
+  --rs-shell-alert: #b91c1c;
+  --rs-shell-alert-text: #ffffff;
+  --rs-shell-notice-text: #92400e;
+  --rs-shell-focus: #1d4ed8;
+  --rs-bg: #f3f4f6;
+  --rs-surface: #ffffff;
+  --rs-surface-2: #f3f4f6;
+  --rs-surface-3: #e5e7eb;
+  --rs-line: #e5e7eb;
+  --rs-line-strong: #7f8a9a;
+  --rs-text: #111827;
+  --rs-text-2: #374151;
+  --rs-text-3: #4b5563;
+  --rs-accent: #2563eb;
+  --rs-accent-text: #ffffff;
+  --rs-accent-soft: #dbeafe;
+  --rs-link: #1d4ed8;
+  --rs-focus: #1d4ed8;
+  --rs-ok: #15803d;
+  --rs-run: #1d4ed8;
+  --rs-warn: #925207;
+  --rs-held: #b93c0c;
+  --rs-danger: #b91c1c;
+  --rs-off: #4b5563;
+  --rs-ok-soft: #dcfce7;
+  --rs-run-soft: #dbeafe;
+  --rs-warn-soft: #fef9c3;
+  --rs-held-soft: #ffedd5;
+  --rs-danger-soft: #fee2e2;
+  --rs-svn: #1d4ed8;
+  --rs-git: #7e22ce;
+  --rs-code-bg: #f3f4f6;
+  --rs-code-text: #111827;
+  --rs-add-bg: #dcfce7;
+  --rs-del-bg: #fee2e2;
+  --rs-scrim: rgba(17,24,39,.5);
+  --rs-shadow: 0 10px 30px rgba(17,24,39,.18);
+  --rs-danger-solid: #b91c1c;
+  --rs-danger-solid-text: #ffffff;
+  color-scheme: light;
+}

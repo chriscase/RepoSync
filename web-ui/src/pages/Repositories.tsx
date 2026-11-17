@@ -18,8 +18,9 @@ import { readBranchPairRemovalNotice, readPersistedBranchPairRemovalNotice } fro
 import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
 import ManagedRemovalReceiptNotice from '../components/ManagedRemovalReceiptNotice';
 import { readAllManagedRemovalReceipts, shouldDisplayManagedRemovalReceipt } from '../managedRemoval';
-import { GitBranch, Plus, Database, Clock, X, ArrowRight } from 'lucide-react';
+import { GitBranch, Plus, Database, Clock, X, ArrowRight, CheckCircle2, XCircle } from 'lucide-react';
 import { getStoredUser } from '../utils/auth';
+import { useText } from '../layouts/vocabulary';
 
 /** Custom SVG icon: two circular sync arrows, one blue (SVN) and one purple (Git) */
 function SyncArrowsIcon({ className = 'w-8 h-8' }: { className?: string }) {
@@ -28,30 +29,73 @@ function SyncArrowsIcon({ className = 'w-8 h-8' }: { className?: string }) {
       {/* Blue (SVN) arrow - top arc going right */}
       <path
         d="M8 14 A8 8 0 0 1 24 14"
-        stroke="#3b82f6"
+        style={{ stroke: 'var(--rs-svn, #3b82f6)' }}
         strokeWidth="2.5"
         strokeLinecap="round"
         fill="none"
       />
-      <path d="M22 10 L24 14 L20 14" fill="#3b82f6" />
+      <path d="M22 10 L24 14 L20 14" style={{ fill: 'var(--rs-svn, #3b82f6)' }} />
       {/* Purple (Git) arrow - bottom arc going left */}
       <path
         d="M24 18 A8 8 0 0 1 8 18"
-        stroke="#a855f7"
+        style={{ stroke: 'var(--rs-git, #a855f7)' }}
         strokeWidth="2.5"
         strokeLinecap="round"
         fill="none"
       />
-      <path d="M10 22 L8 18 L12 18" fill="#a855f7" />
+      <path d="M10 22 L8 18 L12 18" style={{ fill: 'var(--rs-git, #a855f7)' }} />
     </svg>
   );
 }
 
+/** A connection test's outcome as the dialog shows it: the client's message and when it arrived. */
+export interface ConnectionTestOutcome {
+  ok: boolean;
+  message: string;
+  testedAt: Date;
+}
+
+function twoDigits(value: number): string {
+  return String(value).padStart(2, '0');
+}
+
+/** Local wall-clock time of a test result, hours:minutes:seconds. */
+function testedAtLabel(at: Date): string {
+  return `${twoDigits(at.getHours())}:${twoDigits(at.getMinutes())}:${twoDigits(at.getSeconds())}`;
+}
+
+/**
+ * The result beside a "Test … Connection" button. The live region is always in the page so a
+ * new result is announced; it is empty while idle and while a test runs. The result carries a
+ * mark (with its meaning in words for assistive technology) and the time it arrived.
+ */
+export function ConnectionTestResult({ result }: { result: ConnectionTestOutcome | null }) {
+  return (
+    <span role="status">
+      {result && (
+        <span className={`ml-3 text-xs ${result.ok ? 'text-green-300' : 'text-red-300'}`}>
+          {result.ok ? (
+            <CheckCircle2 className="inline-block w-3.5 h-3.5 mr-1 align-text-bottom" aria-hidden="true" />
+          ) : (
+            <XCircle className="inline-block w-3.5 h-3.5 mr-1 align-text-bottom" aria-hidden="true" />
+          )}
+          <span className="sr-only">{result.ok ? 'Connection test passed: ' : 'Connection test failed: '}</span>
+          {result.message}
+          <span className="text-gray-400">
+            {' · tested '}
+            <time dateTime={result.testedAt.toISOString()}>{testedAtLabel(result.testedAt)}</time>
+          </span>
+        </span>
+      )}
+    </span>
+  );
+}
+
 const inputClass =
-  'w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
+  'rs-in w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
 
 const selectClass =
-  'w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
+  'rs-in w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
 
 interface AddRepoForm {
   name: string;
@@ -99,6 +143,7 @@ export default function Repositories() {
 }
 
 function RepositoriesEditor() {
+  const t = useText();
   const fieldId = useId();
   const navigate = useNavigate();
   const location = useLocation();
@@ -112,8 +157,8 @@ function RepositoriesEditor() {
 
   const [showAddModal, setShowAddModal] = useState(false);
   const [form, setForm] = useState<AddRepoForm>({ ...defaultForm });
-  const [svnTestResult, setSvnTestResult] = useState<{ ok: boolean; message: string } | null>(null);
-  const [gitTestResult, setGitTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [svnTestResult, setSvnTestResult] = useState<ConnectionTestOutcome | null>(null);
+  const [gitTestResult, setGitTestResult] = useState<ConnectionTestOutcome | null>(null);
   const [svnTesting, setSvnTesting] = useState(false);
   const [gitTesting, setGitTesting] = useState(false);
   const saveFlow=useRepositorySave(undefined,showAddModal);
@@ -199,9 +244,9 @@ function RepositoriesEditor() {
         username: form.svn_username,
         password: form.svn_password || undefined,
       });
-      setSvnTestResult(result);
+      setSvnTestResult({ ok: result.ok === true, message: result.message, testedAt: new Date() });
     } catch (e: unknown) {
-      setSvnTestResult({ ok: false, message: e instanceof Error ? e.message : String(e) });
+      setSvnTestResult({ ok: false, message: e instanceof Error ? e.message : String(e), testedAt: new Date() });
     } finally {
       setSvnTesting(false);
     }
@@ -217,9 +262,9 @@ function RepositoriesEditor() {
         provider: form.git_provider,
         token: form.git_token || undefined,
       });
-      setGitTestResult(result);
+      setGitTestResult({ ok: result.ok === true, message: result.message, testedAt: new Date() });
     } catch (e: unknown) {
-      setGitTestResult({ ok: false, message: e instanceof Error ? e.message : String(e) });
+      setGitTestResult({ ok: false, message: e instanceof Error ? e.message : String(e), testedAt: new Date() });
     } finally {
       setGitTesting(false);
     }
@@ -269,18 +314,18 @@ function RepositoriesEditor() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-bold text-gray-100">Repositories</h1>
-          <span className="inline-flex items-center justify-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-900/50 text-blue-300">
+          <h1 className="rs-title text-2xl font-bold text-gray-100">Repositories</h1>
+          <span className="rs-mark inline-flex items-center justify-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-900/50 text-blue-300">
             {parents.length}
           </span>
         </div>
         {isAdmin && (
           <button
             onClick={openAdd}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition-colors"
+            className="rs-btn rs-btn--primary inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 rs-text-on-accent text-sm font-medium transition-colors"
           >
             <Plus className="w-4 h-4" />
-            Add Repository
+            {t('repos.add')}
           </button>
         )}
       </div>
@@ -288,7 +333,7 @@ function RepositoriesEditor() {
       {/* Repository List */}
       {parents.length === 0 ? (
         /* Empty State */
-        <div className="bg-gray-800/60 border border-gray-700 rounded-lg py-20 px-8 text-center flex flex-col items-center">
+        <div className="rs-sec bg-gray-800/60 border border-gray-700 rounded-lg py-20 px-8 text-center flex flex-col items-center">
           <SyncArrowsIcon className="w-16 h-16 mb-6 opacity-60" />
           <p className="text-gray-300 text-xl font-semibold">No repositories configured</p>
           <p className="text-gray-500 text-sm mt-2 mb-6">
@@ -297,10 +342,10 @@ function RepositoriesEditor() {
           {isAdmin && (
             <button
               onClick={openAdd}
-              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition-colors"
+              className="rs-btn rs-btn--primary inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 rs-text-on-accent text-sm font-medium transition-colors"
             >
               <Plus className="w-4 h-4" />
-              Add Repository
+              {t('repos.add')}
             </button>
           )}
         </div>
@@ -308,7 +353,7 @@ function RepositoriesEditor() {
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
           {parents.map((repo: Repository) => {
             return (
-              <div key={repo.id} className="group/card bg-gray-800/60 border border-gray-700 rounded-lg overflow-hidden hover:border-blue-500/50 transition-colors">
+              <div key={repo.id} className="rs-sec group/card bg-gray-800/60 border border-gray-700 rounded-lg overflow-hidden hover:border-blue-500/50 transition-colors">
                 {/* Parent Repo Card */}
                 <button
                   onClick={() => navigate(`/repos/${repo.id}`)}
@@ -324,11 +369,11 @@ function RepositoriesEditor() {
                     <div className="flex-1 min-w-0">
                       {/* Name + Badge row */}
                       <div className="flex items-center gap-3 mb-2.5">
-                        <h3 className="text-lg font-semibold text-gray-100 truncate group-hover/card:text-blue-400 transition-colors">
+                        <h3 className="rs-heading text-lg font-semibold text-gray-100 truncate group-hover/card:text-blue-400 transition-colors">
                           {repo.name}
                         </h3>
                         <span
-                          className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium flex-shrink-0 ${
+                          className={`rs-mark inline-flex items-center px-2 py-0.5 rounded text-xs font-medium flex-shrink-0 ${
                             repo.enabled
                               ? 'bg-blue-900/50 text-blue-300'
                               : 'bg-gray-700 text-gray-400'
@@ -365,8 +410,8 @@ function RepositoriesEditor() {
 
       {/* Add Repository Modal */}
       {showAddModal && (
-        <Dialog title="Add Repository" description="Configure the registered SVN and Git endpoints and import policy. Review saved and pending stages before retrying." onClose={closeAdd} busy={saveFlow.pending}>
-          <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+        <Dialog title={t('repos.add')} description="Configure the registered SVN and Git endpoints and import policy. Review saved and pending stages before retrying." onClose={closeAdd} busy={saveFlow.pending}>
+          <div className="rs-dlg bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
             {/* Modal header */}
             <div className="flex items-center justify-between p-6 border-b border-gray-700">
 
@@ -385,7 +430,7 @@ function RepositoriesEditor() {
 
               {/* Name */}
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1" htmlFor={`${fieldId}-1`}>Repository Name</label>
+                <label className="block text-sm font-medium text-gray-300 mb-1" htmlFor={`${fieldId}-1`}>{t('repos.add.name')}</label>
                 <input
                   type="text"
                   className={inputClass}
@@ -397,13 +442,13 @@ function RepositoriesEditor() {
 
               {/* SVN Section */}
               <div>
-                <h3 className="text-sm font-medium text-gray-300 mb-3 flex items-center gap-2">
+                <h3 className="rs-heading text-sm font-medium text-gray-300 mb-3 flex items-center gap-2">
                   <Database className="w-4 h-4 text-blue-400" />
-                  SVN Configuration
+                  {t('repos.add.svn')}
                 </h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-2`}>SVN URL</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-2`}>{t('field.svnUrl')}</label>
                     <input
                       type="text"
                       className={inputClass}
@@ -433,7 +478,7 @@ function RepositoriesEditor() {
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-5`}>Password</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-5`}>{t('field.svnPassword')}</label>
                     <input
                       type="password"
                       className={inputClass}
@@ -447,24 +492,20 @@ function RepositoriesEditor() {
                       type="button"
                       onClick={handleTestSvn}
                       disabled={svnTesting || !form.svn_url}
-                      className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border border-blue-600 text-blue-300 hover:bg-blue-900/30 disabled:opacity-50 transition-colors"
+                      className="rs-btn rs-btn--quiet inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border border-blue-600 text-blue-300 hover:bg-blue-900/30 disabled:opacity-50 transition-colors"
                     >
                       {svnTesting ? 'Testing...' : 'Test SVN Connection'}
                     </button>
-                    {svnTestResult && (
-                      <span className={`ml-3 text-xs ${svnTestResult.ok ? 'text-green-300' : 'text-red-300'}`}>
-                        {svnTestResult.message}
-                      </span>
-                    )}
+                    <ConnectionTestResult result={svnTestResult} />
                   </div>
                 </div>
               </div>
 
               {/* Git Section */}
               <div>
-                <h3 className="text-sm font-medium text-gray-300 mb-3 flex items-center gap-2">
+                <h3 className="rs-heading text-sm font-medium text-gray-300 mb-3 flex items-center gap-2">
                   <GitBranch className="w-4 h-4 text-purple-400" />
-                  Git Configuration
+                  {t('repos.add.git')}
                 </h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
@@ -499,7 +540,7 @@ function RepositoriesEditor() {
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-9`}>Default Branch</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-9`}>{t('field.defaultBranch')}</label>
                     <input
                       type="text"
                       className={inputClass}
@@ -509,7 +550,7 @@ function RepositoriesEditor() {
                     />
                   </div>
                   <div className="md:col-span-2">
-                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-10`}>Git Token</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-10`}>{t('field.gitToken')}</label>
                     <input
                       type="password"
                       className={inputClass}
@@ -523,22 +564,18 @@ function RepositoriesEditor() {
                       type="button"
                       onClick={handleTestGit}
                       disabled={gitTesting || !form.git_repo}
-                      className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border border-purple-600 text-purple-300 hover:bg-purple-900/30 disabled:opacity-50 transition-colors"
+                      className="rs-btn rs-btn--quiet inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border border-purple-600 text-purple-300 hover:bg-purple-900/30 disabled:opacity-50 transition-colors"
                     >
                       {gitTesting ? 'Testing...' : 'Test Git Connection'}
                     </button>
-                    {gitTestResult && (
-                      <span className={`ml-3 text-xs ${gitTestResult.ok ? 'text-green-300' : 'text-red-300'}`}>
-                        {gitTestResult.message}
-                      </span>
-                    )}
+                    <ConnectionTestResult result={gitTestResult} />
                   </div>
                 </div>
               </div>
 
               {/* Initial import baseline */}
               <div>
-                <h3 className="text-sm font-medium text-gray-300 mb-3">Initial SVN import</h3>
+                <h3 className="rs-heading text-sm font-medium text-gray-300 mb-3">Initial SVN import</h3>
                 <ImportModeFields
                   mode={form.initial_import_mode}
                   svnRevision={form.initial_svn_revision}
@@ -549,13 +586,13 @@ function RepositoriesEditor() {
 
               {/* Sync Section */}
               <div>
-                <h3 className="text-sm font-medium text-gray-300 mb-3 flex items-center gap-2">
+                <h3 className="rs-heading text-sm font-medium text-gray-300 mb-3 flex items-center gap-2">
                   <Clock className="w-4 h-4 text-green-400" />
-                  Sync Settings
+                  {t('repos.add.sync')}
                 </h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-11`}>Sync Mode</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-11`}>{t('field.syncMode')}</label>
                     <select
                       className={selectClass}
                       value={form.sync_mode}
@@ -566,7 +603,7 @@ function RepositoriesEditor() {
                     </select>
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-12`}>Poll Interval (seconds)</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-12`}>{t('repos.add.pollInterval')}</label>
                     <input
                       type="number"
                       className={inputClass}
@@ -576,7 +613,7 @@ function RepositoriesEditor() {
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-13`}>LFS Threshold (MB, 0 = disabled)</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-13`}>{t('repos.add.lfsThreshold')}</label>
                     <input
                       type="number"
                       className={inputClass}
@@ -587,7 +624,7 @@ function RepositoriesEditor() {
                   </div>
                   <div className="flex items-end gap-3">
                     <div>
-                      <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-14`}>Auto Merge</label>
+                      <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-14`}>{t('field.autoMerge')}</label>
                       <button
                         type="button"
                         role="switch"
@@ -599,7 +636,7 @@ function RepositoriesEditor() {
                         }`} id={`${fieldId}-14`}
                       >
                         <span
-                          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                          className={`inline-block h-4 w-4 transform rounded-full rs-knob transition-transform ${
                             form.auto_merge ? 'translate-x-6' : 'translate-x-1'
                           }`}
                         />
@@ -618,7 +655,7 @@ function RepositoriesEditor() {
                         }`} id={`${fieldId}-15`}
                       >
                         <span
-                          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                          className={`inline-block h-4 w-4 transform rounded-full rs-knob transition-transform ${
                             form.enabled ? 'translate-x-6' : 'translate-x-1'
                           }`}
                         />
@@ -633,14 +670,14 @@ function RepositoriesEditor() {
             <div className="flex items-center justify-end gap-3 p-6 border-t border-gray-700">
               <button
                 onClick={closeAdd}
-                className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+                className="rs-btn rs-btn--quiet px-4 py-2 rounded-lg border border-gray-600 text-gray-300 rs-hover-text-strong text-sm font-medium transition-colors"
                data-dialog-cancel disabled={saveFlow.pending}>
                 Cancel
               </button>
               <button
                 onClick={handleCreate}
                 disabled={saveFlow.pending || !form.name.trim()}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+                className="rs-btn rs-btn--primary inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rs-text-on-accent text-sm font-medium transition-colors"
               >
                 <Plus className="w-4 h-4" />
                 {saveFlow.pending ? 'Saving...' : saveFlow.attempt?.repoId ? 'Resume / Save on Existing ID' : saveFlow.attempt ? 'Resume Same Save Request' : 'Create Repository'}

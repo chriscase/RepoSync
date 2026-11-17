@@ -1,25 +1,42 @@
 /**
- * #262 presentation catalog and shared navigation metadata.
+ * #262 presentation catalog and shared navigation metadata, extended by #264.
  *
  * A layout only arranges the one shared application shell. It never grants a
  * capability, changes server mode, adds or removes a route, or alters which
  * navigation entries an account may see. PRIMARY_NAVIGATION below is shared
  * metadata only: Layout.tsx still derives visibility from the signed-in
  * account exactly as before.
+ *
+ * #264 adds the three accepted #263 designs (Ledger, Console, Guide) after the
+ * existing three, a light theme in every layout, and the shell extensions
+ * E1 (More), E2 (theme), E3 (vocabulary), E4 (Help) and E6 (navigation icons).
  */
-export const LAYOUT_IDS = ['classic', 'individual', 'team'] as const;
+export const LAYOUT_IDS = ['classic', 'individual', 'team', 'ledger', 'console', 'guide'] as const;
 export type LayoutId = (typeof LAYOUT_IDS)[number];
 /** Classic is the default and the fallback for absent, unknown or unusable preferences. */
 export const DEFAULT_LAYOUT: LayoutId = 'classic';
+/** The layouts that existed before #264. They keep today's arrangement and wording. */
+export const EXISTING_LAYOUT_IDS: readonly LayoutId[] = Object.freeze(['classic', 'individual', 'team'] as LayoutId[]);
 
 /**
- * Theme seam. Only the current dark shell palette exists in this build. A later
- * design adds an id here, a token block in layoutTokens.css and lists the id in
- * each layout that supports it. Page content is not themed by this seam.
+ * Theme seam. Dark is the default in every layout and stays until a person
+ * chooses light. Every layout lists both. Existing layouts in dark render with
+ * the page's own classes exactly as before; any other combination takes page
+ * colour from tokens (see pageTokens.css and colourBridge.css).
  */
-export const THEME_IDS = ['dark'] as const;
+export const THEME_IDS = ['dark', 'light'] as const;
 export type ThemeId = (typeof THEME_IDS)[number];
 export const DEFAULT_THEME: ThemeId = 'dark';
+export const THEME_LABELS: Readonly<Record<ThemeId, string>> = Object.freeze({ dark: 'Dark', light: 'Light' });
+
+/**
+ * E3: one text catalogue with two vocabularies. Classic, Individual and Team use the
+ * existing vocabulary, which is today's strings byte for byte. Ledger, Console and
+ * Guide use the plain vocabulary of the #263 crosswalk. Safety and truthful-status
+ * sentences are identical in both (decision D17).
+ */
+export const VOCABULARY_IDS = ['existing', 'plain'] as const;
+export type VocabularyId = (typeof VOCABULARY_IDS)[number];
 
 export type NavPresentation = 'inline' | 'grouped';
 export const NAV_GROUP_IDS = ['workspace', 'account', 'administration'] as const;
@@ -31,27 +48,58 @@ export const NAV_GROUP_LABELS: Readonly<Record<NavGroupId, string>> = Object.fre
   administration: 'Administration',
 });
 
+/** E6: an optional icon per navigation entry, rendered in every layout and hidden in the existing three. */
+export type NavIconId = 'dashboard' | 'repositories' | 'conflicts' | 'audit' | 'account' | 'help' | 'users' | 'directory' | 'identity' | 'setup';
+
 export interface PrimaryNavItem {
   readonly to: string;
+  /** The existing vocabulary: today's label, byte for byte. */
   readonly label: string;
+  /** The plain vocabulary used by Ledger, Console and Guide. */
+  readonly plainLabel: string;
+  readonly icon: NavIconId;
   readonly group: NavGroupId;
   readonly end?: boolean;
   readonly adminOnly?: boolean;
   readonly conflictCount?: boolean;
+  /** E4: an entry shown only in the listed layouts. Absent means every layout. */
+  readonly onlyIn?: readonly LayoutId[];
 }
 
 /** Targets, labels, order, active matching and admin-only visibility, shared by every layout. */
 export const PRIMARY_NAVIGATION: readonly PrimaryNavItem[] = [
-  { to: '/', label: 'Dashboard', group: 'workspace', end: true },
-  { to: '/repos', label: 'Repositories', group: 'workspace' },
-  { to: '/conflicts', label: 'Conflicts', group: 'workspace', conflictCount: true },
-  { to: '/audit', label: 'Audit Log', group: 'workspace' },
-  { to: '/settings', label: 'Settings', group: 'account' },
-  { to: '/users', label: 'Users', group: 'administration', adminOnly: true },
-  { to: '/ldap', label: 'LDAP', group: 'administration', adminOnly: true },
-  { to: '/config', label: 'Config', group: 'administration', adminOnly: true },
-  { to: '/setup', label: 'Setup', group: 'administration', adminOnly: true },
+  { to: '/', label: 'Dashboard', plainLabel: 'Dashboard', icon: 'dashboard', group: 'workspace', end: true },
+  { to: '/repos', label: 'Repositories', plainLabel: 'Repositories', icon: 'repositories', group: 'workspace' },
+  { to: '/conflicts', label: 'Conflicts', plainLabel: 'Conflicts', icon: 'conflicts', group: 'workspace', conflictCount: true },
+  { to: '/audit', label: 'Audit Log', plainLabel: 'Audit log', icon: 'audit', group: 'workspace' },
+  { to: '/settings', label: 'Settings', plainLabel: 'My account', icon: 'account', group: 'account' },
+  { to: '/docs', label: 'Help', plainLabel: 'Help', icon: 'help', group: 'account', onlyIn: ['ledger', 'console', 'guide'] },
+  { to: '/users', label: 'Users', plainLabel: 'Users', icon: 'users', group: 'administration', adminOnly: true },
+  { to: '/ldap', label: 'LDAP', plainLabel: 'Directory (LDAP)', icon: 'directory', group: 'administration', adminOnly: true },
+  { to: '/config', label: 'Config', plainLabel: 'Identity & notifications', icon: 'identity', group: 'administration', adminOnly: true },
+  { to: '/setup', label: 'Setup', plainLabel: 'Server setup', icon: 'setup', group: 'administration', adminOnly: true },
 ];
+
+/** The entries a layout shows to an account: admin visibility as before, plus E4's layout limit. */
+export function visibleNavigation(layout: LayoutId, isAdmin: boolean): readonly PrimaryNavItem[] {
+  return PRIMARY_NAVIGATION.filter(item => (!item.adminOnly || isAdmin) && (!item.onlyIn || item.onlyIn.includes(layout)));
+}
+
+export function navLabel(item: PrimaryNavItem, vocabulary: VocabularyId): string {
+  return vocabulary === 'plain' ? item.plainLabel : item.label;
+}
+
+/** Shell text in each vocabulary (E3). The existing column is today's text. */
+export interface ShellText {
+  readonly logout: string;
+  readonly more: string;
+  readonly moreLong: string;
+}
+export const SHELL_TEXT: Readonly<Record<VocabularyId, ShellText>> = Object.freeze({
+  existing: Object.freeze({ logout: 'Logout', more: 'More', moreLong: 'More' }),
+  plain: Object.freeze({ logout: 'Sign out', more: 'More', moreLong: 'More' }),
+});
+
 /** Layout and spacing utilities for each fixed shell slot. Colors come from layoutTokens.css. */
 export interface ShellClasses {
   readonly root: string;
@@ -75,12 +123,20 @@ export interface LayoutPresentation {
   readonly description: string;
   readonly navPresentation: NavPresentation;
   readonly themes: readonly ThemeId[];
+  readonly vocabulary: VocabularyId;
+  /** Text on the E1 control when it shows a long label (Guide at wide sizes). */
+  readonly moreLongLabel?: string;
   readonly classes: ShellClasses;
 }
 
 function presentation(value: LayoutPresentation): LayoutPresentation {
   return Object.freeze({ ...value, themes: Object.freeze([...value.themes]), classes: Object.freeze({ ...value.classes }) });
 }
+
+const EXTENDED_SHELL_CLASSES: ShellClasses = {
+  root: '', nav: '', navInner: '', navRow: '', brand: '', brandName: '', links: '',
+  group: '', groupLabel: '', groupLinks: '', link: '', account: '', main: '',
+};
 
 export const LAYOUT_CATALOG: Readonly<Record<LayoutId, LayoutPresentation>> = Object.freeze({
   // The single shell as it was before #262: same slots and spacing. The account group
@@ -92,7 +148,8 @@ export const LAYOUT_CATALOG: Readonly<Record<LayoutId, LayoutPresentation>> = Ob
     label: 'Classic',
     description: 'The original top navigation bar.',
     navPresentation: 'inline',
-    themes: ['dark'],
+    themes: ['dark', 'light'],
+    vocabulary: 'existing',
     classes: {
       root: 'min-h-screen',
       nav: 'rs-shell-chrome border-b',
@@ -116,7 +173,8 @@ export const LAYOUT_CATALOG: Readonly<Record<LayoutId, LayoutPresentation>> = Ob
     label: 'Individual',
     description: 'Compact tabs with centred content.',
     navPresentation: 'inline',
-    themes: ['dark'],
+    themes: ['dark', 'light'],
+    vocabulary: 'existing',
     classes: {
       root: 'min-h-screen',
       nav: 'rs-shell-chrome border-b',
@@ -140,7 +198,8 @@ export const LAYOUT_CATALOG: Readonly<Record<LayoutId, LayoutPresentation>> = Ob
     label: 'Team',
     description: 'Grouped sidebar navigation.',
     navPresentation: 'grouped',
-    themes: ['dark'],
+    themes: ['dark', 'light'],
+    vocabulary: 'existing',
     classes: {
       root: 'min-h-screen md:flex',
       nav: 'rs-shell-chrome border-b md:sticky md:top-0 md:h-screen md:w-64 md:flex-shrink-0 md:overflow-y-auto md:border-b-0 md:border-r',
@@ -156,6 +215,36 @@ export const LAYOUT_CATALOG: Readonly<Record<LayoutId, LayoutPresentation>> = Ob
       account: 'flex flex-wrap items-center gap-3 md:mt-auto md:flex-col md:items-start',
       main: 'min-w-0 flex-1 px-4 py-6 sm:px-6 lg:px-10',
     },
+  }),
+  // #264, the three accepted #263 designs. Their arrangement lives in layoutOptions.css,
+  // keyed on data-rs-layout; the slot utilities here are empty so nothing competes with it.
+  ledger: presentation({
+    id: 'ledger',
+    label: 'Ledger',
+    description: 'A record to read: a two-row masthead, ruled sections and stamps.',
+    navPresentation: 'grouped',
+    themes: ['dark', 'light'],
+    vocabulary: 'plain',
+    classes: EXTENDED_SHELL_CLASSES,
+  }),
+  console: presentation({
+    id: 'console',
+    label: 'Console',
+    description: 'An operations console: a grouped sidebar, dense tables and status beside the work.',
+    navPresentation: 'grouped',
+    themes: ['dark', 'light'],
+    vocabulary: 'plain',
+    classes: EXTENDED_SHELL_CLASSES,
+  }),
+  guide: presentation({
+    id: 'guide',
+    label: 'Guide',
+    description: 'Task-led: four large destinations, roomy sections and big targets.',
+    navPresentation: 'grouped',
+    themes: ['dark', 'light'],
+    vocabulary: 'plain',
+    moreLongLabel: 'Account and admin',
+    classes: EXTENDED_SHELL_CLASSES,
   }),
 });
 
@@ -175,4 +264,16 @@ export function isThemeId(value: unknown): value is ThemeId {
 /** A theme a layout does not list falls back to the default theme. */
 export function resolveTheme(layout: LayoutPresentation, requested: unknown = DEFAULT_THEME): ThemeId {
   return isThemeId(requested) && layout.themes.includes(requested) ? requested : DEFAULT_THEME;
+}
+
+export function isExistingLayout(layout: LayoutId): boolean {
+  return EXISTING_LAYOUT_IDS.includes(layout);
+}
+
+/**
+ * Page colour comes from tokens everywhere except an existing layout in dark, which keeps
+ * the page's own utility colours exactly as before #264.
+ */
+export function usesPageTokens(layout: LayoutId, theme: ThemeId): boolean {
+  return !(isExistingLayout(layout) && theme === 'dark');
 }

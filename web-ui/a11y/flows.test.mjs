@@ -57,7 +57,7 @@ test('rs121 branch links and typed deletion prompt are keyboard accessible witho
  const {page,close}=await open('/repos/A');try{
   const link=page.getByRole('link',{name:'Synthetic branch',exact:true});await link.waitFor();assert.equal(await link.getAttribute('href'),'/repos/B');await press(page,link);await page.waitForURL(url=>url.pathname==='/repos/B');
   await page.goto(origin+'repos/A');await press(page,page.getByTestId('delete-child-pair-B'));
-  const modal=page.getByRole('dialog',{name:'Delete branch pair',exact:true});await modal.waitFor();
+  const modal=page.getByRole('dialog',{name:'Remove branch pair',exact:true});await modal.waitFor();
   const confirm=page.getByTestId('confirm-delete-branch-pair');assert.equal(await confirm.isDisabled(),true);assert.equal(await page.getByTestId('delete-git-opt').isChecked(),false);assert.equal(await page.getByTestId('delete-svn-opt').isChecked(),false);
   const input=page.getByLabel(/Type feature\/synthetic to confirm/);await reach(page,input);await page.keyboard.type('feature/synthetic');assert.equal(await input.inputValue(),'feature/synthetic');await page.waitForFunction(()=>!document.querySelector('[data-testid="confirm-delete-branch-pair"]')?.disabled);assert.equal(await confirm.isDisabled(),false);await contained(page);await audit(page,'branch removal');
   await page.keyboard.press('Escape');assert.equal(await modal.count(),0);assert.ok(await page.getByTestId('delete-child-pair-B').evaluate(el=>el===document.activeElement));
@@ -69,7 +69,9 @@ test('rs121 conflict navigation/edit/defer works by keyboard with labelled manua
  const {page,close}=await open('/conflicts/conflict-1');try{
   await page.getByRole('heading',{name:'example.txt',exact:true}).waitFor();const manual=page.getByRole('button',{name:'Manual Edit',exact:true});await press(page,manual);assert.equal(await manual.getAttribute('aria-pressed'),'true');
   const editor=page.getByLabel('Edit merged content:');await reach(page,editor);await page.keyboard.press('ControlOrMeta+A');await page.keyboard.type('Keyboard synthetic resolution\n');assert.equal(await editor.inputValue(),'Keyboard synthetic resolution\n');await audit(page,'conflict manual editor');
-  await press(page,page.getByRole('button',{name:'Apply Manual Edit',exact:true}));await page.waitForURL(url=>url.pathname==='/conflicts');
+  // #264 G06.4: choosing a resolution no longer sends it; "Record decision…" opens one confirmation first.
+  await press(page,page.getByRole('button',{name:'Apply Manual Edit',exact:true}));assert.equal(fixture.requests.filter(r=>r.method==='POST'&&r.path==='/api/conflicts/conflict-1/resolve').length,0);
+  await press(page,page.getByRole('button',{name:'Record decision…',exact:true}));await press(page,page.getByRole('dialog').getByRole('button',{name:'Record decision',exact:true}));await page.waitForURL(url=>url.pathname==='/conflicts');
   const manualRequest=fixture.requests.filter(r=>r.method==='POST'&&r.path==='/api/conflicts/conflict-1/resolve');assert.equal(manualRequest.length,1);assert.deepEqual(manualRequest[0].body,{resolution:'custom',merged_content:'Keyboard synthetic resolution\n'});
   await page.goto(origin+'conflicts/conflict-1');await page.getByRole('heading',{name:'example.txt',exact:true}).waitFor();
   await press(page,page.getByRole('button',{name:'Defer',exact:true}));await page.waitForURL(url=>url.pathname==='/conflicts');assert.equal(fixture.requests.filter(r=>r.method==='POST'&&r.path==='/api/conflicts/conflict-1/defer').length,1);
@@ -157,8 +159,12 @@ test('rs121 LDAP and notification failures are announced and associated without 
   await page.goto(origin+'config');const teams=page.getByLabel('Teams Webhook URL',{exact:true});await teams.waitFor();await replaceByKeyboard(page,teams,'https://synthetic-notifications.example.invalid/fixture');
   const notify=page.getByRole('group',{name:'Microsoft Teams notification settings',exact:true});const notifications=()=>fixture.requests.filter(r=>r.method!=='GET'&&r.path.startsWith('/api/config/notifications'));const beforeNotify=notifications().length;
   await press(page,notify.getByRole('button',{name:'Save',exact:true}));await notify.getByRole('alert').filter({hasText:'Save failed'}).waitFor();await describedFeedback(page,teams,'Save failed');assert.equal(await teams.getAttribute('aria-invalid'),null);
-  await press(page,notify.getByRole('button',{name:'Test',exact:true}));await notify.getByRole('alert').filter({hasText:'Synthetic notification test refused'}).waitFor();await describedFeedback(page,teams,'Synthetic notification test refused');await describedFeedback(page,notify,'Synthetic notification test refused');assert.equal(await teams.inputValue(),'https://synthetic-notifications.example.invalid/fixture');assert.equal(await teams.getAttribute('aria-invalid'),null);assert.equal(notifications().length,beforeNotify+2);assert.deepEqual(notifications().slice(-2).map(r=>[r.method,r.path]),[['POST','/api/config/notifications'],['POST','/api/config/notifications/test']]);await audit(page,'notification failure feedback');
- }finally{await close()}
+  // #264 G11.2: the test request carries no URL, so Test is offered only in the Set state, never beside a typed value that is not saved.
+  assert.equal(await notify.getByRole('button',{name:'Test',exact:true}).count(),0);assert.equal(await teams.inputValue(),'https://synthetic-notifications.example.invalid/fixture');assert.equal(notifications().length,beforeNotify+1);assert.deepEqual(notifications().slice(-1).map(r=>[r.method,r.path]),[['POST','/api/config/notifications']]);await audit(page,'notification failure feedback');
+  await fetch(fixture.origin+'/__fixture/state',{method:'POST',body:JSON.stringify({notifications_set:true})});await page.goto(origin+'config');
+  const saved=page.getByRole('group',{name:'Microsoft Teams notification settings',exact:true});const sendTest=saved.getByRole('button',{name:'Test',exact:true});await sendTest.waitFor();assert.equal(await saved.getByLabel('Teams Webhook URL',{exact:true}).count(),0);
+  await press(page,sendTest);await saved.getByRole('alert').filter({hasText:'Synthetic notification test refused'}).waitFor();await describedFeedback(page,sendTest,'Synthetic notification test refused');await describedFeedback(page,saved,'Synthetic notification test refused');assert.equal(notifications().length,beforeNotify+2);assert.deepEqual(notifications().slice(-1).map(r=>[r.method,r.path]),[['POST','/api/config/notifications/test']]);await audit(page,'notification test feedback');
+ }finally{await close();await fetch(fixture.origin+'/__fixture/state',{method:'POST',body:JSON.stringify({notifications_set:false})})}
 });
 
 test('rs121 Edit User retains immutable selected username, exact target, pending containment and focus return', {timeout:45000},async()=>{

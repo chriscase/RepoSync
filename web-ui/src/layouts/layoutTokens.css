@@ -53,34 +53,35 @@
   color: var(--rs-shell-text-strong);
 }
 
-/* Filled links (Classic, Team). Active is declared after hover so it wins. */
-.rs-layout-shell .rs-shell-link {
+/* Filled links (Classic, Team). Active is declared after hover so it wins. Scoped to the
+   existing layouts by #264; Ledger, Console and Guide style their links in layoutOptions.css. */
+.rs-layout-shell:is([data-rs-layout='classic'], [data-rs-layout='individual'], [data-rs-layout='team']) .rs-shell-link {
   color: var(--rs-shell-text-muted);
 }
 
-.rs-layout-shell .rs-shell-link:hover {
+.rs-layout-shell:is([data-rs-layout='classic'], [data-rs-layout='individual'], [data-rs-layout='team']) .rs-shell-link:hover {
   background-color: var(--rs-shell-hover);
   color: var(--rs-shell-text-strong);
 }
 
-.rs-layout-shell .rs-shell-link.rs-shell-link--active,
-.rs-layout-shell .rs-shell-link.rs-shell-link--active:hover {
+.rs-layout-shell:is([data-rs-layout='classic'], [data-rs-layout='individual'], [data-rs-layout='team']) .rs-shell-link.rs-shell-link--active,
+.rs-layout-shell:is([data-rs-layout='classic'], [data-rs-layout='individual'], [data-rs-layout='team']) .rs-shell-link.rs-shell-link--active:hover {
   background-color: var(--rs-shell-accent);
   color: var(--rs-shell-accent-text);
 }
 
 /* Tab links (Individual): an accent underline instead of a filled pill. */
-.rs-layout-shell .rs-shell-link.rs-shell-link--tab {
+.rs-layout-shell:is([data-rs-layout='classic'], [data-rs-layout='individual'], [data-rs-layout='team']) .rs-shell-link.rs-shell-link--tab {
   border-color: transparent;
 }
 
-.rs-layout-shell .rs-shell-link.rs-shell-link--tab:hover {
+.rs-layout-shell:is([data-rs-layout='classic'], [data-rs-layout='individual'], [data-rs-layout='team']) .rs-shell-link.rs-shell-link--tab:hover {
   background-color: transparent;
   border-color: var(--rs-shell-hover);
 }
 
-.rs-layout-shell .rs-shell-link.rs-shell-link--tab.rs-shell-link--active,
-.rs-layout-shell .rs-shell-link.rs-shell-link--tab.rs-shell-link--active:hover {
+.rs-layout-shell:is([data-rs-layout='classic'], [data-rs-layout='individual'], [data-rs-layout='team']) .rs-shell-link.rs-shell-link--tab.rs-shell-link--active,
+.rs-layout-shell:is([data-rs-layout='classic'], [data-rs-layout='individual'], [data-rs-layout='team']) .rs-shell-link.rs-shell-link--tab.rs-shell-link--active:hover {
   background-color: transparent;
   border-color: var(--rs-shell-accent);
   color: var(--rs-shell-text-strong);
@@ -120,4 +121,14 @@
     text-decoration: underline;
     text-decoration-thickness: 2px;
   }
+}
+
+/*
+ * #264 E1 and E6: the "More" button and the navigation icons are in the tree of every
+ * layout. Classic, Individual and Team hide them, so they look and tab as before #264
+ * (decision D15). layoutOptions.css shows them in Ledger, Console and Guide.
+ */
+.rs-layout-shell .rs-nav-icon,
+.rs-layout-shell .rs-shell-more {
+  display: none;
 }

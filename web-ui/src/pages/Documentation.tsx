@@ -61,7 +61,7 @@ function SectionOverview() {
         watches both systems, automatically syncs non-conflicting changes, and
         alerts you only when human intervention is needed.
       </p>
-      <h3 className="text-lg font-semibold text-gray-900">Two Modes</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Two Modes</h3>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
           <h4 className="font-semibold text-blue-900">Team Mode</h4>
@@ -84,7 +84,7 @@ function SectionOverview() {
         alt="RepoSync Architecture Diagram"
         caption="High-level architecture showing bidirectional sync between SVN and Git"
       />
-      <h3 className="text-lg font-semibold text-gray-900">Key Features</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Key Features</h3>
       <ul className="list-disc list-inside space-y-1 text-gray-700">
         <li>Bidirectional sync — SVN commits appear in Git, Git pushes appear in SVN</li>
         <li>Author identity mapping — SVN usernames mapped to Git name+email</li>
@@ -119,7 +119,7 @@ function SectionGettingStarted() {
         section.
       </p>
 
-      <h3 className="text-lg font-semibold text-gray-900">Prerequisites</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Prerequisites</h3>
       <ul className="list-disc list-inside space-y-1 text-gray-700">
         <li>SVN client (<code className="bg-gray-100 px-1 rounded">svn</code> CLI) installed</li>
         <li>Git installed</li>
@@ -127,7 +127,7 @@ function SectionGettingStarted() {
         <li>A GitHub personal access token with <code className="bg-gray-100 px-1 rounded">repo</code> scope</li>
       </ul>
 
-      <h3 className="text-lg font-semibold text-gray-900">Installation</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Installation</h3>
       <div className="space-y-3">
         <p className="font-medium text-gray-800">From binary release:</p>
         <pre className="bg-gray-900 text-gray-100 rounded-lg p-4 overflow-x-auto text-sm">
@@ -145,7 +145,7 @@ cargo build --release`}
         </pre>
       </div>
 
-      <h3 className="text-lg font-semibold text-gray-900">Initial Configuration</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Initial Configuration</h3>
       <p>
         After installation, generate a configuration file and edit it with your
         SVN and GitHub details:
@@ -156,7 +156,7 @@ $EDITOR /etc/reposync/config.toml
 $EDITOR /etc/reposync/authors.toml`}
       </pre>
 
-      <h3 className="text-lg font-semibold text-gray-900">Starting the Daemon</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Starting the Daemon</h3>
       <pre className="bg-gray-900 text-gray-100 rounded-lg p-4 overflow-x-auto text-sm">
 {`# As a systemd service
 sudo cp scripts/reposync.service /etc/systemd/system/
@@ -195,7 +195,7 @@ function SectionDashboard() {
         caption="The main dashboard showing sync status, recent activity, and repository health"
       />
 
-      <h3 className="text-lg font-semibold text-gray-900">Status Cards</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Status Cards</h3>
       <p>
         The top row shows at-a-glance metrics: current sync state, last SVN
         revision synced, total syncs performed, active conflicts, and error
@@ -207,7 +207,7 @@ function SectionDashboard() {
         caption="Status cards showing sync state, revision info, and conflict counts"
       />
 
-      <h3 className="text-lg font-semibold text-gray-900">Activity Feed</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Activity Feed</h3>
       <p>
         The activity feed shows recent sync operations in chronological order.
         Each entry includes the direction (SVN→Git or Git→SVN), the commit
@@ -219,7 +219,7 @@ function SectionDashboard() {
         caption="Recent sync activity showing bidirectional commits with author mapping"
       />
 
-      <h3 className="text-lg font-semibold text-gray-900">Import Progress</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Import Progress</h3>
       <p>
         When a repository import is running, a progress card appears showing the
         current phase, revision count, and estimated time remaining.
@@ -241,7 +241,7 @@ function SectionRepositories() {
         watermarks.
       </p>
 
-      <h3 className="text-lg font-semibold text-gray-900">Adding a Repository</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Adding a Repository</h3>
       <p>
         From the dashboard or the Repositories page, click{' '}
         <span className="font-semibold">Add Repository</span> and provide:
@@ -259,7 +259,7 @@ function SectionRepositories() {
         caption="The repository setup form with SVN and GitHub connection details"
       />
 
-      <h3 className="text-lg font-semibold text-gray-900">Test Connection</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Test Connection</h3>
       <p>
         After entering credentials, use the <strong>Test Connection</strong>{' '}
         buttons to verify that RepoSync can reach both the SVN server and
@@ -270,7 +270,7 @@ function SectionRepositories() {
         caption="Connection test showing successful SVN and GitHub connectivity"
       />
 
-      <h3 className="text-lg font-semibold text-gray-900">Initial Import</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Initial Import</h3>
       <p>
         For new repositories, run an initial import to bring the full SVN
         history into Git. This is a one-time operation that replays all SVN
@@ -281,7 +281,7 @@ function SectionRepositories() {
         caption="Running an initial import — SVN history is replayed as Git commits"
       />
 
-      <h3 className="text-lg font-semibold text-gray-900">Repository Detail</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Repository Detail</h3>
       <p>
         Click any repository to see its detail page with sync history,
         watermark state, recent errors, and per-repo configuration.
@@ -303,7 +303,7 @@ function SectionIdentityMapping() {
         the two so that commits are attributed correctly in both systems.
       </p>
 
-      <h3 className="text-lg font-semibold text-gray-900">Authors File</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Authors File</h3>
       <p>
         The mapping is defined in a TOML file (typically{' '}
         <code className="bg-gray-100 px-1 rounded">/etc/reposync/authors.toml</code>):
@@ -317,7 +317,7 @@ bob   = { name = "Bob Williams", email = "bob@company.com", github = "bobw" }
 email_domain = "company.com"`}
       </pre>
 
-      <h3 className="text-lg font-semibold text-gray-900">How Mapping Works</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">How Mapping Works</h3>
       <div className="bg-gray-50 rounded-lg p-4 space-y-2">
         <p><strong>SVN → Git:</strong> When syncing an SVN commit by user{' '}
           <code className="bg-gray-100 px-1 rounded">alice</code>, RepoSync looks up the
@@ -331,7 +331,7 @@ email_domain = "company.com"`}
         </p>
       </div>
 
-      <h3 className="text-lg font-semibold text-gray-900">Unmapped Users</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Unmapped Users</h3>
       <p>
         If an SVN username isn't in the mapping file, RepoSync falls back to{' '}
         <code className="bg-gray-100 px-1 rounded">username@email_domain</code> using the
@@ -340,7 +340,7 @@ email_domain = "company.com"`}
         attribution.
       </p>
 
-      <h3 className="text-lg font-semibold text-gray-900">LDAP Integration</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">LDAP Integration</h3>
       <p>
         For large teams, RepoSync can optionally query LDAP/Active Directory to
         automatically resolve SVN usernames to name+email. Configure the LDAP
@@ -364,14 +364,14 @@ function SectionConflictResolution() {
         auto-merge fails, the conflict is flagged for human review.
       </p>
 
-      <h3 className="text-lg font-semibold text-gray-900">Automatic Resolution</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Automatic Resolution</h3>
       <p>
         RepoSync uses three-way merge with the last synced state as the common
         ancestor. Non-overlapping changes (different lines of the same file) are
         merged automatically. Overlapping changes create a conflict.
       </p>
 
-      <h3 className="text-lg font-semibold text-gray-900">Conflict Types</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Conflict Types</h3>
       <div className="space-y-2">
         <div className="flex items-start space-x-3 p-3 bg-yellow-50 rounded-lg">
           <span className="text-yellow-600 font-bold text-lg">!</span>
@@ -401,7 +401,7 @@ function SectionConflictResolution() {
         caption="The conflicts page showing pending conflicts with file paths and conflict types"
       />
 
-      <h3 className="text-lg font-semibold text-gray-900">Resolving Conflicts</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Resolving Conflicts</h3>
       <p>
         Click a conflict to see a side-by-side diff of the SVN and Git versions.
         Choose to accept the SVN version, the Git version, or provide a manual
@@ -412,7 +412,7 @@ function SectionConflictResolution() {
         caption="Side-by-side diff view for resolving a content conflict"
       />
 
-      <h3 className="text-lg font-semibold text-gray-900">Notifications</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Notifications</h3>
       <p>
         When a conflict requires human intervention, RepoSync can notify your
         team via Slack webhook or email. Configure notification channels in the{' '}
@@ -437,7 +437,7 @@ function SectionConfiguration() {
         caption="The configuration page showing current sync settings"
       />
 
-      <h3 className="text-lg font-semibold text-gray-900">Key Configuration Sections</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Key Configuration Sections</h3>
 
       <h4 className="font-semibold text-gray-800 mt-4">[daemon]</h4>
       <p className="text-gray-700">
@@ -497,7 +497,7 @@ email_from = "reposync@company.com"
 email_recipients = ["team@company.com"]`}
       </pre>
 
-      <h3 className="text-lg font-semibold text-gray-900">Environment Variables</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Environment Variables</h3>
       <p>
         Secrets are stored in environment variables, not in the config file.
         Create an env file at{' '}
@@ -523,7 +523,7 @@ function SectionPersonalMode() {
         so every sync is reviewable.
       </p>
 
-      <h3 className="text-lg font-semibold text-gray-900">Quick Start</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Quick Start</h3>
       <pre className="bg-gray-900 text-gray-100 rounded-lg p-4 overflow-x-auto text-sm">
 {`reposync personal init           # Interactive setup wizard
 reposync personal import --full  # Import SVN history to GitHub
@@ -534,7 +534,7 @@ reposync personal start          # Start sync daemon`}
         caption="The interactive init wizard configuring SVN and GitHub connections"
       />
 
-      <h3 className="text-lg font-semibold text-gray-900">How It Works</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">How It Works</h3>
       <ol className="list-decimal list-inside space-y-2 text-gray-700">
         <li>
           <strong>Init</strong> creates a config file at{' '}
@@ -551,7 +551,7 @@ reposync personal start          # Start sync daemon`}
         </li>
       </ol>
 
-      <h3 className="text-lg font-semibold text-gray-900">PR-Based Workflow</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">PR-Based Workflow</h3>
       <p>
         Unlike Team Mode's direct sync, Personal Mode creates GitHub Pull
         Requests for each batch of SVN changes. This lets you review what's
@@ -562,16 +562,16 @@ reposync personal start          # Start sync daemon`}
         caption="SVN changes appear as GitHub PRs for review before merging"
       />
 
-      <h3 className="text-lg font-semibold text-gray-900">CLI Commands</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">CLI Commands</h3>
       <div className="overflow-x-auto">
-        <table className="min-w-full divide-y divide-gray-200">
+        <table className="rs-tbl min-w-full divide-y divide-gray-200">
           <thead className="bg-gray-50">
             <tr>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Command</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Description</th>
             </tr>
           </thead>
-          <tbody className="bg-white divide-y divide-gray-200 text-sm">
+          <tbody className="rs-surface-white divide-y divide-gray-200 text-sm">
             <tr><td className="px-4 py-2 font-mono">reposync personal init</td><td className="px-4 py-2">Interactive setup wizard</td></tr>
             <tr><td className="px-4 py-2 font-mono">reposync personal import --full</td><td className="px-4 py-2">Full SVN history import</td></tr>
             <tr><td className="px-4 py-2 font-mono">reposync personal start</td><td className="px-4 py-2">Start background sync daemon</td></tr>
@@ -594,7 +594,7 @@ function SectionDeployment() {
         run directly. All methods use the same configuration file.
       </p>
 
-      <h3 className="text-lg font-semibold text-gray-900">systemd</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">systemd</h3>
       <p>
         The recommended method for Linux servers. The service file runs as a
         dedicated <code className="bg-gray-100 px-1 rounded">reposync</code> user with
@@ -610,7 +610,7 @@ sudo systemctl status reposync
 sudo journalctl -u reposync -f`}
       </pre>
 
-      <h3 className="text-lg font-semibold text-gray-900">Docker</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Docker</h3>
       <pre className="bg-gray-900 text-gray-100 rounded-lg p-4 overflow-x-auto text-sm">
 {`docker run -d \\
   --name reposync \\
@@ -621,7 +621,7 @@ sudo journalctl -u reposync -f`}
   ghcr.io/chriscase/reposync:latest`}
       </pre>
 
-      <h3 className="text-lg font-semibold text-gray-900">Docker Compose</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Docker Compose</h3>
       <pre className="bg-gray-900 text-gray-100 rounded-lg p-4 overflow-x-auto text-sm">
 {`services:
   reposync:
@@ -639,23 +639,23 @@ volumes:
   reposync-data:`}
       </pre>
 
-      <h3 className="text-lg font-semibold text-gray-900">Health Check</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Health Check</h3>
       <p>
         The daemon exposes a health endpoint at{' '}
         <code className="bg-gray-100 px-1 rounded">/api/status/health</code> for
         load balancer and monitoring integration.
       </p>
 
-      <h3 className="text-lg font-semibold text-gray-900">File Paths</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">File Paths</h3>
       <div className="overflow-x-auto">
-        <table className="min-w-full divide-y divide-gray-200">
+        <table className="rs-tbl min-w-full divide-y divide-gray-200">
           <thead className="bg-gray-50">
             <tr>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Path</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Purpose</th>
             </tr>
           </thead>
-          <tbody className="bg-white divide-y divide-gray-200 text-sm">
+          <tbody className="rs-surface-white divide-y divide-gray-200 text-sm">
             <tr><td className="px-4 py-2 font-mono">/etc/reposync/config.toml</td><td className="px-4 py-2">Main configuration</td></tr>
             <tr><td className="px-4 py-2 font-mono">/etc/reposync/authors.toml</td><td className="px-4 py-2">Author identity mappings</td></tr>
             <tr><td className="px-4 py-2 font-mono">/etc/reposync/env</td><td className="px-4 py-2">Environment secrets</td></tr>
@@ -670,7 +670,7 @@ volumes:
 function SectionTroubleshooting() {
   return (
     <div className="space-y-4">
-      <h3 className="text-lg font-semibold text-gray-900">Common Issues</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Common Issues</h3>
 
       <div className="space-y-4">
         <div className="border border-gray-200 rounded-lg p-4">
@@ -724,7 +724,7 @@ function SectionTroubleshooting() {
         </div>
       </div>
 
-      <h3 className="text-lg font-semibold text-gray-900">Diagnostic Commands</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Diagnostic Commands</h3>
       <pre className="bg-gray-900 text-gray-100 rounded-lg p-4 overflow-x-auto text-sm">
 {`# Check daemon status and logs
 sudo systemctl status reposync
@@ -739,7 +739,7 @@ sqlite3 /var/lib/reposync/reposync.db "SELECT * FROM watermarks;"
 sqlite3 /var/lib/reposync/reposync.db "SELECT * FROM kv_state;"`}
       </pre>
 
-      <h3 className="text-lg font-semibold text-gray-900">Getting Help</h3>
+      <h3 className="rs-heading text-lg font-semibold text-gray-900">Getting Help</h3>
       <p>
         If you're stuck, file an issue at{' '}
         <a
@@ -773,11 +773,11 @@ export default function Documentation() {
   const ActiveContent = sectionComponents[activeSection];
 
   return (
-    <div className="flex gap-6">
+    <div className="rs-docs flex gap-6">
       {/* Sidebar navigation */}
-      <nav className="w-56 flex-shrink-0">
+      <nav className="rs-docs-nav w-56 flex-shrink-0">
         <div className="sticky top-6">
-          <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">
+          <h2 className="rs-heading text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">
             Documentation
           </h2>
           <ul className="space-y-1">
@@ -802,8 +802,8 @@ export default function Documentation() {
 
       {/* Main content */}
       <div className="flex-1 min-w-0">
-        <div className="bg-white shadow rounded-lg p-8">
-          <h1 className="text-2xl font-bold text-gray-900 mb-6">
+        <div className="rs-surface-white shadow rounded-lg p-8">
+          <h1 className="rs-title text-2xl font-bold text-gray-900 mb-6">
             {sections.find((s) => s.id === activeSection)?.title}
           </h1>
           <div className="prose prose-gray max-w-none text-gray-700">

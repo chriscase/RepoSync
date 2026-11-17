@@ -1,6 +1,6 @@
 export function RepoBadge({ name }: { name: string }) {
   return (
-    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-900/40 text-blue-300 border border-blue-700/30 truncate max-w-[120px]">
+    <span className="rs-mark inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-900/40 text-blue-300 border border-blue-700/30 truncate max-w-[120px]">
       {name}
     </span>
   );
@@ -10,7 +10,7 @@ export function DirectionBadge({ direction }: { direction: string }) {
   const isToGit = direction === 'svn_to_git';
   return (
     <span
-      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+      className={`rs-mark inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
         isToGit
           ? 'bg-blue-900/50 text-blue-300'
           : 'bg-purple-900/50 text-purple-300'
@@ -36,7 +36,7 @@ export function ActionBadge({ action }: { action: string }) {
   const label = action.replace(/_/g, ' ');
   return (
     <span
-      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+      className={`rs-mark inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
         ACTION_COLORS[action] ?? 'bg-gray-700 text-gray-300'
       }`}
     >
