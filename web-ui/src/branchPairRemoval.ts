@@ -2,6 +2,7 @@ import { accountStorageKey, RetiredSessionError } from './session';
 /** UI-only classification for an existing branch-pair DELETE response. */
 
 export interface BranchPairRemovalResult {
+  archive_pair?: boolean;
   ok?: boolean;
   message?: string;
   warnings?: string[];
@@ -48,6 +49,12 @@ export function branchPairRemovalOutcome(result: BranchPairRemovalResult): Branc
   if (result.ok === true) return 'completed';
   if (result.operation_id) return 'in_progress';
   return 'rejected';
+}
+
+/** A terminal archive stays inspectable; never retire its detail route. */
+export function shouldRetireBranchPair(result: BranchPairRemovalResult): boolean {
+  if (result.archive_pair || result.registration_listed === true) return false;
+  return result.registration_listed === false || branchPairRemovalOutcome(result) === 'completed';
 }
 
 /**

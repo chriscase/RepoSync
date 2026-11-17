@@ -10534,6 +10534,26 @@ async fn rs65_reviewed_api_401_403_foreign_actor_and_untrusted_payload_refuse() 
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN, "{path}");
     }
+    // #199 uses the same authenticated admission, never a side-door deletion.
+    for path in ["removal/review", "removal/approve"] {
+        let body = if path == "removal/approve" {
+            serde_json::json!({"delete_git":true,"delete_svn":false,"archive_pair":true,"review_pin":"not-a-pin","request_id":"not-approved-archive"})
+        } else {
+            serde_json::json!({"delete_git":true,"delete_svn":false,"archive_pair":true})
+        };
+        for (token, expected) in [
+            (None, reqwest::StatusCode::UNAUTHORIZED),
+            (Some("reader-token"), reqwest::StatusCode::FORBIDDEN),
+        ] {
+            let request = reader.post(format!("{base}/{path}")).json(&body);
+            let request = if let Some(token) = token {
+                request.bearer_auth(token)
+            } else {
+                request
+            };
+            assert_eq!(request.send().await.unwrap().status(), expected);
+        }
+    }
     let extra = authed_client()
         .post(format!("{base}/removal/review"))
         .json(&serde_json::json!({"actor":"other-admin","cleanup_completed":true}))
@@ -10656,4 +10676,92 @@ async fn rs65_reviewed_api_missing_parent_and_stale_pin_preserve_custody() {
     assert!(state.db.managed_removal(stale_id).unwrap().is_none());
     assert!(state.db.get_repository(stale_id).unwrap().unwrap().enabled);
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs199_api_archive_retains_pair_and_refuses_legacy_removal() {
+    for delete_git in [true, false] {
+        let (addr, state, server, tmp, id) = rs65_native_api_fixture().await;
+        let client = authed_client();
+        let base = format!("http://{addr}/api/repos/{id}");
+        let choices = serde_json::json!({"delete_git":delete_git,"delete_svn":!delete_git,"archive_pair":true});
+        let response = client
+            .post(format!("{base}/removal/review"))
+            .json(&choices)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let plan: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(plan["archive_pair"], true);
+        let mut approval = choices.clone();
+        approval["review_pin"] = plan["review_pin"].clone();
+        approval["request_id"] = serde_json::json!("archive-api");
+        let mut changed = approval.clone();
+        changed["archive_pair"] = serde_json::json!(false);
+        assert_eq!(
+            client
+                .post(format!("{base}/removal/approve"))
+                .json(&changed)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::CONFLICT,
+            "archive disposition is pinned"
+        );
+        let response = client
+            .post(format!("{base}/removal/approve"))
+            .json(&approval)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let done: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(done["archive_pair"], true);
+        assert_eq!(done["registration_listed"], true);
+        assert_eq!(done["restore_supported"], false);
+        let repo = state.db.get_repository(&id).unwrap().unwrap();
+        assert_eq!(repo.sync_status, "archived");
+        assert!(!repo.enabled);
+        assert!(tmp
+            .path()
+            .join("repos")
+            .join(&id)
+            .join("custody.txt")
+            .exists());
+        assert!(!client
+            .post(format!("{base}/remove"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        assert_eq!(
+            client
+                .post(format!("{base}/restore"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::CONFLICT
+        );
+        assert!(state.db.get_repository(&id).unwrap().is_some());
+        assert!(tmp
+            .path()
+            .join("repos")
+            .join(&id)
+            .join("custody.txt")
+            .exists());
+        let repeat = client
+            .post(format!("{base}/removal/approve"))
+            .json(&approval)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(repeat.status(), reqwest::StatusCode::OK);
+        let repeat: serde_json::Value = repeat.json().await.unwrap();
+        assert_eq!(repeat["operation_id"], done["operation_id"]);
+        server.abort();
+    }
 }

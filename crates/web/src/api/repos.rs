@@ -855,6 +855,7 @@ fn removal_response(
         Json(serde_json::json!({
             "ok": operation.state.is_terminal_success(),
             "action": "managed_remove",
+            "archive_pair": operation.archives_pair(),
             "state": operation.state,
             "operation_id": operation.id,
             "updated_at": operation.updated_at,
@@ -983,6 +984,13 @@ async fn remove_repo(
     if reposync_core::managed_remove::validate_repo_id(&id).is_err() {
         return Err(AppError::BadRequest(
             "repository id is not a single safe path component".into(),
+        ));
+    }
+    if reposync_core::db::managed_remove::archived_pair(&state.db.conn(), &id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        return Ok(removal_v2_refusal(
+            "archived pair is terminal; removal and reattachment are not supported",
         ));
     }
     if opts.explicit_remote_deletion_opts
@@ -4545,6 +4553,8 @@ async fn get_pre_commit_hook(
 #[serde(deny_unknown_fields)]
 struct ReviewRemovalV2 {
     #[serde(default)]
+    archive_pair: bool,
+    #[serde(default)]
     delete_git: bool,
     #[serde(default)]
     delete_svn: bool,
@@ -4553,6 +4563,8 @@ struct ReviewRemovalV2 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApproveRemovalV2 {
+    #[serde(default)]
+    archive_pair: bool,
     delete_git: bool,
     delete_svn: bool,
     review_pin: String,
@@ -4601,6 +4613,7 @@ async fn review_removal_v2(
     let choices = reposync_core::db::managed_remove::RemovalChoices {
         delete_git: body.delete_git,
         delete_svn: body.delete_svn,
+        archive_pair: body.archive_pair,
     };
     let plan = match reposync_core::managed_remove::reviewed::capture(
         &state.db,
@@ -4614,8 +4627,18 @@ async fn review_removal_v2(
         Ok(plan) => plan,
         Err(error) => return Ok(removal_v2_refusal(error)),
     };
-    let dependency = removal_dependency_preview_json(&state.db, &id)?;
-    Ok(Json(serde_json::json!({"ok":true,"action":"reviewed_removal","protocol":2,"repo_id":id,"review_pin":plan.approval_digest,"delete_git":plan.choices.delete_git,"delete_svn":plan.choices.delete_svn,"git":plan.git,"svn":plan.svn,"dependency_preview":dependency,"retention":"Indefinite tombstone, audit and mapping retention; no automatic purge. Restore returns a disabled registration and does not recreate deleted remote branches."})).into_response())
+    let mut dependency = removal_dependency_preview_json(&state.db, &id)?;
+    if plan.choices.archive_pair {
+        if let Some(credentials) = dependency
+            .get_mut("credentials")
+            .and_then(|v| v.as_array_mut())
+        {
+            for credential in credentials {
+                credential["action"] = serde_json::json!("retain_for_archive");
+            }
+        }
+    }
+    Ok(Json(serde_json::json!({"ok":true,"action":"reviewed_removal","protocol":2,"repo_id":id,"review_pin":plan.approval_digest,"delete_git":plan.choices.delete_git,"delete_svn":plan.choices.delete_svn,"archive_pair":plan.choices.archive_pair,"git":plan.git,"svn":plan.svn,"dependency_preview":dependency,"retention":if plan.choices.archive_pair { "Terminal archived pair: surviving branch, registration, local data, audit and mappings retained indefinitely. Sync and restore are blocked." } else { "Indefinite tombstone, audit and mapping retention; no automatic purge. Restore returns a disabled registration and does not recreate deleted remote branches." }})).into_response())
 }
 
 async fn run_removal_v2(
@@ -4680,6 +4703,7 @@ async fn approve_removal_v2(
     let choices = reposync_core::db::managed_remove::RemovalChoices {
         delete_git: body.delete_git,
         delete_svn: body.delete_svn,
+        archive_pair: body.archive_pair,
     };
     let op = match reposync_core::managed_remove::reviewed::begin(
         &state.db,

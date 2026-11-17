@@ -283,6 +283,7 @@ async fn rs65_reviewed_native_completion_is_retained_repeatable_and_restorable()
         use reposync_core::managed_remove::reviewed;
         let f = native_fixture().await;
         let choices = RemovalChoices {
+            archive_pair: false,
             delete_git: true,
             delete_svn: true,
         };
@@ -375,6 +376,7 @@ async fn rs65_stale_review_and_post_claim_git_drift_preserve_all_local_custody()
         use reposync_core::managed_remove::reviewed;
         let f = native_fixture().await;
         let choices = RemovalChoices {
+            archive_pair: false,
             delete_git: true,
             delete_svn: true,
         };
@@ -460,6 +462,7 @@ async fn rs65_verified_remote_results_survive_cleanup_failure_and_database_reope
         use reposync_core::managed_remove::reviewed::{self, Fault};
         let f = native_fixture().await;
         let options = RemovalChoices {
+            archive_pair: false,
             delete_git: true,
             delete_svn: true,
         };
@@ -563,6 +566,7 @@ async fn rs65_git_success_then_svn_rejection_retains_each_side_across_reopen() {
         use reposync_core::managed_remove::reviewed;
         let f = native_fixture().await;
         let options = RemovalChoices {
+            archive_pair: false,
             delete_git: true,
             delete_svn: true,
         };
@@ -628,6 +632,7 @@ async fn rs65_git_success_then_svn_rejection_retains_each_side_across_reopen() {
             "unknown side cannot lose errors, change identity or silently retry"
         );
         let changed = RemovalChoices {
+            archive_pair: false,
             delete_git: false,
             delete_svn: false,
         };
@@ -672,6 +677,7 @@ async fn rs65_review_rejects_symlink_and_missing_parent_before_claim_or_effects(
             &f.child.id,
             "synthetic-admin",
             RemovalChoices {
+                archive_pair: false,
                 delete_git: true,
                 delete_svn: true
             }
@@ -693,6 +699,7 @@ async fn rs65_review_rejects_symlink_and_missing_parent_before_claim_or_effects(
             &f.child.id,
             "synthetic-admin",
             RemovalChoices {
+                archive_pair: false,
                 delete_git: true,
                 delete_svn: true
             }
@@ -846,6 +853,7 @@ async fn rs65_real_http_git_uses_child_credentials_and_honors_revocation_and_anc
         )
         .unwrap();
         let options = RemovalChoices {
+            archive_pair: false,
             delete_git: true,
             delete_svn: false,
         };
@@ -952,7 +960,7 @@ async fn rs65_restart_after_intent_and_each_remote_effect_holds_without_replay()
     tokio::time::timeout(std::time::Duration::from_secs(90),async {
         use reposync_core::managed_remove::reviewed::{self,Fault};
         for point in [Fault::AfterGitIntent,Fault::AfterGitEffect,Fault::AfterSvnEffect] {
-            let f=native_fixture().await;let options=RemovalChoices{delete_git:true,delete_svn:true};
+            let f=native_fixture().await;let options=RemovalChoices{delete_git:true,delete_svn:true,archive_pair:false};
             let plan=reviewed::capture(&f.db,&f.data,&f.child.id,"synthetic-admin",options.clone()).await.unwrap();
             let op=reviewed::begin(&f.db,&f.data,&f.child.id,"synthetic-admin",options,&plan.approval_digest,"restart-window").await.unwrap();
             reviewed::set_fault(&f.child.id,point.clone());
@@ -1035,6 +1043,7 @@ async fn rs65_unrequested_svn_stays_untouched_and_failed_git_cannot_change_choic
         )
         .await;
         let options = RemovalChoices {
+            archive_pair: false,
             delete_git: true,
             delete_svn: false,
         };
@@ -1113,4 +1122,262 @@ async fn rs65_unrequested_svn_stays_untouched_and_failed_git_cannot_change_choic
     })
     .await
     .expect("bounded failed-side and unrequested-side fixture");
+}
+
+#[tokio::test]
+async fn rs199_single_side_archive_retains_survivor_history_and_fences_restart() {
+    use reposync_core::managed_remove::reviewed;
+    for delete_git in [true, false] {
+        let mut f = native_fixture().await;
+        let svn_path = f.root.path().join("svn");
+        let svn_before = native_command(
+            f.root.path(),
+            "svnlook",
+            &["youngest", svn_path.to_str().unwrap()],
+        )
+        .await;
+        let git_before = native_command(
+            f.root.path(),
+            "git",
+            &["--git-dir", f.bare.to_str().unwrap(), "show-ref"],
+        )
+        .await;
+        f.child.last_svn_rev = svn_before.trim().parse().unwrap();
+        f.child.last_git_sha = git_before
+            .lines()
+            .find(|line| line.ends_with("refs/heads/dev"))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .into();
+        f.db.update_repository(&f.child).unwrap();
+        f.db.conn().execute("INSERT INTO commit_map (svn_rev,git_sha,direction,synced_at,svn_author,git_author,repo_id) VALUES (?1,?2,'svn_to_git','2026-01-01','synthetic','synthetic',?3)",rusqlite::params![f.child.last_svn_rev,f.child.last_git_sha,f.child.id]).unwrap();
+        let choices = RemovalChoices {
+            delete_git,
+            delete_svn: !delete_git,
+            archive_pair: true,
+        };
+        let plan = reviewed::capture(
+            &f.db,
+            &f.data,
+            &f.child.id,
+            "archive-admin",
+            choices.clone(),
+        )
+        .await
+        .unwrap();
+        let op = reviewed::begin(
+            &f.db,
+            &f.data,
+            &f.child.id,
+            "archive-admin",
+            choices.clone(),
+            &plan.approval_digest,
+            "archive-request",
+        )
+        .await
+        .unwrap();
+        let done = reviewed::run(&f.db, &f.data, &f.child.id, "archive-admin", &op.id)
+            .await
+            .unwrap();
+        assert_eq!(done.state, ManagedRemoveState::Completed, "{done:?}");
+        assert!(!done.restore_supported);
+        let archived = f.db.get_repository(&f.child.id).unwrap().unwrap();
+        assert!(!archived.enabled);
+        assert_eq!(archived.sync_status, "archived");
+        assert_eq!(archived.last_svn_rev, f.child.last_svn_rev);
+        assert_eq!(archived.last_git_sha, f.child.last_git_sha);
+        assert_eq!(
+            std::fs::read(f.data.join("repos").join(&f.child.id).join("owned.txt")).unwrap(),
+            b"custody\n"
+        );
+        let refs = native_command(
+            f.root.path(),
+            "git",
+            &["--git-dir", f.bare.to_str().unwrap(), "show-ref"],
+        )
+        .await;
+        let svn_after = native_command(
+            f.root.path(),
+            "svnlook",
+            &["youngest", svn_path.to_str().unwrap()],
+        )
+        .await;
+        if delete_git {
+            assert!(!refs.contains("refs/heads/dev"));
+            assert!(refs.contains("refs/heads/main"));
+            assert_eq!(
+                svn_before, svn_after,
+                "survivor SVN history must not change"
+            );
+        } else {
+            assert_eq!(refs, git_before, "survivor Git refs must not change");
+            assert_eq!(
+                svn_after.trim().parse::<i64>().unwrap(),
+                svn_before.trim().parse::<i64>().unwrap() + 1
+            );
+            let tree = native_command(
+                f.root.path(),
+                "svnlook",
+                &["tree", svn_path.to_str().unwrap()],
+            )
+            .await;
+            assert!(!tree.contains("dev/"));
+            assert!(tree.contains("trunk/"));
+        }
+        let audit: (String, i64, String, String) = f.db.conn().query_row("SELECT author,svn_rev,git_sha,details FROM audit_log WHERE repo_id=?1 AND action='branch_pair_archived'", [&f.child.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(audit.0, "archive-admin");
+        assert_eq!(audit.1, archived.last_svn_rev);
+        assert_eq!(audit.2, archived.last_git_sha);
+        assert!(audit.3.contains(if delete_git {
+            "\"deleted_side\":\"git\""
+        } else {
+            "\"deleted_side\":\"svn\""
+        }));
+        let db = Database::new(f.root.path().join("state.db")).unwrap();
+        db.initialize().unwrap();
+        let retained: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM commit_map WHERE repo_id=?1 AND svn_rev=?2 AND git_sha=?3",
+                rusqlite::params![f.child.id, f.child.last_svn_rev, f.child.last_git_sha],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 1, "mapped history survives archive and restart");
+        assert!(db.managed_remove_blocks_new_work(&f.child.id).unwrap());
+        assert!(db.restore_managed_registration(&f.child.id).is_err());
+        assert!(db
+            .prepare_managed_remove(&f.child.id, "archive-admin", "legacy-bypass")
+            .is_err());
+        assert!(db.update_repository(&f.child).is_err());
+        assert!(db
+            .create_import_operation(&f.child.id, "archive-admin", "new-import", "fp")
+            .is_err());
+        let replay = reviewed::begin(
+            &db,
+            &f.data,
+            &f.child.id,
+            "archive-admin",
+            choices.clone(),
+            &plan.approval_digest,
+            "archive-request",
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay, done);
+        assert_eq!(
+            reviewed::run(&db, &f.data, &f.child.id, "archive-admin", &op.id)
+                .await
+                .unwrap(),
+            done
+        );
+        assert!(
+            reviewed::capture(&db, &f.data, &f.child.id, "archive-admin", choices)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            native_command(
+                f.root.path(),
+                "svnlook",
+                &["youngest", svn_path.to_str().unwrap()]
+            )
+            .await,
+            svn_after
+        );
+        assert_eq!(
+            native_command(
+                f.root.path(),
+                "git",
+                &["--git-dir", f.bare.to_str().unwrap(), "show-ref"]
+            )
+            .await,
+            refs
+        );
+    }
+}
+
+#[tokio::test]
+async fn rs199_archive_refuses_busy_and_invalid_choices_without_disabling_pair() {
+    use reposync_core::managed_remove::reviewed;
+    let f = native_fixture().await;
+    for (delete_git, delete_svn) in [(false, false), (true, true)] {
+        assert!(reviewed::capture(
+            &f.db,
+            &f.data,
+            &f.child.id,
+            "archive-admin",
+            RemovalChoices {
+                delete_git,
+                delete_svn,
+                archive_pair: true
+            }
+        )
+        .await
+        .is_err());
+    }
+    let choices = RemovalChoices {
+        delete_git: true,
+        delete_svn: false,
+        archive_pair: true,
+    };
+    let plan = reviewed::capture(
+        &f.db,
+        &f.data,
+        &f.child.id,
+        "archive-admin",
+        choices.clone(),
+    )
+    .await
+    .unwrap();
+    let _busy = reposync_core::busy::try_acquire(&f.child.id).unwrap();
+    assert!(reviewed::begin(
+        &f.db,
+        &f.data,
+        &f.child.id,
+        "archive-admin",
+        choices.clone(),
+        &plan.approval_digest,
+        "busy-archive"
+    )
+    .await
+    .is_err());
+    assert!(f.db.get_repository(&f.child.id).unwrap().unwrap().enabled);
+    assert!(f.db.managed_removal(&f.child.id).unwrap().is_none());
+    drop(_busy);
+    f.db.create_import_operation(&f.child.id, "import-owner", "held-import", "fingerprint")
+        .unwrap();
+    assert!(reviewed::begin(
+        &f.db,
+        &f.data,
+        &f.child.id,
+        "archive-admin",
+        choices,
+        &plan.approval_digest,
+        "held-archive"
+    )
+    .await
+    .is_err());
+    assert!(f.db.get_repository(&f.child.id).unwrap().unwrap().enabled);
+    assert!(f.db.managed_removal(&f.child.id).unwrap().is_none());
+}
+
+#[test]
+fn rs199_legacy_choices_keep_identical_serialized_plan_contract() {
+    let legacy: RemovalChoices =
+        serde_json::from_str(r#"{"delete_git":true,"delete_svn":false}"#).unwrap();
+    assert!(!legacy.archive_pair);
+    assert_eq!(
+        serde_json::to_string(&legacy).unwrap(),
+        r#"{"delete_git":true,"delete_svn":false}"#
+    );
+    let explicit = RemovalChoices {
+        archive_pair: true,
+        ..legacy
+    };
+    assert!(serde_json::to_string(&explicit)
+        .unwrap()
+        .contains("\"archive_pair\":true"));
 }

@@ -493,7 +493,7 @@ export const api = {
       managed_removal: boolean;
     }>(`/repos/${id}/disable`, { method: 'POST' }),
 
-  reviewManagedRemoval: (id: string, options: { delete_git: boolean; delete_svn: boolean }, signal?: AbortSignal) =>
+  reviewManagedRemoval: (id: string, options: { delete_git: boolean; delete_svn: boolean; archive_pair?: boolean }, signal?: AbortSignal) =>
     fetchJson<import('./managedRemoval').ReviewedRemovalPreview>(`/repos/${id}/removal/review`, { method: 'POST', signal, body: JSON.stringify(options) }),
 
   approveManagedRemoval: async (id: string, review: import('./managedRemoval').ReviewedRemovalPreview, owner?: { assertCurrent(): void }): Promise<ManagedRemovalStatus> => {
@@ -504,7 +504,7 @@ export const api = {
     const res = await sessionFetch(`${API_BASE}/repos/${id}/removal/approve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${localStorage.getItem('session_token') || ''}` },
-      body: JSON.stringify({ delete_git: review.delete_git, delete_svn: review.delete_svn, review_pin: review.review_pin, request_id: `ui-remove-v2-${review.review_pin}` }),
+      body: JSON.stringify({ delete_git: review.delete_git, delete_svn: review.delete_svn, archive_pair: review.archive_pair ?? false, review_pin: review.review_pin, request_id: `ui-remove-v2-${review.review_pin}` }),
     });
     const body = await res.json() as ManagedRemovalStatus & { error?: string; request_rejected?: boolean };
     session.assertCurrent(origin);

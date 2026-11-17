@@ -99,6 +99,21 @@ pub const REVIEWED_REMOVAL_POLICY: &str = "reviewed_managed_removal_v2";
 pub struct RemovalChoices {
     pub delete_git: bool,
     pub delete_svn: bool,
+    /// Explicit #199 disposition. Omitted false preserves old v2 plan digests.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archive_pair: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl ManagedRemoveOperation {
+    pub fn archives_pair(&self) -> bool {
+        self.reviewed
+            .as_ref()
+            .is_some_and(|r| r.plan.choices.archive_pair)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +257,8 @@ impl ReviewedRemovalPlan {
             || self.choices.delete_git != self.git.is_some()
             || self.choices.delete_svn != self.svn.is_some()
             || ((self.choices.delete_git || self.choices.delete_svn) && self.parent_id.is_none())
+            || (self.choices.archive_pair
+                && (self.parent_id.is_none() || self.choices.delete_git == self.choices.delete_svn))
             || self.approval_digest != self.digest()?
         {
             return Err(invalid());
@@ -644,6 +661,16 @@ pub fn completed_for_foreign_journal(
         && op.id == id
         && op.repo_id == owner
         && op.state == ManagedRemoveState::Completed)
+}
+
+/// Terminal #199 archives retain their registration and evidence indefinitely.
+pub fn archived_pair(conn: &Connection, repo_id: &str) -> Result<bool, DatabaseError> {
+    let Some(raw) = read_value(conn, &key("tombstone", repo_id))? else {
+        return Ok(false);
+    };
+    let tombstone: RemovalTombstone = serde_json::from_str(&raw)
+        .map_err(|e| DatabaseError::Other(format!("invalid removal tombstone: {e}")))?;
+    Ok(tombstone.retention == "terminal_archived_pair_survivor_and_history_retained")
 }
 
 pub fn new_work_blocked(conn: &Connection, repo_id: &str) -> Result<bool, DatabaseError> {
@@ -1360,6 +1387,12 @@ impl Database {
                         "repository is already removed; retained receipt remains available".into(),
                     ));
                 }
+                if tombstone_present(tx, &plan.repo_id)? {
+                    return Err(DatabaseError::Other(
+                        "archived pair is terminal; no new removal or reattachment is permitted"
+                            .into(),
+                    ));
+                }
                 retire_managed_remove_completion_pointer(tx, &plan.repo_id)?;
             }
             let repo = load_repo(tx, &plan.repo_id)?
@@ -1376,6 +1409,15 @@ impl Database {
                 return Err(DatabaseError::Other(
                     "stale removal review; review the current target again".into(),
                 ));
+            }
+            if plan.choices.archive_pair {
+                if crate::busy::is_busy(&repo.id) || writer_blocker(tx, &repo.id)?.is_some() {
+                    return Err(DatabaseError::Other(
+                        "pair is busy or held; archive refused without changing registration"
+                            .into(),
+                    ));
+                }
+                super::ordinary_writer_windows::require_quiet_for_refresh(tx, &repo.id, &scope)?;
             }
             let mut op = fresh_op(&repo, &plan.actor, request_id);
             op.version = 2;
@@ -2037,6 +2079,10 @@ impl Database {
         request_id: &str,
     ) -> Result<RemovalAdvance, DatabaseError> {
         self.transaction(|tx| {
+            if archived_pair(tx, repo_id)? {
+                return Err(DatabaseError::Other("archived pair is terminal; removal is not supported".into()));
+            }
+
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(tx, repo_id)?;
             if let Some(op) = read_op(tx, repo_id)? {
@@ -2257,6 +2303,7 @@ impl Database {
                 remote_git: remote_git.clone(),
                 remote_svn: remote_svn.clone(),
             };
+            let archive_pair = op.archives_pair();
             let tombstone = RemovalTombstone {
                 version: 1,
                 repo_id: repo.id.clone(),
@@ -2273,8 +2320,8 @@ impl Database {
                 commit_map_count,
                 remote_git,
                 remote_svn,
-                restore_supported: true,
-                retention: "tombstone_audit_mappings_retained_restore_available".into(),
+                restore_supported: !archive_pair,
+                retention: if archive_pair { "terminal_archived_pair_survivor_and_history_retained" } else { "tombstone_audit_mappings_retained_restore_available" }.into(),
                 scoped_secrets,
                 inbound_last_git_sha,
                 svn_username: repo.svn_username.clone(),
@@ -2302,6 +2349,12 @@ impl Database {
                     DatabaseError::Other(format!("tombstone serialization failed: {error}"))
                 })?,
             )?;
+            if archive_pair {
+                tx.execute("UPDATE repositories SET enabled=0,sync_status='archived',updated_at=?1 WHERE id=?2", params![Utc::now().to_rfc3339(), repo_id])?;
+                let side = if op.reviewed.as_ref().unwrap().plan.choices.delete_git { "git" } else { "svn" };
+                let details = serde_json::json!({"operation_id":op.id,"deleted_side":side,"git_branch":repo.git_branch,"svn_branch":repo.svn_branch,"survivor":"untouched","state":"archived"}).to_string();
+                tx.execute("INSERT INTO audit_log (action,direction,svn_rev,git_sha,author,details,created_at,success,repo_id) VALUES ('branch_pair_archived',NULL,?1,?2,?3,?4,?5,1,?6)",params![repo.last_svn_rev,repo.last_git_sha,op.initiator_id,details,Utc::now().to_rfc3339(),repo_id])?;
+            } else {
             for secret_key in owned_secret_keys(repo_id) {
                 tx.execute("DELETE FROM kv_state WHERE key=?1", [&secret_key])?;
                 tx.execute("DELETE FROM encrypted_secrets WHERE key=?1", [&secret_key])?;
@@ -2317,14 +2370,17 @@ impl Database {
             if let Some(rev) = scoped_svn_rev_at_removal {
                 write_value(tx, &format!("last_svn_rev_{repo_id}"), &rev.to_string())?;
             }
+            }
             op.state = ManagedRemoveState::Completed;
             if let Some(reviewed) = op.reviewed.as_mut() {
                 reviewed.cleanup_completed = true;
             }
-            op.restore_supported = true;
+            op.restore_supported = !archive_pair;
             op.remote_git = merged_remote.remote_git.clone();
             op.remote_svn = merged_remote.remote_svn.clone();
-            op.outcome_detail = Some(completed_removal_outcome_detail(&merged_remote, true));
+            op.outcome_detail = Some(if archive_pair {
+                "Pair archived permanently; selected remote side deleted, surviving branch, registration, local data and history retained. Sync and restore are blocked.".into()
+            } else { completed_removal_outcome_detail(&merged_remote, true) });
             op.updated_at = Utc::now().to_rfc3339();
             op.last_svn_rev = repo.last_svn_rev;
             op.last_git_sha = repo.last_git_sha;
@@ -2357,6 +2413,9 @@ impl Database {
                 return Err(DatabaseError::Other(
                     "managed removal is still in progress; restore is not available".into(),
                 ));
+            }
+            if read_op(tx, repo_id)?.is_some_and(|op| op.archives_pair() && op.state.is_terminal_success()) {
+                return Err(DatabaseError::Other("archived pair is terminal; restore and reattachment are not supported".into()));
             }
             if let Some(existing) = load_repo(tx, repo_id)? {
                 return Ok(RestoreAdvance::AlreadyListed { repo: existing });
