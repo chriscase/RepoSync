@@ -56,6 +56,8 @@ const EXISTING: Readonly<Record<TextKey, string>> = {
   'repo.about.lastUpdated': 'Last Updated',
   'repo.about.createdBy': 'Created By',
   'repo.header.pause': 'Turn sync off',
+  'repo.header.switchTitle': 'Quick sync on/off via registration update. Use Pause / disable in Danger Zone for the explicit disable API.',
+  'repo.stopRemove.pauseNote': 'The header “Turn sync off” opens this same dialog; “Turn sync on” only updates enabled on the registration.',
   'repo.header.hook': 'Git Hook',
   'repo.paused.skip': 'Skip Commit',
   'account.profile': 'My Profile',
@@ -114,6 +116,8 @@ const PLAIN: Readonly<Record<TextKey, string>> = {
   'repo.about.lastUpdated': 'Last updated',
   'repo.about.createdBy': 'Created by',
   'repo.header.pause': 'Pause sync…',
+  'repo.header.switchTitle': 'Quick sync on/off via registration update. Use Pause / disable in Stop or remove for the explicit disable API.',
+  'repo.stopRemove.pauseNote': 'The header “Pause sync…” opens this same dialog; “Turn sync on” only updates enabled on the registration.',
   'repo.header.hook': 'Download Git pre-commit hook',
   'repo.paused.skip': 'Skip commits…',
   'account.profile': 'My profile',
@@ -132,6 +136,15 @@ const PLAIN: Readonly<Record<TextKey, string>> = {
 
 /** The only entries the crosswalk keeps the same in both vocabularies. */
 const UNCHANGED: readonly TextKey[] = ['shell.layout', 'shell.theme'];
+
+/**
+ * The only whole-sentence entries, each with the catalogued control it names. The existing sentence
+ * is today's text; the plain sentence is the same sentence naming that control's plain label.
+ */
+const SENTENCES: Readonly<Partial<Record<TextKey, TextKey>>> = {
+  'repo.header.switchTitle': 'repo.section.stopOrRemove',
+  'repo.stopRemove.pauseNote': 'repo.header.pause',
+};
 
 const keys = Object.keys(TEXT_CATALOGUE) as TextKey[];
 
@@ -178,10 +191,26 @@ describe('#264 E3 text catalogue', () => {
     expect(TEXT_CATALOGUE['dashboard.manageRepositories'].existing.endsWith('→')).toBe(true);
   });
 
-  it('holds no D11 correction and no safety or truthful-status sentence', () => {
+  it('holds no D11 correction, and no sentence except the ones that name a catalogued control', () => {
     const forbidden = ['Trigger Sync', 'Request sync', 'Retry', 'Resume sync…', 'Cancel operation', 'Stop operation…', 'Sync configured enabled', 'Sync configured disabled', 'Turn sync on', 'Apply Manual Edit', 'Logout', 'Sign out'];
     for (const key of keys) for (const vocabulary of VOCABULARY_IDS) expect(forbidden, key).not.toContain(TEXT_CATALOGUE[key][vocabulary]);
-    for (const key of keys) for (const vocabulary of VOCABULARY_IDS) expect(TEXT_CATALOGUE[key][vocabulary], key).not.toMatch(/\.$/);
+    for (const key of keys.filter(key => !(key in SENTENCES))) for (const vocabulary of VOCABULARY_IDS) expect(TEXT_CATALOGUE[key][vocabulary], key).not.toMatch(/\.$/);
+    expect(keys.filter(key => VOCABULARY_IDS.some(vocabulary => /\.$/.test(TEXT_CATALOGUE[key][vocabulary])))).toEqual(Object.keys(SENTENCES));
+  });
+
+  it('names each control in a sentence by that control\'s label in the same vocabulary, and changes nothing else', () => {
+    for (const [key, control] of Object.entries(SENTENCES) as [TextKey, TextKey][]) {
+      const sentence = TEXT_CATALOGUE[key];
+      const label = TEXT_CATALOGUE[control];
+      expect(sentence.existing, key).toContain(label.existing);
+      expect(sentence.existing, key).not.toContain(label.plain);
+      expect(sentence.plain, key).toContain(label.plain);
+      expect(sentence.plain, key).not.toContain(label.existing);
+      expect(sentence.existing.split(label.existing).join(label.plain), key).toBe(sentence.plain);
+    }
+    // The two mismatches this replaces: the plain layouts named “Turn sync off” and “Danger Zone”.
+    expect(TEXT_CATALOGUE['repo.stopRemove.pauseNote'].plain).toContain('“Pause sync…”');
+    expect(TEXT_CATALOGUE['repo.header.switchTitle'].plain).toContain(' in Stop or remove ');
   });
 
   it('is used by the pages: every key except the shell entries appears as t(key) in a page or component', async () => {
@@ -192,7 +221,7 @@ describe('#264 E3 text catalogue', () => {
     expect(keys.filter(key => !used.has(key))).toEqual(['shell.layout', 'shell.theme']);
     // The pages no longer carry the replaced literals as text; the HTML entity forms are gone too.
     const joined = sources.join('\n');
-    for (const literal of ['Recent Sync Records', 'Commit Map (SVN &harr; Git)', 'Manage Repositories &rarr;', '>Repository Name<', 'Server Monitor</span>', 'Manage Repos</span>', '>My Credentials<', 'Side-by-Side Diff\n']) {
+    for (const literal of ['Recent Sync Records', 'Commit Map (SVN &harr; Git)', 'Manage Repositories &rarr;', '>Repository Name<', 'Server Monitor</span>', 'Manage Repos</span>', '>My Credentials<', 'Side-by-Side Diff\n', 'in Danger Zone for', 'The header “Turn sync off”']) {
       expect(joined, literal).not.toContain(literal);
     }
   });

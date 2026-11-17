@@ -97,17 +97,23 @@ const escapeText = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '
 /**
  * A catalogued label and where it ends: a key alone is swapped wherever it is a whole text node;
  * with `close` (e.g. '</h3>') only where that text node is followed by it, for a page that also
- * shows the same existing text elsewhere outside the catalogue.
+ * shows the same existing text elsewhere outside the catalogue. A whole-sentence entry is swapped
+ * as `sentence: 'text'` wherever it appears in text, or as `sentence: 'title'` where it is a whole
+ * title attribute.
  */
-type Label = TextKey | { readonly key: TextKey; readonly close: string };
+type Label = TextKey | { readonly key: TextKey; readonly close: string } | { readonly key: TextKey; readonly sentence: 'text' | 'title' };
 const labelKey = (label: Label) => (typeof label === 'string' ? label : label.key);
-const labelEnd = (label: Label) => (typeof label === 'string' ? '<' : label.close);
+const labelMarkup = (label: Label, text: string) => {
+  if (typeof label === 'string') return `>${escapeText(text)}<`;
+  if ('close' in label) return `>${escapeText(text)}${label.close}`;
+  return label.sentence === 'title' ? `title="${escapeText(text)}"` : escapeText(text);
+};
 
-/** Replaces each label's existing text with its plain text, as whole text nodes. */
+/** Replaces each label's existing text with its plain text, where the label is. */
 function swapLabels(html: string, labels: readonly Label[]) {
   return labels.reduce((out, label) => {
     const entry = TEXT_CATALOGUE[labelKey(label)];
-    return out.split(`>${escapeText(entry.existing)}${labelEnd(label)}`).join(`>${escapeText(entry.plain)}${labelEnd(label)}`);
+    return out.split(labelMarkup(label, entry.existing)).join(labelMarkup(label, entry.plain));
   }, html);
 }
 
@@ -121,8 +127,8 @@ function inBothVocabularies(page: () => ReactElement, path: string, labels: read
   expect(swapLabels(existing, labels)).toBe(plain);
   for (const label of labels) {
     const entry = TEXT_CATALOGUE[labelKey(label)];
-    expect(existing, labelKey(label)).toContain(`>${escapeText(entry.existing)}${labelEnd(label)}`);
-    expect(plain, labelKey(label)).toContain(`>${escapeText(entry.plain)}${labelEnd(label)}`);
+    expect(existing, labelKey(label)).toContain(labelMarkup(label, entry.existing));
+    expect(plain, labelKey(label)).toContain(labelMarkup(label, entry.plain));
   }
   return { existing, plain };
 }
@@ -174,19 +180,41 @@ describe('#264 E3 repository page in each vocabulary', () => {
   const SECTIONS: TextKey[] = ['repo.section.svn', 'repo.section.git', 'repo.section.sync', 'repo.section.records', 'repo.section.commitMap', 'repo.section.audit', 'repo.section.pairs', 'repo.section.stopOrRemove'];
   const READ_FIELDS: TextKey[] = ['field.svnPassword', 'repo.field.gitToken', 'field.syncMode', 'field.pollInterval', 'field.lfsThreshold', 'field.autoMerge', 'repo.about.lastUpdated', 'repo.about.createdBy'];
   const IDLE_IMPORT: TextKey[] = ['import.manageRepositories'];
+  const PAUSE_NOTE: Label = { key: 'repo.stopRemove.pauseNote', sentence: 'text' };
+  const SWITCH_TITLE: Label = { key: 'repo.header.switchTitle', sentence: 'title' };
 
   it('renames headings, read labels, the pause and hook controls for a repository', () => {
     seedRepository();
-    const { existing, plain } = inBothVocabularies(page, '/repos/r1', [...SECTIONS, ...READ_FIELDS, ...IDLE_IMPORT, 'repo.header.pause', 'repo.header.hook', 'server.title'], '/repos/:id');
+    const { existing, plain } = inBothVocabularies(page, '/repos/r1', [...SECTIONS, ...READ_FIELDS, ...IDLE_IMPORT, 'repo.header.pause', 'repo.header.hook', 'server.title', PAUSE_NOTE], '/repos/:id');
     expect(existing).toMatch(/<button data-testid="header-sync-switch"[^>]*>.*?<\/svg>Turn sync off<\/button>/s);
     expect(plain).toMatch(/<button data-testid="header-sync-switch"[^>]*>.*?<\/svg>Pause sync…<\/button>/s);
     expect(existing).toMatch(/data-testid="download-pre-commit-hook"[^>]*>.*?<\/svg>Git Hook<\/button>/s);
     expect(plain).toMatch(/data-testid="download-pre-commit-hook"[^>]*title="Download Git pre-commit hook script">.*?<\/svg>Download Git pre-commit hook<\/button>/s);
-    // Unchanged in both: the truthful-status mark, the safety paragraph and other controls.
+    // The pause note in Stop or remove names the header control by the label each vocabulary shows,
+    // and stays the last sentence of its paragraph.
+    expect(existing).toContain('remotes stay. The header “Turn sync off” opens this same dialog; “Turn sync on” only updates enabled on the registration.</p>');
+    expect(plain).toContain('remotes stay. The header “Pause sync…” opens this same dialog; “Turn sync on” only updates enabled on the registration.</p>');
+    // The plain page names neither old label anywhere.
+    expect(plain).not.toContain('Turn sync off');
+    expect(plain).not.toContain('Danger Zone');
+    // Unchanged in both: the truthful-status mark and other controls.
     for (const html of [existing, plain]) {
       expect(html).toContain('Sync configured enabled');
-      expect(html).toContain('The header “Turn sync off” opens');
       expect(html).toContain('>Add Branch Pair<');
+    }
+  });
+
+  it('names Stop or remove in the header switch\'s title for a branch pair and when sync is off, in the plain vocabulary only', () => {
+    const existingTitle = 'title="Quick sync on/off via registration update. Use Pause / disable in Danger Zone for the explicit disable API."';
+    const plainTitle = 'title="Quick sync on/off via registration update. Use Pause / disable in Stop or remove for the explicit disable API."';
+    seedRepository({ repo: repo({ parent_id: 'root', name: 'root / feature' }) });
+    const pair = inBothVocabularies(page, '/repos/r1', [...SECTIONS, ...READ_FIELDS, ...IDLE_IMPORT, 'repo.header.hook', 'server.title', SWITCH_TITLE], '/repos/:id');
+    seedRepository({ repo: repo({ enabled: false }) });
+    const off = inBothVocabularies(page, '/repos/r1', [...SECTIONS, ...READ_FIELDS, ...IDLE_IMPORT, 'repo.header.hook', 'server.title', PAUSE_NOTE, SWITCH_TITLE], '/repos/:id');
+    for (const { existing, plain } of [pair, off]) {
+      expect(existing).toContain(`data-testid="header-sync-switch" ${existingTitle}`);
+      expect(plain).toContain(`data-testid="header-sync-switch" ${plainTitle}`);
+      expect(plain).not.toContain('Danger Zone');
     }
   });
 
@@ -203,7 +231,7 @@ describe('#264 E3 repository page in each vocabulary', () => {
 
   it('labels the paused banner\'s skip control “Skip commits…” in the plain vocabulary only', () => {
     seedRepository({ status: status('paused') });
-    const { existing, plain } = inBothVocabularies(page, '/repos/r1', [...SECTIONS, ...READ_FIELDS, ...IDLE_IMPORT, 'repo.header.pause', 'repo.header.hook', 'server.title', 'repo.paused.skip'], '/repos/:id');
+    const { existing, plain } = inBothVocabularies(page, '/repos/r1', [...SECTIONS, ...READ_FIELDS, ...IDLE_IMPORT, 'repo.header.pause', 'repo.header.hook', 'server.title', PAUSE_NOTE, 'repo.paused.skip'], '/repos/:id');
     expect(existing).toMatch(/data-testid="skip-commit-button"[^>]*>Skip Commit<\/button>/);
     expect(plain).toMatch(/data-testid="skip-commit-button"[^>]*>Skip commits…<\/button>/);
     for (const html of [existing, plain]) expect(html).toMatch(/data-testid="resume-sync-button"[^>]*>Resume sync…<\/button>/);
@@ -211,7 +239,7 @@ describe('#264 E3 repository page in each vocabulary', () => {
 
   it('labels the import card\'s stop control “Stop import…” in the plain vocabulary only', () => {
     seedRepository({ imports: importRunning });
-    const { existing, plain } = inBothVocabularies(page, '/repos/r1?section=operations', [...SECTIONS, ...READ_FIELDS, 'repo.header.pause', 'repo.header.hook', 'server.title', 'import.stop'], '/repos/:id');
+    const { existing, plain } = inBothVocabularies(page, '/repos/r1?section=operations', [...SECTIONS, ...READ_FIELDS, 'repo.header.pause', 'repo.header.hook', 'server.title', PAUSE_NOTE, 'import.stop'], '/repos/:id');
     expect(existing).toMatch(/data-testid="stop-import"[^>]*>Stop import<\/button>/);
     expect(plain).toMatch(/data-testid="stop-import"[^>]*>Stop import…<\/button>/);
     expect(plain).not.toContain('stop-import-modal');

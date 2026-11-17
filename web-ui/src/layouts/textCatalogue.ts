@@ -73,6 +73,11 @@ export const TEXT_CATALOGUE = entries({
   // Repository page: controls. The header pause entry is used only where a repository (not a
   // branch pair) shows “Turn sync off”; “Turn sync on” is not an entry.
   'repo.header.pause': { existing: 'Turn sync off', plain: 'Pause sync…' },
+  // Repository page: whole sentences that name a catalogued control. Each plain sentence names
+  // that control's plain label and is otherwise today's sentence; the existing one is today's text.
+  // The header switch's title is one attribute value, so its entry is the whole title.
+  'repo.header.switchTitle': { existing: 'Quick sync on/off via registration update. Use Pause / disable in Danger Zone for the explicit disable API.', plain: 'Quick sync on/off via registration update. Use Pause / disable in Stop or remove for the explicit disable API.' },
+  'repo.stopRemove.pauseNote': { existing: 'The header “Turn sync off” opens this same dialog; “Turn sync on” only updates enabled on the registration.', plain: 'The header “Pause sync…” opens this same dialog; “Turn sync on” only updates enabled on the registration.' },
   'repo.header.hook': { existing: 'Git Hook', plain: 'Download Git pre-commit hook' },
   'repo.paused.skip': { existing: 'Skip Commit', plain: 'Skip commits…' },
 
