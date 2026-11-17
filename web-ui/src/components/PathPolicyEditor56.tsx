@@ -6,8 +6,8 @@ import {
   previewPath, previewReasonText, removePolicyEntry, undoPolicyField, updatePolicyEntry,
 } from '../pathPolicy56';
 
-const buttonClass = 'inline-flex items-center px-2.5 py-1 rounded-md border border-gray-600 text-xs text-gray-200 hover:border-gray-400 hover:text-white focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60';
-const inputClass = 'flex-1 min-w-0 bg-gray-700 border border-gray-600 rounded-md px-3 py-1.5 text-sm text-gray-100 font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 aria-[invalid=true]:border-red-400';
+const buttonClass = 'rs-btn rs-btn--quiet inline-flex items-center px-2.5 py-1 rounded-md border border-gray-600 text-xs text-gray-200 hover:border-gray-400 rs-hover-text-strong focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60';
+const inputClass = 'rs-in flex-1 min-w-0 bg-gray-700 border border-gray-600 rounded-md px-3 py-1.5 text-sm text-gray-100 font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 aria-[invalid=true]:border-red-400';
 
 interface PathPolicyEditor56Props {
   draft: PathPolicyDraft;
@@ -40,8 +40,8 @@ export default function PathPolicyEditor56({ draft, onChange, initialPreview = '
 
   return (
     <section aria-labelledby={`${base}-heading`} className="col-span-full space-y-3" data-testid="path-policy-56">
-      <h3 id={`${base}-heading`} className="text-sm font-semibold text-gray-100">Path policy</h3>
-      <div role="note" aria-labelledby={`${base}-limits`} className="rounded-md border border-amber-700/60 bg-amber-900/20 px-3 py-2 text-xs text-amber-100">
+      <h3 id={`${base}-heading`} className="rs-heading text-sm font-semibold text-gray-100">Path policy</h3>
+      <div role="note" aria-labelledby={`${base}-limits`} className="rs-bn rs-bn--warn rounded-md border border-amber-700/60 bg-amber-900/20 px-3 py-2 text-xs text-amber-100">
         <p id={`${base}-limits`} className="font-medium">Limitations in this build</p>
         <ul className="list-disc pl-4">
           {PATH_POLICY_LIMITATIONS.map(text => <li key={text}>{text}</li>)}
@@ -156,12 +156,12 @@ export default function PathPolicyEditor56({ draft, onChange, initialPreview = '
         <p className="text-xs text-gray-300">Uses the lists as they would be after saving and the same matching as the sync engine. Nothing is sent to the server.</p>
         <label htmlFor={`${base}-samples`} className="block text-xs text-gray-300">Sample Git paths (one per line)</label>
         <textarea id={`${base}-samples`} rows={3} value={samples} onChange={event => setSamples(event.target.value)}
-          className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+          className="rs-in w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
           placeholder={'src/main.rs\nbuild/output.exe'} spellCheck={false} />
         {!effective.ok ? (
           <p className="text-xs text-amber-200">{effective.reason}</p>
         ) : outcomes.length > 0 && (
-          <table className="w-full text-xs text-left" data-testid="path-policy-preview">
+          <table className="rs-tbl w-full text-xs text-left" data-testid="path-policy-preview">
             <caption className="sr-only">Git→SVN preview results</caption>
             <thead><tr><th scope="col" className="py-1 pr-2 text-gray-300">Git path</th><th scope="col" className="py-1 text-gray-300">Result</th></tr></thead>
             <tbody>

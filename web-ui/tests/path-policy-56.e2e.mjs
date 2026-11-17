@@ -185,6 +185,13 @@ async function save(page, expectedPuts) {
 test('rs56 unrelated settings save omits both policy fields and the reread policy is preserved', { timeout: 45000 }, async () => {
   const { page, close } = await open(); try {
     await field(page, 'allowed_paths').getByText('2 allowed path prefixes', { exact: true }).waitFor();
+    // With rules stored, the hook control is shown: by its test id and as the one 'Git Hook' button.
+    // The old-server case below asserts its absence the same two ways.
+    const hook = page.getByTestId('download-pre-commit-hook');
+    await hook.waitFor();
+    assert.equal(await hook.evaluate(el => el.tagName), 'BUTTON');
+    assert.equal(await page.getByRole('button', { name: 'Git Hook' }).count(), 1);
+    assert.ok(await page.getByRole('button', { name: 'Git Hook' }).evaluate(el => el.getAttribute('data-testid') === 'download-pre-commit-hook'));
     await startEditing(page);
     const name = page.getByLabel('Name', { exact: true }); await reach(page, name);
     await name.fill('Policy fixture renamed');
@@ -262,7 +269,8 @@ test('rs56 server without path_policy: policy controls are unavailable and saves
     await startEditing(page);
     assert.equal(await section(page).getByText('Not available from this server — unchanged on save', { exact: true }).count(), 2);
     assert.equal(await section(page).getByRole('button').count(), 0);
-    assert.equal(await page.getByRole('link', { name: 'Git Hook' }).count(), 0);
+    assert.equal(await page.getByTestId('download-pre-commit-hook').count(), 0);
+    assert.equal(await page.getByRole('button', { name: 'Git Hook' }).count(), 0);
     await page.getByLabel('Name', { exact: true }).fill('Old server rename');
     await save(page, 1);
     const body = policy.puts()[0].body;

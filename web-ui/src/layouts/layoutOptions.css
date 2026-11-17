@@ -1,0 +1,196 @@
+/*
+ * #264 arrangement of the three accepted #263 designs: Ledger, Console and Guide.
+ *
+ * Translated from docs/design/263/v1.6/options/<id>/option.css and the shell part of
+ * prototypes/assets/base.css onto the fixed #262 shell slots (rs-slot-*). Only the shell is
+ * arranged here; page styling is in pageClasses.css. Every rule is scoped to one of the three
+ * layouts, so Classic, Individual and Team are untouched by this file.
+ *
+ * Tab order equals reading order at every width: workspace links, "More" where it shows,
+ * then account links, administration links, chooser and sign-out.
+ */
+
+/* Shared base for the three options. */
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-slot-nav { background: var(--rs-shell-chrome); border-color: var(--rs-shell-border); border-style: solid; border-width: 0; color: var(--rs-shell-text-muted); }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-slot-logo { width: 28px; height: 28px; flex: none; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-slot-brand-name { color: var(--rs-shell-text-strong); font-weight: 750; letter-spacing: 0.05em; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-link { color: var(--rs-shell-text-muted); text-decoration: none; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-link:hover { color: var(--rs-shell-text-strong); }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-link--active { color: var(--rs-shell-text-strong); }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-link .rs-nav-icon { display: none; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-count { background: var(--rs-shell-alert); color: var(--rs-shell-alert-text); border-radius: 999px; font-size: 0.75em; font-weight: 750; padding: 0 0.5em; min-width: 1.6em; text-align: center; line-height: 1.6; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-slot-group-label { margin: 0; font: 650 0.72em/1.2 var(--rs-font-ui); letter-spacing: 0.09em; text-transform: uppercase; color: var(--rs-shell-text-muted); }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-status { display: inline-flex; align-items: center; gap: 6px; font-size: 0.86em; color: var(--rs-shell-text-strong); white-space: nowrap; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-status .t3 { color: var(--rs-shell-text-muted); }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-user { font-size: 0.88em; color: var(--rs-shell-text-muted); white-space: nowrap; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-layout-chooser { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-layout-chooser__select { background: var(--rs-shell-chrome); color: var(--rs-shell-text-strong); border: 1px solid var(--rs-shell-border); border-radius: var(--rs-radius); font: 600 0.8em var(--rs-font-ui); padding: 0.3em 0.4em; max-width: 10em; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-layout-chooser__notice { color: var(--rs-shell-notice-text); font-size: 0.78em; margin: 0; flex-basis: 100%; }
+/* An empty notice is hidden visually only, so its live region stays in the accessibility tree and the first notice is announced. */
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-layout-chooser__notice:empty { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-logout, .rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-more { background: none; border: 1px solid transparent; color: var(--rs-shell-text-muted); font: 600 0.88em var(--rs-font-ui); cursor: pointer; border-radius: var(--rs-radius); padding: 0.35em 0.6em; white-space: nowrap; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-logout:hover { color: var(--rs-shell-text-strong); }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-more { display: none; align-items: center; gap: 6px; border-color: var(--rs-shell-border); color: var(--rs-shell-text-strong); }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-more .rs-more-short { display: none; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-more[aria-expanded='true'] { background: var(--rs-shell-hover); }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-slot-nav :focus-visible { outline-color: var(--rs-shell-focus); }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-slot-main { min-width: 0; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) { color: var(--rs-text); font-family: var(--rs-font-ui); }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-slot-nav { font-size: var(--rs-fs); line-height: var(--rs-lh); }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-slot-main:focus { outline: none; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-shell-more { font-family: var(--rs-font-ui); }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-layout-chooser__notice:empty { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
+
+/* ---- ledger ---- */
+/* RepoSync #263 option "ledger": shell arrangement and component styling.
+   Concept: the product as a ledger of what moved between SVN and Git. A two-tier masthead,
+   ruled sections instead of boxes, stamps for state, ink as the only accent.
+   Tab order equals reading order at every width: the four workspace links, then the "More" control
+   (narrow only), then account links, administration links, chooser and sign-out. */
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-nav { border-bottom-width: 3px; border-bottom-style: double; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-nav-inner { max-width: 1180px; margin: 0 auto; padding-block: 12px 8px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-nav-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-nav-row::after { content: ""; flex-basis: 100%; height: 0; order: 5; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-brand, .rs-layout-shell[data-rs-layout='ledger'] .rs-slot-links, .rs-layout-shell[data-rs-layout='ledger'] .rs-slot-account { display: contents; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-logo { order: 1; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-brand-name { order: 2; font-family: var(--rs-font-display); font-size: 1.35em; letter-spacing: 0.01em; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-group { display: flex; align-items: baseline; gap: 10px; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-group-links { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 18px; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-group[data-group='workspace'] { order: 3; margin-left: 14px; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-group[data-group='workspace'] .rs-slot-group-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-shell-status { order: 4; margin-left: auto; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-group[data-group='account'] { order: 6; font-size: 0.9em; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-group[data-group='administration'] { order: 7; font-size: 0.9em; padding-left: 16px; border-left: 1px solid var(--rs-shell-hover); }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-shell-user { order: 8; margin-left: auto; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-layout-chooser { order: 9; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-shell-logout { order: 10; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-shell-link { padding: 0.25em 0; border-bottom: 2px solid transparent; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-shell-link:hover { border-bottom-color: var(--rs-shell-hover); }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-shell-link--active, .rs-layout-shell[data-rs-layout='ledger'] .rs-shell-link--active:hover { border-bottom-color: var(--rs-shell-accent); }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-slot-main { max-width: 1180px; margin: 0 auto; padding-block: 26px 64px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+@media (max-width: 860px) {
+  /* Row one: logo, name, status. Row two: the four workspace links and "More". The rest opens below. */
+  .rs-layout-shell[data-rs-layout='ledger'] .rs-slot-group[data-group='workspace'] { order: 6; flex-basis: 100%; margin-left: 0; }
+  .rs-layout-shell[data-rs-layout='ledger'] .rs-shell-more { display: inline-flex; padding: 0.15em 0.6em; }
+  .rs-layout-shell[data-rs-layout='ledger'] .rs-slot-group[data-group='account'], .rs-layout-shell[data-rs-layout='ledger'] .rs-slot-group[data-group='administration'],
+  .rs-layout-shell[data-rs-layout='ledger'] .rs-shell-user, .rs-layout-shell[data-rs-layout='ledger'] .rs-layout-chooser, .rs-layout-shell[data-rs-layout='ledger'] .rs-shell-logout { display: none; }
+  .rs-layout-shell[data-rs-layout='ledger'][data-nav-open] .rs-slot-group[data-group='account'], .rs-layout-shell[data-rs-layout='ledger'][data-nav-open] .rs-slot-group[data-group='administration'] { display: grid; flex-basis: 100%; gap: 4px; margin: 0; padding: 10px 0 0; border: 0; border-top: 1px solid var(--rs-shell-hover); font-size: 1em; }
+  .rs-layout-shell[data-rs-layout='ledger'][data-nav-open] .rs-slot-group[data-group='account'] { order: 7; }
+  .rs-layout-shell[data-rs-layout='ledger'][data-nav-open] .rs-slot-group[data-group='administration'] { order: 8; }
+  .rs-layout-shell[data-rs-layout='ledger'][data-nav-open] .rs-slot-group[data-group='account'] .rs-slot-group-links, .rs-layout-shell[data-rs-layout='ledger'][data-nav-open] .rs-slot-group[data-group='administration'] .rs-slot-group-links { display: grid; gap: 0; }
+  .rs-layout-shell[data-rs-layout='ledger'][data-nav-open] .rs-slot-group[data-group='account'] .rs-shell-link, .rs-layout-shell[data-rs-layout='ledger'][data-nav-open] .rs-slot-group[data-group='administration'] .rs-shell-link { padding: 0.6em 0; }
+  .rs-layout-shell[data-rs-layout='ledger'][data-nav-open] .rs-shell-user { display: block; order: 9; flex-basis: 100%; margin: 0; padding-top: 10px; border-top: 1px solid var(--rs-shell-hover); }
+  .rs-layout-shell[data-rs-layout='ledger'][data-nav-open] .rs-layout-chooser { display: flex; order: 10; }
+  .rs-layout-shell[data-rs-layout='ledger'][data-nav-open] .rs-shell-logout { display: inline-block; order: 11; margin-left: auto; }
+}
+
+/* ---- console ---- */
+/* RepoSync #263 option "console": shell arrangement and component styling.
+   Concept: an operations console. A grouped sidebar, dense tables, a status inspector beside
+   the working area, and a bottom bar for the four workspace destinations and "More" on a phone.
+   Tab order equals reading order: workspace links, "More" (narrow only), then what it opens. */
+.rs-layout-shell[data-rs-layout='console'] { display: grid; grid-template-columns: 244px minmax(0, 1fr); }
+.rs-layout-shell[data-rs-layout='console'] .rs-slot-nav { position: sticky; top: 0; height: 100vh; overflow-y: auto; border-right-width: 1px; }
+.rs-layout-shell[data-rs-layout='console'] .rs-slot-nav-inner { padding: 14px 10px; min-height: 100%; display: flex; }
+.rs-layout-shell[data-rs-layout='console'] .rs-slot-nav-row { display: flex; flex-direction: column; gap: 14px; flex: 1 1 auto; min-width: 0; }
+.rs-layout-shell[data-rs-layout='console'] .rs-slot-brand { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.rs-layout-shell[data-rs-layout='console'] .rs-slot-brand-name { font-size: 1.15em; }
+.rs-layout-shell[data-rs-layout='console'] .rs-slot-links { flex-basis: 100%; display: grid; gap: 16px; margin-top: 10px; }
+.rs-layout-shell[data-rs-layout='console'] .rs-slot-group { display: grid; gap: 4px; }
+.rs-layout-shell[data-rs-layout='console'] .rs-slot-group-label { padding: 0 8px; }
+.rs-layout-shell[data-rs-layout='console'] .rs-slot-group-links { display: grid; gap: 1px; }
+.rs-layout-shell[data-rs-layout='console'] .rs-shell-link { padding: 0.45em 0.6em; border-radius: var(--rs-radius); border-left: 2px solid transparent; }
+.rs-layout-shell[data-rs-layout='console'] .rs-shell-link .rs-nav-icon { display: block; }
+.rs-layout-shell[data-rs-layout='console'] .rs-shell-link:hover { background: var(--rs-shell-hover); }
+.rs-layout-shell[data-rs-layout='console'] .rs-shell-link--active, .rs-layout-shell[data-rs-layout='console'] .rs-shell-link--active:hover { background: var(--rs-shell-hover); border-left-color: var(--rs-shell-accent); }
+.rs-layout-shell[data-rs-layout='console'] .rs-shell-count { margin-left: auto; }
+.rs-layout-shell[data-rs-layout='console'] .rs-slot-account { margin-top: auto; display: grid; gap: 8px; padding: 12px 8px 0; border-top: 1px solid var(--rs-shell-border); justify-items: start; }
+.rs-layout-shell[data-rs-layout='console'] .rs-slot-main { padding: 18px 22px 48px; }
+@media (max-width: 900px) {
+  /* Top strip: logo, name, status; it stays at the top so the opened links are always in view.
+     Bottom bar: the four workspace links and "More". */
+  .rs-layout-shell[data-rs-layout='console'] { display: block; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-nav { position: sticky; top: 0; z-index: 4; height: auto; overflow: visible; border-right-width: 0; border-bottom-width: 1px; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-nav-inner { display: block; min-height: 0; padding-block: 8px; padding-left: max(12px, env(safe-area-inset-left, 0px)); padding-right: max(12px, env(safe-area-inset-right, 0px)); }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-nav-row { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-brand, .rs-layout-shell[data-rs-layout='console'] .rs-slot-links, .rs-layout-shell[data-rs-layout='console'] .rs-slot-account { display: contents; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-logo { order: 1; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-brand-name { order: 2; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-shell-status { order: 3; margin-left: auto; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-group[data-group='workspace'] { position: fixed; left: 0; right: 0; bottom: 0; z-index: 5; margin: 0; background: var(--rs-shell-chrome); border-top: 1px solid var(--rs-shell-border); padding: 4px max(8px, env(safe-area-inset-right, 0px)) calc(4px + env(safe-area-inset-bottom, 0px)) max(8px, env(safe-area-inset-left, 0px)); }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-group[data-group='workspace'] .rs-slot-group-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-group[data-group='workspace'] .rs-slot-group-links { display: flex; gap: 0; background: none; padding: 0; border-radius: 0; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-group[data-group='workspace'] .rs-shell-link, .rs-layout-shell[data-rs-layout='console'] .rs-shell-more { position: relative; flex: 1 1 0; min-width: 0; display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-size: 0.8em; padding: 0.45em 0; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-shell-more { border-color: transparent; background: none; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-group[data-group='workspace'] .rs-nav-icon, .rs-layout-shell[data-rs-layout='console'] .rs-shell-more .rs-more-icon { display: block; width: 1.5em; height: 1.5em; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-shell-more .rs-more-long { display: none; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-shell-more .rs-more-short { display: inline; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-group[data-group='workspace'] .rs-shell-count { position: absolute; top: 1px; left: calc(50% + 0.5em); margin: 0; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-group[data-group='workspace'] .rs-shell-link, .rs-layout-shell[data-rs-layout='console'] .rs-shell-more { border-left: 0; border-top: 2px solid transparent; border-radius: 0; background: none; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-group[data-group='workspace'] .rs-shell-link--active { border-top-color: var(--rs-shell-accent); background: none; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-group[data-group='account'], .rs-layout-shell[data-rs-layout='console'] .rs-slot-group[data-group='administration'],
+  .rs-layout-shell[data-rs-layout='console'] .rs-shell-user, .rs-layout-shell[data-rs-layout='console'] .rs-layout-chooser, .rs-layout-shell[data-rs-layout='console'] .rs-shell-logout { display: none; }
+  .rs-layout-shell[data-rs-layout='console'][data-nav-open] .rs-slot-group[data-group='account'] { display: grid; order: 6; flex-basis: 100%; padding-top: 8px; border-top: 1px solid var(--rs-shell-border); }
+  .rs-layout-shell[data-rs-layout='console'][data-nav-open] .rs-slot-group[data-group='administration'] { display: grid; order: 7; flex-basis: 100%; }
+  .rs-layout-shell[data-rs-layout='console'][data-nav-open] .rs-shell-user { display: block; order: 8; flex-basis: 100%; padding-top: 8px; border-top: 1px solid var(--rs-shell-border); }
+  .rs-layout-shell[data-rs-layout='console'][data-nav-open] .rs-layout-chooser { display: flex; order: 9; }
+  .rs-layout-shell[data-rs-layout='console'][data-nav-open] .rs-shell-logout { display: inline-block; order: 10; margin-left: auto; }
+  .rs-layout-shell[data-rs-layout='console'] .rs-slot-main { padding: 14px 12px 92px; }
+}
+
+/* ---- guide ---- */
+/* RepoSync #263 option "guide": shell arrangement and component styling.
+   Concept: a task-led layout for people who visit occasionally. Four large workspace
+   destinations, everything else behind one "Account and admin" control that sits at the end of
+   the same row, plain-language cards, large targets, and a bottom bar on a phone.
+   Tab order equals reading order: the four destinations, the control, then what it opens. */
+.rs-layout-shell[data-rs-layout='guide'] .rs-slot-nav { position: sticky; top: 0; z-index: 4; border-bottom-width: 1px; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-slot-nav-inner { max-width: 1080px; margin: 0 auto; padding-block: 10px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+.rs-layout-shell[data-rs-layout='guide'] .rs-slot-nav-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-slot-nav-row::after { content: ""; flex-basis: 100%; height: 0; order: 5; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-slot-brand, .rs-layout-shell[data-rs-layout='guide'] .rs-slot-links, .rs-layout-shell[data-rs-layout='guide'] .rs-slot-account { display: contents; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-slot-logo { order: 1; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-slot-brand-name { order: 2; font-size: 1.1em; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-slot-group[data-group='workspace'] { order: 3; margin: 0 auto; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-slot-group[data-group='workspace'] .rs-slot-group-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-slot-group[data-group='workspace'] .rs-slot-group-links { display: flex; align-items: center; gap: 4px; background: var(--rs-shell-hover); padding: 4px; border-radius: 999px; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-shell-link { padding: 0.5em 1.05em; border-radius: 999px; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-shell-link--active, .rs-layout-shell[data-rs-layout='guide'] .rs-shell-link--active:hover { background: var(--rs-shell-accent); color: var(--rs-shell-accent-text); }
+.rs-layout-shell[data-rs-layout='guide'] .rs-shell-more { display: inline-flex; border-radius: 999px; padding: 0.5em 0.9em; background: var(--rs-shell-chrome); }
+.rs-layout-shell[data-rs-layout='guide'] .rs-shell-status { order: 4; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-slot-group[data-group='account'], .rs-layout-shell[data-rs-layout='guide'] .rs-slot-group[data-group='administration'],
+.rs-layout-shell[data-rs-layout='guide'] .rs-shell-user, .rs-layout-shell[data-rs-layout='guide'] .rs-layout-chooser, .rs-layout-shell[data-rs-layout='guide'] .rs-shell-logout { display: none; }
+.rs-layout-shell[data-rs-layout='guide'][data-nav-open] .rs-slot-group[data-group='account'] { display: grid; order: 6; flex: 1 1 200px; align-content: start; gap: 6px; padding-top: 12px; border-top: 1px solid var(--rs-shell-border); }
+.rs-layout-shell[data-rs-layout='guide'][data-nav-open] .rs-slot-group[data-group='administration'] { display: grid; order: 7; flex: 2 1 320px; align-content: start; gap: 6px; padding-top: 12px; border-top: 1px solid var(--rs-shell-border); }
+.rs-layout-shell[data-rs-layout='guide'][data-nav-open] .rs-slot-group[data-group='account'] .rs-slot-group-links, .rs-layout-shell[data-rs-layout='guide'][data-nav-open] .rs-slot-group[data-group='administration'] .rs-slot-group-links { display: grid; gap: 2px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); }
+.rs-layout-shell[data-rs-layout='guide'][data-nav-open] .rs-slot-group[data-group='account'] .rs-shell-link, .rs-layout-shell[data-rs-layout='guide'][data-nav-open] .rs-slot-group[data-group='administration'] .rs-shell-link { border-radius: var(--rs-radius); padding: 0.6em 0.7em; }
+.rs-layout-shell[data-rs-layout='guide'][data-nav-open] .rs-slot-group[data-group='account'] .rs-shell-link:hover, .rs-layout-shell[data-rs-layout='guide'][data-nav-open] .rs-slot-group[data-group='administration'] .rs-shell-link:hover { background: var(--rs-shell-hover); }
+.rs-layout-shell[data-rs-layout='guide'][data-nav-open] .rs-shell-user { display: block; order: 8; flex-basis: 100%; padding-top: 10px; border-top: 1px solid var(--rs-shell-border); }
+.rs-layout-shell[data-rs-layout='guide'][data-nav-open] .rs-layout-chooser { display: flex; order: 9; }
+.rs-layout-shell[data-rs-layout='guide'][data-nav-open] .rs-shell-logout { display: inline-block; order: 10; margin-left: auto; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-slot-main { max-width: 1080px; margin: 0 auto; padding-block: 28px 72px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+@media (max-width: 760px) {
+  /* Top bar: logo, name, status. Bottom bar: the four destinations and "More". "More" opens the rest under the top bar. */
+  .rs-layout-shell[data-rs-layout='guide'] .rs-slot-group[data-group='workspace'] { position: fixed; left: 0; right: 0; bottom: 0; z-index: 5; margin: 0; background: var(--rs-shell-chrome); border-top: 1px solid var(--rs-shell-border); padding: 6px max(8px, env(safe-area-inset-right, 0px)) calc(6px + env(safe-area-inset-bottom, 0px)) max(8px, env(safe-area-inset-left, 0px)); }
+  .rs-layout-shell[data-rs-layout='guide'] .rs-slot-group[data-group='workspace'] .rs-slot-group-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .rs-layout-shell[data-rs-layout='guide'] .rs-slot-group[data-group='workspace'] .rs-slot-group-links { display: flex; gap: 0; background: none; padding: 0; border-radius: 0; }
+  .rs-layout-shell[data-rs-layout='guide'] .rs-slot-group[data-group='workspace'] .rs-shell-link, .rs-layout-shell[data-rs-layout='guide'] .rs-shell-more { position: relative; flex: 1 1 0; min-width: 0; display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-size: 0.68em; padding: 0.45em 0; }
+  .rs-layout-shell[data-rs-layout='guide'] .rs-shell-more { border-color: transparent; background: none; }
+  .rs-layout-shell[data-rs-layout='guide'] .rs-slot-group[data-group='workspace'] .rs-nav-icon, .rs-layout-shell[data-rs-layout='guide'] .rs-shell-more .rs-more-icon { display: block; width: 1.9em; height: 1.9em; }
+  .rs-layout-shell[data-rs-layout='guide'] .rs-shell-more .rs-more-long { display: none; }
+  .rs-layout-shell[data-rs-layout='guide'] .rs-shell-more .rs-more-short { display: inline; }
+  .rs-layout-shell[data-rs-layout='guide'] .rs-slot-group[data-group='workspace'] .rs-shell-count { position: absolute; top: 1px; left: calc(50% + 0.5em); margin: 0; }
+  .rs-layout-shell[data-rs-layout='guide'] .rs-slot-group[data-group='workspace'] .rs-shell-link, .rs-layout-shell[data-rs-layout='guide'] .rs-shell-more { border-radius: 12px; }
+  .rs-layout-shell[data-rs-layout='guide'] .rs-shell-status { margin-left: auto; }
+  .rs-layout-shell[data-rs-layout='guide'] .rs-slot-main { padding-bottom: 104px; }
+}
+/* Guide: the two opened groups start at the same height. */
+.rs-layout-shell[data-rs-layout='guide'][data-nav-open] .rs-slot-group[data-group='account'],
+.rs-layout-shell[data-rs-layout='guide'][data-nav-open] .rs-slot-group[data-group='administration'] { align-self: flex-start; }
+/* Ledger: when the account row wraps at wide sizes, sign-out stays at the right edge. */
+@media (min-width: 861px) {
+  .rs-layout-shell[data-rs-layout='ledger'] .rs-shell-logout { margin-left: auto; }
+  .rs-layout-shell[data-rs-layout='ledger'] .rs-layout-chooser__select { max-width: 10em; }
+}
+/* The shell fills the window, as Classic's min-h-screen does, so a short page shows no bare body below it. */
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) { min-height: 100vh; }

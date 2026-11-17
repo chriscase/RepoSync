@@ -17,3 +17,22 @@
   --activity-stream-load-more-text: #9ca3af; /* gray-400 */
   --activity-stream-load-more-hover: #374151;/* gray-700 */
 }
+
+/*
+ * #264: under data-rs-bridge (every layout in light; Ledger, Console and Guide in dark) the
+ * stream takes its colours from the page tokens. Without the bridge the values above apply.
+ */
+.rs-layout-shell[data-rs-bridge] .activity-stream--dark {
+  --activity-stream-text: var(--rs-text);
+  --activity-stream-text-secondary: var(--rs-text-2);
+  --activity-stream-border: var(--rs-line);
+  --activity-stream-hover-bg: var(--rs-surface-2);
+  --activity-stream-icon-bg: var(--rs-surface-2);
+  --activity-stream-icon-color: var(--rs-text-2);
+  --activity-stream-timeline-color: var(--rs-line);
+  --activity-stream-link-color: var(--rs-link);
+  --activity-stream-shadow: transparent;
+  --activity-stream-load-more-bg: var(--rs-surface-2);
+  --activity-stream-load-more-text: var(--rs-text-2);
+  --activity-stream-load-more-hover: var(--rs-surface-3);
+}

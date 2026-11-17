@@ -27,7 +27,11 @@ export default function Dialog({ isOpen = true, title, description, onClose, bus
     const cancel = dialog.querySelector<HTMLElement>('[data-dialog-cancel]:not(:disabled)');
     (cancel ?? dialog.querySelector<HTMLElement>(`#${CSS.escape(id)}-title`))?.focus();
     return () => {
-      const ownedFocus = dialog.contains(document.activeElement) || document.activeElement === document.body;
+      const active = document.activeElement;
+      // #264: when this dialog was opened from inside another dialog, that dialog takes focus
+      // while this one unmounts; focus parked on the enclosing dialog is still ours to restore.
+      const ownedFocus = dialog.contains(active) || active === document.body
+        || (active instanceof HTMLDialogElement && previous instanceof Node && active !== dialog && active.contains(previous));
       dialog.close();
       // Never steal focus from a replacement route/session. If the completed
       // action removed its trigger, return to the current main landmark.
@@ -47,7 +51,9 @@ export default function Dialog({ isOpen = true, title, description, onClose, bus
   if (!isOpen) return null;
   return <dialog ref={ref} tabIndex={-1} data-testid={testId} aria-labelledby={`${id}-title`}
     aria-describedby={`${id}-description`} aria-modal="true" aria-busy={busy || undefined}
-    onCancel={event => { event.preventDefault(); if (!busy) onClose(); }}
+    // #264: a confirmation can open inside another dialog. React passes a nested dialog's
+    // cancel (Escape) up to its ancestors, so each dialog handles only its own.
+    onCancel={event => { if (event.target !== event.currentTarget) return; event.preventDefault(); event.stopPropagation(); if (!busy) onClose(); }}
     onKeyDownCapture={event => {
       if (event.key !== 'Tab') return;
       const dialog = event.currentTarget;
@@ -61,7 +67,7 @@ export default function Dialog({ isOpen = true, title, description, onClose, bus
       }
     }}
     className={`app-dialog m-auto max-h-[90vh] w-[calc(100%-2rem)] max-w-lg overflow-y-auto rounded-lg border border-gray-600 bg-gray-800 p-6 text-gray-100 shadow-xl ${className}`}>
-    <h2 id={`${id}-title`} tabIndex={-1} className="text-lg font-semibold mb-2">{title}</h2>
+    <h2 id={`${id}-title`} tabIndex={-1} className="rs-heading text-lg font-semibold mb-2">{title}</h2>
     <div id={`${id}-description`} className="text-sm text-gray-300 mb-4">{description}</div>
     {busy && <p role="status" className="mb-3 text-sm text-gray-300">Request in progress. Please wait before closing this dialog.</p>}
     {children}

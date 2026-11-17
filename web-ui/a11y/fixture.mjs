@@ -11,14 +11,14 @@ export const skipContext={pinned_cursor:'a'.repeat(40),observed_remote_tip:'c'.r
 
 /** Closed, loopback-only API substitute: every write affects only this in-memory fixture. */
 export async function startFixture(port=0) {
- const requests=[];let held=false,removeResult='refused',reportedPhase='importing',reportedRevision=21,logGeneration=0,setupActive=true,skipMode='off';const pending=new Set(),removed=new Set();
+ const requests=[];let held=false,removeResult='refused',reportedPhase='importing',reportedRevision=21,logGeneration=0,setupActive=true,skipMode='off',notificationsSet=false;const pending=new Set(),removed=new Set();
  const activeProgress=()=>({...progress(),phase:reportedPhase,current_rev:reportedRevision,log_lines:[`Synthetic log generation ${logGeneration}`]});
  const server=createServer(async(req,res)=>{
   const url=new URL(req.url,'http://127.0.0.1'),path=url.pathname;let bytes=0,chunks=[];
   for await(const chunk of req){bytes+=chunk.length;if(bytes>65536){res.writeHead(413).end();return;}chunks.push(chunk)}
   let body;try{body=JSON.parse(Buffer.concat(chunks).toString()||'{}')}catch{res.writeHead(400).end();return;}
   const reply=(code,data)=>{if(res.destroyed)return;const json=JSON.stringify(data);res.writeHead(code,{'content-type':'application/json','content-length':Buffer.byteLength(json)});res.end(json)};
-  if(path==='/__fixture/state'){if(req.method==='POST'){if('hold' in body)held=!!body.hold;if(['completed','refused'].includes(body.removeResult))removeResult=body.removeResult;if(['connecting','importing','verifying','final_push'].includes(body.phase))reportedPhase=body.phase;if(Number.isSafeInteger(body.current_rev)&&body.current_rev>=0&&body.current_rev<=100)reportedRevision=body.current_rev;if(body.bump_log&&logGeneration<255)logGeneration++;if(typeof body.setup_active==='boolean')setupActive=body.setup_active;if(['off','eligible','held','unknown'].includes(body.skip_mode))skipMode=body.skip_mode;}return reply(200,{held,requests})}
+  if(path==='/__fixture/state'){if(req.method==='POST'){if('hold' in body)held=!!body.hold;if(['completed','refused'].includes(body.removeResult))removeResult=body.removeResult;if(['connecting','importing','verifying','final_push'].includes(body.phase))reportedPhase=body.phase;if(Number.isSafeInteger(body.current_rev)&&body.current_rev>=0&&body.current_rev<=100)reportedRevision=body.current_rev;if(body.bump_log&&logGeneration<255)logGeneration++;if(typeof body.setup_active==='boolean')setupActive=body.setup_active;if(['off','eligible','held','unknown'].includes(body.skip_mode))skipMode=body.skip_mode;if(typeof body.notifications_set==='boolean')notificationsSet=body.notifications_set;}return reply(200,{held,requests})}
   if(path==='/__fixture/release'){held=false;for(const done of pending)done();pending.clear();return reply(200,{ok:true})}
   if(path==='/api/auth/info')return reply(200,{ldap_enabled:false,ldap_domain:null});
   if(path==='/api/auth/login')return body.username==='fixture-admin'&&body.password==='synthetic-only'?reply(200,{token:'synthetic-session-only',user:syntheticUser}):reply(401,{error:'Synthetic login refused'});
@@ -112,7 +112,7 @@ export async function startFixture(port=0) {
   if(path==='/api/status/system')return reply(200,{disk_free_bytes:100,disk_total_bytes:200,disk_usage_percent:50,mem_used_bytes:100,mem_total_bytes:200,mem_usage_percent:50,cpu_load_1m:0,cpu_load_5m:0,cpu_load_15m:0,git_push_active:false,git_push_pid:null,git_push_elapsed_secs:null,data_dir_size_bytes:0,net_bytes_sent:0,net_bytes_recv:0,net_up_bytes_per_sec:0,net_down_bytes_per_sec:0,svn_active:false});
   if(path.startsWith('/api/users/')&&path.endsWith('/credentials'))return reply(200,[]);
   if(path==='/api/admin/ldap')return reply(200,{enabled:false,url:'ldaps://directory.example.invalid',base_dn:'dc=example,dc=invalid',search_filter:'(uid={username})',display_name_attr:'displayName',email_attr:'mail',group_attr:'memberOf',bind_dn:'',bind_password_set:false});
-  if(path==='/api/config/notifications')return reply(200,{teams_webhook_url:''});
+  if(path==='/api/config/notifications')return reply(200,{teams_webhook_url:notificationsSet?'https://synthetic-notifications.example.invalid/saved':''});
   if(path.endsWith('/credentials'))return reply(200,{svn_password_set:false,git_token_set:false});
   if(path.endsWith('/branches'))return reply(200,path.includes('/A/')?[repository('B')]:[]);
   if(path.endsWith('/import/status'))return reply(200,(path.startsWith('/api/setup/')&&setupActive)||path.includes('/A/')?activeProgress():{...activeProgress(),phase:'idle',lifecycle:undefined,current_rev:0,total_revs:0,commits_created:0,log_lines:[],started_at:null,busy:false,can_start:true,operation_id:undefined});
@@ -122,6 +122,8 @@ export async function startFixture(port=0) {
   if(path==='/api/audit')return reply(200,{entries:[],total:0,page:1,per_page:Number(url.searchParams.get('limit')||50),total_pages:0,offset:0});
   if(path==='/api/commit-map'||path==='/api/sync-records')return reply(200,{entries:[],total:0});
   if(path==='/api/config/identity')return reply(200,[]);
+  // #264 G12.10: the wizard turns its form off when the saved configuration cannot be read, so the fixture serves a synthetic one.
+  if(path==='/api/setup/config')return reply(200,{svn_url:'',svn_username:'',svn_layout:'standard',svn_trunk_path:'trunk',svn_password_set:false,git_provider:'github',git_api_url:'',git_repo:'',git_branch:'main',git_token_set:false,sync_mode:'direct',auto_merge:false,sync_tags:true,lfs_threshold:0,email_domain:'',listen:'127.0.0.1:8080',auth_mode:'simple',poll_interval:60,log_level:'info',data_dir:'/synthetic-only/data',admin_password_set:false});
   if(path==='/api/users')return reply(200,[syntheticUser,...syntheticEditors]);
   return reply(404,{error:'No such synthetic fixture resource'});
  });
