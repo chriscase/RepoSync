@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { Outlet, NavLink, useLocation } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import {
@@ -107,6 +107,19 @@ export function LayoutFrame({ layout, theme = DEFAULT_THEME, isAdmin, activeConf
     const first = rootRef.current?.querySelector<HTMLElement>(`#${groupId('account')} a, #${groupId('administration')} a`);
     first?.focus();
   }, [navOpen]);
+
+  // A layout change made from the chooser must not hide the chooser that holds focus. Guide
+  // always, Ledger and Console at narrow widths, keep it behind "More"; when the new
+  // arrangement hides the focused control, open "More" so it stays shown and focused.
+  // Chromium drops focus from a hidden element on a later task, so this runs in time.
+  const previousLayout = useRef(layout);
+  useLayoutEffect(() => {
+    if (previousLayout.current === layout) return;
+    previousLayout.current = layout;
+    const active = document.activeElement;
+    const chooser = rootRef.current?.querySelector('.rs-layout-chooser');
+    if (active instanceof HTMLElement && chooser?.contains(active) && active.getClientRects().length === 0) setNavOpen(true);
+  }, [layout]);
 
   const toggleMore = () => {
     focusOnOpen.current = !navOpen;

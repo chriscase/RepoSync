@@ -62,6 +62,18 @@ describe('#264 G11.1 author identity mappings', () => {
     expect(html).not.toContain('role="alert"');
   });
 
+  it('holds the typed mapping while a save is pending: the inputs and Add are off until it settles', () => {
+    const draft: AuthorMapping = { svn_username: 'fixture-c', name: 'Fixture C', email: 'c@fixture.invalid' };
+    const html = mappingsView({ saving: true, newMapping: draft });
+    const fields = inputs(html);
+    expect(fields).toHaveLength(3);
+    expect(fields.every((input) => input.includes('disabled=""'))).toBe(true);
+    expect(fields.map((input) => input.match(/value="([^"]*)"/)?.[1])).toEqual(['fixture-c', 'Fixture C', 'c@fixture.invalid']);
+    expect(button(html, 'Add')?.disabled).toBe(true);
+    const settled = inputs(mappingsView({ saving: false, newMapping: draft }));
+    expect(settled.every((input) => !input.includes('disabled=""'))).toBe(true);
+  });
+
   it('says so when the list is empty', () => {
     const html = mappingsView({ mappings: [] });
     expect(html).toContain('No mappings yet');

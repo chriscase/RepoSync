@@ -184,6 +184,46 @@ test('rs264 More at phone width: reading-order tab stops, focus moves in, Escape
   }
 });
 
+test('rs264 a keyboard layout change keeps the chooser shown and focused; where the new layout keeps it behind More, More opens', { timeout: 120000 }, async () => {
+  for (const [label, viewport] of [['wide', WIDE], ['phone width', NARROW]]) {
+    const { page, close } = await open('/', { viewport, stored: record('classic', 'dark') });
+    try {
+      const select = page.locator('select[data-rs-layout-chooser]');
+      assert.equal(await select.isVisible(), true, `${label}: Classic shows the chooser`);
+      await select.focus();
+      // Arrow keys on a closed select change it at once, so this walks every layout from the keyboard.
+      for (const layout of LAYOUTS.slice(1)) {
+        await page.keyboard.press('ArrowDown');
+        await page.locator(`[data-rs-layout="${layout}"]`).waitFor();
+        // Give Chromium's deferred check for a focused element that is no longer shown time to run.
+        await page.waitForTimeout(250);
+        assert.equal(await select.evaluate(el => el === document.activeElement), true, `${label} ${layout}: the chooser keeps focus`);
+        assert.equal(await select.isVisible(), true, `${label} ${layout}: the chooser stays shown`);
+      }
+      const moreOpen = await shell(page).evaluate(el => el.hasAttribute('data-nav-open'));
+      assert.equal(moreOpen, true, `${label}: Guide keeps the chooser behind More, so More opened`);
+      const more = page.locator('.rs-shell-more');
+      assert.equal(await more.getAttribute('aria-expanded'), 'true');
+      await page.keyboard.press('Escape');
+      assert.equal(await more.getAttribute('aria-expanded'), 'false');
+      assert.equal(await more.evaluate(el => el === document.activeElement), true, `${label}: Escape returns focus to More`);
+    } finally { await close(); }
+  }
+  // At a wide window Ledger and Console show the chooser in the bar, so a change to them leaves More closed.
+  for (const layout of ['ledger', 'console']) {
+    const { page, close } = await open('/', { viewport: WIDE, stored: record('classic', 'dark') });
+    try {
+      const select = page.locator('select[data-rs-layout-chooser]');
+      await select.focus();
+      await select.selectOption(layout);
+      await page.locator(`[data-rs-layout="${layout}"]`).waitFor();
+      await page.waitForTimeout(250);
+      assert.equal(await select.evaluate(el => el === document.activeElement), true, `wide ${layout}: the chooser keeps focus`);
+      assert.equal(await shell(page).evaluate(el => el.hasAttribute('data-nav-open')), false, `wide ${layout}: More stays closed`);
+    } finally { await close(); }
+  }
+});
+
 test('rs264 repository sections: tabs navigate, Back works, unknown falls back to Overview, a Settings draft survives', { timeout: 90000 }, async () => {
   const { page, close } = await open('/repos/A?section=settings', { stored: record('console', 'dark') });
   try {

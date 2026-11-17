@@ -239,7 +239,7 @@ export function IdentityMappingsView({ mappings, loading, readError, saving, sav
           <input
             aria-label="Mapping SVN username" placeholder="SVN username"
             value={newMapping.svn_username}
-            disabled={editingOff}
+            disabled={editingOff || saving}
             onChange={(e) =>
               onNewMapping({ ...newMapping, svn_username: e.target.value })
             }
@@ -248,7 +248,7 @@ export function IdentityMappingsView({ mappings, loading, readError, saving, sav
           <input
             aria-label="Mapping full name" placeholder="Full Name"
             value={newMapping.name}
-            disabled={editingOff}
+            disabled={editingOff || saving}
             onChange={(e) =>
               onNewMapping({ ...newMapping, name: e.target.value })
             }
@@ -257,7 +257,7 @@ export function IdentityMappingsView({ mappings, loading, readError, saving, sav
           <input
             aria-label="Mapping email" placeholder="email@company.com"
             value={newMapping.email}
-            disabled={editingOff}
+            disabled={editingOff || saving}
             onChange={(e) =>
               onNewMapping({ ...newMapping, email: e.target.value })
             }
