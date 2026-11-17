@@ -944,7 +944,9 @@ export interface Repository {
   allowed_paths: string | null;
   blocked_patterns: string | null;
   consecutive_errors: number;
-  sync_status: string;
+  /** Public detail/list DTO label. Branch-pair rows expose sync_status instead. */
+  status?: string;
+  sync_status?: string;
   initializing?: boolean;
   import_mode?: RepoImportMode | string | null;
   starting_revision?: number | null;

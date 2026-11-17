@@ -42,7 +42,8 @@ for (const side of ['git', 'svn']) test(`archive ${side} side keeps detail and r
         reviewed: { git: { phase: side === 'git' ? 'verified_deleted' : 'not_requested', errors: [] }, svn: { phase: side === 'svn' ? 'verified_deleted' : 'not_requested', errors: [] }, cleanup_started: true, cleanup_completed: true, cleanup_errors: [] } };
       return json(receipt);
     }
-    if (archived && url.pathname === '/api/repos/B') return json({ ...repository('B'), sync_status: 'archived', enabled: false });
+    if (archived && url.pathname === '/api/repos') return json([repository('A'), { ...repository('B'), status: 'archived', enabled: false }]);
+    if (archived && url.pathname === '/api/repos/B') return json({ ...repository('B'), status: 'archived', enabled: false });
     if (archived && url.pathname === '/api/repos/B/removal') return json(receipt);
     return route.continue();
   });
@@ -74,6 +75,8 @@ for (const side of ['git', 'svn']) test(`archive ${side} side keeps detail and r
     assert.equal(approvals.length, 1);
     await page.goto(origin+'repos/B?section=activity');
     await page.getByRole('heading', { name: /Recent Audit Log/ }).waitFor();
+    await page.goto(origin+'repos');
+    await page.getByText('Archived · sync stopped', { exact: true }).waitFor();
     assert.deepEqual(errors, []);
   } finally { await context.close(); }
 });

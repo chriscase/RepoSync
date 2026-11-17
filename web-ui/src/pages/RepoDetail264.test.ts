@@ -439,8 +439,10 @@ describe('S20 plain lifecycle words, raw value kept in details', () => {
 
 
 describe('#199 archived detail is read-only', () => {
-  it('retains history navigation and disables mutation controls', () => {
-    seed({ repo: repo({ parent_id: 'root', enabled: false, sync_status: 'archived' }) });
+  it('uses the real detail DTO status (without sync_status) to retain history and disable mutations', () => {
+    const detail = repo({ parent_id: 'root', enabled: false, status: 'archived' });
+    delete detail.sync_status;
+    seed({ repo: detail });
     const html = renderPage('/repos/r1');
     expect(html).toContain('archived-pair-notice');
     expect(html).toContain('Archived · sync permanently stopped');

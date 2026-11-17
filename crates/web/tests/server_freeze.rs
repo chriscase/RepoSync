@@ -10684,6 +10684,9 @@ async fn rs199_api_archive_retains_pair_and_refuses_legacy_removal() {
         let (addr, state, server, tmp, id) = rs65_native_api_fixture().await;
         let client = authed_client();
         let base = format!("http://{addr}/api/repos/{id}");
+        let initial = state.db.get_repository(&id).unwrap().unwrap();
+        assert_eq!(initial.last_svn_rev, 0);
+        assert!(initial.last_sync_at.is_none());
         let choices = serde_json::json!({"delete_git":delete_git,"delete_svn":!delete_git,"archive_pair":true});
         let response = client
             .post(format!("{base}/removal/review"))
@@ -10724,6 +10727,58 @@ async fn rs199_api_archive_retains_pair_and_refuses_legacy_removal() {
         let repo = state.db.get_repository(&id).unwrap().unwrap();
         assert_eq!(repo.sync_status, "archived");
         assert!(!repo.enabled);
+        let detail: serde_json::Value = client
+            .get(&base)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            detail["status"], "archived",
+            "archive takes precedence over zero or inconsistent baseline"
+        );
+        assert_eq!(detail["initializing"], false);
+        assert!(
+            detail.get("sync_status").is_none(),
+            "detail uses the public status DTO"
+        );
+        let summaries: Vec<serde_json::Value> = client
+            .get(format!("http://{addr}/api/repos"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            summaries.iter().find(|row| row["id"] == id).unwrap()["status"],
+            "archived"
+        );
+        let children: Vec<serde_json::Value> = client
+            .get(format!(
+                "http://{addr}/api/repos/{}/branches",
+                repo.parent_id.as_ref().unwrap()
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            children.iter().find(|row| row["id"] == id).unwrap()["sync_status"],
+            "archived",
+            "branch rows retain their raw model contract"
+        );
+
         assert!(tmp
             .path()
             .join("repos")
@@ -10793,4 +10848,65 @@ async fn rs199_api_archive_retains_pair_and_refuses_legacy_removal() {
         assert_eq!(repeat["operation_id"], done["operation_id"]);
         server.abort();
     }
+}
+
+/// Baseline reconciliation is historical evidence, not the archived lifecycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs199_archive_detail_overrides_orphan_baseline_reconciliation() {
+    let (addr, state, server, _tmp, id) = rs65_native_api_fixture().await;
+    state
+        .db
+        .set_state(&format!("last_svn_rev_{id}"), "2")
+        .unwrap();
+    assert!(matches!(
+        resolve_repo_import_baseline(&state.db, &id).unwrap(),
+        RepoImportBaseline::ReconciliationRequired { .. }
+    ));
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}");
+    let mut choices = serde_json::json!({"delete_git":true,"delete_svn":false,"archive_pair":true});
+    let review: serde_json::Value = client
+        .post(format!("{base}/removal/review"))
+        .json(&choices)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    choices["review_pin"] = review["review_pin"].clone();
+    choices["request_id"] = serde_json::json!("archive-orphan-dto");
+    let done: serde_json::Value = client
+        .post(format!("{base}/removal/approve"))
+        .json(&choices)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(done["state"], "completed");
+    assert_eq!(done["archive_pair"], true);
+    assert!(matches!(
+        resolve_repo_import_baseline(&state.db, &id).unwrap(),
+        RepoImportBaseline::ReconciliationRequired { .. }
+    ));
+    let detail: serde_json::Value = client
+        .get(&base)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["status"], "archived");
+    assert_eq!(detail["initializing"], false);
+    assert_eq!(detail["enabled"], false);
+    server.abort();
 }

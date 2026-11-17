@@ -269,7 +269,7 @@ function RepositoryDetailEditor() {
     refetchOnReconnect: (query) => !isNotFoundError(query.state.error),
   });
   const { data: repo, isLoading, isError, error } = repoQuery;
-  const archived = repo?.sync_status === 'archived';
+  const archived = repo?.status === 'archived';
   const repoMissing = isNotFoundError(error);
   const detailLive = !!id && id !== retiredId && !repoMissing;
 

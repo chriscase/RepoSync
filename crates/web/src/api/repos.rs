@@ -240,6 +240,7 @@ struct RepoDetail {
 
 impl From<reposync_core::models::Repository> for RepoDetail {
     fn from(r: reposync_core::models::Repository) -> Self {
+        let archived = r.sync_status == "archived";
         Self {
             save_receipt: None,
             id: r.id,
@@ -260,12 +261,12 @@ impl From<reposync_core::models::Repository> for RepoDetail {
             created_by: r.created_by,
             created_at: r.created_at,
             updated_at: r.updated_at,
-            status: if r.last_sync_at.is_none() && r.last_svn_rev == 0 {
+            status: if !archived && r.last_sync_at.is_none() && r.last_svn_rev == 0 {
                 "initializing".to_string()
             } else {
                 r.sync_status
             },
-            initializing: r.last_sync_at.is_none() && r.last_svn_rev == 0,
+            initializing: !archived && r.last_sync_at.is_none() && r.last_svn_rev == 0,
             import_mode: None,
             starting_revision: None,
             history_boundary: None,
@@ -275,21 +276,27 @@ impl From<reposync_core::models::Repository> for RepoDetail {
 }
 
 fn enrich_repo_detail(db: &Database, mut detail: RepoDetail) -> Result<RepoDetail, AppError> {
-    match resolve_repo_import_baseline(db, &detail.id)
-        .map_err(|e| AppError::Internal(e.to_string()))?
-    {
-        RepoImportBaseline::Verified { .. } => {
-            detail.initializing = false;
-        }
-        RepoImportBaseline::Pending => {
-            detail.initializing = true;
-            if detail.status == "unknown" || detail.status == "idle" {
-                detail.status = "initializing".into();
+    // Terminal archive is authoritative even without a completed baseline.
+    // Preserve historical import metadata below, but never advertise recovery
+    // or initialization as the current lifecycle of an immutable archive.
+    let archived = detail.status == "archived";
+    if !archived {
+        match resolve_repo_import_baseline(db, &detail.id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+        {
+            RepoImportBaseline::Verified { .. } => {
+                detail.initializing = false;
             }
-        }
-        RepoImportBaseline::ReconciliationRequired { reason, .. } => {
-            detail.initializing = true;
-            detail.status = reason;
+            RepoImportBaseline::Pending => {
+                detail.initializing = true;
+                if detail.status == "unknown" || detail.status == "idle" {
+                    detail.status = "initializing".into();
+                }
+            }
+            RepoImportBaseline::ReconciliationRequired { reason, .. } => {
+                detail.initializing = true;
+                detail.status = reason;
+            }
         }
     }
 
@@ -308,7 +315,7 @@ fn enrich_repo_detail(db: &Database, mut detail: RepoDetail) -> Result<RepoDetai
             detail.history_boundary = Some(pin.history_boundary());
             detail.snapshot_pin = Some(pin);
         }
-        if !op.state.is_terminal() || op.state != ImportOperationState::Completed {
+        if !archived && (!op.state.is_terminal() || op.state != ImportOperationState::Completed) {
             detail.initializing = true;
             if detail.status == "unknown" || detail.status == "idle" {
                 detail.status = "initializing".into();
@@ -457,7 +464,11 @@ async fn list_repos(
             enabled: r.enabled,
             created_at: r.created_at,
             updated_at: r.updated_at,
-            status: "unknown".to_string(),
+            status: if r.sync_status == "archived" {
+                "archived".to_string()
+            } else {
+                "unknown".to_string()
+            },
         })
         .collect();
 
