@@ -44,6 +44,7 @@ import {
   managedRemovalStatusFromReceipt,
   removalDependencyPreviewConfirmReady,
   reviewedRemovalReady,
+  removalReviewForDisplay,
   readPendingRemovalReview,
   clearPendingRemovalReview,
   shouldPersistPolledManagedRemovalReceipt,
@@ -699,7 +700,12 @@ function RepositoryDetailEditor() {
       && !!branchPairDeleteSubject.parent_id,
     retry: false,
   });
-  const branchPairDependencyPreview = branchPairPreviewQuery.data?.dependency_preview;
+  const displayedBranchReview = pendingRemovalReview.error ? undefined : removalReviewForDisplay(
+    pendingRemovalReview.review, reviewedRemovalQuery.data, branchPairDeleteSubject?.id,
+    reviewedRemovalOptions, reviewedRemovalQuery.isFetching || reviewedRemovalQuery.isError,
+  );
+  const displayedBranchChoices = displayedBranchReview ?? reviewedRemovalOptions;
+  const branchPairDependencyPreview = displayedBranchReview?.dependency_preview;
   const branchPairPreviewReady = removalDependencyPreviewConfirmReady({
     isLoading: branchPairPreviewQuery.isLoading,
     isFetching: branchPairPreviewQuery.isFetching,
@@ -812,7 +818,7 @@ function RepositoryDetailEditor() {
             <p>A previously approved removal request has no retained outcome receipt. Recover that same request before approving different work. Original disposition: {pendingRemovalReview.review.archive_pair ? 'archive the pair permanently, preserving the survivor and local data' : 'remove the registration and clean owned local data (not archive)'}. Git deletion: {String(pendingRemovalReview.review.delete_git)}; SVN deletion: {String(pendingRemovalReview.review.delete_svn)}.</p>
             <button type="button" disabled={removeMutation.isPending} onClick={() => removeMutation.mutate()}>Recover retained removal request</button>
           </div>}
-          {reviewedRemovalConfirmReady && reviewedRemovalQuery.data && <>
+          {!pendingRemovalReview.review && reviewedRemovalConfirmReady && reviewedRemovalQuery.data && <>
             <p>Review for {reviewedRemovalQuery.data.repo_id}</p>
             <p className="break-all">Git: {reviewedRemovalQuery.data.git ? `${reviewedRemovalQuery.data.git.remote_url} · ${reviewedRemovalQuery.data.git.reference} · ${reviewedRemovalQuery.data.git.expected_sha ?? 'already absent'}` : 'preserved'}</p>
             <p className="break-all">SVN: {reviewedRemovalQuery.data.svn ? `${reviewedRemovalQuery.data.svn.url} · UUID ${reviewedRemovalQuery.data.svn.uuid} · r${reviewedRemovalQuery.data.svn.base_revision} · ${reviewedRemovalQuery.data.svn.expected_present ? 'present' : 'already absent'}` : 'preserved'}</p>
@@ -2259,7 +2265,7 @@ function RepositoryDetailEditor() {
       )}
 
       {branchPairDeleteSubject && (
-        <Dialog title={removePairWording(removeBranchOpts).title} description="Review the exact branch and deletion side. Deleting one side archives the pair permanently and preserves the other side." onClose={() => {
+        <Dialog title={pendingRemovalReview.review && !pendingRemovalReview.review.archive_pair ? 'Recover original removal request' : removePairWording(displayedBranchChoices).title} description={displayedBranchChoices.archive_pair ? 'Review the exact branch and deletion side. Deleting one side archives the pair permanently and preserves the other side.' : 'Review the exact removal request. The registration and owned local data will be removed; selected remote deletions remain explicit.'} onClose={() => {
                   setBranchPairDeleteTarget(null);
                   setBranchPairDeleteError(null);
                   setRemoveConfirmText('');
@@ -2274,14 +2280,14 @@ function RepositoryDetailEditor() {
                 </div>
               )}
               <p className="text-sm text-gray-300">
-                {reviewedRemovalOptions.archive_pair ? 'Archive branch pair ' : 'Remove branch pair '}<span className="font-semibold text-gray-100">{branchPairDeleteSubject.name}</span>{' '}
-                {reviewedRemovalOptions.archive_pair ? 'after deleting the selected side. The other branch, pair record, local data and history are retained. Sync stops permanently; reattachment is not supported.' : 'from RepoSync. Remote ref/path deletion is opt-in below.'}
+                {displayedBranchChoices.archive_pair ? 'Archive branch pair ' : 'Remove branch pair '}<span className="font-semibold text-gray-100">{branchPairDeleteSubject.name}</span>{' '}
+                {displayedBranchChoices.archive_pair ? 'after deleting the selected side. The other branch, pair record, local data and history are retained. Sync stops permanently; reattachment is not supported.' : 'from RepoSync. Remote ref/path deletion is opt-in below.'}
               </p>
               <div className="text-xs text-gray-400 border border-gray-600 rounded p-2 space-y-1" data-testid="branch-remote-deletion-preview">
-                <p>Git ref: <span className="font-mono text-gray-200">{branchPairDeleteSubject.git_branch}</span> — {removeBranchOpts.delete_git ? 'will be deleted on remote when authorized' : 'left on remote'}</p>
-                <p>SVN path: <span className="font-mono text-gray-200">{branchPairDeleteSubject.svn_branch}</span> — {removeBranchOpts.delete_svn ? 'will be deleted on remote when authorized (history retained)' : 'left on remote'}</p>
+                <p>Git ref: <span className="font-mono text-gray-200">{branchPairDeleteSubject.git_branch}</span> — {displayedBranchChoices.delete_git ? 'will be deleted on remote when authorized' : 'left on remote'}</p>
+                <p>SVN path: <span className="font-mono text-gray-200">{branchPairDeleteSubject.svn_branch}</span> — {displayedBranchChoices.delete_svn ? 'will be deleted on remote when authorized (history retained)' : 'left on remote'}</p>
               </div>
-              {branchPairPreviewQuery.isLoading && (
+              {!pendingRemovalReview.review && (branchPairPreviewQuery.isLoading || reviewedRemovalQuery.isFetching) && (
                 <p className="text-sm text-gray-400" data-testid="branch-removal-preview-loading">
                   Loading dependency preview…
                 </p>
@@ -2307,7 +2313,7 @@ function RepositoryDetailEditor() {
                               && cred.retained_for_repo_ids.length > 0
                               ? ` (other registrations keep their own keys: ${cred.retained_for_repo_ids.join(', ')})`
                               : ''}
-                            {cred.inheriting_repo_ids.length > 0
+                            {cred.action !== 'retain_for_archive' && cred.inheriting_repo_ids.length > 0
                               ? ` (child registrations inherit this key and would lose access: ${cred.inheriting_repo_ids.join(', ')})`
                               : ''}
                           </li>
@@ -2316,7 +2322,7 @@ function RepositoryDetailEditor() {
                     </div>
                   )}
                   <p className="text-gray-400 text-xs">
-                    {reviewedRemovalOptions.archive_pair ? 'Local path retained:' : 'Local path removed:'}{' '}
+                    {displayedBranchChoices.archive_pair ? 'Local path retained:' : 'Local path removed:'}{' '}
                     <span className="font-mono text-gray-200">
                       {branchPairDependencyPreview.managed_local_path}
                     </span>
@@ -2346,16 +2352,16 @@ function RepositoryDetailEditor() {
               )}
               <div className="space-y-2">
                 <label className="flex items-center gap-2 cursor-pointer">
-                  <input type="checkbox" checked={removeBranchOpts.delete_git}
-                    disabled={removeMutation.isPending}
+                  <input type="checkbox" checked={displayedBranchChoices.delete_git}
+                    disabled={removeMutation.isPending || !!pendingRemovalReview.review}
                     data-testid="delete-git-opt"
                     onChange={(e) => { setRemoveConfirmText(''); setRemoveBranchOpts((p) => ({ ...p, delete_git: e.target.checked })); }}
                     className="rounded border-gray-600 bg-gray-700 text-red-600" />
                   <span className="text-sm text-gray-300">Delete Git branch <span className="text-gray-300 font-mono">({branchPairDeleteSubject.git_branch})</span></span>
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
-                  <input type="checkbox" checked={removeBranchOpts.delete_svn}
-                    disabled={removeMutation.isPending}
+                  <input type="checkbox" checked={displayedBranchChoices.delete_svn}
+                    disabled={removeMutation.isPending || !!pendingRemovalReview.review}
                     data-testid="delete-svn-opt"
                     onChange={(e) => { setRemoveConfirmText(''); setRemoveBranchOpts((p) => ({ ...p, delete_svn: e.target.checked })); }}
                     className="rounded border-gray-600 bg-gray-700 text-red-600" />
@@ -2403,7 +2409,7 @@ function RepositoryDetailEditor() {
                 className="rs-btn rs-btn--danger inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 rs-text-on-danger text-sm font-medium transition-colors"
               >
                 <Trash2 className="w-4 h-4" />
-                {removeMutation.isPending ? removePairWording(removeBranchOpts).pending : removePairWording(removeBranchOpts).confirm}
+                {pendingRemovalReview.review ? 'Recover original request above' : removeMutation.isPending ? removePairWording(removeBranchOpts).pending : removePairWording(removeBranchOpts).confirm}
               </button>
             </div>
           </div>

@@ -10753,6 +10753,35 @@ async fn rs199_api_archive_retains_pair_and_refuses_legacy_removal() {
             .join(&id)
             .join("custody.txt")
             .exists());
+        let status: serde_json::Value = client
+            .get(format!("http://{addr}/api/status"))
+            .query(&[("repo_id", id.as_str())])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            status["observation"]["health"], "disabled",
+            "terminal archive is not reconciliation-held: {status}"
+        );
+        let aggregate: serde_json::Value = client
+            .get(format!("http://{addr}/api/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_ne!(
+            aggregate["observation"]["health"], "held",
+            "archive must not poison aggregate health: {aggregate}"
+        );
+        assert!(
+            state.db.managed_remove_blocks_new_work(&id).unwrap(),
+            "observation never releases archive write fence"
+        );
         let repeat = client
             .post(format!("{base}/removal/approve"))
             .json(&approval)

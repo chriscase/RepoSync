@@ -62,3 +62,11 @@ The independent source review found a legacy `/remove` path that could replace
 an archive with ordinary removal. The implementation now refuses that path at
 storage and API boundaries; native and HTTP regressions preserve the archive.
 Final exact-commit review and hosted CI are separate gates, not claimed here.
+
+Review corrections also bind the displayed dependency preview to the exact
+reviewed archive (or original retained legacy request), and classify a verified
+terminal archive as disabled rather than reconciliation-held in scoped and
+aggregate status. The write fence remains enforced. The successor frontend
+verification passed 646 unit tests and three sandbox-enabled browser cases,
+including populated credentials and legacy-request recovery. Archive API tests
+cover scoped/aggregate health and confirm the fence remains active.

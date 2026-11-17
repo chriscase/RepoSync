@@ -2060,6 +2060,10 @@ impl Database {
     pub fn legacy_disable_repository(&self, repo_id: &str) -> Result<bool, DatabaseError> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
+        if archived_pair(&tx, repo_id)? {
+            return Err(DatabaseError::Other("archived pair is immutable".into()));
+        }
+
         super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
         super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
             &tx, repo_id,

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from './api';
 import { clientSession } from './session';
 import { shouldRetireBranchPair } from './branchPairRemoval';
-import { managedRemovalReceiptFromStatus, managedRemovalStatusFromReceipt, readPendingRemovalReview, retainPendingRemovalReview, reviewedRemovalReady, reviewedRemovalDisplay, type ManagedRemovalStatus, type ReviewedRemovalPreview } from './managedRemoval';
+import { removalReviewForDisplay, managedRemovalReceiptFromStatus, managedRemovalStatusFromReceipt, readPendingRemovalReview, retainPendingRemovalReview, reviewedRemovalReady, reviewedRemovalDisplay, type ManagedRemovalStatus, type ReviewedRemovalPreview } from './managedRemoval';
 import ManagedRemovalPanel from './components/ManagedRemovalPanel';
 
 const preview = (archive = true): ReviewedRemovalPreview => ({ protocol: 2, repo_id: 'child', review_pin: 'a'.repeat(64), archive_pair: archive, delete_git: true, delete_svn: false,
@@ -29,6 +29,20 @@ describe('single-side pair archive', () => {
     expect(reviewedRemovalReady(preview(), 'child', { ...options, archive_pair: false }, false)).toBe(false);
     expect(reviewedRemovalReady({ ...preview(), delete_svn: true }, 'child', { ...options, delete_svn: true }, false)).toBe(false);
     expect(reviewedRemovalReady({ ...preview(), archive_pair: 'true' } as unknown as ReviewedRemovalPreview, 'child', options, false)).toBe(false);
+  });
+
+  it('displays the exact disposition-specific dependency evidence, never stale deletion advice', () => {
+    const archive = preview();
+    archive.dependency_preview.credentials = [{ key: 'synthetic-key', action: 'retain_for_archive', retained_for_repo_ids: [], inheriting_repo_ids: ['other'] }];
+    expect(removalReviewForDisplay(null, archive, 'child', archive, false)?.dependency_preview.credentials[0].action).toBe('retain_for_archive');
+    expect(removalReviewForDisplay(null, archive, 'child', { ...archive, delete_git: false, delete_svn: true }, false)).toBeUndefined();
+    expect(removalReviewForDisplay(null, archive, 'child', archive, true)).toBeUndefined();
+    const legacy = preview(false); delete legacy.archive_pair;
+    legacy.dependency_preview.credentials = [{ key: 'synthetic-key', action: 'delete_if_present', retained_for_repo_ids: [], inheriting_repo_ids: ['other'] }];
+    const displayed = removalReviewForDisplay(legacy, archive, 'child', archive, false);
+    expect(displayed).toBe(legacy);
+    expect(displayed?.archive_pair).toBeUndefined();
+    expect(displayed?.dependency_preview.credentials[0].action).toBe('delete_if_present');
   });
 
   it('does not reinterpret a retained legacy single-side removal as archival', async () => {

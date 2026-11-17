@@ -1248,6 +1248,7 @@ async fn rs199_single_side_archive_retains_survivor_history_and_fences_restart()
         assert_eq!(retained, 1, "mapped history survives archive and restart");
         assert!(db.managed_remove_blocks_new_work(&f.child.id).unwrap());
         assert!(db.restore_managed_registration(&f.child.id).is_err());
+        assert!(db.legacy_disable_repository(&f.child.id).is_err());
         assert!(db
             .prepare_managed_remove(&f.child.id, "archive-admin", "legacy-bypass")
             .is_err());

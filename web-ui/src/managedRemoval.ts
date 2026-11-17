@@ -74,6 +74,21 @@ export function reviewedRemovalReady(review: ReviewedRemovalPreview | undefined,
     && review.dependency_preview?.parent_removal_blocked === false;
 }
 
+/** Display the original recoverable intent, or only a fresh matching review.
+ * The legacy dependency endpoint cannot describe the archive disposition. */
+export function removalReviewForDisplay(
+  pending: ReviewedRemovalPreview | null | undefined,
+  fresh: ReviewedRemovalPreview | undefined,
+  repoId: string | undefined,
+  options: { delete_git: boolean; delete_svn: boolean; archive_pair?: boolean },
+  unavailable: boolean,
+): ReviewedRemovalPreview | undefined {
+  if (pending) {
+    return reviewedRemovalReady(pending, repoId, pending, false) ? pending : undefined;
+  }
+  return reviewedRemovalReady(fresh, repoId, options, unavailable) ? fresh : undefined;
+}
+
 const PENDING_REVIEW_PREFIX = 'reposync.pendingReviewedRemoval.';
 /** Save the original approved request before the destructive send. A lost
  * response must not silently turn a new preview into a second approval. */
