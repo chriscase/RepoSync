@@ -6,7 +6,7 @@ export default function RepositorySaveNotice({ attempt, error, pending, onLoadCu
   onLoadCurrent?:()=>void; onUseReviewed?:()=>void; reviewed?:boolean;
 }) {
   if (!attempt && !error && !pending) return null;
-  return <div className="rounded border border-yellow-700 bg-yellow-900/20 p-3 mb-4 text-sm text-gray-200" aria-live="polite">
+  return <div className="rs-bn rs-bn--warn rounded border border-yellow-700 bg-yellow-900/20 p-3 mb-4 text-sm text-gray-200" aria-live="polite">
     {attempt && <>
       <p>Recorded configuration stage: {attempt.configurationStage}. Credential stage: {attempt.credentialStage}.</p>
       {attempt.repoId && <p>{attempt.protocolFailure ? 'Unconfirmed response repository ID:' : 'Existing repository:'} <Link className="text-blue-300 underline" to={`/repos/${encodeURIComponent(attempt.repoId)}`}>{attempt.repoId}</Link>. This ID is retained; no new registration is silently created.</p>}

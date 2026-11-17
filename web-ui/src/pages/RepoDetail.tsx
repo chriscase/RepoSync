@@ -13,8 +13,8 @@ import ErrorAcknowledgement from '../components/ErrorAcknowledgement';
 import { errorScope } from '../errorAcknowledgement';
 import React, { useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useParams, useNavigate, useLocation, Link } from 'react-router-dom';
-import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry, type LatePairPlan, type PairRefreshPlan, type SkipCommitContext } from '../api';
+import { useParams, useNavigate, useLocation, useSearchParams, Link } from 'react-router-dom';
+import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry, type LatePairPlan, type PairRefreshPlan, type SkipCommitContext, type SkipCommitPending } from '../api';
 import { CommitMapTargetCell } from '../components/CommitMapTargetCell';
 import {
   type BranchPairRemovalNotice as RemovalNotice,
@@ -65,6 +65,7 @@ import {
 
 import { getStoredUser } from '../utils/auth';
 import { formatTimeAgo } from '../utils/time';
+import { useText } from '../layouts/vocabulary';
 
 type EditForm = {
   name: string;
@@ -107,10 +108,62 @@ function repoToForm(repo: Repository, recovered?: PublicConfiguration): EditForm
 }
 
 const inputClass =
-  'w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
+  'rs-in w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
 
 const selectClass =
-  'w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
+  'rs-in w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
+
+/*
+ * #264 page regions (contracts/page-regions.md; decisions D7, D8, D12). One region tree in
+ * every layout and in today's order. Each region names the sections it shows in; the page
+ * names the current section. Layout styles decide what is shown; nothing here branches on
+ * the layout, and changing section never unmounts a region.
+ */
+const REPO_SECTIONS = [
+  { id: 'overview', label: 'Overview' },
+  { id: 'activity', label: 'Activity' },
+  { id: 'branches', label: 'Branch pairs' },
+  { id: 'operations', label: 'Operations' },
+  { id: 'settings', label: 'Settings' },
+] as const;
+type RepoSection = (typeof REPO_SECTIONS)[number]['id'];
+const EVERY_SECTION = REPO_SECTIONS.map(section => section.id).join(' ');
+
+/** G04.31: absent or unknown values mean Overview. */
+function normaliseRepoSection(value: string | null): RepoSection {
+  return REPO_SECTIONS.find(section => section.id === value)?.id ?? 'overview';
+}
+
+/** The search string for a section link: keeps any other parameter and sets `section`. */
+function sectionSearch(search: string, section: RepoSection): string {
+  const params = new URLSearchParams(search);
+  params.set('section', section);
+  return `?${params.toString()}`;
+}
+
+function region(name: string, sections: string) {
+  return { 'data-rs-region': name, 'data-rs-sections': sections };
+}
+
+/**
+ * Whether the repository section navigation is displayed, from its computed `display` (null
+ * before it renders). Only then does the page show one section at a time, so only then do
+ * Edit and Replace switch to Settings, and only then does a section change not scroll. Where
+ * it is hidden (Classic, Individual, Team) every section is on the page, and Edit leaves the
+ * URL, the history and the scroll position as they were.
+ */
+function sectionNavDisplayed(display: string | null | undefined): boolean {
+  return display != null && display !== 'none';
+}
+
+/** D7: the first displayed region of a section, not counting the head and the status line. */
+function firstSectionRegion(root: ParentNode, section: RepoSection): HTMLElement | null {
+  const candidates = Array.from(root.querySelectorAll<HTMLElement>(`[data-rs-region][data-rs-sections~="${section}"]`));
+  return candidates.find(element => {
+    const name = element.getAttribute('data-rs-region');
+    return name !== 'head' && name !== 'status-line' && element.getClientRects().length > 0;
+  }) ?? null;
+}
 
 export default function RepoDetail() {
   const {id}=useParams<{id:string}>();
@@ -119,11 +172,20 @@ export default function RepoDetail() {
 }
 
 function RepositoryDetailEditor() {
+  const t = useText();
   const fieldId = useId();
   const view = useViewOwnership();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const sectionParam = searchParams.get('section');
+  const section = normaliseRepoSection(sectionParam);
+  const pageRef = useRef<HTMLDivElement>(null);
+  const sectionNavRef = useRef<HTMLElement>(null);
+  // D7: a first load without a parameter does not scroll; every later change of section does.
+  const pendingSectionScroll = useRef<RepoSection | null>(sectionParam === null ? null : section);
+  const previousSection = useRef<RepoSection>(section);
   const queryClient = useQueryClient();
   const user = getStoredUser();
   const isAdmin = user?.role === 'admin';
@@ -151,6 +213,7 @@ function RepositoryDetailEditor() {
   const [svnTestResult, setSvnTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [gitTestResult, setGitTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [svnTesting, setSvnTesting] = useState(false);
+  const [credentialFocus, setCredentialFocus] = useState<{ field: CredentialField; request: number } | null>(null);
   const [gitTesting, setGitTesting] = useState(false);
   const [showBranchModal, setShowBranchModal] = useState(false);
   const [removalTarget, setRemovalTarget] = useState<Repository | null>(null);
@@ -196,6 +259,7 @@ function RepositoryDetailEditor() {
   const [refreshPlan, setRefreshPlan] = useState<PairRefreshPlan | null>(null);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [showSkipModal, setShowSkipModal] = useState(false);
+  const [showResumeConfirm, setShowResumeConfirm] = useState(false);
   const [skipSelectedCount, setSkipSelectedCount] = useState(0);
   const [skipError, setSkipError] = useState<string | null>(null);
 
@@ -227,7 +291,7 @@ function RepositoryDetailEditor() {
   const detailRetry = (failureCount: number, queryError: unknown) =>
     !isNotFoundError(queryError) && failureCount < 2;
 
-  const { data: syncRecords } = useQuery({
+  const syncRecordsQuery = useQuery({
     queryKey: ['sync-records', id],
     queryFn: () => api.getSyncRecords(20, id),
     enabled: detailLive,
@@ -254,13 +318,14 @@ function RepositoryDetailEditor() {
   });
 
   // Credential status
-  const { data: credStatus } = useQuery({
+  const credentialsQuery = useQuery({
     queryKey: ['repo-credentials', id],
     queryFn: () => api.getRepoCredentials(id!),
     enabled: detailLive,
     refetchInterval: detailLive ? 5000 : false,
     retry: detailRetry,
   });
+  const credStatus = credentialsQuery.data;
 
   // Branch pairs
   const needsImportStatusForNotice =
@@ -356,6 +421,9 @@ function RepositoryDetailEditor() {
   const [branchIncludeParent, setBranchIncludeParent] = useState(false);
   const branchPlanMatches = !!branchPlan && branchPlan.git_branch === branchForm.git_branch
     && branchPlan.svn_branch === branchForm.svn_branch && branchPlan.include_parent === branchIncludeParent;
+  // #264 D11 and the interaction contract: "Stop operation…" asks once before the same cancel request.
+  const [confirmStopOperation, setConfirmStopOperation] = useState(false);
+  const [stopOperationError, setStopOperationError] = useState<string | null>(null);
   const branchMutation = useMutation({
     mutationFn: (data: { svn_branch: string; git_branch: string; skip_import: boolean; auto_create_svn_branch: boolean; auto_create_git_branch: boolean;
       action?: 'preview' | 'publish' | 'status' | 'resume' | 'cancel'; review_pin?: string; operation_id?: string }) =>
@@ -412,6 +480,26 @@ function RepositoryDetailEditor() {
       queryClient.invalidateQueries({ queryKey: ['repo', id] });
       queryClient.invalidateQueries({ queryKey: ['repos'] });
     },
+  });
+  function openDisableConfirm() {
+    disableMutation.reset();
+    setShowDisableConfirm(true);
+  }
+
+  // G04.9: the existing retry call, now sent only from its confirmation.
+  const resumeMutation = useMutation({
+    mutationFn: () => api.retryRepo(id!),
+    onSuccess: () => {
+      setShowResumeConfirm(false);
+      queryClient.invalidateQueries({ queryKey: ['repo-status', id] });
+      queryClient.invalidateQueries({ queryKey: ['repo', id] });
+      queryClient.invalidateQueries({ queryKey: ['status', id] });
+    },
+  });
+
+  // G04.7: the same hook request, sent with the session instead of as a plain link.
+  const hookDownload = useMutation({
+    mutationFn: async () => saveTextDownload('pre-commit', await fetchPreCommitHook(id!)),
   });
 
   const removalSubject = removalTarget ?? repo;
@@ -773,9 +861,21 @@ function RepositoryDetailEditor() {
     // Untouched, malformed and unavailable policy fields are omitted, so the server keeps them.
     return {...data,...pathPolicyConfiguration(path_policy)};
   }
+  /** A navigation (Back works) that keeps the route's state; nothing is remounted. */
+  function showSection(next: RepoSection) {
+    if (next === section) return;
+    navigate({ pathname: location.pathname, search: sectionSearch(location.search, next) }, { state: location.state });
+  }
+  /** The section navigation's computed display, or null before it renders. */
+  function readSectionNavDisplay(): string | null {
+    const nav = sectionNavRef.current;
+    return nav ? getComputedStyle(nav).display : null;
+  }
   function startEdit() {
     if(!repo)return;editVersion.current++;restoredSave.current=null;
     setForm(repoToForm(repo));setEditing(true);setSaveError(null);setSaveMessage(null);
+    // The form is in Settings: show that section only where the section navigation is displayed.
+    if (sectionNavDisplayed(readSectionNavDisplay())) showSection('settings');
   }
   async function loadCurrentSettingsForReview() {
     const generation=editVersion.current;
@@ -885,6 +985,21 @@ function RepositoryDetailEditor() {
     if(next)saveFlow.rememberDraft(editConfiguration(next));
   }
 
+  /**
+   * The credentials summary sends nothing: it opens the existing field in its own region.
+   * Like Edit, it changes the section only where the section navigation is displayed.
+   */
+  function replaceCredential(field: CredentialField) {
+    if (!editing) startEdit();
+    setCredentialFocus(previous => ({ field, request: (previous?.request ?? 0) + 1 }));
+  }
+  useEffect(() => {
+    if (!credentialFocus || !editing || !form) return;
+    const input = document.getElementById(`${fieldId}-${credentialFocus.field === 'svn' ? 1 : 2}`);
+    if (input) { input.focus(); input.scrollIntoView({ block: 'center' }); }
+    setCredentialFocus(null);
+  }, [credentialFocus, editing, form, fieldId]);
+
   useEffect(() => {
     setLocalNotice(null);
     if (!id) {
@@ -917,11 +1032,28 @@ function RepositoryDetailEditor() {
     setRetiredId(null);
   }, [id, retiredId, queryClient]);
 
+  const pageReady = !repoMissing && !!repo && !isError;
+  useEffect(() => {
+    if (previousSection.current !== section) {
+      previousSection.current = section;
+      pendingSectionScroll.current = section;
+    }
+    const target = pendingSectionScroll.current;
+    const root = pageRef.current;
+    const nav = sectionNavRef.current;
+    // Until the page itself renders, keep the request for when it does.
+    if (!target || !root || !nav) return;
+    pendingSectionScroll.current = null;
+    // Where the section navigation is shown, the layout shows the section; nothing scrolls.
+    if (sectionNavDisplayed(getComputedStyle(nav).display)) return;
+    firstSectionRegion(root, target)?.scrollIntoView({ block: 'start' });
+  }, [section, pageReady]);
+
   const removalNotice = localNotice ?? routedNotice ?? readPersistedBranchPairRemovalNotice();
 
   if (repoMissing) {
     return (
-        <div className="max-w-lg mx-auto py-16 text-center space-y-4" data-testid="repo-not-found">
+        <div className="rs-page max-w-lg mx-auto py-16 text-center space-y-4" data-testid="repo-not-found" data-rs-page="repo" data-rs-section={section}>
           {removalNotice && <BranchPairRemovalNotice notice={removalNotice} />}
           {isAdmin && (
             <section data-testid="removed-registration-recovery" className="text-left space-y-3">
@@ -936,14 +1068,14 @@ function RepositoryDetailEditor() {
               {restoreMutation.isError && <p role="alert">Restore failed: {restoreMutation.error.message}</p>}
             </section>
           )}
-          <h1 className="text-xl font-semibold text-gray-100">Repository not found</h1>
+          <h1 className="rs-title text-xl font-semibold text-gray-100">Repository not found</h1>
           <p className="text-sm text-gray-400">
             This repository or branch pair is no longer available. It may have been removed.
           </p>
           <Link
             to="/repos"
             data-testid="repo-not-found-repositories"
-            className="inline-flex items-center justify-center px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium"
+            className="inline-flex items-center justify-center px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 rs-text-on-accent text-sm font-medium"
           >
             Back to repositories
           </Link>
@@ -952,12 +1084,12 @@ function RepositoryDetailEditor() {
   }
 
   if (!repo && (isLoading || retiredId === id)) {
-    return <div className="text-center py-8 text-gray-400">Loading repository...</div>;
+    return <div className="rs-page text-center py-8 text-gray-400" data-rs-page="repo" data-rs-section={section}>Loading repository...</div>;
   }
 
   if (isError || !repo) {
     return (
-      <div className="text-center py-8 space-y-4">
+      <div className="rs-page text-center py-8 space-y-4" data-rs-page="repo" data-rs-section={section}>
         <p className="text-red-400">
           Error loading repository: {error?.message ?? 'Not found'}
         </p>
@@ -968,14 +1100,16 @@ function RepositoryDetailEditor() {
     );
   }
 
-  const records = syncRecords?.entries ?? [];
   const cmEntries = commitMap?.entries ?? [];
+  // G04.9: shown only while the scoped status is fresh and reports the pause (unchanged condition).
+  const pausedBannerShown = statusView.canAct && status?.state === 'error_paused' && isAdmin;
+  const syncSwitch = headerSyncSwitch(repo);
 
   return (
-    <div className="space-y-6" data-testid="repo-detail" data-repo-id={id}>
+    <div ref={pageRef} className="rs-page space-y-6" data-testid="repo-detail" data-repo-id={id} data-rs-page="repo" data-rs-section={section}>
       {removalNotice && <BranchPairRemovalNotice notice={removalNotice} />}
       {branchPairDeleteError && (
-        <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" role="alert">
+        <div className="rs-bn rs-bn--danger bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" role="alert">
           {branchPairDeleteError}
         </div>
       )}
@@ -997,7 +1131,7 @@ function RepositoryDetailEditor() {
         />
       )}
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between" {...region('head', EVERY_SECTION)}>
         <div className="flex items-center gap-4">
           <Link
             to="/repos"
@@ -1009,11 +1143,11 @@ function RepositoryDetailEditor() {
         </div>
       </div>
 
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between" {...region('head', EVERY_SECTION)}>
         <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-bold text-gray-100" data-testid="repo-detail-heading">{repo.name}</h1>
+          <h1 className="rs-title text-2xl font-bold text-gray-100" data-testid="repo-detail-heading">{repo.name}</h1>
           <span
-            className={`inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium ${
+            className={`rs-mark inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium ${
               repo.enabled
                 ? 'bg-blue-900/50 text-blue-300'
                 : 'bg-gray-700 text-gray-400'
@@ -1023,25 +1157,29 @@ function RepositoryDetailEditor() {
           </span>
         </div>
         <div className="flex items-center gap-3">
-          {/* Quick sync toggle (PATCH enabled) — not the explicit Pause/disable API in Danger Zone */}
+          {/* G04.23: a repository pauses through the explicit disable call and its dialog; a branch
+              pair and turning sync on keep the one-click registration update (PUT enabled). */}
           <button
-            onClick={() => toggleMutation.mutate(!repo.enabled)}
-            disabled={toggleMutation.isPending}
-            title="Quick sync on/off via registration update. Use Pause / disable in Danger Zone for the explicit disable API."
-            className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            data-testid="header-sync-switch"
+            onClick={() => (syncSwitch === 'explicit-pause' ? openDisableConfirm() : toggleMutation.mutate(!repo.enabled))}
+            disabled={toggleMutation.isPending || (syncSwitch === 'explicit-pause' && disableMutation.isPending)}
+            title={syncSwitch === 'explicit-pause'
+              ? 'Opens Pause / disable sync, which uses the explicit disable API.'
+              : 'Quick sync on/off via registration update. Use Pause / disable in Danger Zone for the explicit disable API.'}
+            className={`rs-btn rs-btn--quiet inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
               repo.enabled
                 ? 'border border-yellow-600 text-yellow-300 hover:bg-yellow-900/30'
                 : 'border border-green-600 text-green-300 hover:bg-green-900/30'
             } disabled:opacity-50`}
           >
             <Power className="w-4 h-4" />
-            {repo.enabled ? 'Turn sync off' : 'Turn sync on'}
+            {syncSwitch === 'explicit-pause' ? t('repo.header.pause') : repo.enabled ? 'Turn sync off' : 'Turn sync on'}
           </button>
 
           {!editing ? (
             <button
               onClick={startEdit}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-600 hover:border-gray-500 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+              className="rs-btn rs-btn--quiet inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-600 hover:border-gray-500 text-gray-300 rs-hover-text-strong text-sm font-medium transition-colors"
             >
               <Settings className="w-4 h-4" />
               Edit
@@ -1051,14 +1189,14 @@ function RepositoryDetailEditor() {
               <button
                 onClick={handleSave}
                 disabled={saveFlow.pending}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+                className="rs-btn rs-btn--primary inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rs-text-on-accent text-sm font-medium transition-colors"
               >
                 <Save className="w-4 h-4" />
                 {saveFlow.pending ? 'Saving...' : 'Save'}
               </button>
               <button
                 onClick={cancelEdit}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-600 hover:border-gray-500 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+                className="rs-btn rs-btn--quiet inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-600 hover:border-gray-500 text-gray-300 rs-hover-text-strong text-sm font-medium transition-colors"
               >
                 <X className="w-4 h-4" />
                 Cancel
@@ -1066,20 +1204,23 @@ function RepositoryDetailEditor() {
             </>
           )}
           {pathPolicyHasRules(repo) && (
-            <a
-              href={`/api/repos/${id}/hooks/pre-commit`}
-              download="pre-commit"
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white hover:border-gray-500 text-sm font-medium transition-colors"
+            <button
+              type="button"
+              data-testid="download-pre-commit-hook"
+              onClick={() => hookDownload.mutate()}
+              disabled={hookDownload.isPending}
+              aria-busy={hookDownload.isPending || undefined}
+              className="rs-btn rs-btn--quiet inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-600 text-gray-300 rs-hover-text-strong hover:border-gray-500 disabled:opacity-50 text-sm font-medium transition-colors"
               title="Download Git pre-commit hook script"
             >
               <GitBranch className="w-4 h-4" />
-              Git Hook
-            </a>
+              {t('repo.header.hook')}
+            </button>
           )}
           <button
             onClick={() => syncMutation.mutate()}
             disabled={syncMutation.isPending || syncTriggered || !statusView.canAct}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium transition-colors"
+            className="rs-btn rs-btn--primary inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed rs-text-on-accent text-sm font-medium transition-colors"
           >
             <RefreshCw className={`w-4 h-4 ${syncMutation.isPending ? 'animate-spin' : ''}`} />
             {syncTriggered ? 'Sync Triggered' : 'Trigger Sync'}
@@ -1087,32 +1228,45 @@ function RepositoryDetailEditor() {
         </div>
       </div>
 
+      <RepositoryStatusLine view={statusView} />
+      <RepositorySectionNav current={section} navRef={sectionNavRef} />
+
       {/* Mutation errors */}
       {syncMutation.isError && (
-        <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-300 text-sm" role="alert">
+        <div className="rs-bn rs-bn--danger bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-300 text-sm" role="alert">
           Failed to trigger sync: {syncMutation.error?.message}
+        </div>
+      )}
+      {toggleMutation.isError && (
+        <div className="rs-bn rs-bn--danger bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-300 text-sm" role="alert" data-testid="sync-switch-error">
+          {toggleMutation.variables ? 'Sync could not be turned on' : 'Sync could not be turned off'}: {toggleMutation.error?.message}
+        </div>
+      )}
+      {hookDownload.isError && (
+        <div className="rs-bn rs-bn--danger bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-300 text-sm" role="alert" data-testid="hook-download-error">
+          The hook could not be downloaded: {hookDownload.error?.message}
         </div>
       )}
       {editing && <RepositorySaveNotice attempt={saveFlow.attempt} error={saveError ?? saveFlow.error} pending={saveFlow.pending} onLoadCurrent={loadCurrentSettingsForReview} onUseReviewed={useReviewedSettings} reviewed={!!saveFlow.reviewedCurrent} />}
       {editing && saveMessage && <p role="status" className="text-yellow-300 mb-3">{saveMessage}</p>}
 
       {/* Config Cards - SVN and Git side by side */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4" data-rs-sections="settings">
         {/* SVN Config */}
-        <div className="bg-gray-800/60 border border-gray-700 rounded-lg p-5">
+        <div className="rs-sec bg-gray-800/60 border border-gray-700 rounded-lg p-5" {...region('svn', 'settings')}>
           <div className="flex items-center gap-2 mb-4">
             <Database className="w-5 h-5 text-blue-400" />
-            <h2 className="text-lg font-semibold text-gray-100">SVN Configuration</h2>
+            <h2 className="rs-heading text-lg font-semibold text-gray-100">{t('repo.section.svn')}</h2>
           </div>
           <div className="space-y-3">
             {editing && form ? (
               <>
                 <FieldInput label="Name" value={form.name} onChange={(v) => setField('name', v)} />
-                <FieldInput label="SVN URL" value={form.svn_url} onChange={(v) => setField('svn_url', v)} />
+                <FieldInput label={t('field.svnUrl')} value={form.svn_url} onChange={(v) => setField('svn_url', v)} />
                 <FieldInput label="Branch" value={form.svn_branch} onChange={(v) => setField('svn_branch', v)} />
                 <FieldInput label="Username" value={form.svn_username} onChange={(v) => setField('svn_username', v)} />
                 <div>
-                  <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-1`}>SVN Password</label>
+                  <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-1`}>{t('repo.field.svnPassword')}</label>
                   <input
                     type="password"
                     className={inputClass}
@@ -1125,7 +1279,7 @@ function RepositoryDetailEditor() {
                   type="button"
                   onClick={handleTestSvn}
                   disabled={svnTesting}
-                  className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border border-blue-600 text-blue-300 hover:bg-blue-900/30 disabled:opacity-50 transition-colors"
+                  className="rs-btn rs-btn--quiet inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border border-blue-600 text-blue-300 hover:bg-blue-900/30 disabled:opacity-50 transition-colors"
                 >
                   {svnTesting ? 'Testing...' : 'Test SVN Connection'}
                 </button>
@@ -1141,17 +1295,17 @@ function RepositoryDetailEditor() {
                 <ConfigRow label="URL" value={repo.svn_url} />
                 <ConfigRow label="Branch" value={repo.svn_branch} />
                 <ConfigRow label="Username" value={repo.svn_username} />
-                <ConfigRow label="Password" value={credStatus?.svn_password_set ? '\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF (saved)' : 'Not set'} />
+                <ConfigRow label={t('field.svnPassword')} value={credStatus?.svn_password_set ? '\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF (saved)' : 'Not set'} />
               </>
             )}
           </div>
         </div>
 
         {/* Git Config */}
-        <div className="bg-gray-800/60 border border-gray-700 rounded-lg p-5">
+        <div className="rs-sec bg-gray-800/60 border border-gray-700 rounded-lg p-5" {...region('git', 'settings')}>
           <div className="flex items-center gap-2 mb-4">
             <GitBranch className="w-5 h-5 text-purple-400" />
-            <h2 className="text-lg font-semibold text-gray-100">Git Configuration</h2>
+            <h2 className="rs-heading text-lg font-semibold text-gray-100">{t('repo.section.git')}</h2>
           </div>
           <div className="space-y-3">
             {editing && form ? (
@@ -1167,9 +1321,9 @@ function RepositoryDetailEditor() {
                 />
                 <FieldInput label="API URL" value={form.git_api_url} onChange={(v) => setField('git_api_url', v)} />
                 <FieldInput label="Repository" value={form.git_repo} onChange={(v) => setField('git_repo', v)} placeholder="owner/repo" />
-                <FieldInput label="Default Branch" value={form.git_branch} onChange={(v) => setField('git_branch', v)} />
+                <FieldInput label={t('field.defaultBranch')} value={form.git_branch} onChange={(v) => setField('git_branch', v)} />
                 <div>
-                  <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-2`}>Git Token</label>
+                  <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-2`}>{t('field.gitToken')}</label>
                   <input
                     type="password"
                     className={inputClass}
@@ -1182,7 +1336,7 @@ function RepositoryDetailEditor() {
                   type="button"
                   onClick={handleTestGit}
                   disabled={gitTesting}
-                  className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border border-purple-600 text-purple-300 hover:bg-purple-900/30 disabled:opacity-50 transition-colors"
+                  className="rs-btn rs-btn--quiet inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border border-purple-600 text-purple-300 hover:bg-purple-900/30 disabled:opacity-50 transition-colors"
                 >
                   {gitTesting ? 'Testing...' : 'Test Git Connection'}
                 </button>
@@ -1198,23 +1352,25 @@ function RepositoryDetailEditor() {
                 <ConfigRow label="API URL" value={repo.git_api_url} />
                 <ConfigRow label="Repository" value={repo.git_repo} />
                 <ConfigRow label="Branch" value={repo.git_branch} />
-                <ConfigRow label="Token" value={credStatus?.git_token_set ? '\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF (saved)' : 'Not set'} />
+                <ConfigRow label={t('repo.field.gitToken')} value={credStatus?.git_token_set ? '\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF (saved)' : 'Not set'} />
               </>
             )}
           </div>
         </div>
       </div>
 
+      <CredentialsSummary read={credentialsQuery} onReplace={replaceCredential} />
+
       {/* Sync Settings */}
-      <div className="bg-gray-800/60 border border-gray-700 rounded-lg p-5">
+      <div className="rs-sec bg-gray-800/60 border border-gray-700 rounded-lg p-5" {...region('sync', 'settings')}>
         <div className="flex items-center gap-2 mb-4">
           <Activity className="w-5 h-5 text-green-400" />
-          <h2 className="text-lg font-semibold text-gray-100">Sync Settings</h2>
+          <h2 className="rs-heading text-lg font-semibold text-gray-100">{t('repo.section.sync')}</h2>
         </div>
         {editing && form ? (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             <FieldSelect
-              label="Sync Mode"
+              label={t('field.syncMode')}
               value={form.sync_mode}
               options={[
                 { value: 'direct', label: 'Direct' },
@@ -1222,32 +1378,34 @@ function RepositoryDetailEditor() {
               ]}
               onChange={(v) => setField('sync_mode', v)}
             />
-            <FieldNumber label="Poll Interval (s)" value={form.poll_interval_secs} onChange={(v) => setField('poll_interval_secs', v)} min={10} />
-            <FieldNumber label="LFS Threshold (MB)" value={form.lfs_threshold_mb} onChange={(v) => setField('lfs_threshold_mb', v)} min={0} />
-            <FieldToggle label="Auto Merge" checked={form.auto_merge} onChange={(v) => setField('auto_merge', v)} />
-            <PathPolicyEditor56 draft={form.path_policy} onChange={(next) => setField('path_policy', next)} />
+            <FieldNumber label={t('repo.field.pollInterval')} value={form.poll_interval_secs} onChange={(v) => setField('poll_interval_secs', v)} min={10} />
+            <FieldNumber label={t('repo.field.lfsThreshold')} value={form.lfs_threshold_mb} onChange={(v) => setField('lfs_threshold_mb', v)} min={0} />
+            <FieldToggle label={t('field.autoMerge')} checked={form.auto_merge} onChange={(v) => setField('auto_merge', v)} />
+            <div className="col-span-full" {...region('policy', 'settings')}>
+              <PathPolicyEditor56 draft={form.path_policy} onChange={(next) => setField('path_policy', next)} />
+            </div>
           </div>
         ) : (
           <>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div>
-              <span className="text-sm text-gray-400">Sync Mode</span>
+              <span className="text-sm text-gray-400">{t('field.syncMode')}</span>
               <p className="text-lg text-gray-100 capitalize">{repo.sync_mode}</p>
             </div>
             <div>
-              <span className="text-sm text-gray-400">Poll Interval</span>
+              <span className="text-sm text-gray-400">{t('field.pollInterval')}</span>
               <p className="text-lg text-gray-100">{repo.poll_interval_secs}s</p>
             </div>
             <div>
-              <span className="text-sm text-gray-400">LFS Threshold</span>
+              <span className="text-sm text-gray-400">{t('field.lfsThreshold')}</span>
               <p className="text-lg text-gray-100">{repo.lfs_threshold_mb} MB</p>
             </div>
             <div>
-              <span className="text-sm text-gray-400">Auto Merge</span>
+              <span className="text-sm text-gray-400">{t('field.autoMerge')}</span>
               <p className="text-lg text-gray-100">{repo.auto_merge ? 'Yes' : 'No'}</p>
             </div>
           </div>
-          <div className="mt-4">
+          <div className="mt-4" {...region('policy', 'settings')}>
             <PathPolicyEditor56 draft={pathPolicyDraft(repo)} />
           </div>
           </>
@@ -1255,10 +1413,10 @@ function RepositoryDetailEditor() {
       </div>
 
       {/* Quick Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4" {...region('about', 'settings')}>
         <StatCard
           icon={<Zap className="w-5 h-5 text-yellow-400" />}
-          label="LFS Threshold"
+          label={t('field.lfsThreshold')}
           value={`${repo.lfs_threshold_mb} MB`}
         />
         <StatCard
@@ -1268,12 +1426,12 @@ function RepositoryDetailEditor() {
         />
         <StatCard
           icon={<Activity className="w-5 h-5 text-green-400" />}
-          label="Last Updated"
+          label={t('repo.about.lastUpdated')}
           value={formatTimeAgo(repo.updated_at)}
         />
         <StatCard
           icon={<Database className="w-5 h-5 text-purple-400" />}
-          label="Created By"
+          label={t('repo.about.createdBy')}
           value={repo.created_by ?? 'System'}
         />
       </div>
@@ -1281,8 +1439,8 @@ function RepositoryDetailEditor() {
       {/* ===== NEW DASHBOARD SECTIONS ===== */}
 
       {/* Circuit Breaker: Error Paused Banner */}
-      {statusView.canAct && status?.state === 'error_paused' && isAdmin && (
-        <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 flex items-center justify-between">
+      {pausedBannerShown && (
+        <div className="rs-bn rs-bn--danger bg-red-900/30 border border-red-700 rounded-lg p-4 flex items-center justify-between" {...region('paused', 'overview')}>
           <div>
             <p className="text-red-300 font-medium">Sync Paused — Permanent Error</p>
             <p className="text-sm text-red-400 mt-1">
@@ -1307,19 +1465,20 @@ function RepositoryDetailEditor() {
                 setSkipSelectedCount(0);
                 setShowSkipModal(true);
               }}
-              className="px-3 py-1.5 rounded-lg bg-yellow-600 hover:bg-yellow-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium transition-colors"
+              className="rs-btn rs-btn--state px-3 py-1.5 rounded-lg bg-yellow-600 hover:bg-yellow-700 disabled:opacity-50 disabled:cursor-not-allowed rs-text-on-state text-sm font-medium transition-colors"
             >
-              Skip Commit
+              {t('repo.paused.skip')}
             </button>
             <button
-              onClick={async () => {
-                await api.retryRepo(id!);
-                queryClient.invalidateQueries({ queryKey: ['repo-status', id] });
-                queryClient.invalidateQueries({ queryKey: ['repo', id] });
+              type="button"
+              data-testid="resume-sync-button"
+              onClick={() => {
+                resumeMutation.reset();
+                setShowResumeConfirm(true);
               }}
-              className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition-colors"
+              className="rs-btn rs-btn--primary px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 rs-text-on-accent text-sm font-medium transition-colors"
             >
-              Retry
+              Resume sync…
             </button>
           </div>
         </div>
@@ -1327,30 +1486,22 @@ function RepositoryDetailEditor() {
 
       {showSkipModal && skipContextEnabled && skipContext && (
         <Dialog title="Skip selected pending commits" description="Only the selected observed pending prefix will be excluded. Unselected work stays pending." onClose={() => { setShowSkipModal(false); setSkipError(null); }} busy={skipMutation.isPending} testId="skip-commit-modal">
-          <div className="bg-gray-800 border border-gray-600 rounded-lg p-6 max-w-lg w-full mx-4 shadow-xl">
+          <div className="rs-dlg rs-sec bg-gray-800 border border-gray-600 rounded-lg p-6 max-w-lg w-full mx-4 shadow-xl">
 
             <p className="text-sm text-gray-400 mb-4">
               Select the oldest contiguous pending prefix to exclude. Unselected commits remain pending.
               Observed remote tip: <span className="font-mono text-gray-300">{skipContext.observed_remote_tip?.slice(0, 12) ?? 'unavailable'}</span>
             </p>
-            <div className="space-y-2 mb-4 max-h-48 overflow-y-auto">
-              {skipContext.pending_commits.filter((c) => !c.excluded).map((commit, index) => (
-                <label key={commit.sha} className="flex items-start gap-2 text-sm text-gray-200">
-                  <input
-                    type="checkbox"
-                    checked={index < skipSelectedCount}
-                    onChange={() => setSkipSelectedCount(index + 1)}
-                    data-testid={`skip-commit-select-${index}`}
-                  />
-                  <span>
-                    <span className="font-mono text-xs text-gray-400">{commit.sha.slice(0, 8)}</span>
-                    {' '}{commit.subject}
-                  </span>
-                </label>
-              ))}
-            </div>
+            <SkipPrefixChoices
+              name={`${fieldId}-skip-through`}
+              commits={skipContext.pending_commits.filter((c) => !c.excluded)}
+              selectedCount={skipSelectedCount}
+              onSelect={setSkipSelectedCount}
+              disabled={skipMutation.isPending}
+            />
             {skipError && <p className="text-sm text-red-400 mb-3" role="alert">{skipError}</p>}
-            <div className="flex justify-end gap-2">
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              {skipSelectedCount === 0 && <span className="text-xs text-gray-400 mr-auto">Nothing is selected yet.</span>}
               <button
                 type="button"
                 onClick={() => { setShowSkipModal(false); setSkipError(null); }}
@@ -1368,7 +1519,7 @@ function RepositoryDetailEditor() {
                   const selected = pending.slice(0, skipSelectedCount).map((c) => c.sha);
                   skipMutation.mutate(selected);
                 }}
-                className="px-3 py-1.5 rounded-lg bg-yellow-700 hover:bg-yellow-800 disabled:opacity-50 text-sm text-white font-medium"
+                className="rs-btn rs-btn--state px-3 py-1.5 rounded-lg bg-yellow-700 hover:bg-yellow-800 disabled:opacity-50 text-sm rs-text-on-state font-medium"
               >
                 {skipMutation.isPending ? 'Skipping…' : 'Skip selected'}
               </button>
@@ -1377,9 +1528,24 @@ function RepositoryDetailEditor() {
         </Dialog>
       )}
 
-      <StatusObservationPanel view={statusView}/>
+      {showResumeConfirm && (
+        <ResumeSyncDialog
+          repoName={repo.name}
+          pendingCount={skipContext ? skipContext.pending_commits.filter((c) => !c.excluded).length : null}
+          allowed={pausedBannerShown}
+          pending={resumeMutation.isPending}
+          error={resumeMutation.isError ? resumeMutation.error.message : null}
+          onConfirm={() => { if (pausedBannerShown) resumeMutation.mutate(); }}
+          onClose={() => { setShowResumeConfirm(false); resumeMutation.reset(); }}
+        />
+      )}
+
+      {/* The panel's own top margin is replaced by the page spacing, as before. */}
+      <div className="[&>section]:mt-0" {...region('status', 'overview')}>
+        <StatusObservationPanel view={statusView}/>
+      </div>
       {/* Status Cards Row */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4" {...region('status', 'overview')}>
         <StatusCard
           title="Effective sync health"
           value={statusView.healthLabel}
@@ -1421,7 +1587,9 @@ function RepositoryDetailEditor() {
       </div>
 
       {showBaselineNotice && baselineNoticeFields && (
-        <ImportHistoryNotice fields={baselineNoticeFields} />
+        <div className="empty:hidden" {...region('import', 'overview operations')}>
+          <ImportHistoryNotice fields={baselineNoticeFields} />
+        </div>
       )}
 
       {/* Import Progress */}
@@ -1431,41 +1599,35 @@ function RepositoryDetailEditor() {
           repoName={repo?.name}
           defaultImportMode={importPrefs?.importMode ?? DEFAULT_REPO_IMPORT_MODE}
           defaultSvnRevision={importPrefs?.svnRevision ?? 'HEAD'}
+          regionName="import"
+          regionSections="overview operations"
         />
       )}
 
       {/* Sync Records */}
-      <div className="bg-gray-800 shadow rounded-lg border border-gray-700">
+      <div className="rs-sec bg-gray-800 shadow rounded-lg border border-gray-700" {...region('records', 'overview activity')}>
         <div className="p-6 pb-3">
-          <h2 className="text-lg font-semibold text-gray-100">
-            Sync Records
+          <h2 className="rs-heading text-lg font-semibold text-gray-100">
+            {t('repo.section.records')}
             <span className="ml-2 text-sm font-normal text-blue-400">&mdash; {repo.name}</span>
           </h2>
           <p className="text-sm text-gray-400 mt-1">Recent commits synced for this repository (click to expand)</p>
         </div>
-        {records.length > 0 ? (
-          <div className="divide-y divide-gray-700">
-            {records.map((record) => (
-              <SyncRecordRow key={record.id} record={record} />
-            ))}
-          </div>
-        ) : (
-          <p className="text-gray-400 text-sm px-6 pb-6">No sync records yet</p>
-        )}
+        <SyncRecordsBody read={syncRecordsQuery} />
       </div>
 
       {/* Commit Map */}
-      <div className="bg-gray-800 shadow rounded-lg border border-gray-700">
+      <div className="rs-sec bg-gray-800 shadow rounded-lg border border-gray-700" {...region('commit-map', 'activity')}>
         <div className="p-6 pb-3">
-          <h2 className="text-lg font-semibold text-gray-100">
-            Commit Map (SVN &harr; Git)
+          <h2 className="rs-heading text-lg font-semibold text-gray-100">
+            {t('repo.section.commitMap')}
             <span className="ml-2 text-sm font-normal text-blue-400">&mdash; {repo.name}</span>
           </h2>
           <p className="text-sm text-gray-400 mt-1">Bidirectional mapping between SVN revisions and Git commits</p>
         </div>
         {cmEntries.length > 0 ? (
           <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-gray-700">
+            <table className="rs-tbl min-w-full divide-y divide-gray-700">
               <thead>
                 <tr>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">SVN Rev</th>
@@ -1500,17 +1662,17 @@ function RepositoryDetailEditor() {
       </div>
 
       {/* Audit Log (compact) */}
-      <div className="bg-gray-800 shadow rounded-lg border border-gray-700">
+      <div className="rs-sec bg-gray-800 shadow rounded-lg border border-gray-700" {...region('audit', 'activity')}>
         <div className="p-6 pb-3">
-          <h2 className="text-lg font-semibold text-gray-100">
-            Recent Audit Log
+          <h2 className="rs-heading text-lg font-semibold text-gray-100">
+            {t('repo.section.audit')}
             <span className="ml-2 text-sm font-normal text-blue-400">&mdash; {repo.name}</span>
           </h2>
           <p className="text-sm text-gray-400 mt-1">Last 10 audit entries for this repository</p>
         </div>
         {auditGroups.length > 0 ? (
           <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-gray-700">
+            <table className="rs-tbl min-w-full divide-y divide-gray-700">
               <thead>
                 <tr>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Sync configuration</th>
@@ -1555,7 +1717,7 @@ function RepositoryDetailEditor() {
                           <div className="flex items-center space-x-2">
                             <ActionBadge action={latest.action} />
                             {isGroup && (
-                              <span className="text-xs bg-gray-600 text-gray-300 rounded-full px-2 py-0.5">
+                              <span className="rs-mark text-xs bg-gray-600 text-gray-300 rounded-full px-2 py-0.5">
                                 &times;{group.entries.length}
                               </span>
                             )}
@@ -1605,8 +1767,8 @@ function RepositoryDetailEditor() {
       </div>
 
       {repo?.parent_id && (
-        <div className="bg-gray-800 shadow rounded-lg border border-gray-700 p-6">
-          <h2 className="text-lg font-semibold text-gray-100">Update pair from parent</h2>
+        <div className="rs-sec bg-gray-800 shadow rounded-lg border border-gray-700 p-6" {...region('refresh', 'branches')}>
+          <h2 className="rs-heading text-lg font-semibold text-gray-100">Update pair from parent</h2>
           <p className="text-sm text-gray-400 mt-1">
             Read-only preview. Published Git commits and SVN revisions stay. Unsynced work on either side is reported and is not discarded. Running the refresh is not available in this slice.
           </p>
@@ -1618,16 +1780,17 @@ function RepositoryDetailEditor() {
               data-testid="preview-update-from-parent"
               onClick={() => refreshMutation.mutate({ repoId: id!, operation: 'update_pair_from_parent' })}
               disabled={refreshMutation.isPending}
-              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white"
+              className="rs-btn rs-btn--primary inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rs-text-on-accent"
             >
               <RefreshCw className="w-3.5 h-3.5" />
               {refreshMutation.isPending ? 'Previewing...' : 'Preview update from parent'}
             </button>
             <button
+              {...region('reanchor', 'branches')}
               data-testid="reanchor-not-implemented"
               onClick={() => refreshMutation.mutate({ repoId: id!, operation: 'reanchor' })}
               disabled={refreshMutation.isPending}
-              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border border-amber-700 text-amber-200 hover:bg-amber-900/30 disabled:opacity-50"
+              className="rs-btn rs-btn--quiet inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border border-amber-700 text-amber-200 hover:bg-amber-900/30 disabled:opacity-50"
             >
               Re-anchor pair (not implemented)
             </button>
@@ -1636,9 +1799,9 @@ function RepositoryDetailEditor() {
       )}
 
       {(refreshPlan || refreshError) && (
-        <div className="bg-gray-800 shadow rounded-lg border border-gray-700 p-6" data-testid="pair-refresh-result">
+        <div className="rs-sec bg-gray-800 shadow rounded-lg border border-gray-700 p-6" data-testid="pair-refresh-result" {...region('refresh', 'branches')}>
           {refreshError && (
-            <div className="bg-amber-900/30 border border-amber-700 rounded-lg p-3 text-amber-100 text-sm">
+            <div className="rs-bn rs-bn--warn bg-amber-900/30 border border-amber-700 rounded-lg p-3 text-amber-100 text-sm">
               {refreshError}
             </div>
           )}
@@ -1676,19 +1839,19 @@ function RepositoryDetailEditor() {
       )}
 
       {/* Branch Pairs */}
-      <div className="bg-gray-800 shadow rounded-lg border border-gray-700">
+      <div className="rs-sec bg-gray-800 shadow rounded-lg border border-gray-700" {...region('pairs', 'overview branches')}>
         <div className="p-6 pb-3 flex items-center justify-between">
           <div>
-            <h2 className="text-lg font-semibold text-gray-100 flex items-center gap-2">
+            <h2 className="rs-heading text-lg font-semibold text-gray-100 flex items-center gap-2">
               <GitBranch className="w-5 h-5 text-purple-400" />
-              Branch Pairs
+              {t('repo.section.pairs')}
             </h2>
             <p className="text-sm text-gray-400 mt-1">SVN branches synced to separate Git branches</p>
           </div>
           {isAdmin && (
             <button
               onClick={() => setShowBranchModal(true)}
-              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium bg-purple-600 hover:bg-purple-700 text-white transition-colors"
+              className="rs-btn rs-btn--state inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium bg-purple-600 hover:bg-purple-700 rs-text-on-state transition-colors"
             >
               <Plus className="w-3.5 h-3.5" />
               Add Branch Pair
@@ -1696,15 +1859,15 @@ function RepositoryDetailEditor() {
           )}
         </div>
         {branchSuccess && branchPlan && (
-          <div className="mx-6 mb-3 bg-blue-900/30 border border-blue-700 rounded-lg p-3 text-blue-200 text-sm">
-            {branchPlan.published ? 'Pair publication completed.' : branchPlan.operation_id ? `Pair operation: ${branchPlan.pair_state}.` : 'Preview only; no repository changes.'}
+          <div className="rs-bn rs-bn--info mx-6 mb-3 bg-blue-900/30 border border-blue-700 rounded-lg p-3 text-blue-200 text-sm">
+            {branchPlan.published ? 'Pair publication completed.' : branchPlan.operation_id ? <>Pair operation: {latePairStateWord(branchPlan.pair_state)}{latePairStateWord(branchPlan.pair_state) !== branchPlan.pair_state && <> <span className="font-mono text-xs">({branchPlan.pair_state})</span></>}.</> : 'Preview only; no repository changes.'}
             {' '}Git tip {branchPlan.git_tip?.slice(0, 8) || 'unknown'}, baseline r{branchPlan.verified_baseline?.svn_revision ?? '?'},
             {' '}{branchPlan.pending_git.count} pending Git commits. Scheduler {branchPlan.scheduler_active ? 'active' : 'inactive'}.
           </div>
         )}
         {(branchPairs ?? []).length > 0 ? (
           <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-gray-700">
+            <table className="rs-tbl min-w-full divide-y divide-gray-700">
               <thead>
                 <tr>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Name</th>
@@ -1726,7 +1889,7 @@ function RepositoryDetailEditor() {
                     <td className="px-6 py-3 text-sm font-mono text-blue-400">{bp.svn_branch}</td>
                     <td className="px-6 py-3 text-sm font-mono text-purple-400">{bp.git_branch}</td>
                     <td className="px-6 py-3">
-                      <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+                      <span className={`rs-mark inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
                         bp.enabled ? 'bg-blue-900/50 text-blue-300' : 'bg-gray-700 text-gray-400'
                       }`}>
                         {bp.enabled ? 'Configured enabled' : 'Configured disabled'}
@@ -1789,7 +1952,7 @@ function RepositoryDetailEditor() {
       {/* Add Branch Pair Modal */}
       {showBranchModal && (
         <Dialog title="Review Branch Pair" description="Capture both sides, inspect the intended result, then explicitly publish or recover the pinned operation." onClose={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: false, auto_create_svn_branch: true, auto_create_git_branch: true }); setBranchPlan(null); branchMutation.reset(); }} busy={branchMutation.isPending}>
-          <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
+          <div className="rs-dlg bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
             <div className="flex items-center justify-between p-6 border-b border-gray-700">
 
               <button
@@ -1801,7 +1964,7 @@ function RepositoryDetailEditor() {
             </div>
             <div className="p-6 space-y-4">
               {branchMutation.isError && (
-                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" role="alert">
+                <div className="rs-bn rs-bn--danger bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" role="alert">
                   Pairing refused: {branchMutation.error?.message}
                 </div>
               )}
@@ -1912,14 +2075,14 @@ function RepositoryDetailEditor() {
             <div className="flex flex-wrap items-center justify-end gap-3 p-6 border-t border-gray-700">
               <button
                 onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: false, auto_create_svn_branch: true, auto_create_git_branch: true }); setBranchPlan(null); branchMutation.reset(); }}
-                className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+                className="rs-btn rs-btn--quiet px-4 py-2 rounded-lg border border-gray-600 text-gray-300 rs-hover-text-strong text-sm font-medium transition-colors"
                data-dialog-cancel disabled={branchMutation.isPending}>
                 Cancel
               </button>
               <button
                 onClick={() => branchMutation.mutate({ ...branchForm, action: 'preview' })}
                 disabled={branchMutation.isPending || !!branchPlan?.operation_id || gitBranchValidation.previewRefused || svnBranchValidation.previewRefused}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+                className="rs-btn rs-btn--state inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 disabled:opacity-50 rs-text-on-state text-sm font-medium transition-colors"
               >
                 <GitBranch className="w-4 h-4" />
                 {branchMutation.isPending ? 'Working...' : 'Preview Pair'}
@@ -1927,17 +2090,24 @@ function RepositoryDetailEditor() {
               {!branchPlan?.operation_id && <button
                 onClick={() => branchMutation.mutate({ ...branchForm, action: 'publish', review_pin: branchPlan?.review_pin })}
                 disabled={branchMutation.isPending || !branchPlanMatches || !branchPlan?.review_pin || !branchPlan.admitted || branchPlan.conflicts.length > 0 || branchForm.skip_import}
-                className="px-4 py-2 rounded bg-green-700 disabled:opacity-50 text-white text-sm">Publish reviewed result</button>}
+                className="px-4 py-2 rounded bg-green-700 disabled:opacity-50 rs-text-on-state text-sm">Publish reviewed result</button>}
               <button disabled={branchMutation.isPending || gitBranchValidation.previewRefused || svnBranchValidation.previewRefused}
                 onClick={() => branchMutation.mutate({ ...branchForm, action: 'status', operation_id: branchPlan?.operation_id ?? undefined })}
-                className="px-3 py-2 rounded border border-gray-600 text-sm">Inspect operation</button>
+                className="rs-btn rs-btn--quiet px-3 py-2 rounded border border-gray-600 text-sm">Inspect operation</button>
               {branchPlan?.operation_id && !branchPlan.published && branchPlan.pair_state !== 'cancelled' && <>
                 <button disabled={branchMutation.isPending}
                   onClick={() => branchMutation.mutate({ ...branchForm, action: 'resume', operation_id: branchPlan.operation_id!, review_pin: branchPlan.review_pin })}
-                  className="px-3 py-2 rounded border border-gray-600 text-sm">Reconcile / resume</button>
+                  className="rs-btn rs-btn--quiet px-3 py-2 rounded border border-gray-600 text-sm">Reconcile / resume</button>
                 <button disabled={branchMutation.isPending}
-                  onClick={() => branchMutation.mutate({ ...branchForm, action: 'cancel', operation_id: branchPlan.operation_id! })}
-                  className="px-3 py-2 rounded border border-gray-600 text-sm">Cancel operation</button>
+                  onClick={() => { setStopOperationError(null); setConfirmStopOperation(true); }}
+                  className="rs-btn rs-btn--quiet px-3 py-2 rounded border border-gray-600 text-sm">Stop operation…</button>
+                <StopOperationConfirm open={confirmStopOperation} pending={branchMutation.isPending}
+                  onCancel={() => setConfirmStopOperation(false)}
+                  error={stopOperationError}
+                  onConfirm={() => branchMutation.mutate({ ...branchForm, action: 'cancel', operation_id: branchPlan.operation_id! }, {
+                    onSuccess: () => setConfirmStopOperation(false),
+                    onError: error => setStopOperationError(error instanceof Error ? error.message : String(error)),
+                  })} />
                 <p className="text-xs text-amber-200">Cancellation after intent retains the hold; it does not undo remote work.</p>
               </>}
             </div>
@@ -1946,12 +2116,12 @@ function RepositoryDetailEditor() {
       )}
 
       {/* Server Monitor */}
-      <ServerMonitor />
+      <ServerMonitor {...region('server', 'overview')} />
 
       {/* Danger Zone - admin only */}
       {isAdmin && (
-        <div className="border-t border-gray-700 pt-6">
-          <h3 className="text-sm font-medium text-red-400 mb-4">Danger Zone</h3>
+        <div className="border-t border-gray-700 pt-6" {...region('stop-remove', 'settings')}>
+          <h3 className="rs-heading text-sm font-medium text-red-400 mb-4">{t('repo.section.stopOrRemove')}</h3>
           <div className="space-y-4">
             <div className="flex items-center justify-between">
               <div>
@@ -1965,14 +2135,14 @@ function RepositoryDetailEditor() {
                   <p className="text-sm text-gray-300 font-medium">Pause / disable sync (explicit API)</p>
                   <p className="text-sm text-gray-300 mt-0.5">
                     Calls POST /disable (same contract as legacy DELETE). Stops scheduling; registration,
-                    mappings, secrets, local files, and remotes stay. The header toggle only updates
-                    enabled on the registration.
+                    mappings, secrets, local files, and remotes stay. The header “Turn sync off” opens
+                    this same dialog; “Turn sync on” only updates enabled on the registration.
                   </p>
                 </div>
                 <button
                   data-testid="pause-disable-repo"
-                  onClick={() => setShowDisableConfirm(true)}
-                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-amber-700 text-amber-300 hover:bg-amber-900/30 text-sm font-medium transition-colors"
+                  onClick={openDisableConfirm}
+                  className="rs-btn rs-btn--quiet inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-amber-700 text-amber-300 hover:bg-amber-900/30 text-sm font-medium transition-colors"
                 >
                   <Power className="w-4 h-4" />
                   Pause / disable
@@ -2001,7 +2171,7 @@ function RepositoryDetailEditor() {
                     setRemoveBranchOpts({ delete_git: false, delete_svn: false });
                     removeMutation.reset();
                   }}
-                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-red-700 text-red-400 hover:bg-red-900/30 text-sm font-medium transition-colors"
+                  className="rs-btn rs-btn--quiet inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-red-700 text-red-400 hover:bg-red-900/30 text-sm font-medium transition-colors"
                 >
                   <Trash2 className="w-4 h-4" />
                   Remove branch pair
@@ -2016,7 +2186,7 @@ function RepositoryDetailEditor() {
                     removeMutation.reset();
                     setShowRemoveConfirm(true);
                   }}
-                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-red-700 text-red-400 hover:bg-red-900/30 text-sm font-medium transition-colors"
+                  className="rs-btn rs-btn--quiet inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-red-700 text-red-400 hover:bg-red-900/30 text-sm font-medium transition-colors"
                 >
                   <Trash2 className="w-4 h-4" />
                   Remove from RepoSync
@@ -2029,21 +2199,21 @@ function RepositoryDetailEditor() {
 
       {showDisableConfirm && (
         <Dialog title="Pause / disable sync" description="Disable syncing without removing data or changing remotes." onClose={() => setShowDisableConfirm(false)} busy={disableMutation.isPending}>
-          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 max-w-md w-full shadow-xl">
+          <div className="rs-dlg rs-sec bg-gray-800 border border-gray-700 rounded-lg p-6 max-w-md w-full shadow-xl">
 
             <p className="text-sm text-gray-400 mb-6">
               Disable <span className="font-semibold text-gray-200">{repo.name}</span>? This does not remove
               data or touch remotes. You can re-enable later.
             </p>
             {disableMutation.isError && (
-              <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4" role="alert">
+              <div className="rs-bn rs-bn--danger bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4" role="alert">
                 Failed to disable: {disableMutation.error?.message}
               </div>
             )}
             <div className="flex items-center justify-end gap-3">
               <button
                 onClick={() => setShowDisableConfirm(false)}
-                className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+                className="rs-btn rs-btn--quiet px-4 py-2 rounded-lg border border-gray-600 text-gray-300 rs-hover-text-strong text-sm font-medium transition-colors"
                data-dialog-cancel disabled={disableMutation.isPending}>
                 Cancel
               </button>
@@ -2051,7 +2221,7 @@ function RepositoryDetailEditor() {
                 data-testid="confirm-pause-disable"
                 onClick={() => disableMutation.mutate()}
                 disabled={disableMutation.isPending}
-                className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+                className="rs-btn rs-btn--state px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 disabled:opacity-50 rs-text-on-state text-sm font-medium transition-colors"
               >
                 {disableMutation.isPending ? 'Disabling…' : 'Pause / disable'}
               </button>
@@ -2065,17 +2235,17 @@ function RepositoryDetailEditor() {
       )}
 
       {branchPairDeleteSubject && (
-        <Dialog title="Delete branch pair" description="Review dependency and remote-deletion choices. Remote deletion is off by default." onClose={() => {
+        <Dialog title={removePairWording(removeBranchOpts).title} description="Review dependency and remote-deletion choices. Remote deletion is off by default." onClose={() => {
                   setBranchPairDeleteTarget(null);
                   setBranchPairDeleteError(null);
                   setRemoveConfirmText('');
                   removeMutation.reset();
                 }} busy={removeMutation.isPending} testId="delete-branch-modal">
-          <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
+          <div className="rs-dlg bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
             <div className="p-6 space-y-4">
               {reviewedRemovalPanel}
               {removeMutation.isError && (
-                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" data-testid="delete-branch-error" role="alert">
+                <div className="rs-bn rs-bn--danger bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" data-testid="delete-branch-error" role="alert">
                   {removeMutation.error?.message}
                 </div>
               )}
@@ -2144,7 +2314,7 @@ function RepositoryDetailEditor() {
                     type="button"
                     data-testid="branch-removal-preview-retry"
                     onClick={() => branchPairPreviewQuery.refetch()}
-                    className="px-3 py-1.5 rounded-md border border-red-700 text-red-200 text-xs"
+                    className="rs-btn rs-btn--quiet px-3 py-1.5 rounded-md border border-red-700 text-red-200 text-xs"
                   >
                     Retry preview
                   </button>
@@ -2175,7 +2345,7 @@ function RepositoryDetailEditor() {
                 <input
                   type="text"
                   id="branch-removal-name" data-testid="delete-branch-confirm-input"
-                  className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-500"
+                  className="rs-in w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-500"
                   value={removeConfirmText}
                   onChange={(e) => setRemoveConfirmText(e.target.value)}
                   placeholder={branchPairDeleteSubject.git_branch}
@@ -2191,7 +2361,7 @@ function RepositoryDetailEditor() {
                   setRemoveConfirmText('');
                   removeMutation.reset();
                 }}
-                className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+                className="rs-btn rs-btn--quiet px-4 py-2 rounded-lg border border-gray-600 text-gray-300 rs-hover-text-strong text-sm font-medium transition-colors"
                data-dialog-cancel disabled={removeMutation.isPending}>
                 Cancel
               </button>
@@ -2206,10 +2376,10 @@ function RepositoryDetailEditor() {
                   || !!pendingRemovalReview.review || !!pendingRemovalReview.error
                   || branchPairDependencyPreview?.parent_removal_blocked
                 }
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+                className="rs-btn rs-btn--danger inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 rs-text-on-danger text-sm font-medium transition-colors"
               >
                 <Trash2 className="w-4 h-4" />
-                {removeMutation.isPending ? 'Deleting...' : 'Delete Branch Pair'}
+                {removeMutation.isPending ? removePairWording(removeBranchOpts).pending : removePairWording(removeBranchOpts).confirm}
               </button>
             </div>
           </div>
@@ -2222,7 +2392,7 @@ function RepositoryDetailEditor() {
                   setRemovalTarget(null);
                   setRemoveConfirmText('');
                 }} busy={removeMutation.isPending} testId="managed-remove-modal">
-          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 max-w-md w-full shadow-xl">
+          <div className="rs-dlg rs-sec bg-gray-800 border border-gray-700 rounded-lg p-6 max-w-md w-full shadow-xl">
             {reviewedRemovalPanel}
 
             <p className="text-sm text-gray-400 mb-4">
@@ -2317,14 +2487,14 @@ function RepositoryDetailEditor() {
                   type="button"
                   data-testid="removal-preview-retry"
                   onClick={() => removalPreviewQuery.refetch()}
-                  className="px-3 py-1.5 rounded-md border border-red-700 text-red-200 text-xs"
+                  className="rs-btn rs-btn--quiet px-3 py-1.5 rounded-md border border-red-700 text-red-200 text-xs"
                 >
                   Retry preview
                 </button>
               </div>
             )}
             {removeMutation.isError && (
-              <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4" role="alert">
+              <div className="rs-bn rs-bn--danger bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4" role="alert">
                 {removeMutation.error?.message}
               </div>
             )}
@@ -2336,7 +2506,7 @@ function RepositoryDetailEditor() {
                   setRemovalTarget(null);
                   setRemoveConfirmText('');
                 }}
-                className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+                className="rs-btn rs-btn--quiet px-4 py-2 rounded-lg border border-gray-600 text-gray-300 rs-hover-text-strong text-sm font-medium transition-colors"
                data-dialog-cancel disabled={removeMutation.isPending}>
                 Cancel
               </button>
@@ -2350,7 +2520,7 @@ function RepositoryDetailEditor() {
                   || !!pendingRemovalReview.review || !!pendingRemovalReview.error
                   || removalDependencyPreview?.parent_removal_blocked
                 }
-                className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+                className="rs-btn rs-btn--danger px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 rs-text-on-danger text-sm font-medium transition-colors"
               >
                 {removeMutation.isPending ? 'Removing…' : removalConfirmLabel}
               </button>
@@ -2362,6 +2532,385 @@ function RepositoryDetailEditor() {
     </div>
   );
 }
+
+/* ---- #264 derived regions and section navigation ---- */
+
+type StatusView = ReturnType<typeof useStatusObservation>;
+type Tone = 'ok' | 'run' | 'warn' | 'danger' | 'muted';
+const toneClasses: Record<Tone, string> = {
+  ok: 'bg-green-900/50 text-green-300',
+  run: 'bg-blue-900/50 text-blue-300',
+  warn: 'bg-yellow-900/50 text-yellow-300',
+  danger: 'bg-red-900/50 text-red-300',
+  muted: 'bg-gray-700 text-gray-300',
+};
+const markClass = 'rs-mark inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium';
+
+function observedClock(iso: string): string {
+  return `${new Date(iso).toLocaleTimeString()} · ${formatTimeAgo(iso)}`;
+}
+
+/** G04.32: read-only, derived from the status read the page already makes. */
+function repositoryStatusLine(view: StatusView) {
+  const status = view.status;
+  const observation = view.observation;
+  const health = view.health;
+  const tone: Tone = health === 'idle' ? 'ok'
+    : health === 'running' || health === 'initializing' || health === 'busy' ? 'run'
+      : health === 'paused' || health === 'held' || health === 'conflict' ? 'warn'
+        : health === 'error' ? 'danger' : 'muted';
+  const lastKnown = view.stale || view.failed ? ' (last known)' : '';
+  const observed = observation
+    ? view.stale || view.failed
+      ? `${view.availability} · last observed ${observedClock(observation.observed_at)}`
+      : `Observed ${observedClock(observation.observed_at)}`
+    : status ? `${view.availability} · observation time not reported` : view.availability;
+  const lastSyncAt = observation ? observation.last_successful_sync_at : status?.last_sync_at ?? null;
+  const lastSync = lastSyncAt
+    ? `${observedClock(lastSyncAt)}${lastKnown}`
+    : !status ? 'Unknown'
+      : observation && observation.data_freshness !== 'never_recorded' ? 'Unknown' : 'Not recorded';
+  const recorded = status
+    ? [status.last_svn_revision !== null ? `r${status.last_svn_revision}` : null, status.last_git_hash ? status.last_git_hash.slice(0, 12) : null]
+      .filter((part): part is string => !!part)
+    : [];
+  const position = !status ? 'Unknown' : recorded.length ? `${recorded.join(' · ')}${lastKnown}` : 'Not recorded';
+  return { word: view.healthLabel, tone, observed, lastSync, position };
+}
+
+/** G04.32: state, observed time, last sync, position and a link to the evidence. */
+export function RepositoryStatusLine({ view }: { view: StatusView }) {
+  const location = useLocation();
+  const line = repositoryStatusLine(view);
+  return (
+    <div
+      className="rs-sec bg-gray-800/60 border border-gray-700 rounded-lg px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm"
+      {...region('status-line', EVERY_SECTION)}
+      data-rs-derived=""
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span role="status" aria-atomic="true" className={`${markClass} ${toneClasses[line.tone]}`}>{line.word}</span>
+        <span className="text-xs text-gray-400">{line.observed}</span>
+      </div>
+      <dl className="flex flex-wrap gap-x-6 gap-y-1">
+        <div className="flex gap-2">
+          <dt className="text-gray-400">Last successful sync</dt>
+          <dd className="text-gray-200">{line.lastSync}</dd>
+        </div>
+        <div className="flex gap-2">
+          <dt className="text-gray-400">Position recorded</dt>
+          <dd className="text-gray-200 font-mono">{line.position}</dd>
+        </div>
+      </dl>
+      <Link
+        to={{ pathname: location.pathname, search: sectionSearch(location.search, 'overview') }}
+        state={location.state}
+        className="ml-auto text-blue-300 underline"
+      >
+        What this status proves
+      </Link>
+    </div>
+  );
+}
+
+/** G04.31: one link per section; a navigation that keeps the route's state. */
+export function RepositorySectionNav({ current, navRef }: { current: RepoSection; navRef?: React.Ref<HTMLElement> }) {
+  const location = useLocation();
+  return (
+    <nav ref={navRef} aria-label="Repository sections" className="rs-page-sections" data-rs-derived="">
+      {REPO_SECTIONS.map(item => (
+        <Link
+          key={item.id}
+          to={{ pathname: location.pathname, search: sectionSearch(location.search, item.id) }}
+          state={location.state}
+          aria-current={item.id === current ? 'page' : undefined}
+        >
+          {item.label}
+        </Link>
+      ))}
+    </nav>
+  );
+}
+
+type CredentialField = 'svn' | 'git';
+interface CredentialRead {
+  data?: { svn_password_set?: unknown; git_token_set?: unknown };
+  isError: boolean;
+  error?: unknown;
+}
+
+/** G04.4 / S23: a word and a mark from the existing credential read; never a placeholder. */
+function credentialState(flag: unknown, read: CredentialRead): { word: string; tone: Tone; note: string | null; set: boolean } {
+  const failure = read.isError ? (read.error instanceof Error && read.error.message) || 'The credential read failed.' : null;
+  if (!read.data) {
+    return failure
+      ? { word: 'Could not be read', tone: 'danger', note: failure, set: false }
+      : { word: 'Loading…', tone: 'muted', note: null, set: false };
+  }
+  if (typeof flag !== 'boolean') {
+    return { word: 'Not reported', tone: 'muted', note: failure ? `The latest read failed: ${failure}` : null, set: false };
+  }
+  return {
+    word: flag ? 'Set' : 'Not set',
+    tone: flag ? 'ok' : 'muted',
+    note: failure ? `Last known. The latest read failed: ${failure}` : null,
+    set: flag,
+  };
+}
+
+/** Settings: Credentials. Read-only; “Replace…” opens the field in its own region and sends nothing. */
+export function CredentialsSummary({ read, onReplace }: { read: CredentialRead; onReplace: (field: CredentialField) => void }) {
+  const id = useId();
+  const rows = [
+    { field: 'svn' as const, label: 'SVN password', state: credentialState(read.data?.svn_password_set, read) },
+    { field: 'git' as const, label: 'Git token', state: credentialState(read.data?.git_token_set, read) },
+  ];
+  return (
+    <section
+      aria-labelledby={`${id}-heading`}
+      className="rs-sec bg-gray-800/60 border border-gray-700 rounded-lg p-5"
+      {...region('credentials', 'settings')}
+      data-rs-derived=""
+    >
+      <h2 id={`${id}-heading`} className="rs-heading text-lg font-semibold text-gray-100">Credentials</h2>
+      <p className="text-sm text-gray-400 mt-1">Used by RepoSync to read and write this repository. A saved value is never shown.</p>
+      <ul className="mt-3 divide-y divide-gray-700">
+        {rows.map(row => (
+          <li key={row.field} className="py-2 flex flex-wrap items-center gap-x-4 gap-y-1">
+            <span id={`${id}-${row.field}`} className="text-sm text-gray-200 min-w-[8rem]">{row.label}</span>
+            <span className={`${markClass} ${toneClasses[row.state.tone]}`}>{row.state.word}</span>
+            <span className="text-xs text-gray-400">Origin not reported</span>
+            <button
+              type="button"
+              onClick={() => onReplace(row.field)}
+              aria-describedby={`${id}-${row.field}`}
+              className="rs-btn rs-btn--quiet ml-auto inline-flex items-center px-3 py-1.5 rounded-md text-xs font-medium border border-gray-600 text-gray-300 rs-hover-text-strong hover:border-gray-500 transition-colors"
+            >
+              {row.state.set ? 'Replace…' : 'Set…'}
+            </button>
+            {row.state.note && <p className="w-full text-xs text-red-300">{row.state.note}</p>}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/* ---- #264 shared changes ---- */
+
+/** G04.23: a repository pauses through the explicit call and its dialog; pairs and “on” stay one click. */
+function headerSyncSwitch(repo: Pick<Repository, 'parent_id' | 'enabled'>): 'explicit-pause' | 'turn-off' | 'turn-on' {
+  if (!repo.enabled) return 'turn-on';
+  return repo.parent_id ? 'turn-off' : 'explicit-pause';
+}
+
+type HookFetcher = (url: string) => Promise<Response>;
+
+/** G04.7: the existing hook request, with the session (a plain link cannot send it). */
+async function fetchPreCommitHook(repoId: string, fetcher: HookFetcher = url => sessionFetch(url)): Promise<string> {
+  const response = await fetcher(`/api/repos/${repoId}/hooks/pre-commit`);
+  const body = await response.text();
+  if (!response.ok) throw new Error(`API error ${response.status}: ${body}`);
+  return body;
+}
+
+/** How long the file's object URL stays valid after the click, so the browser can finish the download. */
+const DOWNLOAD_URL_LIFETIME_MS = 60_000;
+
+/** Hands the fetched text to the browser as a file; nothing else is sent. */
+function saveTextDownload(filename: string, text: string, doc: Document = document): void {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/x-shellscript' }));
+  const link = doc.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.rel = 'noopener';
+  link.style.display = 'none';
+  doc.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), DOWNLOAD_URL_LIFETIME_MS);
+}
+
+function commitCount(count: number): string {
+  return `${count} commit${count === 1 ? '' : 's'}`;
+}
+
+/** G04.10: what choosing a prefix does; the request is unchanged. */
+function skipChoiceHelp(selected: number, total: number): string {
+  const remaining = Math.max(0, total - selected);
+  return `Skips ${commitCount(selected)}. ${remaining === 0 ? 'Nothing stays pending.' : `${commitCount(remaining)} ${remaining === 1 ? 'stays' : 'stay'} pending.`}`;
+}
+
+/** G04.10: the oldest contiguous pending prefix, chosen as radios (“Skip through”). */
+export function SkipPrefixChoices({ name, commits, selectedCount, onSelect, disabled = false }: {
+  name: string;
+  commits: SkipCommitPending[];
+  selectedCount: number;
+  onSelect: (count: number) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="mb-4">
+      <p id={`${name}-label`} className="text-sm text-gray-300 mb-2">Skip through</p>
+      <div role="radiogroup" aria-labelledby={`${name}-label`} className="space-y-2 max-h-48 overflow-y-auto">
+        {commits.map((commit, index) => (
+          <label key={commit.sha} className="flex items-start gap-2 text-sm text-gray-200">
+            <input
+              type="radio"
+              name={name}
+              value={commit.sha}
+              checked={index === selectedCount - 1}
+              disabled={disabled}
+              onChange={() => onSelect(index + 1)}
+              aria-describedby={`${name}-help-${index}`}
+              data-testid={`skip-commit-select-${index}`}
+            />
+            <span>
+              <span className="font-mono text-xs text-gray-400">{commit.sha.slice(0, 8)}</span>
+              {' '}{commit.subject}
+              <span id={`${name}-help-${index}`} className="block text-xs text-gray-400">{skipChoiceHelp(index + 1, commits.length)}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** G04.9: what resuming does and does not do. */
+function resumeSyncConsequences(pendingCount: number | null): string[] {
+  const pending = pendingCount === null ? 'pending commits' : `the ${commitCount(pendingCount).replace('commit', 'pending commit')}`;
+  return [
+    'Clears the error pause so scheduled sync can run again.',
+    `It does not skip or change ${pending}. If the same errors keep recurring, sync pauses again.`,
+    'It does not prove that the two sides match, and it does not release a hold.',
+  ];
+}
+
+/**
+ * G04.9: “Resume sync…” asks once, then sends the existing retry call; pending and failure are
+ * shown. The dialog's description names the repository and says what resuming does and does not do.
+ */
+export function ResumeSyncDialog({ repoName, pendingCount, allowed, pending, error, onConfirm, onClose }: {
+  repoName: string;
+  pendingCount: number | null;
+  allowed: boolean;
+  pending: boolean;
+  error: string | null;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog
+      title="Resume sync?"
+      description={
+        <>
+          <p>{repoName}</p>
+          <ul className="list-disc pl-5 space-y-1 mt-2">
+            {resumeSyncConsequences(pendingCount).map(line => <li key={line}>{line}</li>)}
+          </ul>
+        </>
+      }
+      onClose={onClose}
+      busy={pending}
+      testId="resume-sync-modal"
+    >
+      <div className="rs-dlg rs-sec bg-gray-800 border border-gray-700 rounded-lg p-6 max-w-md w-full shadow-xl">
+        {!allowed && (
+          <p role="status" className="text-sm text-yellow-300 mb-4">
+            Current status no longer reports this pause. No resume request will be sent.
+          </p>
+        )}
+        {error && (
+          <div className="rs-bn rs-bn--danger bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4" role="alert">
+            Sync could not be resumed: {error}
+          </div>
+        )}
+        <div className="flex items-center justify-end gap-3">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rs-btn rs-btn--quiet px-4 py-2 rounded-lg border border-gray-600 text-gray-300 rs-hover-text-strong text-sm font-medium transition-colors"
+            data-dialog-cancel
+            disabled={pending}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            data-testid="confirm-resume-sync"
+            onClick={onConfirm}
+            disabled={pending || !allowed}
+            className="rs-btn rs-btn--primary px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rs-text-on-accent text-sm font-medium transition-colors"
+          >
+            {pending ? 'Resuming…' : 'Resume sync'}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+/** G04.25: “Remove” unless a remote deletion is ticked; the request, defaults and typed name are unchanged. */
+function removePairWording(options: { delete_git: boolean; delete_svn: boolean }) {
+  const deleted = options.delete_git && options.delete_svn ? 'Git and SVN branches'
+    : options.delete_git ? 'Git branch' : options.delete_svn ? 'SVN branch' : null;
+  if (!deleted) return { title: 'Remove branch pair', confirm: 'Remove pair', pending: 'Removing…' };
+  return { title: `Remove branch pair and delete its ${deleted}`, confirm: `Remove pair and delete ${deleted}`, pending: 'Deleting...' };
+}
+
+/** S20: plain words for a late-pairing operation state; the raw value is kept beside it. */
+function latePairStateWord(state: string): string {
+  const words: Record<string, string> = {
+    preview: 'preview only',
+    preparing: 'preparing',
+    queued: 'queued',
+    svn_copy_pending: 'SVN copy pending',
+    svn_copied: 'SVN branch copied',
+    child_registered: 'pair registered',
+    replay_in_progress: 'replaying commits',
+    active: 'active',
+    completed: 'completed',
+    failed: 'failed',
+    reconciliation_required: 'needs reconciliation',
+    reconciliation_held: 'held for reconciliation',
+    cancelled: 'stopped',
+  };
+  return words[state] ?? 'state not recognised';
+}
+
+/** G04.15: a failed read is shown as failed, never as an empty list. */
+export function SyncRecordsBody({ read }: { read: { data?: { entries?: SyncRecord[] }; isError: boolean; error?: unknown } }) {
+  const failure = read.isError ? (read.error instanceof Error && read.error.message) || 'The sync records read failed.' : null;
+  if (!read.data) {
+    return failure
+      ? <p role="alert" className="text-red-300 text-sm px-6 pb-6" data-testid="sync-records-failed">Sync records could not be loaded: {failure}</p>
+      : <p className="text-gray-400 text-sm px-6 pb-6">Loading sync records…</p>;
+  }
+  const records = read.data.entries ?? [];
+  return (
+    <>
+      {failure && (
+        <p role="alert" className="text-red-300 text-sm px-6 pb-3" data-testid="sync-records-stale">
+          Sync records could not be refreshed: {failure}. The list below is the last one loaded.
+        </p>
+      )}
+      {records.length > 0 ? (
+        <div className="divide-y divide-gray-700" data-rs-list="">
+          {records.map((record) => (
+            <SyncRecordRow key={record.id} record={record} />
+          ))}
+        </div>
+      ) : (
+        <p className="text-gray-400 text-sm px-6 pb-6">No sync records yet</p>
+      )}
+    </>
+  );
+}
+
+// Pure helpers, exported for this page's tests only.
+// eslint-disable-next-line react-refresh/only-export-components
+export { normaliseRepoSection, sectionSearch, sectionNavDisplayed, repositoryStatusLine, credentialState, headerSyncSwitch, fetchPreCommitHook, saveTextDownload, skipChoiceHelp, resumeSyncConsequences, removePairWording, latePairStateWord, REPO_SECTIONS };
 
 /* ---- Sub-components ---- */
 
@@ -2463,7 +3012,7 @@ function FieldToggle({ label, checked, onChange }: { label: string; checked: boo
 
 function StatCard({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
   return (
-    <div className="bg-gray-800/60 border border-gray-700 rounded-lg p-4">
+    <div className="rs-sec bg-gray-800/60 border border-gray-700 rounded-lg p-4">
       <div className="flex items-center gap-2 mb-2">
         {icon}
         <span className="text-sm text-gray-400">{label}</span>
@@ -2606,7 +3155,7 @@ function DirectionBadge({ direction }: { direction: string }) {
   const isToGit = direction === 'svn_to_git';
   return (
     <span
-      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+      className={`rs-mark inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
         isToGit
           ? 'bg-blue-900/50 text-blue-300'
           : 'bg-purple-900/50 text-purple-300'
@@ -2633,11 +3182,41 @@ function ActionBadge({ action }: { action: string }) {
 
   return (
     <span
-      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+      className={`rs-mark inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
         colors[action] ?? 'bg-gray-700 text-gray-300'
       }`}
     >
       {label}
     </span>
+  );
+}
+
+/**
+ * #264 (D11, interaction contract): "Stop operation…" opens one confirmation that says what
+ * stopping does not undo; confirming sends the same cancel request as before.
+ */
+export function StopOperationConfirm({ open, pending, error = null, onConfirm, onCancel }: {
+  readonly open: boolean; readonly pending: boolean; readonly error?: string | null;
+  readonly onConfirm: () => void; readonly onCancel: () => void;
+}) {
+  if (!open) return null;
+  return (
+    <Dialog title="Stop this operation?" description="Request a stop for the branch pair operation."
+      onClose={onCancel} busy={pending} testId="stop-operation-modal">
+      <div className="space-y-3 text-sm text-gray-300">
+        <p>Cancellation after intent retains the hold; it does not undo remote work.</p>
+        {error && <p role="alert" className="text-red-400">{error}</p>}
+        <div className="flex items-center justify-end gap-3 pt-1">
+          <button type="button" onClick={onCancel} data-dialog-cancel disabled={pending}
+            className="rs-btn rs-btn--quiet px-4 py-2 rounded-lg border border-gray-600 text-gray-300 rs-hover-text-strong text-sm font-medium transition-colors">
+            Keep running
+          </button>
+          <button type="button" data-testid="confirm-stop-operation" onClick={onConfirm} disabled={pending}
+            className="rs-btn rs-btn--state px-4 py-2 rounded-lg bg-yellow-600 hover:bg-yellow-700 disabled:opacity-50 rs-text-on-state text-sm font-medium transition-colors">
+            {pending ? 'Requesting stop…' : 'Stop operation'}
+          </button>
+        </div>
+      </div>
+    </Dialog>
   );
 }

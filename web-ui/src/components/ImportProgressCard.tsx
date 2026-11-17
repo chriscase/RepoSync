@@ -1,7 +1,9 @@
 import ImportProgressMeter from './ImportProgressMeter';
+import Dialog from './Dialog';
 import { useViewMutation as useMutation } from '../useViewMutation';
 import { sessionFetch } from '../session';
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Clock, ArrowRight, Terminal, CheckCircle2 } from 'lucide-react';
 import { api, type ImportStatus } from '../api';
@@ -15,6 +17,8 @@ import {
 import ImportHistoryNotice from './ImportHistoryNotice';
 import ImportModeFields from './ImportModeFields';
 import { getStoredUser } from '../utils/auth';
+import { importStateLabel } from '../importProgress';
+import { useText } from '../layouts/vocabulary';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -31,20 +35,6 @@ function formatElapsed(startedAt: string | null, endedAt?: string | null): strin
   if (h > 0) return `${h}h ${m}m ${s}s`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
-}
-
-function phaseLabel(phase: string): string {
-  const labels: Record<string, string> = {
-    idle: 'Idle',
-    connecting: 'Connecting',
-    importing: 'Importing',
-    verifying: 'Verifying',
-    final_push: 'Final Push',
-    completed: 'Completed',
-    failed: 'Failed',
-    cancelled: 'Cancelled',
-  };
-  return labels[phase] ?? phase;
 }
 
 function phaseDotColor(phase: string): string {
@@ -112,6 +102,9 @@ interface ImportProgressProps {
   hideIfIdle?: boolean;
   defaultImportMode?: RepoImportMode;
   defaultSvnRevision?: string;
+  /** #264 page regions: the region name and the sections it shows in, put on the card's root. */
+  regionName?: string;
+  regionSections?: string;
 }
 
 /** Subject changes retire local feedback, private preferences and mutation observers together. */
@@ -125,12 +118,18 @@ function ImportProgressSubject({
   hideIfIdle = false,
   defaultImportMode = DEFAULT_REPO_IMPORT_MODE,
   defaultSvnRevision = 'HEAD',
+  regionName,
+  regionSections,
 }: ImportProgressProps) {
+  const regionAttributes = regionName ? { 'data-rs-region': regionName, 'data-rs-sections': regionSections ?? '' } : {};
+  const t = useText();
   const queryClient = useQueryClient();
   const admin = getStoredUser()?.role === 'admin';
   const [importMode, setImportMode] = useState<RepoImportMode>(defaultImportMode);
   const [svnRevision, setSvnRevision] = useState(defaultSvnRevision);
   const [startError, setStartError] = useState<string | null>(null);
+  // G04.13: the operation a stop confirmation is open for.
+  const [stopTarget, setStopTarget] = useState<string | null>(null);
 
   useEffect(() => {
     setImportMode(defaultImportMode);
@@ -195,7 +194,10 @@ function ImportProgressSubject({
       if (!res.ok) throw new Error((await res.json()).error || `Cancellation failed (${res.status})`);
       return res.json();
     },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['import-status', repoId] }),
+    onSuccess: () => {
+      setStopTarget(null);
+      queryClient.invalidateQueries({ queryKey: ['import-status', repoId] });
+    },
   });
   const reconcile = useMutation({
     mutationFn: async (operationId: string) => {
@@ -211,7 +213,7 @@ function ImportProgressSubject({
   // No data yet from API
   if (!status) {
     return (
-      <div className="bg-gray-800 border border-gray-700 rounded-xl p-5 shadow-lg">
+      <div className="rs-sec bg-gray-800 border border-gray-700 rounded-xl p-5 shadow-lg" {...regionAttributes}>
         <div className="text-sm text-gray-300 italic">{isError ? 'Import status unavailable' : 'Loading import status...'}</div>
       </div>
     );
@@ -222,10 +224,10 @@ function ImportProgressSubject({
   if (neverRan) {
     if (hideIfIdle && !status.can_start) return null;
     return (
-      <div className="bg-gray-800 border border-gray-700 rounded-xl p-5 shadow-lg">
+      <div className="rs-sec bg-gray-800 border border-gray-700 rounded-xl p-5 shadow-lg" {...regionAttributes}>
         <div className="flex items-center justify-between">
           <div>
-            <h3 className="text-sm font-semibold text-gray-200">
+            <h3 className="rs-heading text-sm font-semibold text-gray-200">
             SVN Import{repoName && <span className="text-blue-400 ml-1">— {repoName}</span>}
           </h3>
             <p className="text-xs text-gray-300 mt-1">No import history</p>
@@ -248,7 +250,7 @@ function ImportProgressSubject({
                     || (importMode === 'snapshot'
                       && Boolean(validateSvnRevisionInput(svnRevision)))
                   }
-                  className="rounded bg-blue-600 px-3 py-1 text-xs text-white disabled:opacity-50"
+                  className="rs-btn rs-btn--primary rounded bg-blue-600 px-3 py-1 text-xs rs-text-on-accent disabled:opacity-50"
                 >
                   {start.isPending ? 'Starting…' : startImportButtonLabel(importMode)}
                 </button>
@@ -262,7 +264,7 @@ function ImportProgressSubject({
             href="/repos"
             className="flex items-center space-x-1 text-sm text-blue-400 hover:text-blue-300 transition-colors"
           >
-            <span>Manage Repos</span>
+            <span>{t('import.manageRepositories')}</span>
             <ArrowRight className="w-4 h-4" />
           </a>
         </div>
@@ -280,11 +282,11 @@ function ImportProgressSubject({
   // Completed state — show success summary
   if (status.phase === 'completed') {
     return (
-      <div className="bg-gray-800 border border-gray-700 rounded-xl p-5 shadow-lg">
+      <div className="rs-sec bg-gray-800 border border-gray-700 rounded-xl p-5 shadow-lg" {...regionAttributes}>
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center space-x-2">
             <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-            <h3 className="text-sm font-semibold text-gray-200">
+            <h3 className="rs-heading text-sm font-semibold text-gray-200">
               SVN Import Complete{repoName && <span className="text-blue-400 ml-1">— {repoName}</span>}
             </h3>
           </div>
@@ -319,20 +321,21 @@ function ImportProgressSubject({
 
   // Active / failed / cancelled — full card
   const lastLogLines = (status.log_lines ?? []).slice(-5);
+  /** A stop is sent only for the operation the confirmation names, while it is still queued or running. */
+  const stoppable = (operationId: string) => !!repoId && admin && status.operation_id === operationId
+    && (status.lifecycle === 'queued' || status.lifecycle === 'running');
 
   return (
-    <div className="bg-gray-800 border border-gray-700 rounded-xl p-5 shadow-lg">
+    <div className="rs-sec bg-gray-800 border border-gray-700 rounded-xl p-5 shadow-lg" {...regionAttributes}>
       {/* Header row */}
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center space-x-2">
           <span className={`w-2.5 h-2.5 rounded-full ${phaseDotColor(status.phase)}`} />
-          <h3 className="text-sm font-semibold text-gray-200">
+          <h3 className="rs-heading text-sm font-semibold text-gray-200">
             SVN Import{repoName && <span className="text-blue-400 ml-1">— {repoName}</span>}
           </h3>
-          <span className="text-xs text-gray-200 bg-gray-700 px-2 py-0.5 rounded-full">
-            {status.lifecycle === 'cancel_requested' || status.lifecycle === 'cancelling'
-              ? 'Cancellation requested — stopping' : status.lifecycle === 'reconciliation_required'
-                ? 'Reconciliation required' : phaseLabel(status.phase)}
+          <span className="rs-mark text-xs text-gray-200 bg-gray-700 px-2 py-0.5 rounded-full">
+            {importStateLabel(status)}
           </span>
         </div>
         <div className="flex items-center space-x-1 text-xs text-gray-300">
@@ -363,6 +366,9 @@ function ImportProgressSubject({
         <ImportHistoryNotice fields={status} compact />
       </div>
       {status.operation_id && <p className="mb-2 text-xs text-gray-400 font-mono">Operation {status.operation_id}</p>}
+      <p className="mb-2 text-xs text-gray-400 font-mono" data-testid="import-reported-state">
+        Reported lifecycle: {status.lifecycle ?? 'not reported'} · phase: {status.phase}
+      </p>
       {status.last_local_svn_rev != null && (
         <p className="mb-2 text-xs text-gray-400">Local through SVN r{status.last_local_svn_rev};
           remote confirmed through {status.last_confirmed_svn_rev == null ? 'none' : `r${status.last_confirmed_svn_rev}`}.</p>
@@ -382,15 +388,27 @@ function ImportProgressSubject({
           This repository stays held until its local and remote history is reconciled.</p>
       )}
       {repoId && admin && status.operation_id && (status.lifecycle === 'queued' || status.lifecycle === 'running') && (
-        <button type="button" onClick={() => cancel.mutate(status.operation_id!)} disabled={cancel.isPending}
-          className="mb-3 rounded border border-yellow-500 px-3 py-1 text-xs text-yellow-200 disabled:opacity-50">
-          {cancel.isPending ? 'Requesting stop…' : 'Stop import'}
+        <button type="button" data-testid="stop-import"
+          onClick={() => { cancel.reset(); setStopTarget(status.operation_id!); }} disabled={cancel.isPending}
+          className="rs-btn rs-btn--quiet mb-3 rounded border border-yellow-500 px-3 py-1 text-xs text-yellow-200 disabled:opacity-50">
+          {cancel.isPending ? 'Requesting stop…' : t('import.stop')}
         </button>
       )}
-      {cancel.isError && <p role="alert" className="mb-3 text-xs text-red-400">{cancel.error.message}</p>}
+      {cancel.isError && !stopTarget && <p role="alert" className="mb-3 text-xs text-red-400">{cancel.error.message}</p>}
+      {stopTarget && (
+        <StopImportDialog
+          operationId={stopTarget}
+          repoName={repoName}
+          allowed={stoppable(stopTarget)}
+          pending={cancel.isPending}
+          error={cancel.isError ? cancel.error.message : null}
+          onConfirm={() => { if (stoppable(stopTarget)) cancel.mutate(stopTarget); }}
+          onClose={() => setStopTarget(null)}
+        />
+      )}
       {repoId && admin && status.operation_id && status.lifecycle === 'reconciliation_required' && (
         <button type="button" onClick={() => reconcile.mutate(status.operation_id!)} disabled={reconcile.isPending}
-          className="mb-3 rounded border border-blue-500 px-3 py-1 text-xs text-blue-200 disabled:opacity-50">
+          className="rs-btn rs-btn--quiet mb-3 rounded border border-blue-500 px-3 py-1 text-xs text-blue-200 disabled:opacity-50">
           {reconcile.isPending ? 'Verifying remote…' : 'Verify remote'}
         </button>
       )}
@@ -412,14 +430,24 @@ function ImportProgressSubject({
         </div>
       )}
 
-      {/* Link */}
-      <a
-        href="/"
-        className="flex items-center justify-center space-x-1 text-sm text-blue-400 hover:text-blue-300 transition-colors"
-      >
-        <span>View Full Import</span>
-        <ArrowRight className="w-4 h-4" />
-      </a>
+      {/* Link: a repository's import lands on its Operations section (G04.31). */}
+      {repoId ? (
+        <Link
+          to={`/repos/${repoId}?section=operations`}
+          className="flex items-center justify-center space-x-1 text-sm text-blue-400 hover:text-blue-300 transition-colors"
+        >
+          <span>View Full Import</span>
+          <ArrowRight className="w-4 h-4" />
+        </Link>
+      ) : (
+        <a
+          href="/"
+          className="flex items-center justify-center space-x-1 text-sm text-blue-400 hover:text-blue-300 transition-colors"
+        >
+          <span>View Full Import</span>
+          <ArrowRight className="w-4 h-4" />
+        </a>
+      )}
     </div>
   );
 }
@@ -427,6 +455,42 @@ function ImportProgressSubject({
 // ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
+
+/** G04.13: “Stop import” asks once and says what stopping does not undo; then the same call. */
+export function StopImportDialog({ operationId, repoName, allowed, pending, error, onConfirm, onClose }: {
+  operationId: string;
+  repoName?: string;
+  allowed: boolean;
+  pending: boolean;
+  error: string | null;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog title="Stop import?" description={`Request a stop for this SVN import${repoName ? ` of ${repoName}` : ''}.`}
+      onClose={onClose} busy={pending} testId="stop-import-modal">
+      <div className="rs-dlg space-y-3 text-sm text-gray-300">
+        <p>Stopping does not undo commits already published.</p>
+        <p>This repository stays held until its local and remote history is reconciled.</p>
+        <p className="text-xs text-gray-400 font-mono break-all">Operation {operationId}</p>
+        {!allowed && (
+          <p role="status" className="text-yellow-300">This import is no longer queued or running. No stop request will be sent.</p>
+        )}
+        {error && <p role="alert" className="text-red-400">{error}</p>}
+        <div className="flex items-center justify-end gap-3 pt-1">
+          <button type="button" onClick={onClose} data-dialog-cancel disabled={pending}
+            className="rs-btn rs-btn--quiet px-4 py-2 rounded-lg border border-gray-600 text-gray-300 rs-hover-text-strong text-sm font-medium transition-colors">
+            Cancel
+          </button>
+          <button type="button" data-testid="confirm-stop-import" onClick={onConfirm} disabled={pending || !allowed}
+            className="rs-btn rs-btn--state px-4 py-2 rounded-lg bg-yellow-600 hover:bg-yellow-700 disabled:opacity-50 rs-text-on-state text-sm font-medium transition-colors">
+            {pending ? 'Requesting stop…' : 'Stop import'}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
 
 function StatCell({ label, value }: { label: string; value: string }) {
   return (

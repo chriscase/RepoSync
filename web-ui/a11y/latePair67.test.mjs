@@ -73,6 +73,17 @@ test('rs67 actual dialog invalidates changed reviews and distinguishes held publ
       await page.keyboard.press(index%2?'Tab':'Shift+Tab');
       assert.ok(await dialog.evaluate(element=>element.contains(document.activeElement)),'focus stays in the real modal');
     }
+    // #264 (D11): "Stop operation…" asks first. Keep running sends nothing and returns focus;
+    // confirming sends exactly one cancel for the held operation.
+    const stop=page.getByRole('button',{name:'Stop operation…',exact:true});await stop.click();
+    const stopDialog=page.getByRole('dialog',{name:'Stop this operation?',exact:true});await stopDialog.waitFor();
+    await page.waitForFunction(()=>document.activeElement?.textContent?.trim()==='Keep running');
+    await page.keyboard.press('Escape');await stopDialog.waitFor({state:'detached'});
+    await page.waitForFunction(()=>document.activeElement?.textContent?.trim()==='Stop operation…');
+    assert.equal(requests.filter(request=>request.action==='cancel').length,0,'closing the confirmation sends nothing');
+    await stop.click();await stopDialog.waitFor();await stopDialog.getByRole('button',{name:'Stop operation',exact:true}).click();
+    await stopDialog.waitFor({state:'detached'});
+    const cancels=requests.filter(request=>request.action==='cancel');assert.equal(cancels.length,1);assert.equal(cancels[0].operation_id,'fixture-operation-C');
     await page.getByRole('button',{name:'Inspect operation',exact:true}).click();
     await page.getByRole('button',{name:'Reconcile / resume',exact:true}).click();
     await page.waitForFunction(()=>document.body.textContent.includes('Pair publication completed.'));

@@ -1,24 +1,35 @@
 import { useId } from 'react';
-import { LayoutTemplate } from 'lucide-react';
-import { LAYOUT_CATALOG, LAYOUT_IDS, isLayoutId, type LayoutId } from './layoutCatalog';
+import { LayoutTemplate, SunMoon } from 'lucide-react';
+import { DEFAULT_THEME, LAYOUT_CATALOG, LAYOUT_IDS, THEME_IDS, THEME_LABELS, isLayoutId, isThemeId, type LayoutId, type ThemeId } from './layoutCatalog';
 import type { LayoutPreferenceNotice } from './layoutPreference';
 
 export interface LayoutChooserProps {
   readonly value: LayoutId;
   readonly onChange: (layout: LayoutId) => void;
+  /** #264 E2. Absent means dark and no theme change is offered to a caller that cannot store one. */
+  readonly theme?: ThemeId;
+  readonly onThemeChange?: (theme: ThemeId) => void;
   readonly notice: LayoutPreferenceNotice | null;
 }
+
+const HINT = {
+  existing: 'Changes only how navigation is arranged. Pages, actions, permissions and server mode stay the same.',
+  extended: 'Changes how navigation and pages are arranged and worded. Actions, permissions and server mode stay the same.',
+} as const;
 
 /**
  * #262 layout chooser. A native select keeps keyboard and screen-reader behavior
  * standard and stays compact in the Classic header. It sits in one fixed shell
  * slot, so it keeps its DOM node and focus while the presentation changes.
  */
-export default function LayoutChooser({ value, onChange, notice }: LayoutChooserProps) {
+export default function LayoutChooser({ value, onChange, theme = DEFAULT_THEME, onThemeChange, notice }: LayoutChooserProps) {
   const id = useId();
   const selectId = `${id}-layout`;
+  const themeId = `${id}-theme`;
   const hintId = `${id}-hint`;
+  const themeHintId = `${id}-theme-hint`;
   const noticeId = `${id}-notice`;
+  const hint = LAYOUT_CATALOG[value].vocabulary === 'existing' ? HINT.existing : HINT.extended;
   return (
     <div className="rs-layout-chooser flex items-center gap-2">
       <label htmlFor={selectId} className="rs-shell-muted flex items-center" title="Layout">
@@ -37,7 +48,24 @@ export default function LayoutChooser({ value, onChange, notice }: LayoutChooser
           <option key={layoutId} value={layoutId}>{LAYOUT_CATALOG[layoutId].label}</option>
         ))}
       </select>
-      <span id={hintId} className="sr-only">Changes only how navigation is arranged. Pages, actions, permissions and server mode stay the same.</span>
+      <span id={hintId} className="sr-only">{hint}</span>
+      <label htmlFor={themeId} className="rs-shell-muted flex items-center" title="Theme">
+        <SunMoon aria-hidden="true" className="h-4 w-4" />
+        <span className="sr-only">Theme</span>
+      </label>
+      <select
+        id={themeId}
+        value={theme}
+        onChange={event => { const next = event.target.value; if (isThemeId(next)) onThemeChange?.(next); }}
+        aria-describedby={`${themeHintId} ${noticeId}`}
+        className="rs-layout-chooser__select rounded-md border px-2 py-1 text-xs font-medium"
+        data-rs-theme-chooser=""
+      >
+        {THEME_IDS.map(themeOption => (
+          <option key={themeOption} value={themeOption}>{THEME_LABELS[themeOption]}</option>
+        ))}
+      </select>
+      <span id={themeHintId} className="sr-only">Changes only colours. Pages, actions, permissions and server mode stay the same.</span>
       <p id={noticeId} role="status" className="rs-layout-chooser__notice text-xs" title={notice?.detail}>
         {notice && <>{notice.short}<span className="sr-only">. {notice.detail}</span></>}
       </p>

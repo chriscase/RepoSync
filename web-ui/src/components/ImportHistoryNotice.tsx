@@ -22,7 +22,7 @@ export default function ImportHistoryNotice({
       fields.starting_revision != null ? `r${fields.starting_revision}` : null;
     return (
       <div
-        className={`rounded-lg border border-amber-700/60 bg-amber-950/30 ${
+        className={`rs-bn rs-bn--warn rounded-lg border border-amber-700/60 bg-amber-950/30 ${
           compact ? 'p-2.5' : 'p-3'
         }`}
         data-testid="import-history-notice"
@@ -43,7 +43,7 @@ export default function ImportHistoryNotice({
   if (failure) {
     return (
       <div
-        className={`rounded-lg border border-red-700/60 bg-red-950/30 ${
+        className={`rs-bn rs-bn--danger rounded-lg border border-red-700/60 bg-red-950/30 ${
           compact ? 'p-2.5' : 'p-3'
         }`}
         data-testid="import-baseline-failure"

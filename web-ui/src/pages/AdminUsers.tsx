@@ -54,11 +54,11 @@ function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
 
   return (
     <Dialog title="Create User" description="Review the selected user's settings. Changes are submitted only by the save action." onClose={onClose} busy={saving}>
-      <div className="bg-gray-800 rounded-lg border border-gray-700 shadow-xl w-full max-w-md p-6">
+      <div className="rs-dlg rs-sec bg-gray-800 rounded-lg border border-gray-700 shadow-xl w-full max-w-md p-6">
 
 
         {error && (
-          <div className="mb-4 bg-red-900/40 border border-red-700 text-red-300 px-3 py-2 rounded text-sm" id={`${fieldId}-error`} role="alert">
+          <div className="rs-bn rs-bn--danger mb-4 bg-red-900/40 border border-red-700 text-red-300 px-3 py-2 rounded text-sm" id={`${fieldId}-error`} role="alert">
             {error}
           </div>
         )}
@@ -70,7 +70,7 @@ function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+              className="rs-in w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
               placeholder="johndoe" id={`${fieldId}-1`} aria-describedby={error ? `${fieldId}-error` : undefined}
             />
           </div>
@@ -80,7 +80,7 @@ function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
               type="text"
               value={displayName}
               onChange={(e) => setDisplayName(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+              className="rs-in w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
               placeholder="John Doe" id={`${fieldId}-2`} aria-describedby={error ? `${fieldId}-error` : undefined}
             />
           </div>
@@ -90,7 +90,7 @@ function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+              className="rs-in w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
               placeholder="john@example.com" id={`${fieldId}-3`} aria-describedby={error ? `${fieldId}-error` : undefined}
             />
           </div>
@@ -100,7 +100,7 @@ function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+              className="rs-in w-full px-3 py-2 border border-gray-600 bg-gray-700 placeholder-gray-500 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
               placeholder="Minimum 8 characters" id={`${fieldId}-4`} aria-describedby={error ? `${fieldId}-error` : undefined}
             />
           </div>
@@ -109,7 +109,7 @@ function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
             <select
               value={role}
               onChange={(e) => setRole(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-5`} aria-describedby={error ? `${fieldId}-error` : undefined}
+              className="rs-in w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-5`} aria-describedby={error ? `${fieldId}-error` : undefined}
             >
               <option value="user">User</option>
               <option value="admin">Admin</option>
@@ -127,7 +127,7 @@ function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
           <button
             onClick={handleSubmit}
             disabled={saving}
-            className="px-4 py-2 text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="rs-btn rs-btn--primary px-4 py-2 text-sm font-medium rounded-md rs-text-on-accent bg-blue-600 hover:bg-blue-700 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500"
           >
             {saving ? 'Creating...' : 'Create User'}
           </button>
@@ -177,11 +177,11 @@ function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
 
   return (
     <Dialog title={`Edit User: ${user.username}`} description="Review the selected user's settings. Changes are submitted only by the save action." onClose={onClose} busy={saving}>
-      <div className="bg-gray-800 rounded-lg border border-gray-700 shadow-xl w-full max-w-md p-6">
+      <div className="rs-dlg rs-sec bg-gray-800 rounded-lg border border-gray-700 shadow-xl w-full max-w-md p-6">
 
 
         {error && (
-          <div className="mb-4 bg-red-900/40 border border-red-700 text-red-300 px-3 py-2 rounded text-sm" id={`${fieldId}-error`} role="alert">
+          <div className="rs-bn rs-bn--danger mb-4 bg-red-900/40 border border-red-700 text-red-300 px-3 py-2 rounded text-sm" id={`${fieldId}-error`} role="alert">
             {error}
           </div>
         )}
@@ -193,7 +193,7 @@ function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
               type="text"
               value={displayName}
               onChange={(e) => setDisplayName(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-6`} aria-describedby={error ? `${fieldId}-error` : undefined}
+              className="rs-in w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-6`} aria-describedby={error ? `${fieldId}-error` : undefined}
             />
           </div>
           <div>
@@ -202,7 +202,7 @@ function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-7`} aria-describedby={error ? `${fieldId}-error` : undefined}
+              className="rs-in w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-7`} aria-describedby={error ? `${fieldId}-error` : undefined}
             />
           </div>
           <div>
@@ -210,7 +210,7 @@ function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
             <select
               value={role}
               onChange={(e) => setRole(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-8`} aria-describedby={error ? `${fieldId}-error` : undefined}
+              className="rs-in w-full px-3 py-2 border border-gray-600 bg-gray-700 text-gray-100 rounded-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm" id={`${fieldId}-8`} aria-describedby={error ? `${fieldId}-error` : undefined}
             >
               <option value="user">User</option>
               <option value="admin">Admin</option>
@@ -240,7 +240,7 @@ function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
           <button
             onClick={handleSubmit}
             disabled={saving}
-            className="px-4 py-2 text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="rs-btn rs-btn--primary px-4 py-2 text-sm font-medium rounded-md rs-text-on-accent bg-blue-600 hover:bg-blue-700 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500"
           >
             {saving ? 'Saving...' : 'Save Changes'}
           </button>
@@ -281,7 +281,7 @@ export default function AdminUsers() {
   if (currentUser && currentUser.role !== 'admin') {
     return (
       <div className="text-center py-12">
-        <h2 className="text-xl font-semibold text-gray-100 mb-2">Access Denied</h2>
+        <h2 className="rs-heading text-xl font-semibold text-gray-100 mb-2">Access Denied</h2>
         <p className="text-gray-400">You need admin privileges to view this page.</p>
       </div>
     );
@@ -305,21 +305,21 @@ export default function AdminUsers() {
     <div className="max-w-6xl mx-auto space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-100">User Management</h1>
+          <h1 className="rs-title text-2xl font-bold text-gray-100">User Management</h1>
           <p className="mt-1 text-gray-400">Manage user accounts and permissions</p>
         </div>
         <button
           onClick={() => setShowCreate(true)}
-          className="px-4 py-2 text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          className="rs-btn rs-btn--primary px-4 py-2 text-sm font-medium rounded-md rs-text-on-accent bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
         >
           Create User
         </button>
       </div>
 
       {/* Users Table */}
-      <div className="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+      <div className="rs-sec bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-gray-700">
+          <table className="rs-tbl min-w-full divide-y divide-gray-700">
             <thead className="bg-gray-900">
               <tr>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
@@ -360,7 +360,7 @@ export default function AdminUsers() {
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <span
-                        className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                        className={`rs-mark inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
                           u.role === 'admin'
                             ? 'bg-purple-900/50 text-purple-300 border border-purple-700'
                             : 'bg-gray-700 text-gray-300 border border-gray-600'
@@ -371,7 +371,7 @@ export default function AdminUsers() {
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <span
-                        className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                        className={`rs-mark inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
                           u.enabled
                             ? 'bg-green-900/50 text-green-400 border border-green-700'
                             : 'bg-red-900/50 text-red-400 border border-red-700'

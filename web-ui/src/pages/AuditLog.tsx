@@ -4,22 +4,21 @@ import { useState, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
 import { UIForgeActivityStream } from '@appforgeapps/uiforge';
+import { CheckCircle, XCircle } from 'lucide-react';
 import { api, type AuditEntry } from '../api';
 import { DirectionBadge } from '../components/Badges';
 import { renderAuditEvent, renderAuditIcon } from '../components/ActivityEventRenderers';
-import { auditEntryToActivityEvent } from '../utils/activityAdapter';
+import {
+  AUDIT_ACTION_GROUPS,
+  AUDIT_REPOSITORY_NOT_RECORDED,
+  auditEntryToActivityEvent,
+  auditListState,
+  auditOutcomeWord,
+  auditRepositoryName,
+  isListedAuditAction,
+} from '../utils/activityAdapter';
 
-const ACTION_TYPES = [
-  { value: '', label: 'All Actions' },
-  { value: 'sync_cycle', label: 'Sync Cycles' },
-  { value: 'conflict_detected', label: 'Conflicts Detected' },
-  { value: 'conflict_resolved', label: 'Conflicts Resolved' },
-  { value: 'sync_error', label: 'Sync Errors' },
-  { value: 'webhook_received', label: 'Webhooks' },
-  { value: 'daemon_started', label: 'Daemon Events' },
-  { value: 'auth_login', label: 'Auth Events' },
-  { value: 'config_updated', label: 'Config Changes' },
-];
+type RepoNames = readonly { id: string; name: string }[] | undefined;
 
 export default function AuditLog() {
   const [searchParams,setSearchParams]=useSearchParams();
@@ -32,13 +31,14 @@ export default function AuditLog() {
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [viewMode, setViewMode] = useState<'table' | 'stream'>('stream');
 
-  const {data:response,isPending,isError,error,refetch}=useQuery({
+  const {data:response,isPending,isError,error,refetch,dataUpdatedAt}=useQuery({
     queryKey:auditPageKey(filters),
     queryFn:()=>api.getAuditLog(PAGE_SIZE,page,filters.success,filters.repoId,filters.action),
     refetchInterval:15000,enabled:!filters.error,
   });
-  const {data:repos}=useQuery({queryKey:['repos'],queryFn:api.getRepos});
+  const {data:repos,isError:reposFailed}=useQuery({queryKey:['repos'],queryFn:api.getRepos});
   const entries=response?.entries ?? [];
+  const listState=auditListState({filterError:filters.error,isError,isPending,page:response});
   const totalCount=response?.total;
   const totalPages=response?.total_pages ?? 0;
   const allEntries=entries;
@@ -49,7 +49,7 @@ export default function AuditLog() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-100">Audit Log</h1>
+          <h1 className="rs-title text-2xl font-bold text-gray-100">Audit Log</h1>
           <p className="text-sm text-gray-400 mt-1">
             Complete activity trail of all sync operations, events, and changes
           </p>
@@ -66,25 +66,31 @@ export default function AuditLog() {
         </div>
       </div>
 
-      {/* Filters */}
-      <div className="flex items-center space-x-3">
-        <select aria-label="Repository filter" value={filters.repoId ?? 'all'} onChange={e=>setSearchParams(changeListFilter(searchParams,'repo_id',e.target.value==='all' ? '':e.target.value))} className="rounded-md border border-gray-600 bg-gray-700 text-gray-200 px-3 py-2 text-sm">
+      {/* Filters. gap-3 equals the former space-x-3 on one row; the row now wraps when it cannot fit. */}
+      <div className="flex flex-wrap items-center gap-3">
+        <select aria-label="Repository filter" value={filters.repoId ?? 'all'} onChange={e=>setSearchParams(changeListFilter(searchParams,'repo_id',e.target.value==='all' ? '':e.target.value))} className="rs-in rounded-md border border-gray-600 bg-gray-700 text-gray-200 px-3 py-2 text-sm">
           <option value="all">All Repositories</option>
           {filters.repoId && !repos?.some(r=>r.id===filters.repoId) && <option value={filters.repoId}>Repository {filters.repoId}</option>}
           {repos?.map(r=><option key={r.id} value={r.id}>{r.name}</option>)}
+          {reposFailed && !repos && <option value="" disabled>Repository list could not be loaded</option>}
         </select>
         <select
           value={actionFilter}
           aria-label="Action filter"
           onChange={(e) => setActionFilter(e.target.value)}
-          className="rounded-md border border-gray-600 bg-gray-700 text-gray-200 px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+          className="rs-in rounded-md border border-gray-600 bg-gray-700 text-gray-200 px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
         >
-          {actionFilter && !ACTION_TYPES.some(a=>a.value===actionFilter) && <option value={actionFilter}>{actionFilter}</option>}
-          {ACTION_TYPES.map((at) => (
-            <option key={at.value} value={at.value}>{at.label}</option>
+          {actionFilter && !isListedAuditAction(actionFilter) && <option value={actionFilter}>{actionFilter}</option>}
+          <option value="">All Actions</option>
+          {AUDIT_ACTION_GROUPS.map((group) => (
+            <optgroup key={group.label} label={group.label}>
+              {group.options.map((at) => (
+                <option key={at.value} value={at.value}>{at.label}</option>
+              ))}
+            </optgroup>
           ))}
         </select>
-        <div className="flex rounded-md overflow-hidden border border-gray-600">
+        <div role="group" aria-label="Result" className="flex rounded-md overflow-hidden border border-gray-600">
           {[
             { value: '', label: 'All' },
             { value: 'success', label: 'Success' },
@@ -92,35 +98,40 @@ export default function AuditLog() {
           ].map((f) => (
             <button
               key={f.value}
+              type="button"
               aria-pressed={successFilter===f.value}
               onClick={() => setSuccessFilter(f.value)}
-              className={`px-3 py-2 text-sm ${
+              className={`rs-btn px-3 py-2 text-sm ${
                 successFilter === f.value
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                  ? 'rs-btn--primary bg-blue-600 rs-text-on-accent'
+                  : 'rs-btn--quiet bg-gray-700 text-gray-300 hover:bg-gray-600'
               }`}
             >
               {f.label}
             </button>
           ))}
         </div>
-        <div className="flex rounded-md overflow-hidden border border-gray-600">
+        <div role="group" aria-label="View" className="flex rounded-md overflow-hidden border border-gray-600">
           <button
+            type="button"
+            aria-pressed={viewMode === 'stream'}
             onClick={() => setViewMode('stream')}
-            className={`px-3 py-2 text-sm ${
+            className={`rs-btn px-3 py-2 text-sm ${
               viewMode === 'stream'
-                ? 'bg-blue-600 text-white'
-                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                ? 'rs-btn--primary bg-blue-600 rs-text-on-accent'
+                : 'rs-btn--quiet bg-gray-700 text-gray-300 hover:bg-gray-600'
             }`}
           >
             Stream
           </button>
           <button
+            type="button"
+            aria-pressed={viewMode === 'table'}
             onClick={() => setViewMode('table')}
-            className={`px-3 py-2 text-sm ${
+            className={`rs-btn px-3 py-2 text-sm ${
               viewMode === 'table'
-                ? 'bg-blue-600 text-white'
-                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                ? 'rs-btn--primary bg-blue-600 rs-text-on-accent'
+                : 'rs-btn--quiet bg-gray-700 text-gray-300 hover:bg-gray-600'
             }`}
           >
             Table
@@ -131,19 +142,24 @@ export default function AuditLog() {
         </span>
       </div>
 
-      {filters.error ? <div role="alert">{filters.error} <button onClick={()=>setSearchParams(new URLSearchParams())}>Clear filters</button></div>
-      : isError ? <div role="alert" className="text-red-300">Error loading audit log: {error.message}. Results are unknown. <button onClick={()=>void refetch()}>Retry</button></div>
-      : isPending || !response ? <LoadingSpinner/>
-      : !entries.length ? <div role="status">{response.total===0 ? 'No matching audit entries':'No audit entries on this page; matching records exist on other pages.'}</div>
-      : viewMode === 'stream' ? (
-        <AuditStreamView entries={entries} />
+      {listState==='invalid' ? <div role="alert">{filters.error} <button type="button" className="rs-btn rs-btn--quiet" onClick={()=>setSearchParams(new URLSearchParams())}>Clear filters</button></div>
+      : listState==='failed' || listState==='stale' ? <>
+        <div role="alert" className="text-red-300">Error loading audit log: {error?.message}. Results are unknown. <button type="button" className="rs-btn rs-btn--quiet" onClick={()=>void refetch()}>Retry</button></div>
+        {listState==='stale' && <AuditStaleNote loadedAt={dataUpdatedAt} />}
+      </>
+      : listState==='loading' ? <LoadingSpinner/>
+      : listState==='no-matches' || listState==='nothing-on-page' ? <div role="status">{listState==='no-matches' ? 'No matching audit entries':'No audit entries on this page; matching records exist on other pages.'}</div>
+      : null}
+      {(listState==='ready' || listState==='stale') && (viewMode === 'stream' ? (
+        <AuditStreamView entries={entries} repos={repos} />
       ) : (
         <AuditTableView
           entries={entries}
+          repos={repos}
           expandedId={expandedId}
           onToggleExpand={(id) => setExpandedId(expandedId === id ? null : id)}
         />
-      )}
+      ))}
 
       {/* Pagination */}
       {response && !isError && !filters.error && (
@@ -151,7 +167,7 @@ export default function AuditLog() {
           <button
             onClick={() => setSearchParams(changeListPage(searchParams,page-1))}
             disabled={page <= 1}
-            className={`px-3 py-2 text-sm rounded-md border ${
+            className={`rs-btn rs-btn--quiet px-3 py-2 text-sm rounded-md border ${
               page <= 1
                 ? 'border-gray-700 text-gray-600 cursor-not-allowed'
                 : 'border-gray-600 text-gray-300 hover:bg-gray-700'
@@ -165,7 +181,7 @@ export default function AuditLog() {
           <button
             onClick={() => setSearchParams(changeListPage(searchParams,page+1))}
             disabled={page >= totalPages}
-            className={`px-3 py-2 text-sm rounded-md border ${
+            className={`rs-btn rs-btn--quiet px-3 py-2 text-sm rounded-md border ${
               page >= totalPages
                 ? 'border-gray-700 text-gray-600 cursor-not-allowed'
                 : 'border-gray-600 text-gray-300 hover:bg-gray-700'
@@ -173,7 +189,7 @@ export default function AuditLog() {
           >
             Next &rarr;
           </button>
-          {page>1 && !entries.length && <button onClick={()=>setSearchParams(changeListPage(searchParams,1))}>Return to first page</button>}
+          {page>1 && !entries.length && <button type="button" className="rs-btn rs-btn--quiet" onClick={()=>setSearchParams(changeListPage(searchParams,1))}>Return to first page</button>}
         </div>
       )}
     </div>
@@ -184,14 +200,25 @@ export default function AuditLog() {
 // Stream View (UIForgeActivityStream)
 // ---------------------------------------------------------------------------
 
-function AuditStreamView({ entries }: { entries: AuditEntry[] }) {
+/** Earlier entries kept after a failed refresh, marked as possibly out of date. */
+export function AuditStaleNote({ loadedAt }: { loadedAt: number }) {
+  return (
+    <div role="status" className="rs-bn rs-bn--warn rounded-md border border-yellow-700 bg-yellow-900/30 text-yellow-200 px-4 py-3 text-sm">
+      {loadedAt
+        ? `The entries below were last loaded at ${new Date(loadedAt).toLocaleString()} and may be out of date.`
+        : 'The entries below are from an earlier read and may be out of date.'}
+    </div>
+  );
+}
+
+function AuditStreamView({ entries, repos }: { entries: AuditEntry[]; repos: RepoNames }) {
   const activityEvents = useMemo(
-    () => entries.map(e => auditEntryToActivityEvent(e)),
-    [entries],
+    () => entries.map(e => auditEntryToActivityEvent(e, auditRepositoryName(e, repos))),
+    [entries, repos],
   );
 
   return (
-    <div className="bg-gray-800 shadow rounded-lg border border-gray-700 p-6">
+    <div className="rs-sec bg-gray-800 shadow rounded-lg border border-gray-700 p-6">
       <UIForgeActivityStream
         events={activityEvents}
         theme="dark"
@@ -213,40 +240,48 @@ function AuditStreamView({ entries }: { entries: AuditEntry[] }) {
 // Table View (original)
 // ---------------------------------------------------------------------------
 
-function AuditTableView({
+export function AuditTableView({
   entries,
+  repos,
   expandedId,
   onToggleExpand,
 }: {
   entries: AuditEntry[];
+  repos: RepoNames;
   expandedId: number | null;
   onToggleExpand: (id: number) => void;
 }) {
   return (
-    <div className="bg-gray-800 shadow overflow-hidden rounded-lg border border-gray-700">
-      <table className="min-w-full divide-y divide-gray-700">
+    <div role="region" aria-label="Audit entries" tabIndex={0} className="rs-sec bg-gray-800 shadow overflow-x-auto rounded-lg border border-gray-700">
+      <table className="rs-tbl min-w-full divide-y divide-gray-700">
+        <caption className="sr-only">Audit entries</caption>
         <thead>
           <tr>
-            <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase w-8"></th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+            <th scope="col" className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+              Outcome
+            </th>
+            <th scope="col" className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
               Time
             </th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+            <th scope="col" className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+              Repository
+            </th>
+            <th scope="col" className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
               Action
             </th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+            <th scope="col" className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
               Direction
             </th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+            <th scope="col" className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
               Details
             </th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+            <th scope="col" className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
               Author
             </th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+            <th scope="col" className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
               SVN Rev
             </th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+            <th scope="col" className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">
               Git SHA
             </th>
           </tr>
@@ -256,6 +291,7 @@ function AuditTableView({
             <AuditRow
               key={entry.id}
               entry={entry}
+              repository={auditRepositoryName(entry, repos)}
               expanded={expandedId === entry.id}
               onToggle={() => onToggleExpand(entry.id)}
             />
@@ -268,13 +304,16 @@ function AuditTableView({
 
 function AuditRow({
   entry,
+  repository,
   expanded,
   onToggle,
 }: {
   entry: AuditEntry;
+  repository: string | undefined;
   expanded: boolean;
   onToggle: () => void;
 }) {
+  const OutcomeIcon = entry.success ? CheckCircle : XCircle;
   const actionColors: Record<string, string> = {
     sync_cycle: 'bg-cyan-900/50 text-cyan-300',
     conflict_detected: 'bg-red-900/50 text-red-300',
@@ -293,20 +332,23 @@ function AuditRow({
           expanded ? 'bg-gray-700/50' : 'hover:bg-gray-700/30'
         }`}
       >
-        <td className="px-4 py-3">
-          <span
-            className={`inline-block w-2 h-2 rounded-full ${
-              entry.success ? 'bg-green-400' : 'bg-red-400'
-            }`}
-            title={entry.success ? 'Success' : 'Failed'}
-          />
+        <td className="px-4 py-3 whitespace-nowrap">
+          <span className={`inline-flex items-center gap-1 text-sm font-medium ${entry.success ? 'text-green-400' : 'text-red-400'}`}>
+            <OutcomeIcon size={14} aria-hidden="true" />
+            {auditOutcomeWord(entry.success)}
+          </span>
         </td>
         <td className="px-4 py-3 text-sm text-gray-400 whitespace-nowrap">
           {new Date(entry.created_at).toLocaleString()}
         </td>
+        <td className="px-4 py-3 text-sm whitespace-nowrap">
+          {repository
+            ? <span className="text-gray-300">{repository}</span>
+            : <span className="text-gray-500">{AUDIT_REPOSITORY_NOT_RECORDED}</span>}
+        </td>
         <td className="px-4 py-3 whitespace-nowrap">
           <span
-            className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+            className={`rs-mark inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
               actionColors[entry.action] ?? 'bg-gray-700 text-gray-300'
             }`}
           >
@@ -337,7 +379,7 @@ function AuditRow({
       </tr>
       {expanded && (
         <tr>
-          <td colSpan={8} className="px-4 py-4 bg-gray-900/50">
+          <td colSpan={9} className="px-4 py-4 bg-gray-900/50">
             <div className="rounded-lg border border-gray-700 bg-gray-900 p-4">
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
                 <div>

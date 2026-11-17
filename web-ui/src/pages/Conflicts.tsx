@@ -32,14 +32,14 @@ export default function Conflicts() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-gray-100">Conflicts</h1>
+        <h1 className="rs-title text-2xl font-bold text-gray-100">Conflicts</h1>
         <div className="flex space-x-2 items-center">
           {(repos || filters.repoId) && (
             <select
               value={repoFilter}
               onChange={(e) => setRepoFilter(e.target.value)}
               aria-label="Repository filter"
-              className="bg-gray-800 border border-gray-600 text-gray-200 rounded-md px-3 py-1 text-sm"
+              className="rs-in bg-gray-800 border border-gray-600 text-gray-200 rounded-md px-3 py-1 text-sm"
             >
               <option value="all">All Repositories</option>
               {filters.repoId && !repos?.some(r=>r.id===filters.repoId) && <option value={filters.repoId}>Repository {filters.repoId}</option>}
@@ -56,10 +56,10 @@ export default function Conflicts() {
               key={f}
               aria-pressed={filter===f}
               onClick={() => setFilter(f)}
-              className={`px-3 py-1 rounded-md text-sm ${
+              className={`rs-btn px-3 py-1 rounded-md text-sm ${
                 filter === f
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                  ? 'rs-btn--primary bg-blue-600 rs-text-on-accent'
+                  : 'rs-btn--quiet bg-gray-700 text-gray-300 hover:bg-gray-600'
               }`}
             >
               {f === '' ? 'All' : f.charAt(0).toUpperCase() + f.slice(1)}
@@ -72,8 +72,8 @@ export default function Conflicts() {
       : isError ? <div role="alert" className="text-red-300">Error loading conflicts: {error.message}. Results are unknown. <button onClick={()=>void refetch()}>Retry</button></div>
       : isPending || !response ? <div role="status">Loading conflicts…</div>
       : conflicts && conflicts.length > 0 ? (
-        <div className="bg-gray-800 shadow overflow-hidden rounded-lg border border-gray-700">
-          <table className="min-w-full divide-y divide-gray-700">
+        <div className="rs-sec bg-gray-800 shadow overflow-hidden rounded-lg border border-gray-700">
+          <table className="rs-tbl min-w-full divide-y divide-gray-700">
             <thead className="bg-gray-700/50">
               <tr>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
@@ -110,7 +110,7 @@ export default function Conflicts() {
           </table>
         </div>
       ) : (
-        <div className="bg-gray-800 shadow rounded-lg p-12 text-center border border-gray-700">
+        <div className="rs-sec bg-gray-800 shadow rounded-lg p-12 text-center border border-gray-700">
           <p className="text-gray-300 text-lg">{response?.total===0 ? 'No matching conflicts':'No conflicts on this page'}</p>
           <p className="text-gray-500 text-sm mt-1">{response?.total===0 ? 'Try another status or repository filter.':'Matching records exist on other pages.'}</p>
         </div>
@@ -157,7 +157,7 @@ function ConflictRow({ conflict, repoName }: { conflict: ConflictListItem; repoN
       </td>
       <td className="px-6 py-4 whitespace-nowrap">
         <span
-          className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+          className={`rs-mark inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
             statusColors[conflict.status] ?? 'bg-gray-700 text-gray-300'
           }`}
         >
