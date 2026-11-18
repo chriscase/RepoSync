@@ -241,7 +241,9 @@ services:
       - ${LAB_RUN_DIR}/certs:/certs:ro
     ports:
       - 127.0.0.1:${LAB_FAULT_PORT}:8443
-    networks: [lab]
+    networks:
+      lab:
+        aliases: [fault-proxy]
     depends_on:
       svn:
         condition: service_healthy

@@ -3,6 +3,10 @@
   "source_head": "bcb9a96d6efff63ffc7835a6e4134f9bf294c626",
   "design_note": "Retained obligation union introduced by this accounting correction; not a recovered historical 40-test contract. Additions in executor/matrix catalogs remain included. Retiring or replacing a required id requires explicit reviewed plan changes.",
   "required_case_ids": [
+    "LAB_PAIR_DELETE_GIT_SIDE_ONLY",
+    "LAB_PAIR_DELETE_SVN_SIDE_ONLY",
+    "LAB_PAIR_DELETE_SIDE_REFUSED_DURING_SYNC",
+    "LAB_PAIR_DELETE_SIDE_UNAUTHORIZED",
     "64A_AUTH",
     "64A_CANCEL_WRITE",
     "64A_CONNECTING",
@@ -529,6 +533,10 @@
     "WEB-STALE-ERROR-PERMISSION"
   ],
   "r_criteria_by_case": {
+    "LAB_PAIR_DELETE_GIT_SIDE_ONLY": ["R02", "R20"],
+    "LAB_PAIR_DELETE_SVN_SIDE_ONLY": ["R02", "R20"],
+    "LAB_PAIR_DELETE_SIDE_REFUSED_DURING_SYNC": ["R04", "R20"],
+    "LAB_PAIR_DELETE_SIDE_UNAUTHORIZED": ["R18", "R20"],
     "64A_AUTH": [
       ""
     ],

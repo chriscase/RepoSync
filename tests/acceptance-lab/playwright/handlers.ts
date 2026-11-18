@@ -182,6 +182,123 @@ async function remoteDeleteCase(lab: Lab, op: LabOp): Promise<void> {
   lab.pass("Managed child deletion kept Git/SVN remotes when opted out, then removed exactly the opted-in ref/path; parent, sibling, kept remotes and checkpoints stayed intact");
 }
 
+// #199 is a separate disposition: never reuse the legacy remote-delete helper.
+export function archive199AssertPreserved(before: any, after: any, side: "git" | "svn"): void {
+  expect(before.registration).toHaveLength(1); expect(after.registration).toHaveLength(1);
+  const original = before.registration[0], archived = after.registration[0];
+  expect(original.parent_id).toBeTruthy(); expect(archived.id).toBe(original.id);
+  expect(archived.sync_status).toBe("archived"); expect([false, 0]).toContain(archived.enabled);
+  for (const key of Object.keys(original).filter(key => !["enabled", "sync_status", "updated_at"].includes(key))) {
+    expect(archived[key], `retained registration ${key}`).toEqual(original[key]);
+  }
+  expect(after.maps).toEqual(before.maps); expect(after.records).toEqual(before.records);
+  expect(after.localCustody).toEqual(before.localCustody);
+  expect(before.localCustody?.entries).toBeGreaterThan(0);
+  expect(before.localCustody?.sha256).toMatch(/^[a-f0-9]{64}$/);
+  const audits = after.audit.filter((row: any) => row.action === "branch_pair_archived");
+  expect(audits).toHaveLength(1);
+  const audit = audits[0], details = typeof audit.details === "string" ? JSON.parse(audit.details) : audit.details;
+  expect(details.deleted_side).toBe(side); expect(details.survivor).toBe("untouched");
+  expect(audit.author).toBeTruthy(); expect(audit.svn_rev).toBe(original.last_svn_rev);
+  expect(audit.git_sha).toBe(original.last_git_sha);
+  for (const row of before.audit) expect(after.audit).toContainEqual(row);
+  if (side === "git") {
+    expect(before.git.present).toBe(true); expect(after.git.present).toBe(false);
+    expect(after.svn.present).toBe(true);
+    for (const key of ["tree", "properties", "history"]) expect(after.svn[key]).toEqual(before.svn[key]);
+    expect(after.svn.branches).toContain(original.svn_branch.replace(/^branches\//, ""));
+  } else {
+    expect(before.svn.present).toBe(true); expect(after.svn.present).toBe(false);
+    expect(after.git.present).toBe(true);
+    for (const key of ["tip", "tree", "history"]) expect(after.git[key]).toEqual(before.git[key]);
+    // Pegged original history remains accessible after the deletion revision.
+    for (const key of ["tree", "properties", "history"]) expect(after.svn[key]).toEqual(before.svn[key]);
+  }
+  expect(before.git.history).toBeTruthy(); expect(before.svn.history).toBeTruthy();
+}
+
+export function archive199AssertRestart(witness: any): void {
+  expect(witness.beforeStartedAt).toBeTruthy(); expect(witness.afterStartedAt).toBeTruthy();
+  expect(witness.afterStartedAt).not.toBe(witness.beforeStartedAt);
+  expect(witness.before.git).toMatch(/^[a-f0-9]{40}$/);
+  expect(witness.after.git).toMatch(/^[a-f0-9]{40}$/);
+  expect(witness.after.git).not.toBe(witness.before.git);
+  expect(witness.after.gitWatermark).toBe(witness.after.git);
+  expect(Number(witness.after.svn)).toBeGreaterThan(Number(witness.before.svn));
+}
+
+export function archive199AssertRefusal(evidence: any, kind: "busy" | "held"): void {
+  expect(evidence.kind).toBe(kind);
+  expect(evidence.response.status).toBe(409);
+  expect(evidence.witness?.matched).toBe(true);
+  for (const key of ["owner", "runId", "requestId", "method", "target", "phase", "producerJournal"]) expect(evidence.witness[key]).toBeTruthy();
+  expect(evidence.witness.producerJournal.id).toBeTruthy();
+  expect(evidence.witness.producerJournal.repo_id).toBe(evidence.before.registration[0].id);
+  expect(evidence.witness.producerJournal.state).toMatch(kind === "busy" ? /^(running|queued|intent_recorded)$/ : /^(reconciliation_required|held)$/);
+  expect(evidence.witness.reason).toMatch(kind === "busy" ? /busy|running|in.flight|writer/i : /held|reconciliation/i);
+  const reason = JSON.stringify(evidence.response.json);
+  expect(reason).toMatch(/busy|held|reconciliation|writer|in.flight/i);
+  expect(reason).not.toMatch(/stale.*review|timeout|unavailable|cannot.*observ/i);
+  for (const key of ["registration", "maps", "archiveJournal", "localCustody", "git", "svn"]) expect(evidence.after[key]).toEqual(evidence.before[key]);
+  expect(evidence.after.audit.filter((row: any) => row.action === "branch_pair_archived")).toHaveLength(0);
+}
+
+export function archive199AssertUnauthorized(evidence: any): void {
+  expect(evidence.user?.username).toBe("alice"); expect(evidence.user?.role).toBeTruthy();
+  expect(evidence.user.role).not.toBe("admin"); expect(evidence.uiControlsAbsent).toBe(true);
+  expect(evidence.review.status).toBe(403); expect(evidence.approve.status).toBe(403);
+  for (const response of [evidence.review, evidence.approve]) expect(JSON.stringify(response.json)).toMatch(/admin access required/);
+  expect(evidence.after).toEqual(evidence.before);
+}
+
+async function archive199Case(lab: Lab, op: LabOp): Promise<void> {
+  const parent = await lab.archive199CreateParent(labPairKey(op.id));
+  if (op.id === "LAB_PAIR_DELETE_SIDE_REFUSED_DURING_SYNC") {
+    const guards = [];
+    for (const kind of ["busy", "held"] as const) guards.push({kind, pair: await lab.archive199CreateChildUi(parent, `archive199-${kind}`)});
+    await lab.archive199ConfigureScheduling(parent, false, 3600);
+    for (const {kind, pair} of guards) {
+      await lab.archive199ConfigureScheduling(pair, true, 30);
+      const evidence = await lab.archive199WitnessRefusal(pair, kind);
+      lab.observation(`${op.id}-${kind}`, evidence); archive199AssertRefusal(evidence, kind);
+      await lab.archive199DrainGuard(pair);
+    }
+    lab.pass("Separately witnessed active writer and durable hold refused archive without mutation"); return;
+  }
+  const pair = await lab.archive199CreateChildUi(parent, `archive199-${op.id.includes("UNAUTHORIZED") ? "reader" : op.id.includes("GIT_SIDE") ? "git" : "svn"}`);
+  await lab.archive199ConfigureScheduling(parent, false, 3600);
+  if (op.id === "LAB_PAIR_DELETE_SIDE_UNAUTHORIZED") {
+    await lab.archive199WaitQuiet(pair);
+    const evidence = await lab.archive199NonAdminDenial(pair);
+    lab.observation(op.id, evidence); archive199AssertUnauthorized(evidence);
+    lab.pass("Verified LDAP alice had no archive controls and both server admission routes refused without mutation"); return;
+  }
+  const side = op.id === "LAB_PAIR_DELETE_GIT_SIDE_ONLY" ? "git" : "svn";
+  await lab.archive199ConfigureScheduling(pair, true, 30);
+  const synchronized = await lab.syncGitChange(pair, "printf 'archive199 synchronized history\\n' > archive199.txt\ngit add archive199.txt\ngit commit -m 'archive199 before deletion'\n");
+  await lab.archive199ConfigureScheduling(pair, false, 3600);
+  await lab.archive199WaitQuiet(pair, synchronized.git);
+  const before = await lab.archive199Observe(pair);
+  const response = await lab.archive199DeleteUi(pair, side);
+  expect(response.status).toBe(200);
+  expect(response.json).toMatchObject({ok:true,archive_pair:true,state:"completed",registration_listed:true,restore_supported:false});
+  const after = await lab.archive199Observe(pair, side, before); archive199AssertPreserved(before, after, side);
+  const retainedHeads = {...before.git.heads};
+  if (side === "git") delete retainedHeads[`refs/heads/${pair.gitBranch}`];
+  expect(after.git.heads).toEqual(retainedHeads);
+  expect(after.svn.branches).toEqual(before.svn.branches.filter(branch => side !== "svn" || branch !== pair.svnBranch!.replace(/^branches\//, "")));
+  // An explicit request is refused, not mistaken for evidence of a daemon cycle.
+  const trigger = await lab.api("POST", `/api/repos/${pair.id}/sync`, {});
+  expect(trigger.status).toBeGreaterThanOrEqual(400);
+  await lab.archive199ConfigureScheduling(parent, true, 30);
+  const witness = await lab.archive199RestartAndWitnessCycle(parent); archive199AssertRestart(witness);
+  await lab.archive199ConfigureScheduling(parent, false, 3600);
+  await lab.archive199WaitQuiet(parent, witness.after.git);
+  const restarted = await lab.archive199Observe(pair, side, before); archive199AssertPreserved(before, restarted, side);
+  lab.observation(op.id, {pair,side,before,response,after,trigger,witness,restarted});
+  lab.pass("Selected side absent; complete survivor and archive history retained across a witnessed daemon restart and real control sync cycle");
+}
+
 async function syncedGitFile(lab: Lab, op: LabOp, body: string): Promise<void> {
   const pair = await team(lab);
   const path = `${slug(op.id)}.txt`;
@@ -996,6 +1113,12 @@ rm -f "$body" "$body.err" "$meta"
       lab.pass(`${op.id} left the SVN revision at ${after.svn}`);
       return;
     }
+    case "LAB_PAIR_DELETE_GIT_SIDE_ONLY":
+    case "LAB_PAIR_DELETE_SVN_SIDE_ONLY":
+    case "LAB_PAIR_DELETE_SIDE_REFUSED_DURING_SYNC":
+    case "LAB_PAIR_DELETE_SIDE_UNAUTHORIZED":
+      await archive199Case(lab, op);
+      return;
     case "PAIR-REMOTE-DELETE-EXPLICIT":
       await remoteDeleteCase(lab, op);
       return;

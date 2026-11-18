@@ -1549,6 +1549,62 @@
       "audit_evidence": "PARTIAL"
     },
     {
+      "id": "LAB_PAIR_DELETE_GIT_SIDE_ONLY",
+      "title": "Archive a browser-created pair after Git-only deletion; preserve SVN history across actual restart",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R02",
+        "R20"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LAB_PAIR_DELETE_SVN_SIDE_ONLY",
+      "title": "Archive a browser-created pair after SVN-only deletion; preserve Git history across actual restart",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R02",
+        "R20"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LAB_PAIR_DELETE_SIDE_REFUSED_DURING_SYNC",
+      "title": "Refuse archive under separately witnessed active writer and durable ownership hold",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R04",
+        "R20"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LAB_PAIR_DELETE_SIDE_UNAUTHORIZED",
+      "title": "Refuse archive for verified synthetic LDAP non-administrator",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R18",
+        "R20"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
       "id": "PAIR-CANCEL-IMPORT",
       "title": "Cancel one full import by operation id at a real phase boundary",
       "suite": "full",
