@@ -774,7 +774,7 @@ async fn rs19_completed_setup_history_and_new_start_display_their_own_repository
 
 #[tokio::test]
 async fn rs19_stale_stop_never_cancels_a_successor_or_signals_its_worker() {
-    let (addr, state, server, tmp, repo_id, _bare) = setup_wizard_fixture().await;
+    let (addr, state, server, _tmp, repo_id, _bare) = setup_wizard_fixture().await;
     let old = state
         .db
         .create_setup_import_operation(
