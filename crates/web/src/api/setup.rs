@@ -1266,6 +1266,7 @@ async fn import_status(
     // errors to a durable operation when their in-process owner matches.
     let has_worker_progress =
         setup.is_some_and(|op| live.setup_operation_id.as_deref() == Some(&op.id));
+    let mut historical_phase = None;
     let progress = match setup.or(observed.as_ref()) {
         Some(_) if has_worker_progress => live.clone(),
         Some(_) => ImportProgress::default(),
@@ -1278,11 +1279,21 @@ async fn import_status(
         {
             ImportProgress::default()
         }
-        None if live.phase == ImportPhase::Idle => state
-            .db
-            .load_import_progress()
-            .map_err(import_read_error)?
-            .unwrap_or_default(),
+        None if live.phase == ImportPhase::Idle => {
+            let saved = state
+                .db
+                .load_import_progress()
+                .map_err(import_read_error)?
+                .unwrap_or_default();
+            if setup_import_phase_busy(&saved.phase) {
+                // The pre-journal singleton records a previous phase. It cannot
+                // establish a live worker or supply current progress after restart.
+                historical_phase = Some(saved.phase);
+                ImportProgress::default()
+            } else {
+                saved
+            }
+        }
         None => live.clone(),
     };
     let mut status = overlay_setup_import_status(
@@ -1296,6 +1307,9 @@ async fn import_status(
         || observed.as_ref().is_some_and(|op| !op.state.is_terminal())
     {
         status["busy"] = true.into();
+    }
+    if let Some(phase) = historical_phase {
+        status["historical_phase"] = serde_json::json!(phase);
     }
     if let Some(reason) = start_blocked_reason {
         status["start_blocked_reason"] = reason.into();

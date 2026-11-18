@@ -278,3 +278,37 @@ test('RS-19 a reconciliation hold survives reload without reporting failure or r
   await noEnabledAction(startButton(page));
   assert.deepEqual(model.writes, []);
 });
+
+test('RS-19 interrupted legacy progress stays on fresh Welcome and is historical on the reopened Import step', async t => {
+  const interrupted = observation(undefined, {
+    phase: 'idle', historical_phase: 'importing', lifecycle: undefined, busy: false,
+    can_cancel: false, can_start: true, start_repository_id: originalRepository,
+    start_repository_name: 'Original synthetic repository', has_worker_progress: false,
+    last_local_svn_rev: null, last_confirmed_svn_rev: null, log_lines: [],
+  });
+  async function noWorker(page) {
+    assert.equal(await stopButton(page).count(), 0);
+    assert.equal(await page.getByRole('progressbar', { name: /SVN import progress.*Setup import/i }).count(), 0);
+    assert.equal(await page.getByRole('button', { name: /^Server Monitor\b/i }).count(), 0);
+    assert.equal(await page.getByText(/^(Importing|Import in progress)$/i).count(), 0);
+  }
+
+  const fresh = await wizard(t, interrupted);
+  await fresh.page.waitForLoadState('networkidle');
+  assert.ok(fresh.model.reads > 0);
+  await fresh.page.getByRole('heading', { name: 'Welcome to RepoSync', exact: true }).waitFor();
+  assert.equal(await fresh.page.getByRole('heading', { name: 'Import SVN History', exact: true }).count(), 0);
+  await noWorker(fresh.page);
+  assert.deepEqual(fresh.model.writes, []);
+
+  const { page, model } = await wizard(t, observation(first));
+  await stopButton(page).waitFor();
+  model.status = interrupted;
+  await page.reload();
+  await page.getByText(/Interrupted setup history.*last reported “Importing”.*outcome and publication are unknown/i).waitFor();
+  await startButton(page).waitFor();
+  assert.ok(await startButton(page).isEnabled());
+  assert.equal(await page.getByText('Ready to begin the import process.', { exact: true }).count(), 0);
+  await noWorker(page);
+  assert.deepEqual(model.writes, []);
+});

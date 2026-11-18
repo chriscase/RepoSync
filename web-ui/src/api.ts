@@ -976,6 +976,7 @@ export interface ImportStatus {
   can_start?: boolean;
   can_cancel?: boolean;
   has_worker_progress?: boolean;
+  historical_phase?: ImportStatus['phase'];
   operation_repository_id?: string;
   start_repository_id?: string;
   start_repository_name?: string;

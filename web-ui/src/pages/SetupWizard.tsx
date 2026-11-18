@@ -8,7 +8,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import { api, type AuthorMapping, type ImportStatus, type WizardSetupConfig } from '../api';
 import ImportPhaseGraphic from '../components/ImportPhaseGraphic';
 import ServerMonitor from '../components/ServerMonitor';
-import { importStateLabel } from '../importProgress';
+import { importPhaseLabel, importStateLabel } from '../importProgress';
 import { canCancelSetupImport, canStartSetupImport, useSetupImport } from '../useSetupImport';
 
 // ---------------------------------------------------------------------------
@@ -1767,7 +1767,11 @@ function ImportStep() {
       {actionError && <p role="alert" className="text-red-300">{actionError}</p>}
       {actionMessage && <p role="status" className="text-blue-300">{actionMessage}</p>}
       {!status && !statusError && <p role="status">Reading import status…</p>}
-      {status && !isLegacyOutcome && !needsReconciliation && <ImportPhaseGraphic currentPhase={phase} />}
+      {status && !isLegacyOutcome && !status.historical_phase && !needsReconciliation && <ImportPhaseGraphic currentPhase={phase} />}
+      {status?.historical_phase && (
+        <p>Interrupted setup history. The previous session last reported “{importPhaseLabel(status.historical_phase)}”.
+          Its final outcome and publication are unknown.</p>
+      )}
       {isLegacyOutcome && <p>Legacy import progress reported “{reportedPhase}”. A durable operation outcome and publication checkpoint are unavailable.</p>}
       {status?.start_blocked_reason && !canStartSetupImport(status) && <p className="text-yellow-300">{status.start_blocked_reason}</p>}
       {status && !status.start_blocked_reason && !isLegacyOutcome && !isActive && !isTerminal && !canStartSetupImport(status) &&

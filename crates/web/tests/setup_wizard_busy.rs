@@ -582,6 +582,69 @@ async fn rs19_setup_refuses_mismatched_registration_and_existing_fetch_or_push_t
 }
 
 #[tokio::test]
+async fn rs19_saved_active_phase_after_restart_is_history_and_allows_a_fresh_start() {
+    let (_addr, state, server, tmp, id, _) = setup_wizard_fixture().await;
+    let saved = ImportProgress {
+        phase: ImportPhase::Importing,
+        current_rev: 36,
+        commits_created: 14,
+        errors: vec!["previous worker detail".into()],
+        ..Default::default()
+    };
+    state.db.persist_import_progress(&saved).unwrap();
+    let config = state.config.clone();
+    server.abort();
+    let _ = server.await;
+    drop(state);
+    let db = Database::new(tmp.path().join("reposync.db")).unwrap();
+    let (addr, fresh, server) = serve_wizard_fixture(tmp.path(), config, db).await;
+    let client = authed_client();
+    let snapshot = || {
+        let updated: String = fresh
+            .db
+            .conn()
+            .query_row(
+                "SELECT updated_at FROM import_progress WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (
+            updated,
+            serde_json::to_value(fresh.db.load_import_progress().unwrap().unwrap()).unwrap(),
+        )
+    };
+    let before = snapshot();
+    let status = setup_status(&client, addr).await;
+    assert_eq!(status["historical_phase"], "importing", "{status}");
+    assert_eq!(status["phase"], "idle");
+    assert_eq!(status["busy"], false);
+    assert_eq!(status["has_worker_progress"], false);
+    assert_eq!(status["can_cancel"], false);
+    assert_eq!(status["can_start"], true);
+    assert_eq!(status["start_repository_id"], id);
+    assert!(status["operation_id"].is_null());
+    assert_eq!(status["current_rev"], 0);
+    assert_eq!(status["commits_created"], 0);
+    assert_eq!(status["errors"], serde_json::json!([]));
+    assert_eq!(before, snapshot());
+    assert!(!fresh.db.has_any_import_operation_history().unwrap());
+    let guard = reposync_core::busy::try_acquire(&id).unwrap();
+    let busy = setup_status(&client, addr).await;
+    assert_eq!(busy["busy"], true);
+    assert_eq!(busy["can_start"], false);
+    drop(guard);
+    fresh.import_progress.write().await.phase = ImportPhase::Connecting;
+    let live = setup_status(&client, addr).await;
+    assert!(live["historical_phase"].is_null());
+    assert_eq!(live["phase"], "connecting");
+    assert_eq!(live["busy"], true);
+    assert_eq!(live["can_start"], false);
+    assert_eq!(before, snapshot());
+    server.abort();
+}
+
+#[tokio::test]
 async fn rs19_cold_legacy_hold_blocks_another_registration_and_ambiguous_drift_stays_held() {
     let (_addr, state, server, tmp, id, _) = setup_wizard_fixture().await;
     let mut old = state.db.get_repository(&id).unwrap().unwrap();
