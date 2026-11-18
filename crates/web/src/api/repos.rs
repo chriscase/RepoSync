@@ -2133,7 +2133,7 @@ async fn repo_import_status(
         .latest_import_operation(&id)
         .map_err(|e| AppError::Internal(e.to_string()))?;
     if role != "admin" && op.as_ref().is_none_or(|o| o.initiator_id != user_id) {
-        return Err(AppError::Unauthorized(
+        return Err(AppError::Forbidden(
             "import status requires initiating context or admin".into(),
         ));
     }

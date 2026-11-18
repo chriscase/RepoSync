@@ -10910,3 +10910,112 @@ async fn rs199_archive_detail_overrides_orphan_baseline_reconciliation() {
     assert_eq!(detail["enabled"], false);
     server.abort();
 }
+
+#[tokio::test]
+async fn rs199_import_status_permission_denial_is_forbidden_without_mutating_state() {
+    use reposync_core::models::{Session, User};
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let id = "rs199-import-status";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(id, "status", None, "main", "trunk"))
+        .unwrap();
+    let now = chrono::Utc::now();
+    for (user, role) in [("initiator", "user"), ("other", "user"), ("admin", "admin")] {
+        state
+            .db
+            .insert_user(&User {
+                id: user.into(),
+                username: user.into(),
+                display_name: user.into(),
+                email: format!("{user}@example.invalid"),
+                password_hash: "unused".into(),
+                role: role.into(),
+                enabled: true,
+                created_at: now.to_rfc3339(),
+                updated_at: now.to_rfc3339(),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_session(&Session {
+                token: format!("rs199-{user}"),
+                user_id: user.into(),
+                expires_at: (now + chrono::Duration::hours(1)).to_rfc3339(),
+                created_at: now.to_rfc3339(),
+            })
+            .unwrap();
+    }
+    let snapshot = || {
+        let conn = state.db.conn();
+        [
+            "repositories",
+            "kv_state",
+            "users",
+            "sessions",
+            "audit_log",
+            "sync_records",
+            "commit_map",
+        ]
+        .into_iter()
+        .map(|table| {
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let columns = statement.column_count();
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((0..columns)
+                        .map(|index| format!("{:?}", row.get_ref(index).unwrap()))
+                        .collect::<Vec<_>>())
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (table, rows)
+        })
+        .collect::<Vec<_>>()
+    };
+    let client = reqwest::Client::new();
+    for has_operation in [false, true] {
+        if has_operation {
+            state
+                .db
+                .create_import_operation(id, "initiator", "rs199-import-request", "fixture-target")
+                .unwrap();
+        }
+        for (token, expected) in [
+            ("rs199-other", 403),
+            ("rs199-initiator", if has_operation { 200 } else { 403 }),
+            ("rs199-admin", 200),
+            ("invalid-token", 401),
+            ("missing-token", 401),
+        ] {
+            let before = snapshot();
+            let request = client.get(format!("http://{addr}/api/repos/{id}/import/status"));
+            let request = if token == "missing-token" {
+                request
+            } else {
+                request.bearer_auth(token)
+            };
+            let response = request.send().await.unwrap();
+            assert_eq!(
+                response.status().as_u16(),
+                expected,
+                "operation={has_operation}, actor={token}"
+            );
+            let body: serde_json::Value = response.json().await.unwrap();
+            if expected == 403 {
+                assert_eq!(
+                    body["error"],
+                    "import status requires initiating context or admin"
+                );
+            }
+            if expected == 200 {
+                assert!(body.get("phase").is_some());
+            }
+            assert_eq!(snapshot(), before, "status GET mutated durable state");
+        }
+    }
+    server.abort();
+}
