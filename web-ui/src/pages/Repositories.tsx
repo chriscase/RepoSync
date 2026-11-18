@@ -379,7 +379,7 @@ function RepositoriesEditor() {
                               : 'bg-gray-700 text-gray-400'
                           }`}
                         >
-                          {repo.enabled ? 'Configured enabled' : 'Configured disabled'}
+                          {repo.status === 'archived' ? 'Archived' : repo.enabled ? 'Configured enabled' : 'Configured disabled'}
                         </span>
                       </div>
 
@@ -729,7 +729,7 @@ function BranchTree({
             <ArrowRight className="w-2.5 h-2.5 text-gray-600 flex-shrink-0" />
             <span className="text-[10px] text-purple-400/60">{child.git_branch}</span>
             <span className="ml-auto flex items-center gap-1.5 flex-shrink-0">
-              <span className="text-[10px] text-gray-400">Configuration: {child.enabled ? 'enabled':'disabled'}</span>
+              <span className="text-[10px] text-gray-400">{child.status === 'archived' ? 'Archived · sync stopped' : `Configuration: ${child.enabled ? 'enabled' : 'disabled'}`}</span>
             </span>
           </button>
           <RepositoryStatusSummary repoId={child.id}/>

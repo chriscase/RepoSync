@@ -214,6 +214,30 @@ fn add_operation<T: Serialize>(
     }
 }
 
+// Repository writers historically use SQLite datetime('now'), which is UTC.
+// Accept only that exact storage shape in addition to RFC3339; never repair DB
+// values or reuse this compatibility rule for authenticated history evidence.
+fn repository_sync_time(value: &str) -> Option<chrono::DateTime<Utc>> {
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(parsed.with_timezone(&Utc));
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() != 19
+        || bytes.iter().enumerate().any(|(i, b)| match i {
+            4 | 7 => *b != b'-',
+            10 => *b != b' ',
+            13 | 16 => *b != b':',
+            _ => !b.is_ascii_digit(),
+        })
+        || &value[17..19] > "59"
+    {
+        return None;
+    }
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|parsed| parsed.and_utc())
+}
+
 pub fn repository(state: &AppState, repo: &Repository, actor: &str, admin: bool) -> Observation {
     let db = &state.db;
     let mut out = Observation::unknown("repository");
@@ -224,7 +248,7 @@ pub fn repository(state: &AppState, repo: &Repository, actor: &str, admin: bool)
     out.last_successful_sync_at = repo
         .last_sync_at
         .as_ref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .and_then(|s| repository_sync_time(s))
         .filter(|d| *d <= Utc::now())
         .map(|d| d.to_rfc3339());
     out.data_freshness = match (&repo.last_sync_at, &out.last_successful_sync_at) {
@@ -327,12 +351,23 @@ pub fn repository(state: &AppState, repo: &Repository, actor: &str, admin: bool)
             }
         }
     }
+    // A successful terminal archive deliberately keeps a write fence. That is
+    // not an unresolved reconciliation hold and must not poison aggregate health.
+    let archived = !repo.enabled
+        && repo.sync_status == "archived"
+        && matches!((db.managed_removal(&repo.id), db.removal_tombstone(&repo.id)),
+            (Ok(Some(op)), Ok(Some(t))) if op.archives_pair() && op.state.is_terminal_success()
+                && t.operation_id == op.id && !t.restore_supported
+                && t.retention == "terminal_archived_pair_survivor_and_history_retained");
+    if repo.sync_status == "archived" && !archived {
+        out.evidence_complete = false;
+    }
     match db.managed_remove_blocks_new_work(&repo.id) {
         Ok(true) => {
             let mut found = false;
             for op in &mut out.operations {
                 if op.kind == "removal" {
-                    op.held = true;
+                    op.held = !archived;
                     found = true;
                 }
             }
@@ -452,6 +487,7 @@ pub fn repository(state: &AppState, repo: &Repository, actor: &str, admin: bool)
         || !matches!(
             repo.sync_status.as_str(),
             "idle"
+                | "archived"
                 | "initializing"
                 | "detecting"
                 | "applying"
@@ -463,6 +499,8 @@ pub fn repository(state: &AppState, repo: &Repository, actor: &str, admin: bool)
         )
     {
         Health::Unknown
+    } else if archived {
+        Health::Disabled
     } else if !state.scheduler_service_state().is_running() {
         Health::Error
     } else if repo.sync_status == "error_paused" {
@@ -495,6 +533,7 @@ pub fn repository(state: &AppState, repo: &Repository, actor: &str, admin: bool)
         Health::Unknown
     };
     out.safe_next_action=if held {"Inspect the retained operation, intended ref and confirmed checkpoints with the existing reconciliation workflow. Skip, Retry and error acknowledgement do not prove reconciliation or release the hold."}
+        else if archived {"Archived pair is read-only. The surviving branch and retained history remain available; sync, restore and reattachment are blocked."}
         else if out.health==Health::Unknown {"Refresh status and inspect scoped evidence. Unknown is not idle and does not authorize a retry."}
         else if out.health==Health::Paused {"Inspect the recorded failure and pending work. A retry or skip is not proof of reconciliation."}
         else {"Inspect the latest observation and operation evidence. Registry idle and terminal outcomes are not descendant-cleanup or remote-freshness proof."}.into();

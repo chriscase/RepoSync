@@ -108,7 +108,7 @@ function ReviewedRemovalStages({ status }: { status: ManagedRemovalStatus }) {
   return <div data-testid="reviewed-removal-stages" className="text-xs border border-current/30 rounded p-2 space-y-1">
     <p>Git: {view.git}</p>
     <p>SVN: {view.svn}</p>
-    <p>Owned local cleanup: {view.cleanup}</p>
+    <p>{status.archive_pair ? 'Pair archive' : 'Owned local cleanup'}: {view.cleanup}</p>
     <p>Registration still listed: {status.registration_listed ? 'yes' : 'no'}</p>
     {!view.known && <p role="alert">Verified completion evidence is unavailable.</p>}
     {view.errors.map((error, index) => <p key={index}>{error}</p>)}

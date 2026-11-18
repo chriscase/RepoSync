@@ -10534,6 +10534,26 @@ async fn rs65_reviewed_api_401_403_foreign_actor_and_untrusted_payload_refuse() 
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN, "{path}");
     }
+    // #199 uses the same authenticated admission, never a side-door deletion.
+    for path in ["removal/review", "removal/approve"] {
+        let body = if path == "removal/approve" {
+            serde_json::json!({"delete_git":true,"delete_svn":false,"archive_pair":true,"review_pin":"not-a-pin","request_id":"not-approved-archive"})
+        } else {
+            serde_json::json!({"delete_git":true,"delete_svn":false,"archive_pair":true})
+        };
+        for (token, expected) in [
+            (None, reqwest::StatusCode::UNAUTHORIZED),
+            (Some("reader-token"), reqwest::StatusCode::FORBIDDEN),
+        ] {
+            let request = reader.post(format!("{base}/{path}")).json(&body);
+            let request = if let Some(token) = token {
+                request.bearer_auth(token)
+            } else {
+                request
+            };
+            assert_eq!(request.send().await.unwrap().status(), expected);
+        }
+    }
     let extra = authed_client()
         .post(format!("{base}/removal/review"))
         .json(&serde_json::json!({"actor":"other-admin","cleanup_completed":true}))
@@ -10655,5 +10675,347 @@ async fn rs65_reviewed_api_missing_parent_and_stale_pin_preserve_custody() {
     );
     assert!(state.db.managed_removal(stale_id).unwrap().is_none());
     assert!(state.db.get_repository(stale_id).unwrap().unwrap().enabled);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs199_api_archive_retains_pair_and_refuses_legacy_removal() {
+    for delete_git in [true, false] {
+        let (addr, state, server, tmp, id) = rs65_native_api_fixture().await;
+        let client = authed_client();
+        let base = format!("http://{addr}/api/repos/{id}");
+        let initial = state.db.get_repository(&id).unwrap().unwrap();
+        assert_eq!(initial.last_svn_rev, 0);
+        assert!(initial.last_sync_at.is_none());
+        let choices = serde_json::json!({"delete_git":delete_git,"delete_svn":!delete_git,"archive_pair":true});
+        let response = client
+            .post(format!("{base}/removal/review"))
+            .json(&choices)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let plan: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(plan["archive_pair"], true);
+        let mut approval = choices.clone();
+        approval["review_pin"] = plan["review_pin"].clone();
+        approval["request_id"] = serde_json::json!("archive-api");
+        let mut changed = approval.clone();
+        changed["archive_pair"] = serde_json::json!(false);
+        assert_eq!(
+            client
+                .post(format!("{base}/removal/approve"))
+                .json(&changed)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::CONFLICT,
+            "archive disposition is pinned"
+        );
+        let response = client
+            .post(format!("{base}/removal/approve"))
+            .json(&approval)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let done: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(done["archive_pair"], true);
+        assert_eq!(done["registration_listed"], true);
+        assert_eq!(done["restore_supported"], false);
+        let repo = state.db.get_repository(&id).unwrap().unwrap();
+        assert_eq!(repo.sync_status, "archived");
+        assert!(!repo.enabled);
+        let detail: serde_json::Value = client
+            .get(&base)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            detail["status"], "archived",
+            "archive takes precedence over zero or inconsistent baseline"
+        );
+        assert_eq!(detail["initializing"], false);
+        assert!(
+            detail.get("sync_status").is_none(),
+            "detail uses the public status DTO"
+        );
+        let summaries: Vec<serde_json::Value> = client
+            .get(format!("http://{addr}/api/repos"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            summaries.iter().find(|row| row["id"] == id).unwrap()["status"],
+            "archived"
+        );
+        let children: Vec<serde_json::Value> = client
+            .get(format!(
+                "http://{addr}/api/repos/{}/branches",
+                repo.parent_id.as_ref().unwrap()
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            children.iter().find(|row| row["id"] == id).unwrap()["sync_status"],
+            "archived",
+            "branch rows retain their raw model contract"
+        );
+
+        assert!(tmp
+            .path()
+            .join("repos")
+            .join(&id)
+            .join("custody.txt")
+            .exists());
+        assert!(!client
+            .post(format!("{base}/remove"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        assert_eq!(
+            client
+                .post(format!("{base}/restore"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::CONFLICT
+        );
+        assert!(state.db.get_repository(&id).unwrap().is_some());
+        assert!(tmp
+            .path()
+            .join("repos")
+            .join(&id)
+            .join("custody.txt")
+            .exists());
+        let status: serde_json::Value = client
+            .get(format!("http://{addr}/api/status"))
+            .query(&[("repo_id", id.as_str())])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            status["observation"]["health"], "disabled",
+            "terminal archive is not reconciliation-held: {status}"
+        );
+        let aggregate: serde_json::Value = client
+            .get(format!("http://{addr}/api/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_ne!(
+            aggregate["observation"]["health"], "held",
+            "archive must not poison aggregate health: {aggregate}"
+        );
+        assert!(
+            state.db.managed_remove_blocks_new_work(&id).unwrap(),
+            "observation never releases archive write fence"
+        );
+        let repeat = client
+            .post(format!("{base}/removal/approve"))
+            .json(&approval)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(repeat.status(), reqwest::StatusCode::OK);
+        let repeat: serde_json::Value = repeat.json().await.unwrap();
+        assert_eq!(repeat["operation_id"], done["operation_id"]);
+        server.abort();
+    }
+}
+
+/// Baseline reconciliation is historical evidence, not the archived lifecycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs199_archive_detail_overrides_orphan_baseline_reconciliation() {
+    let (addr, state, server, _tmp, id) = rs65_native_api_fixture().await;
+    state
+        .db
+        .set_state(&format!("last_svn_rev_{id}"), "2")
+        .unwrap();
+    assert!(matches!(
+        resolve_repo_import_baseline(&state.db, &id).unwrap(),
+        RepoImportBaseline::ReconciliationRequired { .. }
+    ));
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}");
+    let mut choices = serde_json::json!({"delete_git":true,"delete_svn":false,"archive_pair":true});
+    let review: serde_json::Value = client
+        .post(format!("{base}/removal/review"))
+        .json(&choices)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    choices["review_pin"] = review["review_pin"].clone();
+    choices["request_id"] = serde_json::json!("archive-orphan-dto");
+    let done: serde_json::Value = client
+        .post(format!("{base}/removal/approve"))
+        .json(&choices)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(done["state"], "completed");
+    assert_eq!(done["archive_pair"], true);
+    assert!(matches!(
+        resolve_repo_import_baseline(&state.db, &id).unwrap(),
+        RepoImportBaseline::ReconciliationRequired { .. }
+    ));
+    let detail: serde_json::Value = client
+        .get(&base)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["status"], "archived");
+    assert_eq!(detail["initializing"], false);
+    assert_eq!(detail["enabled"], false);
+    server.abort();
+}
+
+#[tokio::test]
+async fn rs199_import_status_permission_denial_is_forbidden_without_mutating_state() {
+    use reposync_core::models::{Session, User};
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let id = "rs199-import-status";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(id, "status", None, "main", "trunk"))
+        .unwrap();
+    let now = chrono::Utc::now();
+    for (user, role) in [("initiator", "user"), ("other", "user"), ("admin", "admin")] {
+        state
+            .db
+            .insert_user(&User {
+                id: user.into(),
+                username: user.into(),
+                display_name: user.into(),
+                email: format!("{user}@example.invalid"),
+                password_hash: "unused".into(),
+                role: role.into(),
+                enabled: true,
+                created_at: now.to_rfc3339(),
+                updated_at: now.to_rfc3339(),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_session(&Session {
+                token: format!("rs199-{user}"),
+                user_id: user.into(),
+                expires_at: (now + chrono::Duration::hours(1)).to_rfc3339(),
+                created_at: now.to_rfc3339(),
+            })
+            .unwrap();
+    }
+    let snapshot = || {
+        let conn = state.db.conn();
+        [
+            "repositories",
+            "kv_state",
+            "users",
+            "sessions",
+            "audit_log",
+            "sync_records",
+            "commit_map",
+        ]
+        .into_iter()
+        .map(|table| {
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let columns = statement.column_count();
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((0..columns)
+                        .map(|index| format!("{:?}", row.get_ref(index).unwrap()))
+                        .collect::<Vec<_>>())
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (table, rows)
+        })
+        .collect::<Vec<_>>()
+    };
+    let client = reqwest::Client::new();
+    for has_operation in [false, true] {
+        if has_operation {
+            state
+                .db
+                .create_import_operation(id, "initiator", "rs199-import-request", "fixture-target")
+                .unwrap();
+        }
+        for (token, expected) in [
+            ("rs199-other", 403),
+            ("rs199-initiator", if has_operation { 200 } else { 403 }),
+            ("rs199-admin", 200),
+            ("invalid-token", 401),
+            ("missing-token", 401),
+        ] {
+            let before = snapshot();
+            let request = client.get(format!("http://{addr}/api/repos/{id}/import/status"));
+            let request = if token == "missing-token" {
+                request
+            } else {
+                request.bearer_auth(token)
+            };
+            let response = request.send().await.unwrap();
+            assert_eq!(
+                response.status().as_u16(),
+                expected,
+                "operation={has_operation}, actor={token}"
+            );
+            let body: serde_json::Value = response.json().await.unwrap();
+            if expected == 403 {
+                assert_eq!(
+                    body["error"],
+                    "import status requires initiating context or admin"
+                );
+            }
+            if expected == 200 {
+                assert!(body.get("phase").is_some());
+            }
+            assert_eq!(snapshot(), before, "status GET mutated durable state");
+        }
+    }
     server.abort();
 }

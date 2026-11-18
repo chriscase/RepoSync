@@ -389,10 +389,10 @@ describe('G04.23 one pause control for a repository', () => {
 });
 
 describe('G04.25 remove pair wording', () => {
-  it('says Remove unless a remote deletion is ticked', () => {
+  it('archives for one selected side and preserves remove wording for zero or both sides', () => {
     expect(removePairWording({ delete_git: false, delete_svn: false })).toEqual({ title: 'Remove branch pair', confirm: 'Remove pair', pending: 'Removing…' });
-    expect(removePairWording({ delete_git: true, delete_svn: false })).toMatchObject({ title: 'Remove branch pair and delete its Git branch', confirm: 'Remove pair and delete Git branch' });
-    expect(removePairWording({ delete_git: false, delete_svn: true })).toMatchObject({ confirm: 'Remove pair and delete SVN branch' });
+    expect(removePairWording({ delete_git: true, delete_svn: false })).toMatchObject({ title: 'Archive pair and delete Git branch', confirm: 'Archive pair' });
+    expect(removePairWording({ delete_git: false, delete_svn: true })).toMatchObject({ title: 'Archive pair and delete SVN branch', confirm: 'Archive pair' });
     expect(removePairWording({ delete_git: true, delete_svn: true })).toMatchObject({ title: 'Remove branch pair and delete its Git and SVN branches', confirm: 'Remove pair and delete Git and SVN branches' });
   });
 });
@@ -434,5 +434,23 @@ describe('S20 plain lifecycle words, raw value kept in details', () => {
     expect(latePairStateWord('svn_copy_pending')).toBe('SVN copy pending');
     expect(latePairStateWord('reconciliation_held')).toBe('held for reconciliation');
     expect(latePairStateWord('brand_new')).toBe('state not recognised');
+  });
+});
+
+
+describe('#199 archived detail is read-only', () => {
+  it('uses the real detail DTO status (without sync_status) to retain history and disable mutations', () => {
+    const detail = repo({ parent_id: 'root', enabled: false, status: 'archived' });
+    delete detail.sync_status;
+    seed({ repo: detail });
+    const html = renderPage('/repos/r1');
+    expect(html).toContain('archived-pair-notice');
+    expect(html).toContain('Archived · sync permanently stopped');
+    expect(html).toMatch(/data-testid="header-sync-switch"[^>]*disabled/);
+    expect(html).not.toContain('data-testid="delete-viewed-branch-pair"');
+    expect(html).not.toContain('data-testid="preview-update-from-parent"');
+    expect(html).not.toContain('data-testid="reanchor-not-implemented"');
+    expect(html).toContain('data-rs-region="audit"');
+    expect(html).not.toContain('Add Branch Pair</button>');
   });
 });

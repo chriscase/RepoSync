@@ -481,6 +481,15 @@ pub mod reviewed {
         validate_repo_id(id)?;
         let repo = db.get_repository(id)?.context("repository not found")?;
         ensure!(db.managed_removal(id)?.is_none_or(|op|op.state.is_terminal_success()),"an existing removal already owns this registration; inspect and continue its retained operation instead of approving different work");
+        ensure!(
+            db.removal_tombstone(id)?.is_none(),
+            "archived or removed registration cannot be reviewed again"
+        );
+        ensure!(
+            !choices.archive_pair
+                || (repo.parent_id.is_some() && choices.delete_git != choices.delete_svn),
+            "archival requires a branch pair and exactly one deleted side"
+        );
         let root = canonical_root(data)?;
         preflight_owned_target(data, id)?;
         let config = db.reviewed_removal_configuration(id)?;
@@ -618,7 +627,7 @@ pub mod reviewed {
                     "request identity has different deletion choices"
                 );
                 if op.state == ManagedRemoveState::Completed {
-                    ensure!(db.get_repository(id)?.is_none(),"this completed operation predates restoration; a fresh review and request identity are required");
+                    ensure!(db.get_repository(id)?.is_none() || (op.archives_pair() && db.removal_tombstone(id)?.is_some_and(|t| t.operation_id == op.id && !t.restore_supported)),"this completed operation predates restoration; a fresh review and request identity are required");
                 }
                 return Ok(op);
             }
@@ -1107,7 +1116,11 @@ pub mod reviewed {
             "retained cleanup error capacity exhausted; cleanup remains held"
         );
         fault(id, Fault::BeforeCleanup)?;
-        if let Err(error) = remove_owned_repo_tree(data, id) {
+        if let Err(error) = if op.archives_pair() {
+            Ok(())
+        } else {
+            remove_owned_repo_tree(data, id)
+        } {
             return local_failure(db,&op,format!("owned local cleanup failed: {error}; verified remote receipts and registration remain retained"));
         }
         Ok(db.complete_managed_remove(

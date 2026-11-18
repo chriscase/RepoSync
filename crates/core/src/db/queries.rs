@@ -9,6 +9,30 @@ use super::Database;
 use crate::errors::DatabaseError;
 use crate::models;
 
+/// Archived pairs retain their final cursors and diagnostics indefinitely.
+fn require_mutable_pair(conn: &rusqlite::Connection, repo_id: &str) -> Result<(), DatabaseError> {
+    if super::managed_remove::archived_pair(conn, repo_id)? {
+        return Err(DatabaseError::Other(
+            "archived branch pair is immutable".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn archived_repository_ids(conn: &rusqlite::Connection) -> Result<Vec<String>, DatabaseError> {
+    let mut statement = conn.prepare("SELECT id FROM repositories")?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut archived = Vec::new();
+    for id in ids {
+        if super::managed_remove::archived_pair(conn, &id)? {
+            archived.push(id);
+        }
+    }
+    Ok(archived)
+}
+
 /// Explicit acknowledgement scope; absence never means “all”.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -1283,13 +1307,26 @@ impl Database {
     /// Delete audit log entries beyond the most recent `keep` rows.
     pub fn prune_audit_log(&self, keep: u32) -> Result<u64, DatabaseError> {
         let conn = self.conn();
+        let conn = conn.unchecked_transaction()?;
+        let archived = archived_repository_ids(&conn)?;
+        let preservation = if archived.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " AND (repo_id IS NULL OR repo_id NOT IN ({}))",
+                vec!["?"; archived.len()].join(",")
+            )
+        };
+        let values = std::iter::once(rusqlite::types::Value::Integer(i64::from(keep)))
+            .chain(archived.into_iter().map(rusqlite::types::Value::Text));
         let deleted = conn.execute(
-            "DELETE FROM audit_log WHERE id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT ?1)",
-            params![keep],
+            &format!("DELETE FROM audit_log WHERE id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT ?1){preservation}"),
+            rusqlite::params_from_iter(values),
         )?;
         if deleted > 0 {
             debug!(deleted, keep, "pruned audit_log entries");
         }
+        conn.commit()?;
         Ok(deleted as u64)
     }
 
@@ -1738,6 +1775,7 @@ impl Database {
     pub fn delete_sync_records_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
+        require_mutable_pair(&tx, repo_id)?;
         super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
         let count = tx.execute(
             "DELETE FROM sync_records WHERE repo_id = ?1",
@@ -1752,6 +1790,7 @@ impl Database {
     pub fn delete_commit_map_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
+        require_mutable_pair(&tx, repo_id)?;
         super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
         let count = tx.execute(
             "DELETE FROM commit_map WHERE repo_id = ?1",
@@ -1771,6 +1810,7 @@ impl Database {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            require_mutable_pair(&conn, repo_id)?;
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
                 &conn, repo_id,
             )?;
@@ -1823,6 +1863,7 @@ impl Database {
     /// Used for branch pair cleanup. Wraps all deletes in a transaction.
     pub fn hard_delete_repository(&self, repo_id: &str) -> Result<(), DatabaseError> {
         self.transaction(|conn| {
+            require_mutable_pair(conn, repo_id)?;
             super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
                 conn, repo_id,
             )?;
@@ -1926,6 +1967,7 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        require_mutable_pair(&tx, repo_id)?;
         super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -1987,6 +2029,7 @@ impl Database {
         };
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        require_mutable_pair(&tx, repo_id)?;
         super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
 
         // 1. Update repositories table
@@ -2043,6 +2086,8 @@ impl Database {
     /// Increment consecutive permanent error count. Returns the new count.
     pub fn increment_consecutive_errors(&self, repo_id: &str) -> Result<i64, DatabaseError> {
         let conn = self.conn();
+        let conn = conn.unchecked_transaction()?;
+        require_mutable_pair(&conn, repo_id)?;
         conn.execute(
             "UPDATE repositories SET consecutive_errors = consecutive_errors + 1 WHERE id = ?1",
             params![repo_id],
@@ -2052,16 +2097,20 @@ impl Database {
             params![repo_id],
             |row| row.get(0),
         )?;
+        conn.commit()?;
         Ok(count)
     }
 
     /// Reset consecutive error counter (called on successful sync).
     pub fn reset_consecutive_errors(&self, repo_id: &str) -> Result<(), DatabaseError> {
         let conn = self.conn();
+        let conn = conn.unchecked_transaction()?;
+        require_mutable_pair(&conn, repo_id)?;
         conn.execute(
             "UPDATE repositories SET consecutive_errors = 0 WHERE id = ?1",
             params![repo_id],
         )?;
+        conn.commit()?;
         Ok(())
     }
 
@@ -3179,6 +3228,7 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
+        require_mutable_pair(&tx, repo_id)?;
         super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
         tx.execute(
             "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
@@ -3201,6 +3251,7 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
+        require_mutable_pair(&tx, repo_id)?;
         super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
         tx.execute(
             "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
@@ -3226,6 +3277,7 @@ impl Database {
     pub fn advance_svn_watermark(&self, repo_id: &str, svn_rev: i64) -> Result<(), DatabaseError> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
+        require_mutable_pair(&tx, repo_id)?;
         super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
         tx.execute(
             "UPDATE repositories SET last_svn_rev = MAX(last_svn_rev, ?1) WHERE id = ?2",
@@ -3260,33 +3312,42 @@ impl Database {
         status: &str,
     ) -> Result<(), DatabaseError> {
         let conn = self.conn();
+        let conn = conn.unchecked_transaction()?;
+        require_mutable_pair(&conn, repo_id)?;
         conn.execute(
             "UPDATE repositories SET sync_status = ?1 WHERE id = ?2",
             params![status, repo_id],
         )?;
         debug!(repo_id, status, "updated repo sync status");
+        conn.commit()?;
         Ok(())
     }
 
     /// Increment the total_syncs counter for a repository.
     pub fn increment_repo_sync_count(&self, repo_id: &str) -> Result<(), DatabaseError> {
         let conn = self.conn();
+        let conn = conn.unchecked_transaction()?;
+        require_mutable_pair(&conn, repo_id)?;
         conn.execute(
             "UPDATE repositories SET total_syncs = total_syncs + 1 WHERE id = ?1",
             params![repo_id],
         )?;
         debug!(repo_id, "incremented repo sync count");
+        conn.commit()?;
         Ok(())
     }
 
     /// Increment the total_errors counter for a repository.
     pub fn increment_repo_error_count(&self, repo_id: &str) -> Result<(), DatabaseError> {
         let conn = self.conn();
+        let conn = conn.unchecked_transaction()?;
+        require_mutable_pair(&conn, repo_id)?;
         conn.execute(
             "UPDATE repositories SET total_errors = total_errors + 1 WHERE id = ?1",
             params![repo_id],
         )?;
         debug!(repo_id, "incremented repo error count");
+        conn.commit()?;
         Ok(())
     }
 
@@ -3418,6 +3479,12 @@ impl Database {
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
             super::pair_refresh_operations::require_no_pair_refresh_hold(&conn, None)?;
+            if !archived_repository_ids(&conn)?.is_empty() {
+                return Err(DatabaseError::Other(
+                    "sync-data reset is blocked while archived branch-pair evidence is retained"
+                        .into(),
+                ));
+            }
             conn.execute_batch(
                 "DELETE FROM commit_map;
              DELETE FROM sync_records;
@@ -3458,18 +3525,32 @@ impl Database {
     /// retained while the legacy checkpoint reader relies on them.
     pub fn run_maintenance(&self, retention_days: u32) -> Result<(), DatabaseError> {
         let conn = self.conn();
+        let conn = conn.unchecked_transaction()?;
         let cutoff = format!("-{} days", retention_days);
+        let archived = archived_repository_ids(&conn)?;
+        // Bind IDs, never interpolate them. NULL/global diagnostics remain eligible.
+        let preservation = if archived.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " AND (repo_id IS NULL OR repo_id NOT IN ({}))",
+                vec!["?"; archived.len()].join(",")
+            )
+        };
+        let values = std::iter::once(cutoff.as_str())
+            .chain(archived.iter().map(String::as_str))
+            .collect::<Vec<_>>();
 
         let audit_deleted: usize = conn.execute(
-            "DELETE FROM audit_log WHERE created_at < datetime('now', ?1)",
-            params![cutoff],
+            &format!("DELETE FROM audit_log WHERE created_at < datetime('now', ?1){preservation}"),
+            rusqlite::params_from_iter(values.iter()),
         )?;
         // Applied mappings are checkpoint proof for existing installations.
         // They cannot be treated as expiring diagnostics while legacy readers
         // still consult them. Only non-applied diagnostic rows expire here.
         let sync_deleted: usize = conn.execute(
-            "DELETE FROM sync_records WHERE status <> 'applied' AND synced_at < datetime('now', ?1)",
-            params![cutoff],
+            &format!("DELETE FROM sync_records WHERE status <> 'applied' AND synced_at < datetime('now', ?1){preservation}"),
+            rusqlite::params_from_iter(values.iter()),
         )?;
 
         if audit_deleted > 0 || sync_deleted > 0 {
@@ -3480,6 +3561,7 @@ impl Database {
                 "periodic maintenance: pruned old records"
             );
         }
+        conn.commit()?;
         Ok(())
     }
 
@@ -4674,6 +4756,106 @@ mod tests {
         };
         db.insert_repository(&repo).unwrap();
         repo
+    }
+
+    fn archive_query_fixture(db: &Database) -> crate::models::Repository {
+        let mut repo = create_test_repo(db, "archive", "Archived pair");
+        repo.enabled = false;
+        repo.sync_status = "archived".into();
+        repo.last_git_sha = "retained-tip".into();
+        repo.last_svn_rev = 42;
+        repo.consecutive_errors = 3;
+        db.update_repository(&repo).unwrap();
+        // Exercise query guards independently of the native deletion runner.
+        let tombstone = serde_json::json!({
+            "version": 1, "repo_id": repo.id, "operation_id": "archive-op",
+            "name": repo.name, "svn_url": repo.svn_url, "svn_branch": repo.svn_branch,
+            "git_api_url": repo.git_api_url, "git_repo": repo.git_repo,
+            "git_branch": repo.git_branch, "parent_id": null,
+            "last_svn_rev": 42, "last_git_sha": "retained-tip", "commit_map_count": 0,
+            "remote_git": "deleted", "remote_svn": "untouched", "restore_supported": false,
+            "retention": "terminal_archived_pair_survivor_and_history_retained"
+        });
+        db.set_state(
+            "managed_remove_v1:tombstone:archive",
+            &tombstone.to_string(),
+        )
+        .unwrap();
+        repo
+    }
+
+    #[test]
+    fn archived_pair_query_mutations_preserve_terminal_record() {
+        let db = setup_db();
+        let before = archive_query_fixture(&db);
+        assert!(db.update_repo_sync_status("archive", "idle").is_err());
+        assert!(db.update_repo_watermark("archive", 99, "new").is_err());
+        assert!(db
+            .update_repo_watermark_columns_only("archive", 99, "new")
+            .is_err());
+        assert!(db.advance_svn_watermark("archive", 99).is_err());
+        assert!(db.advance_all_watermarks("archive", "new").is_err());
+        assert!(db
+            .advance_exact_skip_watermarks("archive", "new", &[], "skip")
+            .is_err());
+        assert!(db.increment_repo_sync_count("archive").is_err());
+        assert!(db.increment_repo_error_count("archive").is_err());
+        assert!(db.increment_consecutive_errors("archive").is_err());
+        assert!(db.reset_consecutive_errors("archive").is_err());
+        assert!(db.delete_sync_records_for_repo("archive").is_err());
+        assert!(db.delete_commit_map_for_repo("archive").is_err());
+        assert!(db.reset_repo_sync_mappings_for_reimport("archive").is_err());
+        assert!(db.delete_repository("archive").is_err());
+        assert!(db.hard_delete_repository("archive").is_err());
+        assert!(db.clear_sync_data().is_err());
+        let after = db.get_repository("archive").unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        assert!(db.removal_tombstone("archive").unwrap().is_some());
+        // A disabled ordinary registration is still mutable.
+        create_test_repo(&db, "ordinary", "Ordinary");
+        db.update_repo_sync_status("ordinary", "idle").unwrap();
+        db.update_repo_watermark("ordinary", 7, "normal").unwrap();
+    }
+
+    #[test]
+    fn archived_pair_evidence_survives_maintenance_and_count_pruning() {
+        let db = setup_db();
+        archive_query_fixture(&db);
+        create_test_repo(&db, "ordinary", "Ordinary");
+        {
+            let conn = db.conn();
+            for id in ["archive", "ordinary"] {
+                conn.execute("INSERT INTO audit_log (action,created_at,repo_id) VALUES ('synthetic-history','2000-01-01',?1)", [id]).unwrap();
+                conn.execute("INSERT INTO sync_records (id,direction,timestamp,synced_at,status,repo_id) VALUES (?1,'svn_to_git','2000-01-01','2000-01-01','failed',?1)", [id]).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO audit_log (action,created_at) VALUES ('global-history','2000-01-01')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(db.clear_sync_data().is_err());
+        db.run_maintenance(1).unwrap();
+        let count = |table: &str, id: &str| -> i64 {
+            db.conn()
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE repo_id=?1"),
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count("audit_log", "archive"), 1);
+        assert_eq!(count("sync_records", "archive"), 1);
+        assert_eq!(count("audit_log", "ordinary"), 0);
+        assert_eq!(count("sync_records", "ordinary"), 0);
+        db.conn().execute("INSERT INTO audit_log (action,created_at,repo_id) VALUES ('ordinary-new','2026-01-01','ordinary')", []).unwrap();
+        assert_eq!(db.prune_audit_log(0).unwrap(), 1);
+        assert_eq!(count("audit_log", "archive"), 1);
+        assert_eq!(count("audit_log", "ordinary"), 0);
     }
 
     // ---- advance_all_watermarks tests ----

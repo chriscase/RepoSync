@@ -240,6 +240,7 @@ struct RepoDetail {
 
 impl From<reposync_core::models::Repository> for RepoDetail {
     fn from(r: reposync_core::models::Repository) -> Self {
+        let archived = r.sync_status == "archived";
         Self {
             save_receipt: None,
             id: r.id,
@@ -260,12 +261,12 @@ impl From<reposync_core::models::Repository> for RepoDetail {
             created_by: r.created_by,
             created_at: r.created_at,
             updated_at: r.updated_at,
-            status: if r.last_sync_at.is_none() && r.last_svn_rev == 0 {
+            status: if !archived && r.last_sync_at.is_none() && r.last_svn_rev == 0 {
                 "initializing".to_string()
             } else {
                 r.sync_status
             },
-            initializing: r.last_sync_at.is_none() && r.last_svn_rev == 0,
+            initializing: !archived && r.last_sync_at.is_none() && r.last_svn_rev == 0,
             import_mode: None,
             starting_revision: None,
             history_boundary: None,
@@ -275,21 +276,27 @@ impl From<reposync_core::models::Repository> for RepoDetail {
 }
 
 fn enrich_repo_detail(db: &Database, mut detail: RepoDetail) -> Result<RepoDetail, AppError> {
-    match resolve_repo_import_baseline(db, &detail.id)
-        .map_err(|e| AppError::Internal(e.to_string()))?
-    {
-        RepoImportBaseline::Verified { .. } => {
-            detail.initializing = false;
-        }
-        RepoImportBaseline::Pending => {
-            detail.initializing = true;
-            if detail.status == "unknown" || detail.status == "idle" {
-                detail.status = "initializing".into();
+    // Terminal archive is authoritative even without a completed baseline.
+    // Preserve historical import metadata below, but never advertise recovery
+    // or initialization as the current lifecycle of an immutable archive.
+    let archived = detail.status == "archived";
+    if !archived {
+        match resolve_repo_import_baseline(db, &detail.id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+        {
+            RepoImportBaseline::Verified { .. } => {
+                detail.initializing = false;
             }
-        }
-        RepoImportBaseline::ReconciliationRequired { reason, .. } => {
-            detail.initializing = true;
-            detail.status = reason;
+            RepoImportBaseline::Pending => {
+                detail.initializing = true;
+                if detail.status == "unknown" || detail.status == "idle" {
+                    detail.status = "initializing".into();
+                }
+            }
+            RepoImportBaseline::ReconciliationRequired { reason, .. } => {
+                detail.initializing = true;
+                detail.status = reason;
+            }
         }
     }
 
@@ -308,7 +315,7 @@ fn enrich_repo_detail(db: &Database, mut detail: RepoDetail) -> Result<RepoDetai
             detail.history_boundary = Some(pin.history_boundary());
             detail.snapshot_pin = Some(pin);
         }
-        if !op.state.is_terminal() || op.state != ImportOperationState::Completed {
+        if !archived && (!op.state.is_terminal() || op.state != ImportOperationState::Completed) {
             detail.initializing = true;
             if detail.status == "unknown" || detail.status == "idle" {
                 detail.status = "initializing".into();
@@ -457,7 +464,11 @@ async fn list_repos(
             enabled: r.enabled,
             created_at: r.created_at,
             updated_at: r.updated_at,
-            status: "unknown".to_string(),
+            status: if r.sync_status == "archived" {
+                "archived".to_string()
+            } else {
+                "unknown".to_string()
+            },
         })
         .collect();
 
@@ -855,6 +866,7 @@ fn removal_response(
         Json(serde_json::json!({
             "ok": operation.state.is_terminal_success(),
             "action": "managed_remove",
+            "archive_pair": operation.archives_pair(),
             "state": operation.state,
             "operation_id": operation.id,
             "updated_at": operation.updated_at,
@@ -983,6 +995,13 @@ async fn remove_repo(
     if reposync_core::managed_remove::validate_repo_id(&id).is_err() {
         return Err(AppError::BadRequest(
             "repository id is not a single safe path component".into(),
+        ));
+    }
+    if reposync_core::db::managed_remove::archived_pair(&state.db.conn(), &id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        return Ok(removal_v2_refusal(
+            "archived pair is terminal; removal and reattachment are not supported",
         ));
     }
     if opts.explicit_remote_deletion_opts
@@ -2114,7 +2133,7 @@ async fn repo_import_status(
         .latest_import_operation(&id)
         .map_err(|e| AppError::Internal(e.to_string()))?;
     if role != "admin" && op.as_ref().is_none_or(|o| o.initiator_id != user_id) {
-        return Err(AppError::Unauthorized(
+        return Err(AppError::Forbidden(
             "import status requires initiating context or admin".into(),
         ));
     }
@@ -4545,6 +4564,8 @@ async fn get_pre_commit_hook(
 #[serde(deny_unknown_fields)]
 struct ReviewRemovalV2 {
     #[serde(default)]
+    archive_pair: bool,
+    #[serde(default)]
     delete_git: bool,
     #[serde(default)]
     delete_svn: bool,
@@ -4553,6 +4574,8 @@ struct ReviewRemovalV2 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApproveRemovalV2 {
+    #[serde(default)]
+    archive_pair: bool,
     delete_git: bool,
     delete_svn: bool,
     review_pin: String,
@@ -4601,6 +4624,7 @@ async fn review_removal_v2(
     let choices = reposync_core::db::managed_remove::RemovalChoices {
         delete_git: body.delete_git,
         delete_svn: body.delete_svn,
+        archive_pair: body.archive_pair,
     };
     let plan = match reposync_core::managed_remove::reviewed::capture(
         &state.db,
@@ -4614,8 +4638,18 @@ async fn review_removal_v2(
         Ok(plan) => plan,
         Err(error) => return Ok(removal_v2_refusal(error)),
     };
-    let dependency = removal_dependency_preview_json(&state.db, &id)?;
-    Ok(Json(serde_json::json!({"ok":true,"action":"reviewed_removal","protocol":2,"repo_id":id,"review_pin":plan.approval_digest,"delete_git":plan.choices.delete_git,"delete_svn":plan.choices.delete_svn,"git":plan.git,"svn":plan.svn,"dependency_preview":dependency,"retention":"Indefinite tombstone, audit and mapping retention; no automatic purge. Restore returns a disabled registration and does not recreate deleted remote branches."})).into_response())
+    let mut dependency = removal_dependency_preview_json(&state.db, &id)?;
+    if plan.choices.archive_pair {
+        if let Some(credentials) = dependency
+            .get_mut("credentials")
+            .and_then(|v| v.as_array_mut())
+        {
+            for credential in credentials {
+                credential["action"] = serde_json::json!("retain_for_archive");
+            }
+        }
+    }
+    Ok(Json(serde_json::json!({"ok":true,"action":"reviewed_removal","protocol":2,"repo_id":id,"review_pin":plan.approval_digest,"delete_git":plan.choices.delete_git,"delete_svn":plan.choices.delete_svn,"archive_pair":plan.choices.archive_pair,"git":plan.git,"svn":plan.svn,"dependency_preview":dependency,"retention":if plan.choices.archive_pair { "Terminal archived pair: surviving branch, registration, local data, audit and mappings retained indefinitely. Sync and restore are blocked." } else { "Indefinite tombstone, audit and mapping retention; no automatic purge. Restore returns a disabled registration and does not recreate deleted remote branches." }})).into_response())
 }
 
 async fn run_removal_v2(
@@ -4680,6 +4714,7 @@ async fn approve_removal_v2(
     let choices = reposync_core::db::managed_remove::RemovalChoices {
         delete_git: body.delete_git,
         delete_svn: body.delete_svn,
+        archive_pair: body.archive_pair,
     };
     let op = match reposync_core::managed_remove::reviewed::begin(
         &state.db,

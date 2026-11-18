@@ -22,6 +22,7 @@ export interface ManagedRemovalPartialCleanup {
 }
 
 export interface ManagedRemovalStatus {
+  archive_pair?: boolean;
   ok: boolean;
   action: 'managed_remove';
   state: string;
@@ -49,6 +50,7 @@ export interface ManagedRemovalStatus {
 }
 
 export interface ReviewedRemovalPreview {
+  archive_pair?: boolean;
   protocol: 2;
   repo_id: string;
   review_pin: string;
@@ -61,12 +63,30 @@ export interface ReviewedRemovalPreview {
 }
 
 /** The confirmation and send use the same visible target and choices. */
-export function reviewedRemovalReady(review: ReviewedRemovalPreview | undefined, repoId: string | undefined, options: { delete_git: boolean; delete_svn: boolean }, unavailable: boolean): review is ReviewedRemovalPreview {
+export function reviewedRemovalReady(review: ReviewedRemovalPreview | undefined, repoId: string | undefined, options: { delete_git: boolean; delete_svn: boolean; archive_pair?: boolean }, unavailable: boolean): review is ReviewedRemovalPreview {
   return !unavailable && review?.protocol === 2 && review.repo_id === repoId
     && /^[a-f0-9]{64}$/.test(review.review_pin)
+    && (review.archive_pair === undefined || typeof review.archive_pair === 'boolean')
+    && (!review.archive_pair || review.delete_git !== review.delete_svn)
     && typeof review.delete_git === 'boolean' && typeof review.delete_svn === 'boolean'
+    && (review.archive_pair ?? false) === (options.archive_pair ?? false)
     && review.delete_git === options.delete_git && review.delete_svn === options.delete_svn
     && review.dependency_preview?.parent_removal_blocked === false;
+}
+
+/** Display the original recoverable intent, or only a fresh matching review.
+ * The legacy dependency endpoint cannot describe the archive disposition. */
+export function removalReviewForDisplay(
+  pending: ReviewedRemovalPreview | null | undefined,
+  fresh: ReviewedRemovalPreview | undefined,
+  repoId: string | undefined,
+  options: { delete_git: boolean; delete_svn: boolean; archive_pair?: boolean },
+  unavailable: boolean,
+): ReviewedRemovalPreview | undefined {
+  if (pending) {
+    return reviewedRemovalReady(pending, repoId, pending, false) ? pending : undefined;
+  }
+  return reviewedRemovalReady(fresh, repoId, options, unavailable) ? fresh : undefined;
 }
 
 const PENDING_REVIEW_PREFIX = 'reposync.pendingReviewedRemoval.';
@@ -85,7 +105,7 @@ export function readPendingRemovalReview(repoId: string): ReviewedRemovalPreview
   const raw = localStorage.getItem(key);
   if (!raw) return null;
   const parsed = JSON.parse(raw) as ReviewedRemovalPreview;
-  if (!reviewedRemovalReady(parsed, repoId, { delete_git: parsed.delete_git, delete_svn: parsed.delete_svn }, false)) throw new Error('Retained removal review is malformed; do not authorize another request');
+  if (!reviewedRemovalReady(parsed, repoId, { delete_git: parsed.delete_git, delete_svn: parsed.delete_svn, archive_pair: parsed.archive_pair }, false)) throw new Error('Retained removal review is malformed; do not authorize another request');
   return parsed;
 }
 
@@ -164,6 +184,8 @@ export function reviewedRemovalDisplay(status: ManagedRemovalStatus) {
     || !Array.isArray(p.cleanup_errors) || !p.cleanup_errors.every(e => typeof e === 'string')
     || ![p.git, p.svn].every(r => r && Object.prototype.hasOwnProperty.call(DELETION_LABELS, r.phase) && Array.isArray(r.errors) && r.errors.every(e => typeof e === 'string'))
     || status.remote_git !== DELETION_SUMMARIES[p.git.phase] || status.remote_svn !== DELETION_SUMMARIES[p.svn.phase]) return unknown;
+  if (status.archive_pair && ((p.git.phase === 'not_requested') === (p.svn.phase === 'not_requested')
+    || status.restore_supported || (status.state === 'completed' && !status.registration_listed))) return unknown;
   const remoteDone = [p.git, p.svn].every(r => ['not_requested', 'verified_deleted', 'verified_already_absent'].includes(r.phase));
   if ((p.cleanup_completed && (!p.cleanup_started || !remoteDone || status.state !== 'completed' || !status.ok))
     || (status.state === 'completed' && (!p.cleanup_completed || !remoteDone))) return unknown;
@@ -172,13 +194,14 @@ export function reviewedRemovalDisplay(status: ManagedRemovalStatus) {
     remoteDone,
     git: DELETION_LABELS[p.git.phase],
     svn: DELETION_LABELS[p.svn.phase],
-    cleanup: p.cleanup_completed ? 'Completed' : p.cleanup_started ? 'Started; completion not recorded' : 'Not started',
-    errors: [...p.git.errors.map(e => `Git: ${e}`), ...p.svn.errors.map(e => `SVN: ${e}`), ...p.cleanup_errors.map(e => `Local admission/cleanup: ${e}`)],
+    cleanup: status.archive_pair ? (p.cleanup_completed ? 'Archived; local data and history retained' : 'Local data retained; archive completion not recorded') : p.cleanup_completed ? 'Completed' : p.cleanup_started ? 'Started; completion not recorded' : 'Not started',
+    errors: [...p.git.errors.map(e => `Git: ${e}`), ...p.svn.errors.map(e => `SVN: ${e}`), ...p.cleanup_errors.map(e => `${status.archive_pair ? 'Archive admission' : 'Local admission/cleanup'}: ${e}`)],
   };
 }
 
 export function managedRemovalRetryLabel(status: ManagedRemovalStatus, pending: boolean): string {
   if (status.protocol !== 2) return pending ? 'Retrying local cleanup…' : 'Retry local cleanup';
+  if (status.archive_pair) return pending ? 'Checking original archive operation…' : 'Continue original archive operation';
   if (reviewedRemovalDisplay(status).remoteDone) return pending ? 'Retrying owned local cleanup…' : 'Retry owned local cleanup';
   return pending ? 'Checking original reviewed operation…' : 'Continue original reviewed operation';
 }
@@ -187,6 +210,7 @@ export function managedRemovalPanelHeading(status: ManagedRemovalStatus): string
   if (status.protocol !== 2) return managedRemovalStateLabel(status.state);
   const view = reviewedRemovalDisplay(status);
   if (!view.known) return 'Removal evidence unavailable';
+  if (status.archive_pair) return status.state === 'completed' ? 'Pair archived; survivor and history retained' : 'Pair archival in progress; inspect recorded outcomes';
   if (status.state === 'completed') return 'Removal completed; verified cleanup recorded';
   return managedRemovalStateLabel(status.state, 2);
 }
@@ -195,6 +219,7 @@ const RECEIPT_PREFIX = 'reposync.managedRemovalReceipt.';
 const LEGACY_RECEIPT_KEY = 'reposync.managedRemovalReceipt';
 
 export interface ManagedRemovalReceipt {
+  archive_pair?: boolean;
   repoId: string;
   operationId: string;
   state: string;
@@ -218,6 +243,7 @@ export function managedRemovalReceiptFromStatus(
 ): ManagedRemovalReceipt {
   return {
     repoId,
+    ...(status.archive_pair ? { archive_pair: true } : {}),
     operationId: status.operation_id,
     state: status.state,
     message: status.message,
@@ -258,6 +284,7 @@ export function managedRemovalStatusFromReceipt(
   return {
     ok: receipt.state.toLowerCase() === 'completed',
     action: 'managed_remove',
+    ...(receipt.archive_pair ? { archive_pair: true } : {}),
     state: receipt.state,
     operation_id: receipt.operationId,
     message: receipt.message,

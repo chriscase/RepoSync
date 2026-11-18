@@ -184,3 +184,23 @@ describe('#120 route-save and recovery ownership', () => {
     clientSession().end(); expect(readAllManagedRemovalReceipts()).toEqual([]); expect(readPersistedBranchPairRemovalNotice()).toBeNull();
   });
 });
+
+it('#199 import-status permission denial preserves member session while invalid authentication expires it', async () => {
+  loginB();
+  const before = cache.snapshot().client;
+  const endpoint = '/api/repos/import-owner/import/status';
+  fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ error: 'import status requires initiating context or admin' }), { status: 403 }));
+  const denied = await sessionFetch(endpoint);
+  expect(denied.status).toBe(403);
+  expect(storage.getItem('session_token')).toBe('synthetic-B');
+  expect(JSON.parse(storage.getItem('user')!).id).toBe('B');
+  expect(cache.snapshot().client).toBe(before);
+  expect(window.location.href).toBe('/repos/A');
+  expect(fetchMock.mock.calls[0][0]).toBe(endpoint);
+  expect(new Headers(fetchMock.mock.calls[0][1].headers).get('Authorization')).toBe('Bearer synthetic-B');
+  fetchMock.mockResolvedValueOnce(new Response('{"error":"invalid session"}', { status: 401 }));
+  await expect(sessionFetch(endpoint)).rejects.toMatchObject({ status: 401 });
+  expect(storage.getItem('session_token')).toBeNull();
+  expect(storage.getItem('user')).toBeNull();
+  expect(window.location.href).toBe('/login');
+});
