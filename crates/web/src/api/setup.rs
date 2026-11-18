@@ -195,7 +195,7 @@ async fn get_setup_config(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<SetupConfigResponse>, AppError> {
-    crate::api::auth::validate_session(
+    require_admin(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
@@ -276,7 +276,7 @@ async fn test_svn_connection(
     // Require auth unless this is a fresh instance with no users/password configured
     let has_users = state.db.count_users().unwrap_or(0) > 0;
     if state.config.web.admin_password.is_some() || has_users {
-        crate::api::auth::validate_session(
+        require_admin(
             &state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
         )
@@ -319,7 +319,7 @@ async fn test_git_connection(
 ) -> Result<Json<TestConnectionResponse>, AppError> {
     let has_users = state.db.count_users().unwrap_or(0) > 0;
     if state.config.web.admin_password.is_some() || has_users {
-        crate::api::auth::validate_session(
+        require_admin(
             &state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
         )
@@ -418,7 +418,7 @@ async fn apply_config(
 ) -> Result<Json<ApplyConfigResponse>, AppError> {
     let has_users = state.db.count_users().unwrap_or(0) > 0;
     if state.config.web.admin_password.is_some() || has_users {
-        crate::api::auth::validate_session(
+        require_admin(
             &state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
         )
@@ -785,13 +785,24 @@ fn overlay_setup_import_status(
     value
 }
 
+async fn require_admin(
+    state: &Arc<AppState>,
+    authorization: Option<&str>,
+) -> Result<(String, String), AppError> {
+    let identity = validate_session_with_role(state, authorization).await?;
+    if identity.1 != "admin" {
+        return Err(AppError::Forbidden("admin access required".into()));
+    }
+    Ok(identity)
+}
+
 async fn setup_auth(
     state: &Arc<AppState>,
     headers: &HeaderMap,
 ) -> Result<(String, String), AppError> {
     let has_users = state.db.count_users().unwrap_or(0) > 0;
     if state.config.web.admin_password.is_some() || has_users {
-        validate_session_with_role(
+        require_admin(
             state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
         )
@@ -1384,7 +1395,7 @@ async fn reset_and_reimport(
     )
     .await?;
     if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
+        return Err(AppError::Forbidden("admin access required".into()));
     }
 
     let repo = setup_repository(&state.db)?;
