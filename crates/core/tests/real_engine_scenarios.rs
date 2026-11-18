@@ -674,10 +674,29 @@ impl SvnserveDaemon {
         daemon
     }
 
-    fn stop(&mut self) {
-        let mut child = self.child.take().expect("svnserve was running");
-        child.kill().expect("stop fixture svnserve");
-        child.wait().expect("reap fixture svnserve");
+    fn stop(&mut self) -> std::io::Result<()> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        if child.try_wait()?.is_none() {
+            // An exit racing kill() is harmless once try_wait() reaps it.
+            let kill_error = child.kill().err();
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while child.try_wait()?.is_none() {
+                if let Some(error) = kill_error {
+                    return Err(error);
+                }
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "fixture svnserve did not exit after kill",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        self.child = None;
+        Ok(())
     }
 
     fn repo_url(&self, name: &str) -> String {
@@ -687,10 +706,7 @@ impl SvnserveDaemon {
 
 impl Drop for SvnserveDaemon {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let _ = self.stop();
     }
 }
 
@@ -1803,7 +1819,10 @@ async fn scenario_r16_svnserve_svn_remote_unreachable() {
     assert_eq!(git_checkpoint.target_svn_rev, Some(seed_rev));
 
     let port = fixture.daemon.port;
-    fixture.daemon.stop();
+    fixture
+        .daemon
+        .stop()
+        .expect("stop and reap fixture svnserve");
     assert_eq!(
         TcpStream::connect_timeout(
             &([127, 0, 0, 1], port).into(),
