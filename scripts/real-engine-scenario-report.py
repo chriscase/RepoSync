@@ -16,7 +16,6 @@ REAL_ENGINE_BINARY = "real_engine_scenarios"
 PINNED_CI_PARTIAL_ALLOWLIST_IDS = frozenset(
     {
         "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE",
-        "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE",
         "R01_SVNSERVE_POST_WRITE_RECOVERY",
         "R16_SVNSERVE_SVN_REMOTE_RECREATION",
         "R17_SVNSERVE_NOTIFICATION_ISOLATION",
@@ -305,12 +304,22 @@ def run_self_test() -> None:
 
         allowlisted_partial = full_pass_rows()
         for row in allowlisted_partial:
-            if row["id"] in {git_id, svn_id}:
+            if row["id"] in allowed:
                 row["status"] = "PARTIAL"
         code, errs = ci_gate(
             write_summary(tmp, allowlisted_partial, "PARTIAL"), allowlist_path
         )
         assert code == 0 and not errs, (code, errs)
+
+        for row in allowlisted_partial:
+            if row["id"] == svn_id:
+                row["status"] = "PARTIAL"
+        code, errs = ci_gate(
+            write_summary(tmp, allowlisted_partial, "PARTIAL"), allowlist_path
+        )
+        assert code == 1 and any(
+            e.startswith(f"{svn_id}: PARTIAL not on CI allowlist") for e in errs
+        ), (code, errs)
 
         surprise = full_pass_rows()
         for row in surprise:
@@ -361,7 +370,7 @@ def run_self_test() -> None:
 
         stamped_pass_with_partial_rows = full_pass_rows()
         for row in stamped_pass_with_partial_rows:
-            if row["id"] in {git_id, svn_id}:
+            if row["id"] == git_id:
                 row["status"] = "PARTIAL"
         code, errs = ci_gate(
             write_summary(tmp, stamped_pass_with_partial_rows, "PASS"), allowlist_path
