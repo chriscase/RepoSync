@@ -11,6 +11,7 @@ on:
       - 'web-ui/src/pages/SetupWizard.tsx'
       - 'web-ui/src/useSetupImport*.ts'
       - 'crates/web/src/api/setup.rs'
+      - 'crates/web/tests/setup_wizard_busy.rs'
       - 'crates/core/src/import.rs'
       - 'crates/core/src/db/import_operations.rs'
   pull_request:
@@ -19,6 +20,7 @@ on:
       - '.github/workflows/setup-import-ui.yml'
       - 'web-ui/**'
       - 'crates/web/src/api/setup.rs'
+      - 'crates/web/tests/setup_wizard_busy.rs'
       - 'crates/core/src/import.rs'
       - 'crates/core/src/db/import_operations.rs'
 
