@@ -76,6 +76,12 @@
 
 ## Documented States
 
+### Team path policy on partial-52
+
+The team scheduler applies `allowed_paths` and `blocked_patterns` to Git→SVN writes. Allowed paths are literal, case-sensitive directory or file prefixes. If Git renames a file out of scope, only its old path is deleted in SVN. Moving it into scope adds only its new path. A policy edit neither removes files already published nor backfills previously skipped commits.
+
+Initial import and subsequent SVN→Git sync can expose sibling paths to Git readers. Included paths keep their branch-relative names. Path rewriting (including for LFS files) and personal-mode subset rules are unavailable. For example inputs, audit events and local tests, see the [monorepo subset guide](docs/monorepo-subset-sync.md).
+
 ### NULL `commit_map.git_sha` (#54)
 - Since operational schema v15, `commit_map.git_sha` may be NULL. NULL means
   "this SVN revision produced no Git commit", and only when it is proven by a

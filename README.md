@@ -34,6 +34,7 @@ See [docs/personal-branch/](docs/personal-branch/) for the full Personal Branch 
 
 - **Bidirectional sync** -- SVN commits appear in Git, Git pushes appear in SVN
 - **Server daemon** -- runs on a VM, watches both repos, syncs automatically (team mode)
+- **Team path policy** -- limit which Git paths the scheduler writes to an SVN monorepo. SVN-to-Git sync can still publish sibling paths to Git. [Monorepo subset guide](docs/monorepo-subset-sync.md)
 - **Personal branch sync** -- runs on your laptop, PR-based workflow (personal mode)
 - **Author identity mapping** -- SVN usernames mapped to Git name+email, seamlessly preserved
 - **Automatic conflict resolution** -- non-overlapping changes merged automatically
@@ -202,7 +203,7 @@ See [docs/architecture.md](docs/architecture.md) for the full technical design.
 reposync status                              # Show sync status
 reposync conflicts list                      # List active conflicts
 reposync conflicts resolve <id> --accept git # Resolve from CLI
-reposync sync now                            # Trigger immediate sync
+reposync sync now                            # Uses service TOML without the saved repository path policy
 reposync identity list                       # Show author mappings
 reposync audit --limit 20                    # Recent sync history
 ```
