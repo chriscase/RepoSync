@@ -1769,7 +1769,8 @@ function ImportStep() {
       {!status && !statusError && <p role="status">Reading import status…</p>}
       {status && !isLegacyOutcome && !needsReconciliation && <ImportPhaseGraphic currentPhase={phase} />}
       {isLegacyOutcome && <p>Legacy import progress reported “{reportedPhase}”. A durable operation outcome and publication checkpoint are unavailable.</p>}
-      {status && !isLegacyOutcome && !isActive && !isTerminal && !canStartSetupImport(status) &&
+      {status?.start_blocked_reason && !canStartSetupImport(status) && <p className="text-yellow-300">{status.start_blocked_reason}</p>}
+      {status && !status.start_blocked_reason && !isLegacyOutcome && !isActive && !isTerminal && !canStartSetupImport(status) &&
         <p>The server has not made a new setup import available.</p>}
 
       {canStartSetupImport(status) && startRepository && (

@@ -979,6 +979,7 @@ export interface ImportStatus {
   operation_repository_id?: string;
   start_repository_id?: string;
   start_repository_name?: string;
+  start_blocked_reason?: string;
   last_local_svn_rev?: number | null;
   last_local_git_sha?: string | null;
   last_confirmed_svn_rev?: number | null;

@@ -219,8 +219,12 @@ test('RS-19 remount reads the successor after aborting a pending read on exit', 
 test('RS-19 memory-only completion and a legacy worker without a durable ID cannot authorize writes', async t => {
   const { page, model } = await wizard(t, observation(first));
   await stopButton(page).waitFor();
-  model.status = observation(undefined, { can_cancel: false, lifecycle: undefined, log_lines: ['Unnamed legacy worker'] });
+  const reason = 'An older setup import could still hold this checkout.';
+  model.status = observation(undefined, {
+    can_cancel: false, lifecycle: undefined, start_blocked_reason: reason, log_lines: ['Unnamed legacy worker'],
+  });
   await page.getByText('Unnamed legacy worker', { exact: true }).waitFor();
+  await page.getByText(reason, { exact: true }).waitFor();
   await noEnabledAction(stopButton(page));
   model.status = observation(undefined, { phase: 'completed', lifecycle: undefined, busy: false, can_cancel: false, log_lines: ['Memory-only completion'] });
   await page.getByText('Memory-only completion', { exact: true }).waitFor();
