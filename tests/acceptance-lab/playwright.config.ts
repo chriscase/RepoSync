@@ -26,6 +26,11 @@ export default defineConfig({
   ],
   outputDir: process.env.LAB_PLAYWRIGHT_OUTPUT || "test-results",
   use: {
+    // #199 uses an already provisioned executable only when explicitly chosen.
+    // Never download a browser or disable its sandbox; preserve TLS/evidence.
+    ...(process.env.LAB_ARCHIVE199_CHROMIUM_EXECUTABLE ? {
+      launchOptions: { executablePath: process.env.LAB_ARCHIVE199_CHROMIUM_EXECUTABLE, chromiumSandbox: true },
+    } : {}),
     baseURL: process.env.LAB_UI_URL || "http://127.0.0.1:9",
     ignoreHTTPSErrors: false,
     // Failure traces stay in the local output directory. Publication withholds

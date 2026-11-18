@@ -110,7 +110,7 @@ unset EVIDENCE
 ARTIFACT_ROOT="$(mktemp -d)"
 CANDIDATE="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 RUST_IMAGE="rust:cached-lab"
-RUST_TOOLCHAIN="1.98.1"
+RUST_TOOLCHAIN="1.99.0"
 LDAP_IMAGE="ldap:cached-lab"
 DEBIAN_IMAGE="debian:cached-lab"
 NODE_IMAGE="node:cached-lab"

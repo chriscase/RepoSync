@@ -389,11 +389,19 @@ passwd = "\n".join([
 PY
   cp "$LAB_DIR/config/daemon.toml.template" "$RUN_DIR/daemon.toml"
   python3 - "$RUN_DIR/daemon.toml" "$LAB_UI_PORT" <<'PY'
-import pathlib, sys
+import os, pathlib, sys
 path, port = pathlib.Path(sys.argv[1]), sys.argv[2]
 if not port.isdigit():
     raise SystemExit("ui port is not an integer")
 text = path.read_text()
+archive_profile = os.environ.get("ACCEPTANCE_LAB_ARCHIVE199_MANUAL_POLL", "")
+if archive_profile not in ("", "1"):
+    raise SystemExit("invalid archive199 scheduler profile")
+if archive_profile == "1":
+    scheduler = "[daemon]\npoll_interval_secs = 30\n"
+    if text.count(scheduler) != 1:
+        raise SystemExit("archive199 profile requires the unchanged daemon timer template")
+    text = text.replace(scheduler, "[daemon]\npoll_interval_secs = 3600\n", 1)
 needle = 'admin_password_env = "REPOSYNC_ADMIN_PASSWORD"\n'
 origin = f'cors_origins = ["http://127.0.0.1:{port}"]\n'
 for raw in text.splitlines():
@@ -780,8 +788,9 @@ record_rust_image_identity() {
     echo "candidate=${CANDIDATE}"
     echo "rust_image=${RUST_IMAGE}"
     echo "rust_toolchain=${RUST_TOOLCHAIN}"
-    echo "aligned_with=Dockerfile.reliability rust:1.98.1-bookworm"
-    echo "previous_lab_pin=rust:1.83.0-bookworm"
+    echo "compiler_scope=independent acceptance-lab toolchain"
+    echo "reliability_dockerfile=unchanged rust:1.98.1-bookworm"
+    echo "previous_lab_pin=rust:1.98.1-bookworm"
     echo "product_dockerfile=unchanged rust:1.83-bookworm"
     echo "note=this pin does not prove the product Dockerfile or its MSRV"
     echo "rust_image_id=${image_id}"
@@ -858,8 +867,9 @@ extract_build_graph() {
       echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       echo "candidate=${CANDIDATE}"
       echo "identity_source=loaded image rustc-version.txt"
-      echo "aligned_with=Dockerfile.reliability rust:1.98.1-bookworm"
-      echo "previous_lab_pin=rust:1.83.0-bookworm"
+      echo "compiler_scope=independent acceptance-lab toolchain"
+      echo "reliability_dockerfile=unchanged rust:1.98.1-bookworm"
+      echo "previous_lab_pin=rust:1.98.1-bookworm"
       echo "product_dockerfile=unchanged rust:1.83-bookworm"
       cat "$dest/rustc-version.txt"
     } > "$dest/image-identity.txt"
@@ -1256,6 +1266,8 @@ import json, sys
 (candidate, head, inspected, catalog_sha, script_sha, run_id, seed, suite,
  live_main, live_parent, pr194, pr_head, github_sha, event,
  fetched_main, fetched_pr194, fetched_pr195) = sys.argv[2:19]
+import os
+archive199_manual_poll = os.environ.get("ACCEPTANCE_LAB_ARCHIVE199_MANUAL_POLL", "") == "1"
 covers = bool(candidate) and candidate == inspected
 note = (
     "The frozen audit inspected %s. Candidate %s is the checkout HEAD. "
@@ -1266,6 +1278,7 @@ note = (
 ) % (inspected, candidate, live_main, live_parent, pr194, fetched_main, fetched_pr194, fetched_pr195)
 payload = {
     "candidate_sha": candidate,
+    "archive199_manual_poll_interval_secs": 3600 if archive199_manual_poll else None,
     "head_sha": head,
     "candidate_matches_head": candidate == head,
     "audit_inspected_sha": inspected,

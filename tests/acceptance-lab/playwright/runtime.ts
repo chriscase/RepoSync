@@ -1,10 +1,23 @@
-import { execFile } from "node:child_process";
-import { createHmac, randomBytes } from "node:crypto";
+import { execFile, spawnSync } from "node:child_process";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
 import { expect, type Page, type TestInfo } from "@playwright/test";
 
 const exec = promisify(execFile);
+
+/** Canonical XML preserves complete history semantics, not serializer attribute order. */
+export function archive199CanonicalXml(xml: string, root: "log" | "properties"): string {
+  if (Buffer.byteLength(xml, "utf8") > 8_000_000 || /<!\s*(?:DOCTYPE|ENTITY)\b/i.test(xml)) throw new Error("unsafe or oversized archive XML");
+  const script = `import sys,xml.etree.ElementTree as ET
+xml=sys.stdin.read()
+if ET.fromstring(xml).tag != sys.argv[1]: raise ValueError("unexpected archive XML root")
+sys.stdout.write(ET.canonicalize(xml, with_comments=True, strip_text=False, rewrite_prefixes=False))
+`;
+  const result = spawnSync("python3", ["-c", script, root], {input: xml, encoding: "utf8", timeout: 5000, maxBuffer: 8_000_000});
+  if (result.error || result.status !== 0 || !result.stdout) throw new Error("archive XML canonicalization failed");
+  return result.stdout;
+}
 
 export type LabOp = {
   id: string;
@@ -32,6 +45,25 @@ export function importOperationId(value: unknown): string | undefined {
 }
 
 export type Snap = { svn: string; git: string; maps: string; records: string; watermark: string; gitWatermark: string; gitColumn: string };
+// RS199-HARNESS-ASTRA-20261117: additive, source-only until qualified execution.
+export type Archive199Side = "git" | "svn";
+export type Archive199Observation = {
+  pairId: string;
+  registration: Array<Record<string, any>>;
+  maps: Array<Record<string, any>>;
+  records: Array<Record<string, any>>;
+  audit: Array<Record<string, any>>;
+  archiveJournal: Array<Record<string, any>>;
+  localCustody: {sha256: string; entries: number};
+  git: {present: boolean; tip: string | null; tree: string | null; history: string | null; heads: Record<string, string>};
+  svn: {present: boolean; revision: string | null; tree: string | null; properties: string | null; history: string | null; branches: string[]};
+};
+export type Archive199Gate = {
+  state: string; run_id?: string; request_id?: string; method?: string; target?: string;
+  scope_path?: string; phase?: string; matched_at?: number; witnessed_at?: number;
+  upstream_response_complete?: boolean; response_status?: number; error?: string;
+};
+
 export type FaultStats = {drop_responses_remaining: number; client_connections: number; upstream_connections: number; dropped_responses: number; forwarded_responses: number};
 
 export function readFaultStats(value: unknown): FaultStats {
@@ -1216,6 +1248,543 @@ git rev-parse HEAD
         return false;
       }
     }, 120_000);
+  }
+
+  async archive199ConfigureScheduling(pair: Pair, enabled: boolean, interval: 30 | 3600): Promise<void> {
+    const saved = await this.api("PUT", `/api/repos/${pair.id}`, {enabled, poll_interval_secs: interval});
+    const readback = await this.api("GET", `/api/repos/${pair.id}`);
+    const row = readback.json as any;
+    if (saved.status !== 200 || readback.status !== 200 || row?.id !== pair.id || row.enabled !== enabled || row.poll_interval_secs !== interval
+      || row.svn_url !== pair.svnUrl || row.git_repo !== pair.gitRepo) throw new Error("archive199 fixture scheduling readback mismatch");
+  }
+
+  static archive199SchedulerInterval(config: string, profile: string | undefined): number {
+    if (profile !== "1" || config.length > 65536) throw new Error("archive199 explicit scheduler profile is required");
+    const sections = config.split(/^\s*\[daemon\]\s*$/m);
+    if (sections.length !== 2) throw new Error("archive199 generated daemon section is ambiguous");
+    const daemon = sections[1].split(/^\s*\[/m)[0];
+    const values = daemon.split("\n").map(line => line.replace(/#.*$/, "").trim()).filter(line => /^poll_interval_secs\s*=/.test(line));
+    if (values.length !== 1 || !/^poll_interval_secs\s*=\s*3600\s*$/.test(values[0])) throw new Error("archive199 global daemon interval must be exactly 3600");
+    return 3600;
+  }
+
+  static archive199PublicationBudget(startedAt: string, workers: string | undefined, now = Date.now()): number {
+    const started = Date.parse(startedAt), age = now - started;
+    if (workers !== "1" || !Number.isFinite(started) || age < 0 || age >= 1_800_000) throw new Error("archive199 requires one worker and a fresh daemon publication budget");
+    return 3_600_000 - age;
+  }
+
+  async archive199AdmitPublicationScheduler(): Promise<void> {
+    const root = required("LAB_RUN_DIR");
+    const config = readFileSync(`${root}/daemon.toml`, "utf8");
+    const interval = Lab.archive199SchedulerInterval(config, process.env.ACCEPTANCE_LAB_ARCHIVE199_MANUAL_POLL);
+    const manifest = JSON.parse(readFileSync(`${root}/run.json`, "utf8"));
+    if (manifest.project !== this.project || manifest.run_id !== required("RUN_ID")) throw new Error("archive199 scheduler profile belongs to another run");
+    const processIdentity = await this.archive199ProcessIdentity();
+    const remainingMs = Lab.archive199PublicationBudget(processIdentity.startedAt, process.env.LAB_WORKERS);
+    const configSha256 = createHash("sha256").update(config).digest("hex");
+    const mountedSha256 = (await this.sh("reposync", "sha256sum /etc/reposync/config.toml | awk '{print $1}'", "root")).trim();
+    if (mountedSha256 !== configSha256) throw new Error("archive199 mounted daemon config differs from generated profile");
+    this.observation("archive199-publication-scheduler", {profile: "explicit-webhook-3600", interval, project: this.project,
+      runId: manifest.run_id, configSha256, mountedSha256, processIdentity, remainingMs, workers: 1});
+  }
+
+  async archive199CreateParent(name: string): Promise<Pair> {
+    const parent = await this.createPair(name, {enable: false});
+    await this.archive199AdmitPublicationScheduler();
+    await this.archive199ConfigureScheduling(parent, true, 3600);
+    return parent;
+  }
+
+  async archive199WaitQuiet(pair: Pair, sourceSha?: string): Promise<void> {
+    if (sourceSha !== undefined && !/^[0-9a-f]{40}$/.test(sourceSha)) throw new Error("invalid archive199 source witness");
+    const id = safe(pair.id, "repo id");
+    let last: Record<string, unknown> = {stage: "status-request"};
+    try {
+      await this.waitUntil(async () => {
+        last = {stage: "status-request"};
+        const response = await this.api("GET", `/api/status?repo_id=${encodeURIComponent(id)}`);
+        const status = response.json as any;
+        const observed = status?.observation;
+        // Keep only the most recent DTO, bounded; never capture repository secrets.
+        last = {stage: "status-admission", httpStatus: response.status,
+          status: JSON.stringify(status)?.length <= 65536 ? status : {omitted: "status DTO exceeds diagnostic bound"}};
+        if (response.status !== 200 || observed?.repository_id !== id || observed.evidence_complete !== true || observed.registry_busy !== false
+          || !Array.isArray(observed.operations) || observed.operations.some((op: any) => op.held || !["completed", "cancelled"].includes(op.state))) return false;
+        last.stage = "writer-windows-and-journals";
+        const rows = await this.sqlRows(`SELECT key,value FROM kv_state WHERE key LIKE 'pair_refresh_writer_window_%' OR key LIKE 'git_to_svn_commit_v1:document:%' OR key LIKE 'svn_to_git_push_v1:document:%';`);
+        const producers: Array<Record<string, any>> = [];
+        for (const row of rows) {
+          const doc = JSON.parse(row.value);
+          if (typeof row.key !== "string" || !doc || typeof doc.id !== "string" || !doc.id) throw new Error("malformed archive199 writer evidence");
+          if (row.key.startsWith("pair_refresh_writer_window_")) {
+            if (!row.key.startsWith("pair_refresh_writer_window_v1:document:") || !["preparing", "unjournalled_publication_possible"].includes(doc.phase)
+              || !(doc.repo_id === null || typeof doc.repo_id === "string" && doc.repo_id.length > 0)) throw new Error("malformed archive199 writer window");
+            if (doc.repo_id === null || doc.repo_id === id) return false;
+          } else if (row.key.startsWith("git_to_svn_commit_v1:document:") || row.key.startsWith("svn_to_git_push_v1:document:")) {
+            if (typeof doc.repo_id !== "string" || !doc.repo_id || typeof doc.state !== "string") throw new Error("malformed archive199 producer journal");
+            if (doc.repo_id === id) producers.push(doc);
+          } else throw new Error("unknown archive199 writer evidence");
+        }
+        last.stage = "producer-completion";
+        if (producers.some(doc => doc.state !== "completed")) return false;
+        last.stage = "source-producer-witness";
+        if (sourceSha && !producers.some(doc => doc.id && doc.source_git_sha === sourceSha && doc.state === "completed")) return false;
+        last.stage = "disabled-config";
+        const config = await this.api("GET", `/api/repos/${id}`);
+        last.config = {httpStatus: config.status, id: (config.json as any)?.id, enabled: (config.json as any)?.enabled};
+        if (config.status !== 200 || (config.json as any)?.enabled !== false) return false;
+        if (sourceSha) {
+          last.stage = "source-checkpoint";
+          const snap = await this.snap(pair);
+          if (snap.git !== sourceSha || snap.gitWatermark !== sourceSha) return false;
+          last.stage = "single-receipt";
+          await this.assertSingleReceipt(pair, "git_to_svn", sourceSha);
+        }
+        this.observation("archive199-quiet-writer", {pairId: id, sourceSha, status, producers, enabled: false});
+        return true;
+      }, 90_000);
+    } catch (error) {
+      try { this.observation("archive199-quiet-failure", {pairId: id, sourceSha, ...last}); }
+      catch { /* Diagnostic failure must not replace the original failure. */ }
+      throw error;
+    }
+  }
+
+  // #199 browser publication must use P's real preview/publish UI, never the
+  // predecessor createChildPair's single POST contract.
+  async archive199CreateChildUi(parent: Pair, branchName: string): Promise<Pair> {
+    const branch = safeRelativePath(branchName);
+    if (branch.includes("/")) throw new Error("archive199 fixtures use one-level branch names");
+    if ((await this.repos()).some(row => row.parent_id === parent.id && row.git_branch === branch)) {
+      this.gap("BLOCKED: archive199 child already exists; no fresh browser creation witness");
+    }
+    await this.archive199AdmitPublicationScheduler();
+    const scheduling = await this.api("GET", `/api/repos/${parent.id}`);
+    if (scheduling.status !== 200 || (scheduling.json as any)?.enabled !== true || (scheduling.json as any)?.poll_interval_secs !== 3600) throw new Error("archive199 child creation requires its admitted enabled publication parent");
+    const parentBefore = await this.snap(parent);
+    await this.commitGit(parent, `git branch ${branch}\ngit push origin refs/heads/${branch}:refs/heads/${branch}\n`);
+    const heads = await this.gitRemoteHeads(parent);
+    if (heads[`refs/heads/${branch}`] !== parentBefore.git) throw new Error("child Git seed is not the observed SVN-derived parent tip");
+    const login = await this.uiLogin(this.adminUser, this.adminPassword);
+    if (login.status !== 200) throw new Error("archive199 administrator browser login failed");
+    await expect(this.page).toHaveURL(/\/$/);
+    await this.page.goto(`/repos/${parent.id}?section=branches`);
+    await this.page.getByRole("button", {name: "Add Branch Pair", exact: true}).click();
+    const dialog = this.page.getByRole("dialog", {name: "Review Branch Pair", exact: true});
+    await dialog.getByLabel(/Branch Name/).fill(branch);
+    await dialog.getByLabel(/SVN Branch Path/).fill(`branches/${branch}`);
+    const endpoint = `/api/repos/${parent.id}/branches`;
+    const reply = (action: string) => this.page.waitForResponse(response => {
+      if (new URL(response.url()).pathname !== endpoint || response.request().method() !== "POST") return false;
+      return response.request().postDataJSON()?.action === action;
+    });
+    const previewResponse = reply("preview");
+    await dialog.getByRole("button", {name: "Preview Pair", exact: true}).click();
+    const preview = await previewResponse; const plan = await preview.json();
+    if (preview.status() !== 200 || !plan.admitted || !plan.review_pin || plan.conflicts?.length || plan.git_branch !== branch || plan.svn_branch !== `branches/${branch}`) {
+      this.observation("archive199-child-preview-refused", {status: preview.status(), plan});
+      this.gap("BLOCKED: real browser child-pair preview did not admit this exact SVN-origin branch");
+    }
+    const publishResponse = reply("publish");
+    await dialog.getByRole("button", {name: "Publish reviewed result", exact: true}).click();
+    const published = await publishResponse; let result = await published.json();
+    if (published.status() !== 200 || result.review_pin !== plan.review_pin || !result.operation_id) {
+      throw new Error("browser publish did not retain the reviewed operation identity");
+    }
+    // Only inspect the admitted operation. No implicit resume or replacement.
+    await this.waitUntil(async () => {
+      if (result.published === true && result.scheduler_active === true) return true;
+      if (["failed", "reconciliation_required", "cancelled"].includes(result.pair_state)) this.gap("BLOCKED: child publication is held or failed");
+      const response = reply("status");
+      await dialog.getByRole("button", {name: "Inspect operation", exact: true}).click();
+      const observed = await response;
+      if (observed.status() !== 200) throw new Error("child operation inspection failed");
+      const next = await observed.json();
+      if (next.operation_id !== result.operation_id) throw new Error("child operation identity changed");
+      result = next; return result.published === true && result.scheduler_active === true;
+    }, 120_000);
+    const rows = (await this.repos()).filter(row => row.parent_id === parent.id && row.git_branch === branch);
+    if (rows.length !== 1 || rows[0].svn_url !== parent.svnUrl || rows[0].svn_branch !== `branches/${branch}` || rows[0].git_repo !== parent.gitRepo) throw new Error("published child identity/remotes differ from reviewed request");
+    const pair: Pair = {id: rows[0].id, name: parent.name, svnUrl: parent.svnUrl, gitRepo: parent.gitRepo, parentId: parent.id, gitBranch: branch, svnBranch: `branches/${branch}`};
+    const childConfig = await this.api("GET", `/api/repos/${pair.id}`);
+    if (childConfig.status !== 200 || (childConfig.json as any)?.poll_interval_secs !== 3600 || (childConfig.json as any)?.enabled !== true) throw new Error("archive199 child did not inherit admitted long scheduling interval");
+    // Publication admits the child enabled. Disable only this owned fixture;
+    // an already-started writer must genuinely exit before further setup.
+    await this.archive199ConfigureScheduling(pair, false, 3600);
+    await this.archive199WaitQuiet(pair);
+    this.observation("archive199-created-child", {parentBefore, seedTip: heads[`refs/heads/${branch}`], plan, published: result, pair});
+    return pair;
+  }
+
+  async archive199DeleteUi(pair: Pair, side: Archive199Side): Promise<{status: number; json: any}> {
+    if (!pair.parentId || !pair.gitBranch || !pair.svnBranch) throw new Error("archive199 requires an observed child pair");
+    const login = await this.uiLogin(this.adminUser, this.adminPassword);
+    if (login.status !== 200) throw new Error("archive199 administrator browser login failed");
+    await expect(this.page).toHaveURL(/\/$/);
+    await this.page.goto(`/repos/${pair.id}?section=settings`);
+    await this.page.getByTestId("delete-viewed-branch-pair").click();
+    await this.page.getByTestId(`delete-${side}-opt`).check();
+    await this.page.getByTestId("delete-branch-confirm-input").fill(side === "git" ? pair.gitBranch : pair.svnBranch);
+    const reply = this.page.waitForResponse(response => new URL(response.url()).pathname === `/api/repos/${pair.id}/removal/approve` && response.request().method() === "POST");
+    await this.page.getByTestId("confirm-delete-branch-pair").click();
+    const response = await reply; const request = response.request().postDataJSON(); const result = await response.json();
+    if (request.archive_pair !== true || request.delete_git !== (side === "git") || request.delete_svn !== (side === "svn") || !request.review_pin) throw new Error("browser sent a different archive disposition");
+    this.observation("archive199-browser-approval", {pairId: pair.id, side, request, status: response.status(), result});
+    if (response.status() !== 200 || !result.ok || result.state !== "completed" || result.archive_pair !== true || result.registration_listed !== true || result.restore_supported !== false) throw new Error("archive completion was not confirmed by the real API");
+    await expect(this.page.getByTestId("archived-pair-notice")).toBeVisible();
+    if (new URL(this.page.url()).pathname !== `/repos/${pair.id}`) throw new Error("archive removed the retained detail route");
+    await expect(this.page.getByTestId("header-sync-switch")).toBeDisabled();
+    await expect(this.page.getByTestId("delete-viewed-branch-pair")).toHaveCount(0);
+    return {status: response.status(), json: result};
+  }
+
+  async archive199Observe(pair: Pair, allowedAbsentSide?: Archive199Side, baseline?: Archive199Observation): Promise<Archive199Observation> {
+    const id = safe(pair.id, "repo id"), branch = safeRelativePath(pair.gitBranch || "");
+    if (!pair.parentId || !/^branches\/[A-Za-z0-9_.-]+$/.test(pair.svnBranch || "") || !/^lab\/[A-Za-z0-9_.-]+$/.test(pair.gitRepo) || !/^https:\/\/(svn|fault-proxy):8443\/svn\/[A-Za-z0-9_.-]+$/.test(pair.svnUrl)) throw new Error("archive199 observation refuses non-fixture or non-child targets");
+    // Observation bypasses only our fault injection, never certificate/auth checks.
+    const direct = {...pair, svnUrl: pair.svnUrl.replace("https://fault-proxy:8443/", "https://svn:8443/")};
+    const heads = await this.gitRemoteHeads(direct), branches = await this.svnBranchNames(direct);
+    const gitPresent = Object.prototype.hasOwnProperty.call(heads, `refs/heads/${branch}`);
+    const svnPresent = branches.includes(pair.svnBranch!.slice("branches/".length));
+    if ((!gitPresent && allowedAbsentSide !== "git") || (!svnPresent && allowedAbsentSide !== "svn")) throw new Error("unexpected survivor absence; healthy parent inventories were read successfully");
+    let gitTree: string | null = null, gitHistory: string | null = null;
+    if (gitPresent) {
+      const dir = `/work/archive199-read-${id}-${randomBytes(4).toString("hex")}`;
+      const output = await this.observer(`set -eu\nmkdir -p ${dir}\ngit -C ${dir} init -q\nauth=$(printf '%s:%s' "$GIT_USER" "$GIT_TOKEN" | base64 | tr -d '\n')\ngit -C ${dir} -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca.crt fetch --no-tags https://gitea:3000/${pair.gitRepo}.git refs/heads/${branch}\ntest "$(git -C ${dir} rev-parse FETCH_HEAD)" = '${heads[`refs/heads/${branch}`]}'\ngit -C ${dir} ls-tree -r -t --full-tree FETCH_HEAD\nprintf '\nARCHIVE199_HISTORY\n'\ngit -C ${dir} rev-list --parents --topo-order FETCH_HEAD\n`);
+      const parts = output.split("\nARCHIVE199_HISTORY\n");
+      if (parts.length !== 2) throw new Error("invalid complete Git tree/history observation");
+      [gitTree, gitHistory] = parts;
+    }
+    let revision: string | null = null, svnTree: string | null = null, properties: string | null = null, history: string | null = null;
+    if (svnPresent) {
+      const latest = await this.observer(`set -eu\nsvn log --xml -l 1 --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" ${svnTarget(direct)}\n`);
+      revision = latest.match(/<logentry\s+revision="([0-9]+)"/)?.[1] ?? null;
+      if (!revision) throw new Error("SVN branch history revision was not observed");
+    }
+    else if (baseline) {
+      if (baseline.pairId !== pair.id || !baseline.svn.present) throw new Error("foreign or incomplete SVN baseline");
+      revision = baseline.svn.revision;
+    }
+    if (revision !== null) {
+      if (!/^[0-9]+$/.test(revision)) throw new Error("invalid observed SVN revision");
+      const target = `${svnTarget(direct)}@${revision}`;
+      const common = `--non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD"`;
+      const listing = await this.observer(`set -eu\nsvn list -R ${common} -r ${revision} ${target}\n`);
+      const entries = listing.split("\n").filter(Boolean).sort();
+      const hashes: Array<{path: string; sha256: string | null}> = [];
+      for (const path of entries) {
+        if (path.endsWith("/")) { safeRelativePath(path.slice(0, -1)); hashes.push({path, sha256: null}); continue; }
+        safeRelativePath(path);
+        const hash = (await this.observer(`set -eu\ntmp=$(mktemp)\ntrap 'rm -f "$tmp"' EXIT\nsvn cat ${common} -r ${revision} ${svnTarget(direct)}/${path}@${revision} > "$tmp"\nsha256sum "$tmp" | awk '{print $1}'\n`)).trim();
+        if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error("invalid SVN file digest"); hashes.push({path, sha256: hash});
+      }
+      svnTree = JSON.stringify(hashes);
+      const rawProperties = await this.observer(`set -eu\nsvn proplist -R --verbose --xml ${common} -r ${revision} ${target}\n`);
+      const rawHistory = await this.observer(`set -eu\nsvn log --xml --verbose ${common} -r ${revision}:1 ${target}\n`);
+      this.observation("archive199-svn-raw-xml", {pairId: pair.id, revision, properties: rawProperties, history: rawHistory});
+      properties = archive199CanonicalXml(rawProperties, "properties");
+      history = archive199CanonicalXml(rawHistory, "log");
+    }
+    const custody = (await this.sh("reposync", `set -eu\nroot=/var/lib/reposync/repos/${id}\ntest -d "$root" && test ! -L "$root"\ncd "$root"\ntmp=$(mktemp)\ntrap 'rm -f "$tmp"' EXIT\ntar --sort=name --format=gnu -cf "$tmp" .\nsha256sum "$tmp" | awk '{print $1}'\nfind . -printf '%p\\0' | tr -cd '\\000' | wc -c\n`, "root")).trim().split(/\s+/);
+    if (custody.length !== 2 || !/^[0-9a-f]{64}$/.test(custody[0]) || !/^[0-9]+$/.test(custody[1])) throw new Error("complete local custody observation unavailable");
+    return {pairId: id,
+      registration: await this.sqlRows(`SELECT * FROM repositories WHERE id='${id}' ORDER BY id;`),
+      maps: await this.sqlRows(`SELECT * FROM commit_map WHERE repo_id='${id}' ORDER BY rowid;`),
+      records: await this.sqlRows(`SELECT * FROM sync_records WHERE repo_id='${id}' ORDER BY rowid;`),
+      audit: await this.sqlRows(`SELECT * FROM audit_log WHERE repo_id='${id}' ORDER BY rowid;`),
+      archiveJournal: await this.sqlRows(`SELECT key,json_extract(value,'$.id') AS operation_id,json_extract(value,'$.operation_id') AS tombstone_operation_id,json_extract(value,'$.state') AS state,json_extract(value,'$.retention') AS retention,json_extract(value,'$.restore_supported') AS restore_supported FROM kv_state WHERE json_valid(value) AND (key LIKE 'managed_remove_v1:%:${id}' OR key IN (SELECT 'managed_remove_v1:document:'||value FROM kv_state WHERE key='managed_remove_v1:active:${id}')) ORDER BY key;`),
+      localCustody: {sha256: custody[0], entries: Number(custody[1])},
+      git: {present: gitPresent, tip: heads[`refs/heads/${branch}`] ?? null, tree: gitTree, history: gitHistory, heads},
+      svn: {present: svnPresent, revision, tree: svnTree, properties, history, branches}};
+  }
+
+  private async archive199ProcessIdentity(): Promise<{container: string; startedAt: string; pid: number}> {
+    const result = await exec("docker", ["compose", "-p", this.project, "-f", this.composeFile, "ps", "-q", "reposync"], {timeout: 10_000});
+    const container = result.stdout.trim(); if (!/^[0-9a-f]{12,64}$/.test(container)) throw new Error("ambiguous owned daemon container");
+    const inspected = await exec("docker", ["inspect", "--format", "{{json .}}", container], {timeout: 10_000});
+    const item = JSON.parse(inspected.stdout);
+    if (item.Config?.Labels?.["com.docker.compose.project"] !== this.project || item.Config?.Labels?.["com.docker.compose.service"] !== "reposync" || !item.State?.Running || !Number.isSafeInteger(item.State.Pid) || item.State.Pid <= 0 || !item.State.StartedAt) throw new Error("owned daemon process identity is unavailable");
+    return {container, startedAt: item.State.StartedAt, pid: item.State.Pid};
+  }
+
+  async archive199RestartAndWitnessCycle(controlPair: Pair) {
+    const beforeProcess = await this.archive199ProcessIdentity();
+    const before = await this.snap(controlPair);
+    await this.restartDaemon();
+    const afterProcess = await this.archive199ProcessIdentity();
+    if (afterProcess.container !== beforeProcess.container || afterProcess.startedAt === beforeProcess.startedAt) throw new Error("no real same-owned-container restart witnessed");
+    const file = `archive199-cycle-${randomBytes(5).toString("hex")}.txt`;
+    const bytes = `archive199 witnessed restart ${randomBytes(8).toString("hex")}`;
+    await this.syncGitChange(controlPair, `printf '%s' '${bytes}' > ${file}\ngit add ${file}\ngit commit -m 'archive199 restart cycle'\n`);
+    await this.waitUntil(async () => { const now = await this.snap(controlPair); return now.gitWatermark === now.git && now.git !== before.git && Number(now.svn) > Number(before.svn); });
+    const after = await this.snap(controlPair);
+    await this.assertSingleReceipt(controlPair, "git_to_svn", after.git);
+    if (await this.svnBytes(controlPair, file) !== bytes) throw new Error("post-restart cycle did not publish exact control bytes");
+    const evidence = {beforeStartedAt: beforeProcess.startedAt, afterStartedAt: afterProcess.startedAt,
+      beforeProcess, afterProcess, before, after, controlPairId: controlPair.id, file, bytes};
+    this.observation("archive199-restart-cycle", evidence);
+    return evidence;
+  }
+
+  async archive199NonAdminDenial(pair: Pair) {
+    await this.admin(); await this.enableLdap();
+    const review = await this.api("POST", `/api/repos/${pair.id}/removal/review`, {archive_pair: true, delete_git: true, delete_svn: false});
+    const plan = review.json as {review_pin?: string} | null;
+    if (review.status !== 200 || !plan?.review_pin) this.gap("BLOCKED: administrator control cannot obtain current archive review");
+    const before = await this.archive199Observe(pair);
+    const login = await this.uiLogin("alice", this.alicePassword);
+    assertLdapUser(login, "alice");
+    const identity = (login.json as {token: string; user: {id: string; username: string; role: string}});
+    if (!identity.user.id || identity.user.role === "admin" || !["user", "viewer"].includes(identity.user.role)) throw new Error("LDAP identity is not a positively verified non-administrator");
+    // The login response precedes client-session persistence and React navigation.
+    await expect(this.page).toHaveURL(/\/$/);
+    await this.page.goto(`/repos/${pair.id}?section=settings`);
+    await expect(this.page.getByTestId("repo-detail-heading")).toBeVisible();
+    await expect(this.page.getByTestId("delete-viewed-branch-pair")).toHaveCount(0);
+    const refused = [];
+    for (const action of ["review", "approve"] as const) {
+      const response = await this.api("POST", `/api/repos/${pair.id}/removal/${action}`, {archive_pair: true, delete_git: true, delete_svn: false, ...(action === "approve" ? {review_pin: plan!.review_pin, request_id: `archive199-denied-${randomBytes(6).toString("hex")}`} : {})}, identity.token);
+      if (response.status !== 403 || (response.json as {operation_id?: string})?.operation_id) throw new Error("non-admin archive did not receive actual server authorization denial");
+      refused.push({action, status: response.status, json: response.json});
+    }
+    const after = await this.archive199Observe(pair);
+    expect(after).toEqual(before);
+    const evidence = {user: identity.user, uiControlsAbsent: true, review: refused[0], approve: refused[1], before, after};
+    this.observation("archive199-nonadmin-denial", evidence);
+    return evidence;
+  }
+
+  /** Exact byte-preserving insertion; never change another host's options. */
+  archive199ProxyConfig(contents: string): string {
+    if (contents.includes("\0")) throw new Error("invalid SVN config bytes");
+    const suffix = "\n# archive199 owned proxy framing\n[archive199-proxy]\nhttp-chunked-requests = no\n";
+    const mapping = "archive199-proxy = fault-proxy\n";
+    const lines = contents.match(/[^\n]*\n|[^\n]+$/g) || [];
+    let section = "", offset = 0, groupEnd = -1, groups = 0, proxies = 0;
+    const groupLines: string[] = [], proxyLines: string[] = [];
+    for (const line of lines) {
+      const trimmed = line.trim(), header = trimmed.match(/^\[([^\]]+)\]$/);
+      if (trimmed.startsWith("[") && !header) throw new Error("ambiguous SVN config section");
+      if (header) {
+        section = header[1].trim().toLowerCase();
+        if (section === "groups") { groups++; groupEnd = offset + line.length; }
+        if (section === "archive199-proxy") proxies++;
+      } else if (trimmed && !/^[#;]/.test(trimmed)) {
+        if (section === "groups") groupLines.push(trimmed);
+        if (section === "archive199-proxy") proxyLines.push(trimmed);
+      }
+      offset += line.length;
+    }
+    if (groups > 1 || proxies > 1) throw new Error("duplicate proxy configuration sections");
+    if (proxies || contents.includes("# archive199 owned proxy framing")) {
+      if (groups !== 1 || proxies !== 1 || !contents.endsWith(suffix) ||
+          groupLines.length !== 1 || groupLines[0] !== mapping.trim() ||
+          proxyLines.length !== 1 || proxyLines[0] !== "http-chunked-requests = no" ||
+          contents.split("# archive199 owned proxy framing").length !== 2) throw new Error("unowned or changed proxy configuration");
+      return contents;
+    }
+    if (groupLines.length) throw new Error("existing nonempty SVN host groups");
+    if (groups) {
+      const separator = contents.slice(0, groupEnd).endsWith("\n") ? "" : "\n";
+      return contents.slice(0, groupEnd) + separator + mapping + contents.slice(groupEnd) + suffix;
+    }
+    return contents + "\n[groups]\n" + mapping + suffix;
+  }
+
+  /** Per-host request framing in the disposable daemon's default SVN config. */
+  async archive199ConfigureProxyFraming(): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{8,80}$/.test(this.project)) throw new Error("invalid owned proxy configuration identity");
+    const process = await this.archive199ProcessIdentity();
+    const inspected = await exec("docker", ["inspect", "--format", "{{json .Config.Labels}}", process.container], {timeout: 10_000});
+    const labels = JSON.parse(inspected.stdout);
+    if (labels["acceptance-lab.disposable"] !== "true" || labels["acceptance-lab.run-id"] !== required("RUN_ID")) throw new Error("proxy framing requires the exact disposable run");
+    // Ordinary SvnClient uses $HOME/.subversion, not SVN_CONFIG_DIR.
+    const admission = String.raw`set -eu
+runuser -u reposync -- sh -s <<'ARCHIVE199_PROCESS'
+set -eu
+count=0
+for proc in /proc/[0-9]*; do
+  exe=$(readlink "$proc/exe" 2>/dev/null || true)
+  if [ "$exe" = /usr/local/bin/reposync-daemon ]; then
+    count=$((count + 1))
+    test "$(tr '\000' '\n' < "$proc/environ" | grep '^HOME=')" = HOME=/var/lib/reposync
+    test "$(awk '/^Uid:/ {print $2}' "$proc/status")" = "$(id -u reposync)"
+  fi
+done
+test "$count" = 1
+ARCHIVE199_PROCESS
+for path in /var /var/lib /var/lib/reposync; do test -d "$path"; test ! -L "$path"; done
+test "$(stat -c %u /var/lib/reposync)" = "$(id -u reposync)"
+runuser -u reposync -- sh -s <<'ARCHIVE199_CONFIG'
+set -eu
+cd /var/lib/reposync
+test ! -L .subversion
+if [ ! -e .subversion ]; then mkdir .subversion; fi
+test -d .subversion
+test "$(stat -c %u .subversion)" = "$(id -u)"
+file=.subversion/servers
+test ! -L "$file"
+if [ -e "$file" ]; then
+  test -f "$file"
+  test "$(stat -c %u "$file")" = "$(id -u)"
+  test "$(stat -c %h "$file")" = 1
+  test "$(stat -c %s "$file")" -le 1048576
+else
+  (set -C; : > "$file")
+fi
+`;
+    const encoded = (await this.sh("reposync", admission + 'base64 "$file"\nARCHIVE199_CONFIG\n', "root")).replace(/\s/g, "");
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) throw new Error("invalid config readback");
+    const bytes = Buffer.from(encoded, "base64"), contents = bytes.toString("utf8");
+    if (!Buffer.from(contents).equals(bytes)) throw new Error("invalid config UTF8");
+    const next = this.archive199ProxyConfig(contents);
+    const before = createHash("sha256").update(bytes).digest("hex");
+    const after = createHash("sha256").update(next).digest("hex");
+    const replacement = Buffer.from(next).toString("base64");
+    const receipt = await this.sh("reposync", admission + `test "$(sha256sum "$file" | cut -d ' ' -f 1)" = '${before}'
+printf '%s' '${replacement}' | base64 -d > "$file"
+test "$(sha256sum "$file" | cut -d ' ' -f 1)" = '${after}'
+printf '%s\\n' '${after}'
+ARCHIVE199_CONFIG
+`, "root");
+    if (receipt.trim() !== after) throw new Error("missing proxy framing option readback");
+    this.observation("archive199-proxy-framing", {path:"/var/lib/reposync/.subversion/servers", host:"fault-proxy", httpChunkedRequests:"no", before, after});
+  }
+
+
+  /** Only the run-owned proxy control namespace; never changes TLS/auth policy. */
+  async archive199GateControl(body?: Record<string, unknown>): Promise<Archive199Gate> {
+    const root = new URL(required("LAB_FAULT_CONTROL_URL"));
+    if (root.protocol !== "http:" || root.hostname !== "127.0.0.1" || !root.port || root.pathname !== "/" || root.username || root.password || root.search || root.hash) throw new Error("archive199 gate requires the owned published loopback port");
+    const response = await fetch(new URL("archive199/gate", root), {method: body ? "POST" : "GET",
+      headers: {"content-type": "application/json"}, body: body ? JSON.stringify(body) : undefined,
+      redirect: "error", signal: AbortSignal.timeout(5000)});
+    const result = await response.json() as {ok?: boolean; gate?: Archive199Gate};
+    if (response.status !== 200 || result.ok !== true || !result.gate?.state) throw new Error(`archive199 gate control refused (${response.status})`);
+    return result.gate;
+  }
+
+  /** Post-oracle drain only: preserve durable holds, never resume or repair them. */
+  async archive199DrainGuard(original: Pair): Promise<void> {
+    if (!original.parentId || !/^archive199-(busy|held)/.test(original.gitBranch || "")
+      || !/^https:\/\/svn:8443\/svn\/[A-Za-z0-9_.-]+$/.test(original.svnUrl)) throw new Error("guard drain requires its dedicated synthetic child");
+    const id = safe(original.id, "repo id");
+    const pair = {...original, svnUrl: original.svnUrl.replace("https://svn:8443/", "https://fault-proxy:8443/")};
+    const initial = await this.api("GET", `/api/repos/${id}`);
+    const row = initial.json as any;
+    if (initial.status !== 200 || row?.id !== id || row.parent_id !== pair.parentId || row.git_branch !== pair.gitBranch
+      || row.svn_branch !== pair.svnBranch || row.svn_url !== pair.svnUrl || row.git_repo !== pair.gitRepo) throw new Error("guard drain refuses changed fixture identity");
+    await this.archive199ConfigureScheduling(pair, false, 3600);
+    await this.waitUntil(async () => {
+      const response = await this.api("GET", `/api/status?repo_id=${encodeURIComponent(id)}`);
+      const observed = (response.json as any)?.observation;
+      if (response.status !== 200 || observed?.repository_id !== id || observed.evidence_complete !== true || observed.registry_busy !== false
+        || !Array.isArray(observed.operations) || observed.operations.some((op: any) => op.held !== true && !["completed", "cancelled"].includes(op.state))) return false;
+      const windows = await this.sqlRows("SELECT key,value FROM kv_state WHERE key LIKE 'pair_refresh_writer_window_%';");
+      for (const window of windows) {
+        const doc = JSON.parse(window.value);
+        if (typeof window.key !== "string" || !window.key.startsWith("pair_refresh_writer_window_v1:document:")
+          || !doc || typeof doc.id !== "string" || !doc.id || !["preparing", "unjournalled_publication_possible"].includes(doc.phase)
+          || !(doc.repo_id === null || typeof doc.repo_id === "string" && doc.repo_id.length > 0)) throw new Error("malformed guard drain writer window");
+        if (doc.repo_id === null || doc.repo_id === id) return false;
+      }
+      const config = await this.api("GET", `/api/repos/${id}`);
+      if (config.status !== 200 || (config.json as any)?.id !== id || (config.json as any)?.enabled !== false
+        || (config.json as any)?.svn_url !== pair.svnUrl || (config.json as any)?.git_repo !== pair.gitRepo) return false;
+      this.observation("archive199-post-refusal-drain", {pairId: id, enabled: false, status: response.json, windows, durableHoldsPreserved: true});
+      return true;
+    }, 90_000);
+  }
+
+  async archive199WitnessRefusal(original: Pair, kind: "busy" | "held") {
+    if (!original.parentId || !original.gitBranch?.startsWith(`archive199-${kind}`) || !/^https:\/\/svn:8443\/svn\/[A-Za-z0-9_.-]+$/.test(original.svnUrl)) throw new Error("refusal requires its dedicated synthetic child on the lab SVN origin");
+    if (!/^[A-Za-z0-9_-]{8,80}$/.test(this.project)) throw new Error("invalid owned gate run identity");
+    await this.admin();
+    await this.archive199ConfigureProxyFraming();
+    const pair = {...original, svnUrl: original.svnUrl.replace("https://svn:8443/", "https://fault-proxy:8443/")};
+    const saved = await this.api("PUT", `/api/repos/${pair.id}`, {svn_url: pair.svnUrl});
+    if (saved.status !== 200 || (saved.json as any)?.svn_url !== pair.svnUrl || (saved.json as any)?.id !== pair.id) this.gap("BLOCKED: dedicated guard fixture could not be routed through the owned proxy");
+    const choices = {archive_pair: true, delete_git: true, delete_svn: false};
+    // Establish an admissible review against the exact rerouted configuration.
+    const initialReview = await this.api("POST", `/api/repos/${pair.id}/removal/review`, choices);
+    if (initialReview.status !== 200 || !(initialReview.json as any)?.review_pin) this.gap("BLOCKED: fresh proxy-configured archive review is unavailable");
+    const ownerToken = randomBytes(32).toString("hex"), requestId = `archive199-${randomBytes(12).toString("hex")}`;
+    this.rememberSecret(ownerToken);
+    const identity = {owner_token: ownerToken, run_id: this.project, request_id: requestId};
+    if (!/^branches\/[A-Za-z0-9_.-]+$/.test(pair.svnBranch || "")) throw new Error("invalid owned producer branch path");
+    const scope = new URL(pair.svnUrl).pathname;
+    const target = `${scope}/${pair.svnBranch}`, phase = kind === "busy" ? "before-forward" : "after-forward";
+    const arm = {...identity, action: "arm", method: "MERGE", target, scope_path: scope, phase, timeout_seconds: 120};
+    let gate = await this.archive199GateControl(arm), terminal = false, primaryFailed = false;
+    const journal = async () => {
+      const rows = await this.sqlRows(`SELECT value FROM kv_state WHERE key=(SELECT 'git_to_svn_commit_v1:document:'||value FROM kv_state WHERE key='git_to_svn_commit_v1:active:${safe(pair.id, "repo id")}');`);
+      return rows.length === 1 ? JSON.parse(rows[0].value) as Record<string, any> : null;
+    };
+    try {
+      const file = `archive199-producer-${randomBytes(5).toString("hex")}.txt`;
+      const source = await this.commitGit(pair, `printf '%s' 'owned archive refusal producer' > ${file}\ngit add ${file}\ngit commit -m 'archive199 producer barrier'\n`);
+      const trigger = await this.triggerGit(pair.gitRepo, false);
+      if (trigger !== 200) this.gap("BLOCKED: actual source producer was not triggered");
+      try {
+        await this.waitUntil(async () => {
+          gate = await this.archive199GateControl();
+          if (["aborted", "timed_out"].includes(gate.state)) this.gap(`BLOCKED: owned producer barrier ended without a witness: ${gate.error || gate.state}`);
+          return gate.state === "blocked";
+        }, 60_000);
+      } catch (error) {
+        this.observation("archive199-missing-producer-barrier", {kind, source, gate, error: String(error)});
+        this.gap("BLOCKED: no exact owned SVN MERGE producer barrier was witnessed");
+      }
+      if (gate.run_id !== this.project || gate.request_id !== requestId || gate.method !== "MERGE" || gate.target !== target || gate.scope_path !== scope || gate.phase !== phase || !gate.matched_at || !gate.witnessed_at) this.gap("BLOCKED: producer barrier identity or phase does not match this operation");
+      const barrier = {...gate};
+      if (kind === "held") {
+        if (gate.upstream_response_complete !== true || !gate.response_status || gate.response_status < 200 || gate.response_status >= 300) this.gap("BLOCKED: no complete successful upstream producer response was witnessed");
+        await this.archive199GateControl({...identity, action: "abort"}); terminal = true;
+        // Dropping a response is NOT itself a durable hold. Observe the actual
+        // producer journal; a completed/reconciled operation must not pass.
+        try { await this.waitUntil(async () => (await journal())?.state === "reconciliation_required", 30_000); }
+        catch (error) {
+          this.observation("archive199-held-not-demonstrated", {barrier, producerJournal: await journal(), error: String(error)});
+          this.gap("BLOCKED: after-forward lost response did not produce an observed durable reconciliation hold");
+        }
+      }
+      const producerJournal = await journal();
+      const expectedStates = kind === "busy" ? ["running", "queued", "intent_recorded"] : ["reconciliation_required", "held"];
+      if (!producerJournal?.id || producerJournal.repo_id !== pair.id || producerJournal.source_git_sha !== source || !expectedStates.includes(producerJournal.state)) this.gap("BLOCKED: barrier has no matching actual durable producer journal/state");
+      // Source advanced after the initial review. Recapture now, under the
+      // witnessed barrier, so stale-pin rejection cannot masquerade as busy.
+      const freshReview = await this.api("POST", `/api/repos/${pair.id}/removal/review`, choices);
+      if (freshReview.status !== 200 || !(freshReview.json as any)?.review_pin) this.gap("BLOCKED: current-target review could not be captured under producer barrier");
+      const before = await this.archive199Observe(pair);
+      const response = await this.api("POST", `/api/repos/${pair.id}/removal/approve`, {...choices, review_pin: (freshReview.json as any).review_pin, request_id: `archive199-refuse-${randomBytes(12).toString("hex")}`});
+      const after = await this.archive199Observe(pair);
+      const finalJournal = await journal();
+      const finalGate = await this.archive199GateControl();
+      if (!finalJournal || finalJournal.id !== producerJournal.id || !expectedStates.includes(finalJournal.state) || (kind === "busy" && finalGate.state !== "blocked")) this.gap("BLOCKED: actual producer barrier/hold did not cover the complete refusal observation");
+      const reason = kind === "busy" ? `writer ${producerJournal.state}` : `reconciliation hold: ${producerJournal.outcome_detail || producerJournal.state}`;
+      const evidence = {kind, before, after, response: {status: response.status, json: response.json},
+        sourceWitness: {gitSha: source, file, trigger}, barrier,
+        witness: {owner: createHash("sha256").update(ownerToken).digest("hex"), runId: this.project, requestId, method: "MERGE", target, phase,
+          matched: true, producerJournal, reason, finalJournal, finalGate}};
+      this.observation(`archive199-${kind}-refusal`, evidence);
+      return evidence;
+    } catch (error) {
+      primaryFailed = true;
+      throw error;
+    } finally {
+      if (!terminal) {
+        try {
+          const current = await this.archive199GateControl();
+          if (current.run_id === this.project && current.request_id === requestId && ["armed", "inflight", "blocked"].includes(current.state)) await this.archive199GateControl({...identity, action: "abort"});
+        } catch (cleanupError) {
+          if (!primaryFailed) throw cleanupError;
+          // Keep the original refusal failure authoritative; cleanup is still
+          // bounded and its failure remains visible in the local test receipt.
+          this.info.annotations.push({type: "labCleanupFailure", description: "owned archive199 gate cleanup failed after the primary test failure"});
+        }
+      }
+    }
   }
 
   async deniedLines(): Promise<number> {

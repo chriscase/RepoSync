@@ -1,11 +1,12 @@
 # Acceptance-lab daemon image. Builds the real daemon and the shipped React
 # bundle. It does not replace the repository's production Dockerfile.
-# The default Rust tag matches Dockerfile.reliability. It does not show that
+# This independently pinned lab compiler does not alter Dockerfile.reliability
+# (1.98.1). It does not show that
 # the product Dockerfile (rust:1.83-bookworm) or its MSRV builds.
 # Pins are build args so prepare can record the toolchain identity.
 
 ARG DEBIAN_IMAGE=debian:bookworm-slim
-ARG RUST_IMAGE=rust:1.98.1-bookworm
+ARG RUST_IMAGE=rust:1.99.0-bookworm
 ARG NODE_IMAGE=node:22.14.0-bookworm-slim
 
 FROM ${NODE_IMAGE} AS ui
@@ -17,7 +18,7 @@ RUN npm run build
 RUN test -f dist/index.html
 
 FROM ${RUST_IMAGE} AS rust
-ARG RUST_IMAGE=rust:1.98.1-bookworm
+ARG RUST_IMAGE=rust:1.99.0-bookworm
 ARG RUST_REPO_DIGEST=unrecorded
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends \

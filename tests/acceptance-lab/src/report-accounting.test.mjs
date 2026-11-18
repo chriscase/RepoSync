@@ -19,26 +19,64 @@ const planPath = join(labRoot, "catalog/qualification-plan.json");
 const catalog = JSON.parse(await readFile(catalogPath, "utf8"));
 const matrix = JSON.parse(await readFile(matrixPath, "utf8"));
 const plan = JSON.parse(await readFile(planPath, "utf8"));
+const archiveCaseIds = [
+  "LAB_PAIR_DELETE_GIT_SIDE_ONLY",
+  "LAB_PAIR_DELETE_SVN_SIDE_ONLY",
+  "LAB_PAIR_DELETE_SIDE_REFUSED_DURING_SYNC",
+  "LAB_PAIR_DELETE_SIDE_UNAUTHORIZED",
+];
+const receivingCriteria = {
+  RS63_CANONICAL_TYPED_OUTCOMES: ["R09"],
+  RS63_DEFERRED_V12_THEN_V14: ["R09", "R21"],
+  RS63_FIELDLESS_GEN2_RECEIPT: ["R09"],
+  RS63_GIT_PROBE_TIMEOUT_KILLS_CHILD: ["R09"],
+  RS63_OPERATIONAL_V14_NO_PAIR_TABLES: ["R09"],
+  RS63_PATH_INCARNATION_HOLD: ["R09", "R15"],
+  RS63_RS11_REDACTION_AND_PARENT_ROTATION: ["R09"],
+  RS63_SVN_UUID_IDENTITY_HOLD: ["R09", "R15"],
+  STARTUP_V14: ["R21"],
+};
+const receivingIds = Object.keys(receivingCriteria);
+const matrixIds = new Set(matrix.harness_case_ids || []);
+for (const row of matrix.scenarios) {
+  for (const id of [row.id, ...(row.required_case_ids || []), ...(row.supporting_case_ids || [])]) matrixIds.add(id);
+}
+const usesHistoricalMatrix = matrixIds.has("STARTUP_V12");
+const expectedMatrixOnlyCount = usesHistoricalMatrix ? 330 : 338;
+const requiredCaseCount = 524 + archiveCaseIds.length + receivingIds.length;
 const controls = plan.required_case_ids.filter((id) => id.startsWith("HARNESS_"));
 const pass = (id, extra = {}) => ({ id, status: "PASS", qualification: "executed", ...extra });
 const account = (rows, options = {}) => accountReport({ rows, selectedIds: ["selected"], requiredIds: ["selected", "other"], ...options });
 
-test("the retained plan contains all 524 accepted obligations and the 330 matrix-only ids", async () => {
+test("the plan retains historical, single-side archive and receiving-matrix obligations", async () => {
   validateQualificationPlan(plan);
   const ids = new Set(controls);
-  const matrixIds = new Set(matrix.harness_case_ids || []);
-  for (const row of matrix.scenarios) {
-    matrixIds.add(row.id);
-    for (const id of [...(row.required_case_ids || []), ...(row.supporting_case_ids || [])]) matrixIds.add(id);
+  const transitionIds = ["STARTUP_V12", ...receivingIds];
+  const declared = transitionIds.filter((id) => matrixIds.has(id));
+  assert.deepEqual(declared, usesHistoricalMatrix ? ["STARTUP_V12"] : receivingIds);
+  for (const [id, criteria] of Object.entries(receivingCriteria)) {
+    assert.deepEqual(plan.r_criteria_by_case[id], criteria, id);
+    if (!usesHistoricalMatrix) {
+      const actual = matrix.scenarios.filter((row) =>
+        row.required_case_ids?.includes(id) || row.supporting_case_ids?.includes(id)).map((row) => row.id);
+      assert.deepEqual(actual.sort(), [...criteria].sort(), id);
+    }
   }
+  for (const id of transitionIds) ids.add(id);
   const operationIds = new Set(catalog.operations.map((op) => op.id));
   for (const id of [...operationIds, ...matrixIds]) ids.add(id);
   const frozen = JSON.parse(await readFile(join(labRoot, "catalog/operation-catalog.json"), "utf8"));
   for (const op of frozen.operations) ids.add(op.id);
-  assert.equal(controls.length, 18);
-  assert.equal([...matrixIds].filter((id) => !operationIds.has(id)).length, 330);
-  assert.equal(ids.size, 524);
   assert.deepEqual([...ids].sort(), [...plan.required_case_ids].sort());
+  assert.equal(controls.length, 18);
+  assert.equal([...matrixIds].filter((id) => !operationIds.has(id)).length, expectedMatrixOnlyCount);
+  assert.equal([...operationIds].filter((id) => !archiveCaseIds.includes(id)).length, 176);
+  for (const id of archiveCaseIds) {
+    const operation = catalog.operations.find((op) => op.id === id);
+    assert.equal(operation?.suite, "full", id);
+    assert.equal(operation.disposition, "execute", id);
+  }
+  assert.equal(ids.size, requiredCaseCount);
 });
 
 test("all required rows passing is necessary for whole-plan PASS", () => {
@@ -147,27 +185,40 @@ async function syntheticReport(suite, options = {}) {
   }
 }
 
-test("counterfactual full executor success is 180 PASS / 344 NOT_RUN, never full PASS", async () => {
+test("counterfactual full executor success is 184 PASS / 353 NOT_RUN, never full PASS", async () => {
   const { report, markdown } = await syntheticReport("full");
   assert.equal(report.schema, "reposync.acceptance-lab.report.v1");
-  assert.equal(report.rows.length, 524);
-  assert.deepEqual(report.counts, { PASS: 180, FAIL: 0, PARTIAL: 0, NOT_RUN: 344, SKIP: 0 });
-  assert.deepEqual(report.selected_suite_counts, { PASS: 162, FAIL: 0, PARTIAL: 0, NOT_RUN: 0, SKIP: 0 });
+  assert.equal(report.rows.length, requiredCaseCount);
+  assert.deepEqual(report.counts, { PASS: 184, FAIL: 0, PARTIAL: 0, NOT_RUN: 353, SKIP: 0 });
+  assert.deepEqual(report.selected_suite_counts, { PASS: 166, FAIL: 0, PARTIAL: 0, NOT_RUN: 0, SKIP: 0 });
   assert.equal(report.selected_suite_result, "PASS");
   assert.equal(report.suite_result, "FAIL");
   assert.equal(report.overall, "FAIL");
   assert.equal(report.full_qualification, "FAIL");
-  assert.equal(report.discovered_results, 159); // 141 browser annotations + 18 controls, not engine receipts.
+  assert.equal(report.discovered_results, 163); // 145 browser annotations + 18 controls, not engine receipts.
   assert.deepEqual(report.gate_failed, []);
-  assert.equal(report.qualification_plan.required_count, 524);
+  assert.equal(report.qualification_plan.required_count, requiredCaseCount);
   assert.match(report.qualification_plan.sha256, /^[a-f0-9]{64}$/);
-  assert.equal(report.rows.filter((row) => row.source === "acceptance-matrix").length, 330);
+  assert.equal(report.rows.filter((row) => row.source === "acceptance-matrix").length, expectedMatrixOnlyCount);
   const renderedIds = markdown.split("\n").filter((line) => line.startsWith("| ") && !line.startsWith("| ID ") && !line.startsWith("| --- "))
     .map((line) => line.split(" | ")[0].slice(2));
   assert.deepEqual(renderedIds, report.rows.map((row) => row.id));
   assert.ok(report.r_coverage.R01.related.length > 0);
   assert.match(markdown, /Whole-plan overall: FAIL/);
   assert.match(markdown, /SKIP 0/);
+});
+
+test("full executor receipts for the original catalog leave every unobserved archive case NOT_RUN", async () => {
+  const legacyExecutors = catalog.operations.filter((op) =>
+    op.disposition === "execute" && operationSelected("full", op) && !archiveCaseIds.includes(op.id));
+  const { report } = await syntheticReport("full", { playwright: playwrightFor(legacyExecutors) });
+  assert.deepEqual([...report.omitted].sort(), [...archiveCaseIds].sort());
+  for (const id of archiveCaseIds) {
+    assert.equal(report.rows.find((row) => row.id === id)?.status, "NOT_RUN", id);
+  }
+  assert.deepEqual(report.counts, { PASS: 180, FAIL: 0, PARTIAL: 0, NOT_RUN: 357, SKIP: 0 });
+  assert.equal(report.selected_suite_result, "FAIL");
+  assert.equal(report.full_qualification, "FAIL");
 });
 
 for (const [suite, selectedCount] of [["smoke", 16], ["soak", 2]]) {
@@ -177,7 +228,7 @@ for (const [suite, selectedCount] of [["smoke", 16], ["soak", 2]]) {
     assert.equal(report.selected_suite_result, "PASS");
     assert.equal(report.selected_suite_counts.PASS, selectedCount);
     assert.equal(report.counts.PASS, selectedCount + 18);
-    assert.equal(report.rows.length, 524);
+    assert.equal(report.rows.length, requiredCaseCount);
     assert.equal(report.overall, "FAIL");
     assert.equal(report.full_qualification, "NOT_RUN");
   });
@@ -219,7 +270,7 @@ test("deleting an unavailable operation cannot delete its accepted obligation", 
   const baseline = await syntheticReport("full");
   const { report, markdown } = await syntheticReport("full", { removeOperation: "LIVE_ENTERPRISE" });
   const retained = report.rows.find((row) => row.id === "LIVE_ENTERPRISE");
-  assert.equal(report.rows.length, 524);
+  assert.equal(report.rows.length, requiredCaseCount);
   assert.equal(retained.status, "NOT_RUN");
   assert.equal(retained.source, "qualification-plan");
   assert.deepEqual(retained.r_criteria, ["R21"]);
@@ -229,7 +280,7 @@ test("deleting an unavailable operation cannot delete its accepted obligation", 
 });
 
 // A minimal complete plan makes an ignored extra/invalid input observable as a
-// false PASS, rather than letting the production plan's 344 NOT_RUN hide it.
+// false PASS, rather than letting the production plan's 353 NOT_RUN hide it.
 const minimalOperations = [
   { id: "BROWSER_CASE", suite: "smoke", disposition: "execute", r_criteria: ["R01"] },
   { id: "ENGINE_CASE", suite: "full", disposition: "engine", r_criteria: ["R01"] },
@@ -327,7 +378,7 @@ test("removing a matrix criterion and its subcases preserves their retained crit
   const { report } = await syntheticReport("full", {
     matrix: { ...matrix, scenarios: matrix.scenarios.filter((row) => row.id !== "R21") },
   });
-  assert.equal(report.rows.length, 524);
+  assert.equal(report.rows.length, requiredCaseCount);
   assert.deepEqual(report.r_coverage.R21, baseline.report.r_coverage.R21);
 });
 
@@ -450,7 +501,7 @@ test("matrix declaration duplicates block while legitimate cross-criterion refer
   assert.ok(report.input_validation_errors.some((error) => error.source === "acceptance-matrix:scenarios" && error.code === "duplicate_identity"));
   const valid = await syntheticReport("full", { auditDir: join(labRoot, "catalog") });
   assert.deepEqual(valid.report.input_validation_errors, []);
-  assert.equal(valid.report.rows.length, 524);
+  assert.equal(valid.report.rows.length, requiredCaseCount);
 });
 
 test("audit declaration duplicates and ambiguous aliases cannot disappear before the join", async () => {
@@ -466,7 +517,7 @@ test("audit declaration duplicates and ambiguous aliases cannot disappear before
 
 for (const [name, options, predicate] of [
   ["gate failure", { failedControl: controls[0] }, (r) => r.gate_failed.includes(controls[0])],
-  ["missing gate", { missingControl: controls[0] }, (r) => r.gate_failed.includes(controls[0]) && r.rows.length === 524],
+  ["missing gate", { missingControl: controls[0] }, (r) => r.gate_failed.includes(controls[0]) && r.rows.length === requiredCaseCount],
   ["omission and zero discovery", { playwright: { suites: [] } }, (r) => r.zero_discovery && r.omitted.length === 16],
   ["unexpected skip", { change: { id: "LAB_SMOKE_STACK", actual: "skipped" } }, (r) => r.unexpected_skips.length === 1],
   ["runner error", { playwright: { ...playwrightFor(catalog.operations.filter((op) => op.suite === "smoke")), errors: [{ message: "runner failed" }] } }, (r) => r.rows.some((row) => row.source === "playwright" && row.status === "FAIL")],
