@@ -214,6 +214,30 @@ fn add_operation<T: Serialize>(
     }
 }
 
+// Repository writers historically use SQLite datetime('now'), which is UTC.
+// Accept only that exact storage shape in addition to RFC3339; never repair DB
+// values or reuse this compatibility rule for authenticated history evidence.
+fn repository_sync_time(value: &str) -> Option<chrono::DateTime<Utc>> {
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(parsed.with_timezone(&Utc));
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() != 19
+        || bytes.iter().enumerate().any(|(i, b)| match i {
+            4 | 7 => *b != b'-',
+            10 => *b != b' ',
+            13 | 16 => *b != b':',
+            _ => !b.is_ascii_digit(),
+        })
+        || &value[17..19] > "59"
+    {
+        return None;
+    }
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|parsed| parsed.and_utc())
+}
+
 pub fn repository(state: &AppState, repo: &Repository, actor: &str, admin: bool) -> Observation {
     let db = &state.db;
     let mut out = Observation::unknown("repository");
@@ -224,7 +248,7 @@ pub fn repository(state: &AppState, repo: &Repository, actor: &str, admin: bool)
     out.last_successful_sync_at = repo
         .last_sync_at
         .as_ref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .and_then(|s| repository_sync_time(s))
         .filter(|d| *d <= Utc::now())
         .map(|d| d.to_rfc3339());
     out.data_freshness = match (&repo.last_sync_at, &out.last_successful_sync_at) {

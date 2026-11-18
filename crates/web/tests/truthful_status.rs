@@ -848,3 +848,114 @@ async fn rs116_review_late_pair_and_svn_actual_target_schemas_survive_registrati
     }
     server.abort();
 }
+
+#[tokio::test]
+async fn rs199_sqlite_writer_timestamp_is_complete_and_status_reads_preserve_storage() {
+    let (addr, state, server, _tmp) = status_fixture(&[("sqlite-time", "idle")]).await;
+    // Exercise the real successful-sync database writer, not a repaired fixture.
+    state
+        .db
+        .update_repo_watermark("sqlite-time", 7, &"a".repeat(40))
+        .unwrap();
+    let stored = state.db.get_repository("sqlite-time").unwrap().unwrap();
+    assert_eq!(stored.last_sync_at.as_ref().unwrap().len(), 19);
+    assert_eq!(&stored.last_sync_at.as_ref().unwrap()[10..11], " ");
+    let before = kv_snapshot(&state);
+    let before_repo = serde_json::to_value(&stored).unwrap();
+    for id in [Some("sqlite-time"), None] {
+        let result = status(addr, id).await;
+        let observation = &result["observation"];
+        assert_eq!(observation["evidence_complete"], true);
+        assert_eq!(observation["health"], "idle");
+        if id.is_some() {
+            assert_eq!(observation["data_freshness"], "recorded_success");
+            assert!(chrono::DateTime::parse_from_rfc3339(
+                observation["last_successful_sync_at"].as_str().unwrap()
+            )
+            .is_ok());
+        }
+    }
+    assert_eq!(kv_snapshot(&state), before);
+    assert_eq!(
+        serde_json::to_value(state.db.get_repository("sqlite-time").unwrap().unwrap()).unwrap(),
+        before_repo
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn rs199_timestamp_compatibility_preserves_unknown_and_missing_semantics() {
+    let (addr, state, server, _tmp) = status_fixture(&[("time-shapes", "idle")]).await;
+    state
+        .db
+        .update_repo_watermark("time-shapes", 7, &"a".repeat(40))
+        .unwrap();
+    for (input, valid) in [
+        (Some("2024-02-29 12:34:56"), true),
+        (Some("2024-02-29T12:34:56Z"), true),
+        (Some("2024-02-29T14:34:56+02:00"), true),
+        (Some("2024-02-29T07:34:56-05:00"), true),
+        (Some("2023-02-29 12:34:56"), false),
+        (Some("2024-02-29 24:34:56"), false),
+        (Some("2024-02-29 12:34:60"), false),
+        (Some("2024-2-29 12:34:56"), false),
+        // Preserve the existing RFC3339 parser's accepted space separator.
+        (Some("2024-02-29 12:34:56Z"), true),
+        (Some("2024-02-29 12:34:56.0"), false),
+        (Some(" 2024-02-29 12:34:56"), false),
+        (Some("2099-01-01 00:00:00"), false),
+        (Some("2099-01-01T00:00:00Z"), false),
+        (Some("garbage"), false),
+        (None, true),
+    ] {
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE repositories SET last_sync_at=?1 WHERE id='time-shapes'",
+                [input],
+            )
+            .unwrap();
+        let before = kv_snapshot(&state);
+        let before_repo =
+            serde_json::to_value(state.db.get_repository("time-shapes").unwrap().unwrap()).unwrap();
+        let scoped = status(addr, Some("time-shapes")).await;
+        let o = &scoped["observation"];
+        assert_eq!(o["evidence_complete"], valid, "{input:?}");
+        assert_eq!(
+            o["health"],
+            if valid { "idle" } else { "unknown" },
+            "{input:?}"
+        );
+        assert_eq!(
+            o["data_freshness"],
+            if input.is_none() {
+                "never_recorded"
+            } else if valid {
+                "recorded_success"
+            } else {
+                "unknown"
+            }
+        );
+        if input.is_some() && valid {
+            assert_eq!(o["last_successful_sync_at"], "2024-02-29T12:34:56+00:00");
+        } else {
+            assert!(o["last_successful_sync_at"].is_null());
+        }
+        let aggregate = status(addr, None).await;
+        assert_eq!(
+            aggregate["observation"]["evidence_complete"], valid,
+            "{input:?}"
+        );
+        assert_eq!(
+            aggregate["observation"]["health"],
+            if valid { "idle" } else { "unknown" }
+        );
+        assert_eq!(kv_snapshot(&state), before);
+        assert_eq!(
+            serde_json::to_value(state.db.get_repository("time-shapes").unwrap().unwrap()).unwrap(),
+            before_repo
+        );
+    }
+    server.abort();
+}
