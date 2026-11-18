@@ -144,6 +144,81 @@ fn personal_writers_refuse_orphan_recovery_before_checkpoint_or_git_preparation(
     }
 }
 
+// Existence is not publication: fs::write can expose an empty file. Only the exact child PID acknowledges readiness.
+fn pid_readiness(
+    expected: &str,
+    contents: std::io::Result<String>,
+    child_alive: bool,
+    before_deadline: bool,
+) -> Result<bool, String> {
+    if !child_alive {
+        return Err("fresh startup exited before PID readiness".into());
+    }
+    if !before_deadline {
+        return Err("personal start never became ready".into());
+    }
+    match contents {
+        Ok(contents) if contents == expected => Ok(true),
+        Ok(contents) if contents.is_empty() => Ok(false),
+        Ok(contents) => Err(format!(
+            "unexpected PID contents: {contents:?}; expected {expected:?}"
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("failed to read startup PID: {error}")),
+    }
+}
+
+#[test]
+fn pid_readiness_waits_for_exact_publication_not_existence() {
+    let expected = "14185";
+    let observations = [
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        Ok(String::new()),
+        Ok(expected.into()),
+    ];
+    for (index, observation) in observations.into_iter().enumerate() {
+        // The predecessor's exists()-only loop would stop at the empty file,
+        // and its immediately following exact-content assertion would fail.
+        if index == 1 {
+            assert!(observation.is_ok());
+            assert_ne!(observation.as_ref().unwrap(), expected);
+        }
+        assert_eq!(
+            pid_readiness(expected, observation, true, true),
+            Ok(index == 2)
+        );
+    }
+}
+
+#[test]
+fn pid_readiness_rejects_wrong_contents_and_read_errors() {
+    for contents in ["14", "14186", "141850", "other", "14185\n", " 14185"] {
+        assert!(pid_readiness("14185", Ok(contents.into()), true, true)
+            .unwrap_err()
+            .contains("unexpected PID contents"));
+    }
+    assert!(pid_readiness(
+        "14185",
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        true,
+        true
+    )
+    .unwrap_err()
+    .contains("failed to read startup PID"));
+}
+
+#[test]
+fn pid_readiness_preserves_timeout_and_early_exit_even_for_exact_pid() {
+    for contents in ["", "14", "14185"] {
+        assert!(pid_readiness("14185", Ok(contents.into()), true, false)
+            .unwrap_err()
+            .contains("never became ready"));
+        assert!(pid_readiness("14185", Ok(contents.into()), false, true)
+            .unwrap_err()
+            .contains("startup exited"));
+    }
+}
+
 #[test]
 fn fresh_personal_start_initializes_storage_and_restarts_after_joined_shutdown() {
     let root = tempfile::tempdir().unwrap();
@@ -155,16 +230,22 @@ fn fresh_personal_start_initializes_storage_and_restarts_after_joined_shutdown()
     for _ in 0..2 {
         let mut process = spawn(root.path(), &config, &["start", "--foreground"]);
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !data.join("personal.pid").exists() {
-            assert!(
+        loop {
+            let ready = pid_readiness(
+                &process.0.id().to_string(),
+                std::fs::read_to_string(data.join("personal.pid")),
                 process.0.try_wait().unwrap().is_none(),
-                "fresh startup exited: {}",
-                std::fs::read_to_string(root.path().join("stderr")).unwrap()
-            );
-            assert!(
                 Instant::now() < deadline,
-                "personal start never became ready"
-            );
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{error}: {}",
+                    std::fs::read_to_string(root.path().join("stderr")).unwrap()
+                )
+            });
+            if ready {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(
