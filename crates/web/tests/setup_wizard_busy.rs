@@ -176,9 +176,18 @@ token_env = ""
     db.initialize().unwrap();
     let repo_id = insert_wizard_repo(&db, &svn_url, tmp.path());
 
+    let (addr, state, server) = serve_wizard_fixture(tmp.path(), config, db).await;
+    (addr, state, server, tmp, repo_id, bare)
+}
+
+async fn serve_wizard_fixture(
+    dir: &Path,
+    config: AppConfig,
+    db: Database,
+) -> (SocketAddr, Arc<AppState>, tokio::task::JoinHandle<()>) {
     let engine_db = Database::in_memory().unwrap();
     engine_db.initialize().unwrap();
-    let dummy_git = tmp.path().join("dummy-git");
+    let dummy_git = dir.join("dummy-git");
     git2::Repository::init(&dummy_git).unwrap();
     let engine = Arc::new(SyncEngine::new(
         config.clone(),
@@ -197,7 +206,7 @@ token_env = ""
         ws_broadcast: ws_tx,
         sessions: tokio::sync::RwLock::new(HashMap::new()),
         import_progress: Arc::new(tokio::sync::RwLock::new(ImportProgress::default())),
-        config_path,
+        config_path: dir.join("config.toml"),
         prev_net_snapshot: std::sync::Mutex::new(None),
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
@@ -217,7 +226,7 @@ token_env = ""
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, state, server, tmp, repo_id, bare)
+    (addr, state, server)
 }
 
 async fn setup_status(client: &reqwest::Client, addr: SocketAddr) -> serde_json::Value {
@@ -483,6 +492,74 @@ async fn rs19_status_keeps_legacy_checkpoints_read_only_and_reports_storage_erro
     server.abort();
 }
 
+fn complete_fixture_setup(db: &Database, repo_id: &str, op_id: &str) {
+    db.note_import_local(repo_id, op_id, 1, "fixture-tip", 1, 1)
+        .unwrap();
+    db.begin_import_publication(repo_id, op_id, "refs/heads/main", "fixture-tip")
+        .unwrap();
+    db.confirm_import_publication(repo_id, op_id, "fixture-tip")
+        .unwrap();
+    db.complete_import_operation(repo_id, op_id, 1, "fixture-tip")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn rs19_completed_setup_history_and_new_start_display_their_own_repository() {
+    let (addr, state, server, _tmp, id, _) = setup_wizard_fixture().await;
+    let mut other = state.db.get_repository(&id).unwrap().unwrap();
+    other.id = "next-start-target".into();
+    other.name = "AAA pending".into();
+    let old = state
+        .db
+        .create_setup_import_operation(&id, "fixture", "finished", "setup-target")
+        .unwrap();
+    state.db.start_import_operation(&id, &old.id).unwrap();
+    complete_fixture_setup(&state.db, &id, &old.id);
+    state.db.insert_repository(&other).unwrap();
+    let observed = setup_status(&authed_client(), addr).await;
+    assert_eq!(observed["operation_id"], old.id, "{observed}");
+    assert_eq!(observed["operation_repository_id"], id);
+    assert_eq!(observed["lifecycle"], "completed");
+    assert_eq!(observed["can_start"], true);
+    assert_eq!(observed["start_repository_id"], other.id);
+    assert_eq!(observed["start_repository_name"], other.name);
+    let mut newer = other.clone();
+    newer.id = "target-after-reordering".into();
+    newer.name = "000 now first".into();
+    state.db.insert_repository(&newer).unwrap();
+    let refused: serde_json::Value = authed_client()
+        .post(format!("http://{addr}/api/setup/import"))
+        .query(&[("expected_repository_id", &other.id)])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(refused["message"]
+        .as_str()
+        .unwrap()
+        .contains("selection changed"));
+    assert!(state
+        .db
+        .latest_import_operation(&newer.id)
+        .unwrap()
+        .is_none());
+    assert!(state
+        .db
+        .latest_import_operation(&other.id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        state.db.setup_import_owner().unwrap().unwrap().operation.id,
+        old.id
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn rs19_stale_stop_never_cancels_a_successor_or_signals_its_worker() {
     let (addr, state, server, tmp, repo_id, _bare) = setup_wizard_fixture().await;
@@ -493,7 +570,7 @@ async fn rs19_stale_stop_never_cancels_a_successor_or_signals_its_worker() {
     );
     let old = state
         .db
-        .create_import_operation(&repo_id, "fixture", "first", &fingerprint)
+        .create_setup_import_operation(&repo_id, "fixture", "first", &fingerprint)
         .unwrap();
     state.db.start_import_operation(&repo_id, &old.id).unwrap();
     let client = authed_client();
@@ -508,25 +585,10 @@ async fn rs19_stale_stop_never_cancels_a_successor_or_signals_its_worker() {
             .await
             .is_err()
     );
-    state
-        .db
-        .note_import_local(&repo_id, &old.id, 1, "fixture-tip", 1, 1)
-        .unwrap();
-    state
-        .db
-        .begin_import_publication(&repo_id, &old.id, "refs/heads/main", "fixture-tip")
-        .unwrap();
-    state
-        .db
-        .confirm_import_publication(&repo_id, &old.id, "fixture-tip")
-        .unwrap();
-    state
-        .db
-        .complete_import_operation(&repo_id, &old.id, 1, "fixture-tip")
-        .unwrap();
+    complete_fixture_setup(&state.db, &repo_id, &old.id);
     let next = state
         .db
-        .create_import_operation(&repo_id, "fixture", "second", &fingerprint)
+        .create_setup_import_operation(&repo_id, "fixture", "second", &fingerprint)
         .unwrap();
     *slot = ImportProgress::default();
     slot.setup_operation_id = Some(next.id.clone());
@@ -624,6 +686,139 @@ async fn rs19_setup_does_not_expose_or_cancel_managed_full_or_snapshot_imports()
         );
         assert!(!signal.load(std::sync::atomic::Ordering::Acquire));
     }
+    server.abort();
+}
+
+#[tokio::test]
+async fn rs19_reopened_wizard_identifies_terminal_operation_after_settings_and_order_change() {
+    let (_addr, state, server, tmp, id, _) = setup_wizard_fixture().await;
+    let mut original = state.db.get_repository(&id).unwrap().unwrap();
+    let fingerprint = reposync_core::db::import_operations::import_target_fingerprint(
+        &original,
+        &tmp.path().join("git-repo"),
+    );
+    let op = state
+        .db
+        .create_setup_import_operation(&id, "fixture", "setup", &fingerprint)
+        .unwrap();
+    state.db.start_import_operation(&id, &op.id).unwrap();
+    state
+        .db
+        .note_import_local(&id, &op.id, 4, "original-checkpoint", 1, 1)
+        .unwrap();
+    state
+        .db
+        .finish_import_operation(
+            &id,
+            &op.id,
+            ImportOperationState::Cancelled,
+            "held at original checkpoint",
+        )
+        .unwrap();
+    original.name = "ZZ renamed".into();
+    original.allowed_paths = Some("[\"modified/\"]".into());
+    original.lfs_threshold_mb += 1;
+    original.auto_merge = !original.auto_merge;
+    state.db.update_repository(&original).unwrap();
+    assert_ne!(
+        fingerprint,
+        reposync_core::db::import_operations::import_target_fingerprint(
+            &original,
+            &tmp.path().join("git-repo")
+        )
+    );
+    let mut other = original.clone();
+    other.id = "other".into();
+    other.name = "AA new registration".into();
+    state.db.insert_repository(&other).unwrap();
+    let foreign = state
+        .db
+        .create_import_operation(&other.id, "fixture", "managed", "managed-target")
+        .unwrap();
+    let config = state.config.clone();
+    server.abort();
+    let _ = server.await;
+    drop(state);
+    let db = Database::new(tmp.path().join("reposync.db")).unwrap();
+    let (addr, fresh, server) = serve_wizard_fixture(tmp.path(), config, db).await;
+    let client = authed_client();
+    assert_eq!(fresh.db.list_repositories().unwrap()[0].id, other.id);
+    let observed = setup_status(&client, addr).await;
+    assert_eq!(observed["operation_id"], op.id, "{observed}");
+    assert_eq!(observed["lifecycle"], "cancelled");
+    assert_eq!(observed["can_start"], false);
+    assert_eq!(observed["can_cancel"], false);
+    assert_eq!(observed["has_worker_progress"], false);
+    assert_eq!(observed["last_local_svn_rev"], 4);
+    assert_eq!(observed["last_local_git_sha"], "original-checkpoint");
+    assert_eq!(
+        cancel_selected(&client, addr, &op.id).await["lifecycle"],
+        "cancelled"
+    );
+    assert_eq!(
+        cancel_selected(&client, addr, &foreign.id).await["ok"],
+        false
+    );
+    assert_eq!(
+        fresh
+            .db
+            .get_import_operation(&other.id, &foreign.id)
+            .unwrap()
+            .unwrap(),
+        foreign
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn rs19_only_one_setup_admission_across_two_repositories_and_connections() {
+    let (_addr, state, server, tmp, id, _) = setup_wizard_fixture().await;
+    let mut other = state.db.get_repository(&id).unwrap().unwrap();
+    other.id = "other".into();
+    other.name = "other".into();
+    state.db.insert_repository(&other).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let contenders: Vec<_> = [id.clone(), other.id.clone()]
+        .into_iter()
+        .map(|candidate| {
+            let db = Database::new(tmp.path().join("reposync.db")).unwrap();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.create_setup_import_operation(&candidate, "fixture", "new", "setup-target")
+                    .is_ok()
+            })
+        })
+        .collect();
+    let results: Vec<_> = contenders
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|won| **won).count(), 1);
+    let owner = state.db.setup_import_owner().unwrap().unwrap();
+    assert!(owner.holds_slot);
+    let other_id = if owner.operation.repo_id == id {
+        &other.id
+    } else {
+        &id
+    };
+    assert!(state
+        .db
+        .create_setup_import_operation(other_id, "fixture", "retry", "setup-target")
+        .is_err());
+    assert!(state
+        .db
+        .latest_import_operation(other_id)
+        .unwrap()
+        .is_none());
+    state
+        .db
+        .create_import_operation(other_id, "fixture", "managed", "managed-target")
+        .unwrap();
+    assert_eq!(
+        state.db.setup_import_owner().unwrap().unwrap().operation.id,
+        owner.operation.id
+    );
     server.abort();
 }
 
@@ -1068,6 +1263,7 @@ async fn candidate_64c07_setup_wizard_connecting_barrier_busy_and_cancel() {
     let client = authed_client();
     let started: serde_json::Value = client
         .post(format!("http://{addr}/api/setup/import"))
+        .query(&[("expected_repository_id", &repo_id)])
         .header("x-request-id", "setup-connecting")
         .send()
         .await
@@ -1079,6 +1275,12 @@ async fn candidate_64c07_setup_wizard_connecting_barrier_busy_and_cancel() {
     let op_id = started["operation_id"].as_str().unwrap();
     wait_for_file(&barrier.join("connecting.ready")).await;
     assert!(reposync_core::busy::is_busy(&repo_id));
+    // A name-sorted repository read no longer puts the enrolled worker first.
+    let mut other = state.db.get_repository(&repo_id).unwrap().unwrap();
+    other.id = "another-registration".into();
+    other.name = "AAA comes first".into();
+    state.db.insert_repository(&other).unwrap();
+    assert_eq!(state.db.list_repositories().unwrap()[0].id, other.id);
     let status = setup_status(&client, addr).await;
     assert_eq!(status["busy"], true, "{status}");
     assert_eq!(status["operation_id"], op_id);

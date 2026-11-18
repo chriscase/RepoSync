@@ -285,7 +285,7 @@ function AdminSetupWizard() {
   const navigate = useNavigate();
   const location = useLocation();
   const resumeImport = location.state?.setupImportOpen === true;
-  const resumedOnEntry = useRef(resumeImport);
+  const [checkingOnEntry, setCheckingOnEntry] = useState(!resumeImport);
   const [step, setStep] = useState(() => resumeImport ? 7 : 0);
   // Reload this history entry on the same step even if the worker stopped while away.
   useEffect(() => {
@@ -318,32 +318,12 @@ function AdminSetupWizard() {
     [],
   );
 
-  // Resume an active import only while the operator is still on Welcome.
-  useEffect(() => {
-    if (resumedOnEntry.current) return;
-    const controller = new AbortController();
-    (async () => {
-      try {
-        const status: ImportStatus = await api.getImportStatus(controller.signal);
-        const running =
-          status.phase === 'importing' ||
-          status.phase === 'connecting' ||
-          status.phase === 'verifying' ||
-          status.phase === 'final_push' ||
-          status.busy === true ||
-          status.lifecycle === 'queued' ||
-          status.lifecycle === 'running' ||
-          status.lifecycle === 'cancel_requested' ||
-          status.lifecycle === 'cancelling' ||
-          status.lifecycle === 'reconciliation_required';
-        if (running && !controller.signal.aborted) {
-          setStep(current => current === 0 ? 7 : current);
-        }
-      } catch {
-        // No import running or API not available — stay on Welcome
-      }
-    })();
-    return () => controller.abort();
+  const onEntryStatus = useCallback((status: ImportStatus) => {
+    setCheckingOnEntry(false);
+    const needsAttention = status.busy ||
+      ['connecting', 'importing', 'verifying', 'final_push'].includes(status.phase) ||
+      ['queued', 'running', 'cancel_requested', 'cancelling', 'reconciliation_required'].includes(status.lifecycle ?? '');
+    if (needsAttention) setStep(current => current === 0 ? 7 : current);
   }, []);
 
   // Pre-populate wizard from saved config. A failed read is shown as failed and turns the
@@ -382,6 +362,7 @@ function AdminSetupWizard() {
     const errs = validateStep(step, data);
     setErrors(errs);
     if (Object.keys(errs).length > 0) return;
+    setCheckingOnEntry(false);
     setStep(s => Math.min(s + 1, STEPS.length - 1));
   };
 
@@ -475,6 +456,7 @@ function AdminSetupWizard() {
 
         {/* Step Content */}
         <div ref={stepRef} className="rs-sec mt-8 bg-gray-800 rounded-xl shadow-lg border border-gray-700 p-8">
+          {step === 0 && checkingOnEntry && <WelcomeImportCheck onStatus={onEntryStatus} />}
           {step === STEPS.length - 1 ? (
             renderStep()
           ) : (
@@ -1716,6 +1698,14 @@ export function ReviewStep({
 // Step 7: Import
 // ---------------------------------------------------------------------------
 
+function WelcomeImportCheck({ onStatus }: { onStatus: (status: ImportStatus) => void }) {
+  const { status, statusError } = useSetupImport();
+  useEffect(() => {
+    if (status && !statusError) onStatus(status);
+  }, [onStatus, status, statusError]);
+  return statusError ? <p role="alert" className="mb-4 text-yellow-300">{statusError} Checking again automatically.</p> : null;
+}
+
 function ImportStep() {
   const navigate = useNavigate();
   const { status, statusError, actionError, actionMessage, starting, cancelling, awaitingStatus, start, cancel } = useSetupImport();
@@ -1748,6 +1738,9 @@ function ImportStep() {
   const hasWorkerPhase = ['connecting', 'importing', 'verifying', 'final_push'].includes(reportedPhase);
   const isActive = !isTerminal && (hasWorkerPhase || status?.busy === true ||
     lifecycle === 'queued' || lifecycle === 'running' || isCancelling);
+  const startRepository = status?.start_repository_id;
+  const startName = status?.start_repository_name || startRepository;
+  const changedRepository = status?.operation_repository_id && status.operation_repository_id !== startRepository;
   const isLegacyOutcome = !identified && ['completed', 'cancelled', 'failed'].includes(reportedPhase);
   // The journal owns outcomes. The worker supplies only the current execution phase.
   const phase: ImportStatus['phase'] = isComplete ? 'completed' : isCancelled ? 'cancelled'
@@ -1779,16 +1772,17 @@ function ImportStep() {
       {status && !isLegacyOutcome && !isActive && !isTerminal && !canStartSetupImport(status) &&
         <p>The server has not made a new setup import available.</p>}
 
-      {canStartSetupImport(status) && (
+      {canStartSetupImport(status) && startRepository && (
         <div className="text-center py-4">
           <button
-            onClick={start}
+            onClick={() => { void start(startRepository); }}
             disabled={actionsDisabled}
             className="rs-btn rs-btn--primary px-8 py-3 bg-blue-600 rs-text-on-accent hover:bg-blue-700 rounded-lg text-base font-medium transition-colors shadow-lg disabled:opacity-50"
           >
-            {starting ? 'Starting import…' : isFailed ? 'Retry Import' : isCancelled ? 'Restart Import' : 'Start Full Import'}
+            {starting ? 'Starting import…' : changedRepository ? `Start import for ${startName}`
+              : isFailed ? 'Retry Import' : isCancelled ? 'Restart Import' : 'Start Full Import'}
           </button>
-          <p className="text-xs text-gray-300 mt-3">This will import all SVN revisions as individual Git commits.</p>
+          <p className="text-xs text-gray-300 mt-3">This will import all SVN revisions for {startName} as individual Git commits.</p>
         </div>
       )}
 

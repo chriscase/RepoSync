@@ -13,6 +13,50 @@ use crate::errors::DatabaseError;
 use crate::models::Repository;
 
 const PREFIX: &str = "import_operation_v1:";
+const SETUP_OWNER_KEY: &str = "import_operation_v1:setup_owner";
+
+#[derive(Serialize, Deserialize)]
+struct SetupImportIdentity {
+    repo_id: String,
+    operation_id: String,
+}
+
+pub struct SetupImportOwner {
+    pub operation: ImportOperation,
+    /// Terminal operations may still hold their repository's active slot.
+    pub holds_slot: bool,
+}
+
+impl SetupImportOwner {
+    pub fn blocks_admission(&self) -> bool {
+        self.holds_slot || !self.operation.state.is_terminal()
+    }
+}
+
+fn read_setup_import_owner(conn: &Connection) -> Result<Option<SetupImportOwner>, DatabaseError> {
+    let Some(raw) = read_value(conn, SETUP_OWNER_KEY)? else {
+        return Ok(None);
+    };
+    let identity: SetupImportIdentity = serde_json::from_str(&raw)
+        .map_err(|_| DatabaseError::Other("invalid setup import identity".into()))?;
+    let raw = read_value(conn, &key("document", &identity.operation_id))?
+        .ok_or_else(|| DatabaseError::Other("missing owned setup import document".into()))?;
+    let operation = parse(&raw)?;
+    if operation.id != identity.operation_id
+        || operation.repo_id != identity.repo_id
+        || operation.operation_type != "full_import"
+    {
+        return Err(DatabaseError::Other(
+            "setup import identity mismatch".into(),
+        ));
+    }
+    let holds_slot = read_value(conn, &key("active", &operation.repo_id))?.as_deref()
+        == Some(operation.id.as_str());
+    Ok(Some(SetupImportOwner {
+        operation,
+        holds_slot,
+    }))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -588,6 +632,14 @@ impl Database {
             |r| r.get::<_, i64>(0),
         )? != 0)
     }
+    pub fn setup_import_owner(&self) -> Result<Option<SetupImportOwner>, DatabaseError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let owner = read_setup_import_owner(&tx)?;
+        tx.commit()?;
+        Ok(owner)
+    }
+
     pub fn create_import_operation(
         &self,
         repo_id: &str,
@@ -595,12 +647,40 @@ impl Database {
         request_id: &str,
         fingerprint: &str,
     ) -> Result<ImportOperation, DatabaseError> {
+        self.enroll_import(repo_id, initiator_id, request_id, fingerprint, false)
+    }
+
+    /// Publish the immutable wizard identity in the same transaction as the
+    /// repository admission. Managed full/snapshot imports never claim this slot.
+    pub fn create_setup_import_operation(
+        &self,
+        repo_id: &str,
+        initiator_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+    ) -> Result<ImportOperation, DatabaseError> {
+        self.enroll_import(repo_id, initiator_id, request_id, fingerprint, true)
+    }
+
+    fn enroll_import(
+        &self,
+        repo_id: &str,
+        initiator_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+        setup: bool,
+    ) -> Result<ImportOperation, DatabaseError> {
         self.transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             if super::managed_remove::new_work_blocked(tx, repo_id)? {
                 return Err(DatabaseError::Other(
                     "repository removal blocks a new import".into(),
+                ));
+            }
+            if setup && read_setup_import_owner(tx)?.is_some_and(|owner| owner.blocks_admission()) {
+                return Err(DatabaseError::Other(
+                    "another setup import is active or held".into(),
                 ));
             }
             let active = key("active", repo_id);
@@ -644,6 +724,17 @@ impl Database {
             )?;
             write_value(tx, &active, &op.id)?;
             write_value(tx, &key("latest", repo_id), &op.id)?;
+            if setup {
+                let identity = SetupImportIdentity {
+                    repo_id: repo_id.into(),
+                    operation_id: op.id.clone(),
+                };
+                write_value(
+                    tx,
+                    SETUP_OWNER_KEY,
+                    &serde_json::to_string(&identity).unwrap(),
+                )?;
+            }
             Ok(op)
         })
     }

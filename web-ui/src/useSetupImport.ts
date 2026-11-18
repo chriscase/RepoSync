@@ -22,7 +22,7 @@ const initialView: SetupImportView = {
 };
 
 export function canStartSetupImport(status: ImportStatus | null) {
-  return status?.can_start === true;
+  return status?.can_start === true && !!status.start_repository_id;
 }
 
 export function canCancelSetupImport(status: ImportStatus | null) {
@@ -138,11 +138,11 @@ export function watchSetupImport(client: SetupImportApi, render: (view: SetupImp
     }
   }
 
-  async function act(action: 'start' | 'cancel', operationId?: string) {
+  async function act(action: 'start' | 'cancel', targetId: string) {
     if (!mounted || view.starting || view.cancelling || view.awaitingStatus || view.statusError) return;
     const observed = view.status;
-    if (action === 'start' && !canStartSetupImport(observed)) return;
-    if (action === 'cancel' && (!operationId || operationId !== observed?.operation_id ||
+    if (action === 'start' && (!canStartSetupImport(observed) || targetId !== observed?.start_repository_id)) return;
+    if (action === 'cancel' && (targetId !== observed?.operation_id ||
       !canCancelSetupImport(observed))) return;
 
     stopReading();
@@ -159,14 +159,14 @@ export function watchSetupImport(client: SetupImportApi, render: (view: SetupImp
       const interrupted = new Promise<never>((_, reject) => {
         request.signal.addEventListener('abort', () => reject(new Error('Request timed out.')), { once: true });
       });
-      const write = action === 'cancel' && operationId
-        ? client.cancelImport(operationId, request.signal)
-        : client.startImport(request.signal);
+      const write = action === 'cancel'
+        ? client.cancelImport(targetId, request.signal)
+        : client.startImport(targetId, request.signal);
       const result = await Promise.race([write, interrupted]);
       if (!mounted) return;
       if (!result.ok) {
         update({ actionError: result.message || 'The server refused the import request.' });
-      } else if (!result.operation_id || (action === 'cancel' && result.operation_id !== operationId)) {
+      } else if (!result.operation_id || (action === 'cancel' && result.operation_id !== targetId)) {
         update({ actionError: 'Could not confirm the operation for this request. Checking import status.' });
       } else {
         receipt = { action, operationId: result.operation_id, previousId: observed?.operation_id, unconfirmedReads: 0 };
@@ -188,7 +188,7 @@ export function watchSetupImport(client: SetupImportApi, render: (view: SetupImp
 
   void read();
   return {
-    start: () => act('start'),
+    start: (repositoryId: string) => act('start', repositoryId),
     cancel: (operationId: string) => act('cancel', operationId),
     dispose: () => {
       mounted = false;
@@ -213,7 +213,7 @@ export function useSetupImport() {
 
   return {
     ...view,
-    start: async () => { await watcher.current?.start(); },
+    start: async (repositoryId: string) => { await watcher.current?.start(repositoryId); },
     cancel: async (operationId: string) => { await watcher.current?.cancel(operationId); },
   };
 }

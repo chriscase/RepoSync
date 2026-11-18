@@ -832,9 +832,16 @@ async fn admit_setup_import(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     user_id: &str,
+    expected_repository_id: Option<&str>,
 ) -> Result<SetupAdmission, AppError> {
     let db = &state.db;
     let repo = setup_repository(db)?;
+    if expected_repository_id.is_some_and(|expected| expected != repo.id) {
+        return Ok(SetupAdmission::Busy {
+            message: "Setup repository selection changed; refresh before starting an import".into(),
+            operation: None,
+        });
+    }
     let request_id = headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
@@ -842,6 +849,17 @@ async fn admit_setup_import(
         .map(str::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+    if let Some(owner) = db.setup_import_owner().map_err(import_read_error)? {
+        if owner.operation.request_id == request_id && owner.operation.initiator_id == user_id {
+            return Ok(SetupAdmission::AlreadyRecorded(Box::new(owner.operation)));
+        }
+        if owner.blocks_admission() {
+            return Ok(SetupAdmission::Busy {
+                message: "A setup import is active or held".into(),
+                operation: Some(Box::new(owner.operation)),
+            });
+        }
+    }
     if let Some(previous) = db
         .latest_import_operation(&repo.id)
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -921,7 +939,7 @@ async fn admit_setup_import(
     let workdir = state.config.daemon.data_dir.join("git-repo");
     let fingerprint = import_target_fingerprint(&repo, &workdir);
     let operation = db
-        .create_import_operation(&repo.id, user_id, &request_id, &fingerprint)
+        .create_setup_import_operation(&repo.id, user_id, &request_id, &fingerprint)
         .map_err(import_write_error)?;
     Ok(SetupAdmission::Ready {
         repo: Box::new(repo),
@@ -973,12 +991,25 @@ impl Drop for SetupPreparationGuard<'_> {
     }
 }
 
+#[derive(Deserialize)]
+struct StartImportQuery {
+    expected_repository_id: Option<String>,
+}
+
 async fn start_import(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<StartImportQuery>,
 ) -> Result<Json<ImportActionResponse>, AppError> {
     let (user_id, _role) = setup_auth(&state, &headers).await?;
-    match admit_setup_import(&state, &headers, &user_id).await? {
+    match admit_setup_import(
+        &state,
+        &headers,
+        &user_id,
+        query.expected_repository_id.as_deref(),
+    )
+    .await?
+    {
         SetupAdmission::AlreadyRecorded(operation) => Ok(Json(ImportActionResponse {
             ok: true,
             message: "Import request already recorded".into(),
@@ -1064,12 +1095,21 @@ async fn import_status(
 ) -> Result<Json<serde_json::Value>, AppError> {
     setup_auth(&state, &headers).await?;
     let live = state.import_progress.read().await;
-    let repo = state
-        .db
-        .list_repositories()
-        .map_err(import_read_error)?
-        .into_iter()
-        .next();
+    let owner = state.db.setup_import_owner().map_err(import_read_error)?;
+    let setup_held = owner.as_ref().is_some_and(|owner| owner.blocks_admission());
+    let repo = if let Some(owner) = owner.as_ref().filter(|_| setup_held) {
+        state
+            .db
+            .get_repository(&owner.operation.repo_id)
+            .map_err(import_read_error)?
+    } else {
+        state
+            .db
+            .list_repositories()
+            .map_err(import_read_error)?
+            .into_iter()
+            .next()
+    };
     let active = if let Some(repo) = &repo {
         state
             .db
@@ -1080,7 +1120,8 @@ async fn import_status(
     };
     let can_start = match &repo {
         Some(repo)
-            if active.is_none()
+            if !setup_held
+                && active.is_none()
                 && !setup_import_phase_busy(&live.phase)
                 && !reposync_core::busy::is_busy(&repo.id) =>
         {
@@ -1089,31 +1130,36 @@ async fn import_status(
         }
         _ => false,
     };
-    let can_cancel = active
-        .as_ref()
-        .zip(repo.as_ref())
-        .is_some_and(|(op, repo)| {
-            matches!(
-                op.state,
-                ImportOperationState::Queued | ImportOperationState::Running
-            ) && is_setup_operation(&state, repo, op, &live)
-        });
-    let observed = match (active, &repo) {
-        (None, Some(repo)) => state
+    let fallback_active = active.is_some();
+    let observed = match (owner.as_ref(), active, &repo) {
+        (Some(_), _, _) => None,
+        (None, None, Some(repo)) => state
             .db
             .latest_import_operation(&repo.id)
             .map_err(import_read_error)?,
-        (active, _) => active,
+        (None, active, _) => active,
     };
-    let setup = observed.as_ref().filter(|op| {
-        repo.as_ref()
-            .is_some_and(|repo| is_setup_operation(&state, repo, op, &live))
-    });
+    let (setup, holds_slot) = if let Some(owner) = &owner {
+        (Some(&owner.operation), owner.holds_slot)
+    } else {
+        let fallback = observed.as_ref().filter(|op| {
+            repo.as_ref()
+                .is_some_and(|repo| is_setup_operation(&state, repo, op, &live))
+        });
+        (fallback, fallback_active)
+    };
+    let can_cancel = holds_slot
+        && setup.is_some_and(|op| {
+            matches!(
+                op.state,
+                ImportOperationState::Queued | ImportOperationState::Running
+            )
+        });
     // A singleton progress row can outlive its worker. Only attach counters or
     // errors to a durable operation when their in-process owner matches.
     let has_worker_progress =
         setup.is_some_and(|op| live.setup_operation_id.as_deref() == Some(&op.id));
-    let progress = match &observed {
+    let progress = match setup.or(observed.as_ref()) {
         Some(_) if has_worker_progress => live.clone(),
         Some(_) => ImportProgress::default(),
         None if live.setup_operation_id.is_some()
@@ -1132,12 +1178,24 @@ async fn import_status(
             .unwrap_or_default(),
         None => live.clone(),
     };
-    let mut status =
-        overlay_setup_import_status(&progress, setup, repo.as_ref().map(|r| r.id.as_str()));
+    let mut status = overlay_setup_import_status(
+        &progress,
+        setup,
+        setup
+            .map(|op| op.repo_id.as_str())
+            .or_else(|| repo.as_ref().map(|r| r.id.as_str())),
+    );
     if setup_import_phase_busy(&live.phase)
         || observed.as_ref().is_some_and(|op| !op.state.is_terminal())
     {
         status["busy"] = true.into();
+    }
+    if let Some(op) = setup {
+        status["operation_repository_id"] = op.repo_id.as_str().into();
+    }
+    if let Some(target) = repo.as_ref().filter(|_| can_start) {
+        status["start_repository_id"] = target.id.as_str().into();
+        status["start_repository_name"] = target.name.as_str().into();
     }
     status["has_worker_progress"] = has_worker_progress.into();
     status["can_start"] = can_start.into();
@@ -1159,18 +1217,23 @@ async fn cancel_import(
     // A successor cannot install its signal while this guard is held. The
     // database separately compares the requested ID inside its write transaction.
     let mut live = state.import_progress.write().await;
-    let repo = state
+    let owner = state.db.setup_import_owner().map_err(import_read_error)?;
+    let op = if let Some(owner) = owner {
+        // An explicit pointer remains authoritative even if the repository
+        // was renamed, reordered or edited since registration.
+        Some(owner.operation)
+    } else if let Some(repo) = state
         .db
         .list_repositories()
         .map_err(import_read_error)?
         .into_iter()
-        .next();
-    if let Some(repo) = repo {
+        .next()
+    {
         let active = state
             .db
             .active_import_operation(&repo.id)
             .map_err(import_read_error)?;
-        let targeted = match (active, &query.operation_id) {
+        let observed = match (active, &query.operation_id) {
             (None, Some(_)) => state
                 .db
                 .latest_import_operation(&repo.id)
@@ -1178,40 +1241,51 @@ async fn cancel_import(
                 .filter(|op| op.state.is_terminal()),
             (active, _) => active,
         };
-        if let Some(op) = targeted {
-            if query.operation_id.as_ref().is_some_and(|id| id != &op.id)
-                || !is_setup_operation(&state, &repo, &op, &live)
-            {
-                return Ok(action_response(
-                    false,
-                    "The selected setup import is not current",
-                    None,
-                ));
-            }
-            let op = if op.state.is_terminal() || op.cancel_requested {
-                op
-            } else {
-                state
-                    .db
-                    .request_import_cancel(&repo.id, &op.id)
-                    .map_err(import_write_error)?
-            };
-            if op.state.is_terminal() {
-                return Ok(action_response(
-                    true,
-                    "terminal outcome retained; published history is not undone",
-                    Some(&op),
-                ));
-            }
-            if live.setup_operation_id.as_deref() == Some(&op.id) {
-                live.cancel_signal.store(true, Ordering::Release);
-            }
+        if observed
+            .as_ref()
+            .is_some_and(|op| !is_setup_operation(&state, &repo, op, &live))
+        {
+            return Ok(action_response(
+                false,
+                "The selected setup import is not current",
+                None,
+            ));
+        }
+        observed
+    } else {
+        None
+    };
+    if let Some(op) = op {
+        if query.operation_id.as_ref().is_some_and(|id| id != &op.id) {
+            return Ok(action_response(
+                false,
+                "The selected setup import is not current",
+                None,
+            ));
+        }
+        let op = if op.state.is_terminal() || op.cancel_requested {
+            op
+        } else {
+            state
+                .db
+                .request_import_cancel(&op.repo_id, &op.id)
+                .map_err(import_write_error)?
+        };
+        if op.state.is_terminal() {
             return Ok(action_response(
                 true,
-                "cancellation durably requested; published history is not undone",
+                "terminal outcome retained; published history is not undone",
                 Some(&op),
             ));
         }
+        if live.setup_operation_id.as_deref() == Some(&op.id) {
+            live.cancel_signal.store(true, Ordering::Release);
+        }
+        return Ok(action_response(
+            true,
+            "cancellation durably requested; published history is not undone",
+            Some(&op),
+        ));
     }
     // Older clients could cancel a pre-journal setup phase. Never use this
     // unbound fallback for a request carrying a durable operation ID.
@@ -1521,6 +1595,15 @@ async fn reset_and_reimport(
         return Err(AppError::Forbidden("admin access required".into()));
     }
 
+    if let Some(owner) = state.db.setup_import_owner().map_err(import_read_error)? {
+        if owner.blocks_admission() {
+            return Ok(action_response(
+                false,
+                "setup import is active or held; inspect or cancel before reset",
+                Some(&owner.operation),
+            ));
+        }
+    }
     let repo = setup_repository(&state.db)?;
     if let Some(active) = state
         .db
@@ -1686,7 +1769,7 @@ async fn reset_and_reimport(
     let fingerprint = import_target_fingerprint(&repo, &git_repo_path);
     let operation = state
         .db
-        .create_import_operation(&repo.id, &user_id, &request_id, &fingerprint)
+        .create_setup_import_operation(&repo.id, &user_id, &request_id, &fingerprint)
         .map_err(import_write_error)?;
     let operation_id = operation.id.clone();
     let mut preparation_guard = SetupPreparationGuard {

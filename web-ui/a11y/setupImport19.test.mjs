@@ -20,29 +20,31 @@ after(async () => { await browser?.close(); await vite?.close(); await fixture?.
 
 const first = 'fixture-operation-A';
 const next = 'fixture-operation-B';
+const originalRepository = 'fixture-original-repo';
 function observation(operationId, overrides = {}) {
   return {
-    ...progress(), operation_id: operationId, can_cancel: true, can_start: false,
+    ...progress(), operation_id: operationId, operation_repository_id: operationId ? originalRepository : undefined,
+    can_cancel: true, can_start: false,
     last_local_svn_rev: 37, last_confirmed_svn_rev: 19,
     log_lines: [`Worker log for ${operationId}`], ...overrides,
   };
 }
 const json = (route, body) => route.fulfill({ json: body });
 const stopButton = page => page.getByRole('button', { name: 'Cancel Import', exact: true });
-const startButton = page => page.getByRole('button', { name: /Start Full Import|Restart Import|Retry Import/i });
+const startButton = page => page.getByRole('button', { name: /Start Full Import|Restart Import|Retry Import|Start import for /i });
 const cancelled = page => page.getByRole('heading', { name: 'Import Cancelled', exact: true });
 async function noEnabledAction(button) {
   assert.ok(await button.count() === 0 || await button.isDisabled());
 }
 
-async function wizard(t, initial) {
+async function wizard(t, initial, { disconnected = false } = {}) {
   const context = await browser.newContext({ reducedMotion: 'reduce' });
   t.after(() => context.close());
   await context.addInitScript(user => {
     localStorage.setItem('user', JSON.stringify(user));
     localStorage.setItem('session_token', 'synthetic-session-only');
   }, syntheticUser);
-  const model = { status: initial, reads: 0, writes: [], disconnected: false };
+  const model = { status: initial, reads: 0, writes: [], disconnected };
   const page = await context.newPage();
   page.setDefaultTimeout(10000);
   await context.route('**/*', async route => {
@@ -55,7 +57,9 @@ async function wizard(t, initial) {
     }
     if (url.pathname.startsWith('/api/setup/') && req.method() !== 'GET') {
       const id = url.searchParams.get('operation_id');
-      model.writes.push({ method: req.method(), path: url.pathname, id });
+      const target = url.pathname === '/api/setup/import'
+        ? { repositoryId: url.searchParams.get('expected_repository_id') } : { id };
+      model.writes.push({ method: req.method(), path: url.pathname, ...target });
       return model.write ? model.write(route, id) : json(route, { ok: false, message: 'Unexpected fixture write' });
     }
     return route.continue();
@@ -112,6 +116,26 @@ for (const failure of ['ok=false', 'disconnect', 'wrong operation']) {
     assert.deepEqual(model.writes, [{ method: 'POST', path: '/api/setup/import/cancel', id: first }]);
   });
 }
+
+test('RS-19 fresh Welcome reports an unavailable status and finds the running import on reconnect', async t => {
+  const { page, model } = await wizard(t, observation(first), { disconnected: true });
+  const welcome = page.getByRole('heading', { name: 'Welcome to RepoSync', exact: true });
+  await welcome.waitFor();
+  await page.getByRole('alert').filter({ hasText: /import status/i }).waitFor();
+  assert.ok(await welcome.isVisible());
+  assert.equal(await stopButton(page).count(), 0);
+  assert.deepEqual(model.writes, []);
+  const failedReads = model.reads;
+  assert.ok(failedReads > 0);
+
+  model.disconnected = false;
+  await page.getByText(`Operation ${first}`, { exact: true }).waitFor();
+  await stopButton(page).waitFor();
+  assert.ok(await stopButton(page).isEnabled());
+  assert.equal(await welcome.count(), 0);
+  assert.ok(model.reads > failedReads);
+  assert.deepEqual(model.writes, []);
+});
 
 test('RS-19 unreadable polls hold actions, then the wizard recovers the same operation', async t => {
   const { page, model } = await wizard(t, observation(first));
@@ -205,23 +229,27 @@ test('RS-19 memory-only completion and a legacy worker without a durable ID cann
   assert.deepEqual(model.writes, []);
 });
 
-test('RS-19 starts a replacement only from a fresh startable observation and once per request', async t => {
+test('RS-19 names and pins the next eligible repository when it differs from the failed import', async t => {
   const { page, model } = await wizard(t, observation(first));
   await stopButton(page).waitFor();
+  const eligible = { id: 'fixture-next-repo', name: 'Next synthetic repository' };
   model.status = observation(first, {
     phase: 'failed', lifecycle: 'failed', busy: false, can_cancel: false, can_start: true,
+    operation_repository_id: originalRepository, start_repository_id: eligible.id, start_repository_name: eligible.name,
     errors: ['Fixture import failed'], log_lines: ['First fixture import failed'],
   });
-  await startButton(page).waitFor();
+  const startEligible = page.getByRole('button', { name: `Start import for ${eligible.name}`, exact: true });
+  await startEligible.waitFor();
+  assert.equal(await page.getByRole('button', { name: /Retry Import|Restart Import/i }).count(), 0);
   model.write = route => json(route, { ok: true, operation_id: next, lifecycle: 'queued', message: 'Replacement accepted' });
-  await startButton(page).click();
+  await startEligible.click();
   // The first read after the receipt still reports the previous operation.
   await noEnabledAction(startButton(page));
   assert.equal(await page.getByRole('heading', { name: 'Import Complete', exact: true }).count(), 0);
-  model.status = observation(next);
+  model.status = observation(next, { operation_repository_id: eligible.id });
   await page.getByText(`Worker log for ${next}`, { exact: true }).waitFor();
   await stopButton(page).waitFor();
-  assert.deepEqual(model.writes, [{ method: 'POST', path: '/api/setup/import', id: null }]);
+  assert.deepEqual(model.writes, [{ method: 'POST', path: '/api/setup/import', repositoryId: eligible.id }]);
 });
 
 test('RS-19 a reconciliation hold survives reload without reporting failure or replaying a write', async t => {

@@ -423,13 +423,13 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  startImport: (signal?: AbortSignal) =>
+  startImport: (repositoryId: string, signal?: AbortSignal) =>
     fetchJson<{
       ok: boolean;
       message: string;
       operation_id?: string;
       lifecycle?: ImportStatus['lifecycle'];
-    }>('/setup/import', {
+    }>(`/setup/import?expected_repository_id=${encodeURIComponent(repositoryId)}`, {
       method: 'POST', signal,
     }),
 
@@ -976,6 +976,9 @@ export interface ImportStatus {
   can_start?: boolean;
   can_cancel?: boolean;
   has_worker_progress?: boolean;
+  operation_repository_id?: string;
+  start_repository_id?: string;
+  start_repository_name?: string;
   last_local_svn_rev?: number | null;
   last_local_git_sha?: string | null;
   last_confirmed_svn_rev?: number | null;

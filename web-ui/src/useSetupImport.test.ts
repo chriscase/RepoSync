@@ -6,7 +6,7 @@ const idle: ImportStatus = {
   phase: 'idle', current_rev: 0, total_revs: 0, commits_created: 0, current_file_count: 0,
   lfs_unique_count: 0, files_skipped: 0, batches_pushed: 0, push_started_at: null,
   verification: null, errors: [], log_lines: [], started_at: null, completed_at: null,
-  can_start: true, can_cancel: false,
+  can_start: true, can_cancel: false, start_repository_id: 'repo-1',
 };
 
 function running(id: string): ImportStatus {
@@ -23,7 +23,7 @@ function deferred<T>() {
 function setup() {
   const client = {
     getImportStatus: vi.fn<(signal?: AbortSignal) => Promise<ImportStatus>>(),
-    startImport: vi.fn<(signal?: AbortSignal) => Promise<{ ok: boolean; message: string; operation_id?: string }>>(),
+    startImport: vi.fn<(id: string, signal?: AbortSignal) => Promise<{ ok: boolean; message: string; operation_id?: string }>>(),
     cancelImport: vi.fn<(id: string, signal?: AbortSignal) => Promise<{ ok: boolean; message: string; operation_id?: string }>>(),
   };
   const render = vi.fn<Parameters<typeof watchSetupImport>[1]>();
@@ -66,13 +66,16 @@ describe('setup import observations and commands', () => {
     client.startImport.mockResolvedValue({ ok: true, operation_id: 'new', message: 'Queued' });
     const watcher = mount();
     await vi.advanceTimersByTimeAsync(1500);
-    await watcher.start();
+    await watcher.start('previous-repository');
+    expect(client.startImport).not.toHaveBeenCalled();
+    await watcher.start('repo-1');
     expect(view().awaitingStatus).toBe(true);
-    await watcher.start();
+    await watcher.start('repo-1');
     stale.resolve(running('old'));
     await vi.advanceTimersByTimeAsync(0);
     expect(view().status?.operation_id).toBeUndefined();
     expect(client.startImport).toHaveBeenCalledTimes(1);
+    expect(client.startImport).toHaveBeenCalledWith('repo-1', expect.any(AbortSignal));
     await vi.advanceTimersByTimeAsync(1500);
     expect(view().status?.operation_id).toBe('new');
     expect(view().awaitingStatus).toBe(false);
@@ -162,7 +165,7 @@ describe('setup import observations and commands', () => {
     client.startImport.mockResolvedValueOnce({ ok: true, message: 'Accepted' });
     const watcher = mount();
     await vi.advanceTimersByTimeAsync(0);
-    await watcher.start();
+    await watcher.start('repo-1');
     expect(view()).toMatchObject({ awaitingStatus: false, status: { operation_id: 'started' } });
     expect(view().actionError).toMatch(/Could not confirm the operation/);
     expect(view().actionMessage).toBe('');
@@ -175,7 +178,7 @@ describe('setup import observations and commands', () => {
     client.startImport.mockResolvedValueOnce({ ok: true, message: 'Accepted', operation_id: 'missing' });
     const watcher = mount();
     await vi.advanceTimersByTimeAsync(0);
-    await watcher.start();
+    await watcher.start('repo-1');
     expect(view().awaitingStatus).toBe(true);
     await vi.advanceTimersByTimeAsync(3000);
     expect(view()).toMatchObject({ awaitingStatus: false, actionMessage: '', status: idle });
