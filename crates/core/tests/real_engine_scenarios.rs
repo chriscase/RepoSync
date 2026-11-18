@@ -16,8 +16,9 @@ use std::time::Instant;
 use reposync_core::config::{AppConfig, IdentityConfig};
 use reposync_core::db::import_operations::ImportOperationState;
 use reposync_core::db::lineage_checkpoints::{
-    independently_established_svn_uuid, independently_established_svn_uuid_kv_key,
-    record_independently_established_svn_uuid,
+    git_source_key, independently_established_svn_uuid, independently_established_svn_uuid_kv_key,
+    load_canonical_lineage, load_directional_checkpoint, record_independently_established_svn_uuid,
+    svn_source_key, CanonicalCheckpoint, CanonicalLineage, CheckpointDirection, MappingOutcome,
 };
 use reposync_core::db::Database;
 use reposync_core::errors::{SvnError, SyncError};
@@ -639,13 +640,16 @@ fn pick_loopback_port() -> u16 {
 }
 
 struct SvnserveDaemon {
-    child: Child,
+    child: Option<Child>,
     port: u16,
 }
 
 impl SvnserveDaemon {
     fn start(root: &Path) -> Self {
-        let port = pick_loopback_port();
+        Self::start_on_port(root, pick_loopback_port())
+    }
+
+    fn start_on_port(root: &Path, port: u16) -> Self {
         let port_arg = port.to_string();
         let child = Command::new("svnserve")
             .args([
@@ -662,8 +666,37 @@ impl SvnserveDaemon {
             .stderr(Stdio::piped())
             .spawn()
             .expect("failed to spawn svnserve");
+        let daemon = Self {
+            child: Some(child),
+            port,
+        };
         wait_for_svnserve(port);
-        Self { child, port }
+        daemon
+    }
+
+    fn stop(&mut self) -> std::io::Result<()> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        if child.try_wait()?.is_none() {
+            // An exit racing kill() is harmless once try_wait() reaps it.
+            let kill_error = child.kill().err();
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while child.try_wait()?.is_none() {
+                if let Some(error) = kill_error {
+                    return Err(error);
+                }
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "fixture svnserve did not exit after kill",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        self.child = None;
+        Ok(())
     }
 
     fn repo_url(&self, name: &str) -> String {
@@ -673,8 +706,7 @@ impl SvnserveDaemon {
 
 impl Drop for SvnserveDaemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.stop();
     }
 }
 
@@ -816,7 +848,7 @@ impl DualRepoFixture {
 
 struct SingleRepoFixture {
     tmp: TempDir,
-    _daemon: SvnserveDaemon,
+    daemon: SvnserveDaemon,
     db_path: PathBuf,
     repo: SvnserveRepo,
     wc: PathBuf,
@@ -922,7 +954,7 @@ impl SingleRepoFixture {
         };
         Self {
             tmp,
-            _daemon: daemon,
+            daemon,
             db_path,
             repo,
             wc,
@@ -1612,70 +1644,311 @@ async fn scenario_r16_svnserve_git_remote_unreachable() {
     );
 }
 
+// Capture every scoped ledger row, including IDs and timestamps. This detects
+// rewriting an existing receipt even when row counts and coordinates agree.
+#[derive(Debug, PartialEq)]
+struct OutageLedger {
+    watermark: (i64, String),
+    inbound_git: Option<String>,
+    lineage: CanonicalLineage,
+    svn_checkpoint: CanonicalCheckpoint,
+    git_checkpoint: Option<CanonicalCheckpoint>,
+    commit_map: Vec<serde_json::Value>,
+    sync_records: Vec<serde_json::Value>,
+    outcomes: Vec<serde_json::Value>,
+}
+
+fn outage_ledger(fixture: &SingleRepoFixture) -> OutageLedger {
+    let db = Database::new(&fixture.db_path).unwrap();
+    let repo_id = &fixture.repo.id;
+    let watermark = db.get_repo_watermark(repo_id).unwrap();
+    let inbound_git = scoped_inbound_git_checkpoint(&db, repo_id);
+    let lineage = load_canonical_lineage(&db, repo_id).unwrap().unwrap();
+    let conn = db.conn();
+    let checkpoint = |direction| {
+        load_directional_checkpoint(&conn, &lineage.scope_uuid, lineage.generation, direction)
+            .unwrap()
+    };
+    let svn_checkpoint = checkpoint(CheckpointDirection::SvnToGit).unwrap();
+    let git_checkpoint = checkpoint(CheckpointDirection::GitToSvn);
+    let rows = |sql: &str, params: &[&dyn rusqlite::ToSql]| {
+        conn.prepare(sql)
+            .unwrap()
+            .query_map(params, |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+            .collect()
+    };
+    let commit_map = rows(
+        "SELECT json_object('revision', svn_rev, 'sha', git_sha, 'direction', direction, 'id', id,
+                            'synced_at', synced_at, 'svn_author', svn_author, 'git_author', git_author)
+         FROM commit_map WHERE repo_id=?1 ORDER BY svn_rev,id",
+        &[repo_id],
+    );
+    let sync_records = rows(
+        "SELECT json_object('revision', svn_rev, 'sha', git_sha, 'direction', direction, 'status', status,
+                            'id', id, 'author', author, 'message', message, 'timestamp', timestamp, 'synced_at', synced_at)
+         FROM sync_records WHERE repo_id=?1 ORDER BY svn_rev,id", &[repo_id]);
+    let outcomes = rows(
+        "SELECT json_object('key', source_key, 'sha', target_git_sha, 'direction', direction, 'outcome', outcome,
+                            'id', id, 'target_svn_rev', target_svn_rev, 'reason', reason,
+                            'policy_snapshot', policy_snapshot, 'created_at', created_at)
+         FROM canonical_mapping_outcomes WHERE scope_uuid=?1 AND generation=?2 ORDER BY id",
+        &[&lineage.scope_uuid, &lineage.generation]);
+    OutageLedger {
+        watermark,
+        inbound_git,
+        lineage,
+        svn_checkpoint,
+        git_checkpoint,
+        commit_map,
+        sync_records,
+        outcomes,
+    }
+}
+
+fn svnlook_at(repo: &Path, command: &str, args: &[&str]) -> String {
+    let output = Command::new("svnlook")
+        .arg(command)
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "svnlook {command}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn git_main_commit_and_tree(repo: &Path) -> (git2::Oid, git2::Oid) {
+    let git = git2::Repository::open(repo).unwrap();
+    let commit = git
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    (commit.id(), commit.tree_id())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scenario_r16_svnserve_svn_remote_unreachable() {
     if !require_toolchain(CASE_SVN_REMOTE) {
         return;
     }
-    let fixture = SingleRepoFixture::new();
+    let mut fixture = SingleRepoFixture::new();
+    let repo = &fixture.repo;
+    let root = fixture.tmp.path().join("svnserve-root");
+    let repo_dir = root.join(&repo.id);
+    let svn = SvnClient::new(&repo.svn_url, &repo.username, &repo.password);
     let engine = fixture.make_engine();
-    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
-    let before = fixture.checkpoint_snapshot();
-    let bridge_before = get_head_sha(&fixture.repo.bridge);
-    let mappings_before: i64 = setup_db(&fixture.db_path).count_sync_records().unwrap();
-    let svn_before = SvnClient::new(
-        &fixture.repo.svn_url,
-        &fixture.repo.username,
-        &fixture.repo.password,
-    )
-    .info()
-    .await
-    .unwrap()
-    .latest_rev;
-    let bad_url = "svn://127.0.0.1:1/unreachable";
-    let db = setup_db(&fixture.db_path);
-    let config = make_app_config(bad_url, fixture.tmp.path());
-    let mut blocked_engine = SyncEngine::new(
-        config,
-        db,
-        SvnClient::new(bad_url, &fixture.repo.username, &fixture.repo.password),
-        GitClient::new(&fixture.repo.bridge).unwrap(),
-        Arc::new(make_identity_mapper()),
+    let baseline = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        (baseline.svn_to_git_count, baseline.git_to_svn_count),
+        (1, 0)
     );
-    blocked_engine.set_repo_id(fixture.repo.id.clone());
-    let result = blocked_engine.run_sync_cycle().await;
-    assert!(
-        matches!(&result, Err(error) if is_remote_transport_failure(error)),
-        "unreachable svn remote must fail as transport error: {result:?}"
+    // Populate the opposite-direction cursor through a normal sync. Its SHA
+    // and the sentinel bytes must survive the SVN outage and recovery.
+    const SENTINEL: &str = "Git sentinel before outage\n";
+    git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
+    let seed_sha = fixture.developer_commit("origin.txt", SENTINEL, "Establish Git sentinel");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let seed = engine.run_sync_cycle().await.unwrap();
+    assert_eq!((seed.git_to_svn_count, seed.svn_to_git_count), (1, 0));
+    let seed_rev = svn.info().await.unwrap().latest_rev;
+    assert_eq!(seed_rev, repo.svn_rev + 1);
+    let settled = engine.run_sync_cycle().await.unwrap();
+    assert_eq!((settled.git_to_svn_count, settled.svn_to_git_count), (0, 0));
+    let first_rev = svn_commit_file(
+        &fixture.wc,
+        "queued.txt",
+        "first pending edit\n",
+        "Queued edit one",
+        &repo.username,
+        &repo.password,
     );
-    let bridge_after = get_head_sha(&fixture.repo.bridge);
-    let checkpoint_after = fixture.checkpoint_snapshot();
-    let mappings_after = setup_db(&fixture.db_path).count_sync_records().unwrap();
-    let svn_after = SvnClient::new(
-        &fixture.repo.svn_url,
-        &fixture.repo.username,
-        &fixture.repo.password,
-    )
-    .info()
-    .await
-    .unwrap()
-    .latest_rev;
-    assert_eq!(bridge_after, bridge_before);
-    assert_eq!(checkpoint_after, before);
-    assert_eq!(mappings_after, mappings_before);
-    assert_eq!(svn_after, svn_before);
+    let last_rev = svn_commit_file(
+        &fixture.wc,
+        "queued.txt",
+        "second pending edit\n",
+        "Queued edit two",
+        &repo.username,
+        &repo.password,
+    );
+    assert_eq!((first_rev, last_rev), (seed_rev + 1, seed_rev + 2));
+    let info = svn.info().await.unwrap();
+    assert_eq!(info.url, repo.svn_url);
+    assert_eq!(info.uuid, uuid_of_constructor_created_svn_repo(&repo_dir));
+    assert_eq!(info.latest_rev, last_rev);
+    let svn_state = || {
+        (
+            svnlook_at(&repo_dir, "uuid", &[]),
+            svnlook_at(&repo_dir, "youngest", &[]),
+            svnlook_at(&repo_dir, "tree", &["--show-ids", "--full-paths"]),
+            svnlook_at(&repo_dir, "cat", &["origin.txt"]),
+            svnlook_at(&repo_dir, "cat", &["queued.txt"]),
+        )
+    };
+    let source = svn_state();
+    assert_eq!(source.1.trim(), last_rev.to_string());
+    assert_eq!(source.3, SENTINEL);
+    assert_eq!(source.4, "second pending edit\n");
+    let git_state = || {
+        let remote = git_main_commit_and_tree(&repo.bare);
+        assert_eq!(git_main_commit_and_tree(&repo.bridge), remote);
+        remote
+    };
+    let before_git = git_state();
+    let (baseline_commit, _) = before_git;
+    let before = outage_ledger(&fixture);
+    assert_eq!(before.lineage.svn_uuid, info.uuid);
+    assert_eq!(
+        before.watermark,
+        (repo.svn_rev, baseline_commit.to_string())
+    );
+    assert_eq!(
+        before.svn_checkpoint.handled_source_key,
+        svn_source_key(repo.svn_rev)
+    );
+
+    assert_eq!(before.inbound_git.as_deref(), Some(seed_sha.as_str()));
+    let git_checkpoint = before.git_checkpoint.as_ref().unwrap();
+    assert_eq!(git_checkpoint.handled_source_key, git_source_key(&seed_sha));
+    assert_eq!(git_checkpoint.outcome, MappingOutcome::AppliedAndVerified);
+    assert_eq!(git_checkpoint.target_svn_rev, Some(seed_rev));
+
+    let port = fixture.daemon.port;
+    fixture
+        .daemon
+        .stop()
+        .expect("stop and reap fixture svnserve");
+    assert_eq!(
+        TcpStream::connect_timeout(
+            &([127, 0, 0, 1], port).into(),
+            std::time::Duration::from_secs(2)
+        )
+        .unwrap_err()
+        .kind(),
+        std::io::ErrorKind::ConnectionRefused
+    );
+    let failure = tokio::time::timeout(std::time::Duration::from_secs(30), engine.run_sync_cycle())
+        .await
+        .expect("outage cycle timed out")
+        .unwrap_err();
+    assert!(is_remote_transport_failure(&failure), "{failure}");
+    drop(engine);
+    assert_eq!(outage_ledger(&fixture), before);
+    assert_eq!(git_state(), before_git);
+    assert_eq!(svn_state(), source);
+
+    fixture.daemon = SvnserveDaemon::start_on_port(&root, port);
+    let restored = svn.info().await.unwrap();
+    assert_eq!(
+        (
+            &restored.url,
+            &restored.root_url,
+            &restored.uuid,
+            restored.latest_rev
+        ),
+        (&info.url, &info.root_url, &info.uuid, last_rev)
+    );
+    // make_engine opens a new connection to the same on-disk database.
+    let recovered_engine = fixture.make_engine();
+    let recovered = recovered_engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        (recovered.svn_to_git_count, recovered.git_to_svn_count),
+        (2, 0)
+    );
+    let after_git = git_state();
+    let (recovered_tip, _) = after_git;
+    let local_git = git2::Repository::open(&repo.bare).unwrap();
+    let last = local_git.find_commit(recovered_tip).unwrap();
+    assert_eq!(last.parent_count(), 1);
+    let first = last.parent(0).unwrap();
+    assert_eq!(first.parent_count(), 1);
+    assert_eq!(first.parent_id(0).unwrap(), baseline_commit);
+    let after = outage_ledger(&fixture);
+    assert_eq!(after.lineage, before.lineage);
+    assert_eq!(after.inbound_git, before.inbound_git);
+    assert_eq!(after.git_checkpoint, before.git_checkpoint);
+    assert_eq!(after.watermark, (last_rev, last.id().to_string()));
+    assert_eq!(
+        after.svn_checkpoint.handled_source_key,
+        svn_source_key(last_rev)
+    );
+    assert_eq!(
+        after.svn_checkpoint.outcome,
+        MappingOutcome::AppliedAndVerified
+    );
+    assert_eq!(
+        after.svn_checkpoint.target_git_sha,
+        Some(last.id().to_string())
+    );
+    // The team journal writes scoped sync_records and canonical outcomes.
+    // Its SVN-to-Git finalizer leaves the legacy commit_map alone.
+    assert_eq!(after.commit_map, before.commit_map);
+    for (current, prior) in [
+        (&after.sync_records, &before.sync_records),
+        (&after.outcomes, &before.outcomes),
+    ] {
+        assert!(current.starts_with(prior), "pre-outage row changed");
+        assert_eq!(current.len(), prior.len() + 2);
+    }
+    for (i, (rev, commit, bytes)) in [
+        (first_rev, &first, "first pending edit\n"),
+        (last_rev, &last, "second pending edit\n"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sha = commit.id().to_string();
+        let record = &after.sync_records[before.sync_records.len() + i];
+        let outcome = &after.outcomes[before.outcomes.len() + i];
+        for row in [record, outcome] {
+            assert_eq!(row["sha"], sha);
+            assert_eq!(row["direction"], "svn_to_git");
+        }
+        assert_eq!(record["revision"], rev);
+        assert_eq!(record["status"], "applied");
+        assert_eq!(outcome["key"], svn_source_key(rev));
+        assert_eq!(outcome["outcome"], "applied_and_verified");
+        let tree = commit.tree().unwrap();
+        assert_eq!(tree.len(), 3);
+        for (path, content) in [
+            (".gitkeep", ""),
+            ("origin.txt", SENTINEL),
+            ("queued.txt", bytes),
+        ] {
+            assert_eq!(git_show_blob(&repo.bare, &sha, path), content);
+            assert_eq!(
+                svnlook_at(&repo_dir, "cat", &["-r", &rev.to_string(), path]),
+                content
+            );
+        }
+    }
+    assert_eq!(svn_state(), source);
+    for _ in 0..2 {
+        let repeat = recovered_engine.run_sync_cycle().await.unwrap();
+        assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+        assert_eq!(outage_ledger(&fixture), after);
+        assert_eq!(git_state(), after_git);
+        assert_eq!(svn_state(), source);
+    }
     emit_evidence(
         CASE_SVN_REMOTE,
-        "PARTIAL",
+        "PASS",
         serde_json::json!({
-            "bad_svn_url": bad_url,
-            "error": result.err().map(|e| e.to_string()),
-            "transport_failure": true,
-            "checkpoint_before_after": [before, checkpoint_after],
-            "bridge_head_before_after": [bridge_before, bridge_after],
-            "svn_revision_before_after": [svn_before, svn_after],
-            "mapping_count_before_after": [mappings_before, mappings_after],
-            "note": "loopback svnserve fixture does not recreate remotes on failure",
+            "direction": "svn_to_git", "restored_url": restored.url, "restored_uuid": restored.uuid,
+            "outage_error": failure.to_string(), "svn_youngest": last_rev, "queued_revisions": [first_rev, last_rev],
+            "baseline_git": baseline_commit.to_string(), "recovered_git": [first.id().to_string(), last.id().to_string()],
+            "recovered_trees": [first.tree_id().to_string(), last.tree_id().to_string()],
+            "seed_git_to_svn_revision": seed_rev,
+            "svn_checkpoint_before_after": [before.svn_checkpoint.handled_source_key, after.svn_checkpoint.handled_source_key],
+            "scoped_inbound_git_before_after": [before.inbound_git, after.inbound_git],
+            "legacy_commit_map_unchanged": true, "canonical_outcome_count_before_after": [before.outcomes.len(), after.outcomes.len()],
+            "sync_record_count_before_after": [before.sync_records.len(), after.sync_records.len()],
+            "outage_state_unchanged": true, "verified_sentinel": "origin.txt", "repeat_noop_cycles": 2,
         }),
     );
 }
