@@ -1,5 +1,6 @@
+import { getStoredUser } from '../utils/auth';
 import { useViewMutation as useMutation } from '../useViewMutation';
-import { sessionFetch } from '../session';
+import { clientSession, sessionFetch } from '../session';
 import React, { useEffect, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Check, Minus } from 'lucide-react';
@@ -10,6 +11,38 @@ import { useText } from '../layouts/vocabulary';
 const EMPTY_MAPPING: AuthorMapping = { svn_username: '', name: '', email: '' };
 
 export default function Config() {
+  // The authenticated route owns missing-session navigation. Do not mount any
+  // administrative queries, effects or forms without the current admin role.
+  const session = clientSession().snapshot();
+  const currentUser = getStoredUser();
+  // Single-password login intentionally omits user; /auth/me resolves its
+  // existing legacy-admin identity. Never infer admin from an absent role.
+  const identity = useQuery({
+    queryKey: ['admin-page-identity', session.epoch],
+    queryFn: api.getMe,
+    // Verify once per session epoch without discarding in-progress admin edits.
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    enabled: !!session.token && !currentUser,
+    retry: false,
+  });
+  if (!currentUser && session.token && (identity.isPending || identity.isFetching)) {
+    return <div role="status" className="text-center py-12 text-gray-400">Verifying administrator access…</div>;
+  }
+  const verifiedIdentity = session.token && identity.isSuccess && !identity.isFetching ? identity.data : null;
+  if ((currentUser ?? verifiedIdentity)?.role !== 'admin') {
+    return (
+      <div className="text-center py-12" role="alert">
+        <h2 className="rs-heading text-xl font-semibold text-gray-100 mb-2">Access Denied</h2>
+        <p className="text-gray-400">You need admin privileges to view this page.</p>
+      </div>
+    );
+  }
+  return <AdminConfig />;
+}
+
+function AdminConfig() {
   const t = useText();
   const queryClient = useQueryClient();
   const { data: mappings, isLoading, error: readError, refetch, dataUpdatedAt, errorUpdatedAt } = useQuery({

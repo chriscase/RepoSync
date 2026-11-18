@@ -8,7 +8,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::api::auth::validate_session;
+use crate::api::auth::validate_session_with_role;
 use crate::api::status::AppError;
 use crate::AppState;
 
@@ -100,11 +100,19 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
 }
 
+async fn require_admin(state: &Arc<AppState>, authorization: Option<&str>) -> Result<(), AppError> {
+    let (_, role) = validate_session_with_role(state, authorization).await?;
+    if role != "admin" {
+        return Err(AppError::Forbidden("admin access required".into()));
+    }
+    Ok(())
+}
+
 async fn get_config(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<ConfigResponse>, AppError> {
-    validate_session(
+    require_admin(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
@@ -146,7 +154,7 @@ async fn get_identity_mappings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<AuthorMapping>>, AppError> {
-    validate_session(
+    require_admin(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
@@ -173,7 +181,7 @@ async fn update_identity_mappings(
     headers: HeaderMap,
     Json(body): Json<UpdateMappingsRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_session(
+    require_admin(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
@@ -201,7 +209,7 @@ async fn get_notification_config(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    crate::api::auth::validate_session(
+    require_admin(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
@@ -234,7 +242,7 @@ async fn save_notification_config(
     )
     .await?;
     if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
+        return Err(AppError::Forbidden("admin access required".into()));
     }
 
     let db = &state.db;
@@ -262,7 +270,7 @@ async fn test_teams_notification(
     )
     .await?;
     if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
+        return Err(AppError::Forbidden("admin access required".into()));
     }
 
     let db = &state.db;

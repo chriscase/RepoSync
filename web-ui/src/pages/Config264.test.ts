@@ -275,7 +275,7 @@ describe('#264 G11 configuration page wiring', () => {
   const fetchMock = vi.fn();
   beforeEach(() => {
     client = new QueryClient({ defaultOptions: { queries: { retry: false, retryOnMount: false, staleTime: Infinity } } });
-    const entries = new Map<string, string>([['session_token', 'fixture-token']]);
+    const entries = new Map<string, string>([['session_token', 'fixture-token'], ['user', JSON.stringify({ id: 'fixture-admin', username: 'fixture-admin', role: 'admin' })]]);
     vi.stubGlobal('localStorage', {
       getItem: (key: string) => entries.get(key) ?? null,
       setItem: (key: string, value: string) => entries.set(key, value),
