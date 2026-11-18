@@ -98,6 +98,9 @@ pub struct ImportProgress {
     pub push_started_at: Option<String>,
     pub completed_at: Option<String>,
     pub verification: Option<VerificationResult>,
+    /// Setup operation owning this in-process progress and cancellation signal.
+    #[serde(skip)]
+    pub setup_operation_id: Option<String>,
     /// Set to true to request cancellation.
     #[serde(skip)]
     pub cancel_requested: bool,
@@ -125,6 +128,7 @@ impl Default for ImportProgress {
             push_started_at: None,
             completed_at: None,
             verification: None,
+            setup_operation_id: None,
             cancel_requested: false,
             cancel_signal: Arc::new(AtomicBool::new(false)),
             lfs_seen: HashSet::new(),
@@ -2299,6 +2303,107 @@ fn without_http_credentials(url: &str) -> String {
         .rfind('@')
         .map_or(rest, |at| &rest[at + 1..]);
     format!("{scheme}{host_path}")
+}
+
+/// Compare the service's clone destination to a checkout's effective fetch and
+/// push destinations. Git's get-url commands only expand local configuration;
+/// they do not open a transport, run the importer, or modify credentials.
+pub fn setup_checkout_matches(workdir: &std::path::Path, expected: &str) -> bool {
+    fn endpoint(value: &str) -> Option<reqwest::Url> {
+        let url = reqwest::Url::parse(&without_http_credentials(value))
+            .ok()
+            .or_else(|| reqwest::Url::from_file_path(value).ok())?;
+        if url.query().is_some() || url.fragment().is_some() {
+            return None;
+        }
+        Some(url)
+    }
+    let Some(target) = endpoint(expected) else {
+        return false;
+    };
+    let same = |output: std::process::Output| {
+        if !output.status.success() {
+            return false;
+        }
+        let Ok(text) = std::str::from_utf8(&output.stdout) else {
+            return false;
+        };
+        let mut urls = text.lines();
+        urls.next().and_then(endpoint).as_ref() == Some(&target) && urls.next().is_none()
+    };
+    if let Ok(meta) = std::fs::symlink_metadata(workdir) {
+        if !meta.is_dir() {
+            return false;
+        }
+    }
+    let git_dir = workdir.join(".git");
+    if !git_dir.exists() {
+        if workdir.exists()
+            && !std::fs::read_dir(workdir).is_ok_and(|mut entries| entries.next().is_none())
+        {
+            return false;
+        }
+        // A pushInsteadOf rule only takes effect after cloning, so a fetch
+        // URL expansion alone cannot qualify a fresh checkout's future push.
+        let Ok(rules) = std::process::Command::new("git")
+            .args([
+                "config",
+                "--null",
+                "--get-regexp",
+                r"^url\..*\.pushinsteadof$",
+            ])
+            .output()
+        else {
+            return false;
+        };
+        match rules.status.code() {
+            Some(1) => {}
+            Some(0) => {
+                let Ok(text) = std::str::from_utf8(&rules.stdout) else {
+                    return false;
+                };
+                if !text.split_terminator('\0').all(|entry| {
+                    entry
+                        .split_once('\n')
+                        .is_some_and(|(_, prefix)| !expected.starts_with(prefix))
+                }) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        // A new clone can also be redirected by global insteadOf rules.
+        return std::process::Command::new("git")
+            .args(["ls-remote", "--get-url", "--", expected])
+            .output()
+            .is_ok_and(same);
+    }
+    if !std::fs::symlink_metadata(&git_dir).is_ok_and(|meta| meta.is_dir()) {
+        return false;
+    }
+    let Ok(repository) = git2::Repository::open(workdir) else {
+        return false;
+    };
+    if repository
+        .workdir()
+        .and_then(|path| path.canonicalize().ok())
+        != workdir.canonicalize().ok()
+    {
+        return false;
+    }
+    for push in [false, true] {
+        let mut command = std::process::Command::new("git");
+        command
+            .current_dir(workdir)
+            .args(["remote", "get-url", "--all"]);
+        if push {
+            command.arg("--push");
+        }
+        if !command.arg("origin").output().is_ok_and(same) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Read-only local proof for a held import. Reject missing/replaced managed

@@ -13,6 +13,105 @@ use crate::errors::DatabaseError;
 use crate::models::Repository;
 
 const PREFIX: &str = "import_operation_v1:";
+const SETUP_OWNER_KEY: &str = "import_operation_v1:setup_owner";
+
+#[derive(Serialize, Deserialize)]
+struct SetupImportIdentity {
+    repo_id: String,
+    operation_id: String,
+}
+
+pub struct SetupImportOwner {
+    pub operation: ImportOperation,
+    /// Terminal operations may still hold their repository's active slot.
+    pub holds_slot: bool,
+}
+
+impl SetupImportOwner {
+    pub fn blocks_admission(&self) -> bool {
+        self.holds_slot || !self.operation.state.is_terminal()
+    }
+}
+
+pub enum SetupImportOwnership {
+    Unclaimed,
+    Owned(Box<SetupImportOwner>),
+    Ambiguous,
+}
+
+fn observe_setup_import_owner(
+    conn: &Connection,
+    data_dir: &Path,
+) -> Result<SetupImportOwnership, DatabaseError> {
+    if let Some(owner) = read_setup_import_owner(conn)? {
+        return Ok(SetupImportOwnership::Owned(Box::new(owner)));
+    }
+    // Pre-pointer builds shared a checkout across registrations. A different
+    // repository sorting first cannot release a legacy active/terminal hold.
+    let mut stmt = conn
+        .prepare("SELECT key,value FROM kv_state WHERE key GLOB 'import_operation_v1:active:*'")?;
+    let pointers = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut owner = None;
+    for pointer in pointers {
+        let (active, id) = pointer?;
+        let repo_id = active.strip_prefix("import_operation_v1:active:").unwrap();
+        let Some(raw) = read_value(conn, &key("document", &id))? else {
+            return Ok(SetupImportOwnership::Ambiguous);
+        };
+        let op = parse(&raw)?;
+        if op.id != id || op.repo_id != repo_id {
+            return Ok(SetupImportOwnership::Ambiguous);
+        }
+        if op.operation_type == "snapshot_import" {
+            continue;
+        }
+        let matches = |workdir: &Path| -> Result<bool, DatabaseError> {
+            Ok(transaction_target_fingerprint(conn, repo_id, workdir)?
+                .is_some_and(|(fingerprint, _)| fingerprint == op.target_fingerprint))
+        };
+        if op.operation_type != "full_import" {
+            return Ok(SetupImportOwnership::Ambiguous);
+        }
+        if matches(&data_dir.join("repos").join(repo_id).join("git-repo"))? {
+            continue;
+        }
+        if owner.is_some() || !matches(&data_dir.join("git-repo"))? {
+            return Ok(SetupImportOwnership::Ambiguous);
+        }
+        owner = Some(Box::new(SetupImportOwner {
+            operation: op,
+            holds_slot: true,
+        }));
+    }
+    Ok(owner.map_or(SetupImportOwnership::Unclaimed, SetupImportOwnership::Owned))
+}
+
+fn read_setup_import_owner(conn: &Connection) -> Result<Option<SetupImportOwner>, DatabaseError> {
+    let Some(raw) = read_value(conn, SETUP_OWNER_KEY)? else {
+        return Ok(None);
+    };
+    let identity: SetupImportIdentity = serde_json::from_str(&raw)
+        .map_err(|_| DatabaseError::Other("invalid setup import identity".into()))?;
+    let raw = read_value(conn, &key("document", &identity.operation_id))?
+        .ok_or_else(|| DatabaseError::Other("missing owned setup import document".into()))?;
+    let operation = parse(&raw)?;
+    if operation.id != identity.operation_id
+        || operation.repo_id != identity.repo_id
+        || operation.operation_type != "full_import"
+    {
+        return Err(DatabaseError::Other(
+            "setup import identity mismatch".into(),
+        ));
+    }
+    let holds_slot = read_value(conn, &key("active", &operation.repo_id))?.as_deref()
+        == Some(operation.id.as_str());
+    Ok(Some(SetupImportOwner {
+        operation,
+        holds_slot,
+    }))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -231,6 +330,22 @@ pub fn resolve_repo_import_baseline(
     db: &Database,
     repo_id: &str,
 ) -> Result<RepoImportBaseline, DatabaseError> {
+    resolve_repo_import_baseline_inner(db, repo_id, true)
+}
+
+/// Check admission for a status response without repairing legacy checkpoint copies.
+pub fn repo_import_baseline_is_pending_read_only(
+    db: &Database,
+    repo_id: &str,
+) -> Result<bool, DatabaseError> {
+    Ok(resolve_repo_import_baseline_inner(db, repo_id, false)?.is_pending())
+}
+
+fn resolve_repo_import_baseline_inner(
+    db: &Database,
+    repo_id: &str,
+    backfill_missing_svn_cursor: bool,
+) -> Result<RepoImportBaseline, DatabaseError> {
     let repo = db
         .get_repository(repo_id)?
         .ok_or_else(|| DatabaseError::Other("repository not found".into()))?;
@@ -309,7 +424,7 @@ pub fn resolve_repo_import_baseline(
             let mut scoped_svn_rev =
                 kv_state_value_tx(tx, &scoped_svn_key)?.and_then(|value| value.parse::<i64>().ok());
             let has_scoped_svn = scoped_svn_rev.is_some_and(|rev| rev > 0);
-            if !has_scoped_svn {
+            if !has_scoped_svn && backfill_missing_svn_cursor {
                 super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
                     tx, repo_id,
                 )?;
@@ -555,6 +670,15 @@ fn complete_import_tx(
 }
 
 impl Database {
+    /// The legacy singleton progress row predates durable, per-operation ownership.
+    pub fn has_any_import_operation_history(&self) -> Result<bool, DatabaseError> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key GLOB 'import_operation_v1:latest:*')",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn has_any_active_import_operation(&self) -> Result<bool, DatabaseError> {
         let conn = self.conn();
         Ok(conn.query_row(
@@ -563,12 +687,60 @@ impl Database {
             |r| r.get::<_, i64>(0),
         )? != 0)
     }
+    pub fn observe_setup_import_ownership(
+        &self,
+        data_dir: &Path,
+    ) -> Result<SetupImportOwnership, DatabaseError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let owner = observe_setup_import_owner(&tx, data_dir)?;
+        tx.commit()?;
+        Ok(owner)
+    }
+
+    pub fn setup_import_owner(&self) -> Result<Option<SetupImportOwner>, DatabaseError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let owner = read_setup_import_owner(&tx)?;
+        tx.commit()?;
+        Ok(owner)
+    }
+
     pub fn create_import_operation(
         &self,
         repo_id: &str,
         initiator_id: &str,
         request_id: &str,
         fingerprint: &str,
+    ) -> Result<ImportOperation, DatabaseError> {
+        self.enroll_import(repo_id, initiator_id, request_id, fingerprint, None)
+    }
+
+    /// Publish the immutable wizard identity in the same transaction as the
+    /// repository admission. Managed full/snapshot imports never claim this slot.
+    pub fn create_setup_import_operation(
+        &self,
+        repo: &Repository,
+        initiator_id: &str,
+        request_id: &str,
+        data_dir: &Path,
+    ) -> Result<ImportOperation, DatabaseError> {
+        self.enroll_import(
+            &repo.id,
+            initiator_id,
+            request_id,
+            &import_target_fingerprint(repo, &data_dir.join("git-repo")),
+            Some(data_dir),
+        )
+    }
+
+    fn enroll_import(
+        &self,
+        repo_id: &str,
+        initiator_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+        setup_data_dir: Option<&Path>,
     ) -> Result<ImportOperation, DatabaseError> {
         self.transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
@@ -577,6 +749,26 @@ impl Database {
                 return Err(DatabaseError::Other(
                     "repository removal blocks a new import".into(),
                 ));
+            }
+            if let Some(data_dir) = setup_data_dir {
+                match observe_setup_import_owner(tx, data_dir)? {
+                    SetupImportOwnership::Unclaimed => {}
+                    SetupImportOwnership::Owned(owner) if !owner.blocks_admission() => {}
+                    _ => {
+                        return Err(DatabaseError::Other(
+                            "another setup import is active, held or ambiguous".into(),
+                        ))
+                    }
+                }
+                let current =
+                    transaction_target_fingerprint(tx, repo_id, &data_dir.join("git-repo"))?
+                        .ok_or_else(|| DatabaseError::Other("missing setup repository".into()))?
+                        .0;
+                if current != fingerprint {
+                    return Err(DatabaseError::Other(
+                        "setup registration changed before admission".into(),
+                    ));
+                }
             }
             let active = key("active", repo_id);
             if read_value(tx, &active)?.is_some() {
@@ -619,6 +811,17 @@ impl Database {
             )?;
             write_value(tx, &active, &op.id)?;
             write_value(tx, &key("latest", repo_id), &op.id)?;
+            if setup_data_dir.is_some() {
+                let identity = SetupImportIdentity {
+                    repo_id: repo_id.into(),
+                    operation_id: op.id.clone(),
+                };
+                write_value(
+                    tx,
+                    SETUP_OWNER_KEY,
+                    &serde_json::to_string(&identity).unwrap(),
+                )?;
+            }
             Ok(op)
         })
     }
