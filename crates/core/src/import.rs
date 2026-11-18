@@ -98,6 +98,9 @@ pub struct ImportProgress {
     pub push_started_at: Option<String>,
     pub completed_at: Option<String>,
     pub verification: Option<VerificationResult>,
+    /// Setup operation owning this in-process progress and cancellation signal.
+    #[serde(skip)]
+    pub setup_operation_id: Option<String>,
     /// Set to true to request cancellation.
     #[serde(skip)]
     pub cancel_requested: bool,
@@ -125,6 +128,7 @@ impl Default for ImportProgress {
             push_started_at: None,
             completed_at: None,
             verification: None,
+            setup_operation_id: None,
             cancel_requested: false,
             cancel_signal: Arc::new(AtomicBool::new(false)),
             lfs_seen: HashSet::new(),

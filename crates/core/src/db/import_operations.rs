@@ -231,6 +231,22 @@ pub fn resolve_repo_import_baseline(
     db: &Database,
     repo_id: &str,
 ) -> Result<RepoImportBaseline, DatabaseError> {
+    resolve_repo_import_baseline_inner(db, repo_id, true)
+}
+
+/// Check admission for a status response without repairing legacy checkpoint copies.
+pub fn repo_import_baseline_is_pending_read_only(
+    db: &Database,
+    repo_id: &str,
+) -> Result<bool, DatabaseError> {
+    Ok(resolve_repo_import_baseline_inner(db, repo_id, false)?.is_pending())
+}
+
+fn resolve_repo_import_baseline_inner(
+    db: &Database,
+    repo_id: &str,
+    backfill_missing_svn_cursor: bool,
+) -> Result<RepoImportBaseline, DatabaseError> {
     let repo = db
         .get_repository(repo_id)?
         .ok_or_else(|| DatabaseError::Other("repository not found".into()))?;
@@ -309,7 +325,7 @@ pub fn resolve_repo_import_baseline(
             let mut scoped_svn_rev =
                 kv_state_value_tx(tx, &scoped_svn_key)?.and_then(|value| value.parse::<i64>().ok());
             let has_scoped_svn = scoped_svn_rev.is_some_and(|rev| rev > 0);
-            if !has_scoped_svn {
+            if !has_scoped_svn && backfill_missing_svn_cursor {
                 super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
                     tx, repo_id,
                 )?;
@@ -555,6 +571,15 @@ fn complete_import_tx(
 }
 
 impl Database {
+    /// The legacy singleton progress row predates durable, per-operation ownership.
+    pub fn has_any_import_operation_history(&self) -> Result<bool, DatabaseError> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key GLOB 'import_operation_v1:latest:*')",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn has_any_active_import_operation(&self) -> Result<bool, DatabaseError> {
         let conn = self.conn();
         Ok(conn.query_row(

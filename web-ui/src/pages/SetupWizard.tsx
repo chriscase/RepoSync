@@ -4,10 +4,12 @@ import { getStoredUser } from '../utils/auth';
 import ImportProgressMeter from '../components/ImportProgressMeter';
 import { useId } from 'react';
 import { useState, useRef, useEffect, useCallback, type ReactNode } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { api, type AuthorMapping, type ImportStatus, type WizardSetupConfig } from '../api';
 import ImportPhaseGraphic from '../components/ImportPhaseGraphic';
 import ServerMonitor from '../components/ServerMonitor';
+import { importStateLabel } from '../importProgress';
+import { canCancelSetupImport, canStartSetupImport, useSetupImport } from '../useSetupImport';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -281,7 +283,19 @@ export default function SetupWizard() {
 
 function AdminSetupWizard() {
   const navigate = useNavigate();
-  const [step, setStep] = useState(0);
+  const location = useLocation();
+  const resumeImport = location.state?.setupImportOpen === true;
+  const resumedOnEntry = useRef(resumeImport);
+  const [step, setStep] = useState(() => resumeImport ? 7 : 0);
+  // Reload this history entry on the same step even if the worker stopped while away.
+  useEffect(() => {
+    const open = step === 7;
+    if (open !== resumeImport) {
+      navigate({ pathname: location.pathname, search: location.search, hash: location.hash }, {
+        replace: true, state: { ...location.state, setupImportOpen: open },
+      });
+    }
+  }, [step, resumeImport, navigate, location]);
   const [data, setData] = useState<WizardData>({ ...DEFAULT_DATA });
   const [errors, setErrors] = useState<Errors>({});
   const [configSaved, setConfigSaved] = useState(false);
@@ -304,11 +318,13 @@ function AdminSetupWizard() {
     [],
   );
 
-  // Auto-detect running import on page load — jump to Import step
+  // Resume an active import only while the operator is still on Welcome.
   useEffect(() => {
+    if (resumedOnEntry.current) return;
+    const controller = new AbortController();
     (async () => {
       try {
-        const status: ImportStatus = await api.getImportStatus();
+        const status: ImportStatus = await api.getImportStatus(controller.signal);
         const running =
           status.phase === 'importing' ||
           status.phase === 'connecting' ||
@@ -318,14 +334,16 @@ function AdminSetupWizard() {
           status.lifecycle === 'queued' ||
           status.lifecycle === 'running' ||
           status.lifecycle === 'cancel_requested' ||
-          status.lifecycle === 'cancelling';
-        if (running) {
-          setStep(7); // Jump to Import step
+          status.lifecycle === 'cancelling' ||
+          status.lifecycle === 'reconciliation_required';
+        if (running && !controller.signal.aborted) {
+          setStep(current => current === 0 ? 7 : current);
         }
       } catch {
         // No import running or API not available — stay on Welcome
       }
     })();
+    return () => controller.abort();
   }, []);
 
   // Pre-populate wizard from saved config. A failed read is shown as failed and turns the
@@ -1700,35 +1718,10 @@ export function ReviewStep({
 
 function ImportStep() {
   const navigate = useNavigate();
-  const [status, setStatus] = useState<ImportStatus | null>(null);
-  const [starting, setStarting] = useState(false);
-  const [startError, setStartError] = useState('');
+  const { status, statusError, actionError, actionMessage, starting, cancelling, awaitingStatus, start, cancel } = useSetupImport();
+  const actionsDisabled = starting || cancelling || awaitingStatus || !!statusError;
   const logRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
-
-  // Poll import status
-  useEffect(() => {
-    let interval: ReturnType<typeof setInterval> | null = null;
-
-    const poll = async () => {
-      try {
-        const s = await api.getImportStatus();
-        setStatus(s);
-      } catch {
-        // ignore poll errors
-      }
-    };
-
-    // Initial fetch
-    poll();
-
-    // Poll while running
-    interval = setInterval(poll, 1500);
-
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, []);
 
   // Auto-scroll log
   useEffect(() => {
@@ -1737,47 +1730,28 @@ function ImportStep() {
     }
   }, [status?.log_lines, autoScroll]);
 
-  const handleStart = async () => {
-    setStarting(true);
-    setStartError('');
-    try {
-      const result = await api.startImport();
-      if (!result.ok) {
-        setStartError(result.message);
-      }
-    } catch (e: unknown) {
-      setStartError(e instanceof Error ? e.message : 'Failed to start import');
-    }
-    setStarting(false);
-  };
-
-  const handleCancel = async () => {
-    try {
-      await api.cancelImport();
-    } catch {
-      // ignore
-    }
-  };
-
   const handleLogScroll = () => {
     if (!logRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = logRef.current;
     setAutoScroll(scrollHeight - scrollTop - clientHeight < 50);
   };
 
-  const phase = status?.phase ?? 'idle';
-  const isCancelling =
-    status?.lifecycle === 'cancel_requested' ||
-    status?.lifecycle === 'cancelling' ||
-    status?.cancelling === true;
-  const isActive =
-    ['connecting', 'importing', 'verifying', 'final_push'].includes(phase) ||
-    status?.busy === true ||
-    isCancelling;
-  const isComplete = phase === 'completed';
-  const isFailed = phase === 'failed';
-  const isCancelled = phase === 'cancelled';
-  const isIdle = !status || phase === 'idle';
+  const identified = !!(status?.operation_id && status.lifecycle);
+  const lifecycle = identified ? status?.lifecycle : undefined;
+  const needsReconciliation = lifecycle === 'reconciliation_required';
+  const isComplete = lifecycle === 'completed';
+  const isFailed = lifecycle === 'failed';
+  const isCancelled = lifecycle === 'cancelled';
+  const isTerminal = isComplete || isFailed || isCancelled || needsReconciliation;
+  const isCancelling = lifecycle === 'cancel_requested' || lifecycle === 'cancelling';
+  const reportedPhase = status?.phase ?? 'idle';
+  const hasWorkerPhase = ['connecting', 'importing', 'verifying', 'final_push'].includes(reportedPhase);
+  const isActive = !isTerminal && (hasWorkerPhase || status?.busy === true ||
+    lifecycle === 'queued' || lifecycle === 'running' || isCancelling);
+  const isLegacyOutcome = !identified && ['completed', 'cancelled', 'failed'].includes(reportedPhase);
+  // The journal owns outcomes. The worker supplies only the current execution phase.
+  const phase: ImportStatus['phase'] = isComplete ? 'completed' : isCancelled ? 'cancelled'
+    : isFailed || needsReconciliation ? 'failed' : hasWorkerPhase ? reportedPhase : 'idle';
   // Elapsed time for push phase
   const pushElapsed = (() => {
     if (!status?.push_started_at) return '';
@@ -1796,47 +1770,51 @@ function ImportStep() {
         color="blue"
       />
 
-      {/* Phase state machine graphic */}
-      <ImportPhaseGraphic currentPhase={phase} />
+      {statusError && <p role="alert" className="text-yellow-300">{statusError} {status && 'Showing the last reported status.'}</p>}
+      {actionError && <p role="alert" className="text-red-300">{actionError}</p>}
+      {actionMessage && <p role="status" className="text-blue-300">{actionMessage}</p>}
+      {!status && !statusError && <p role="status">Reading import status…</p>}
+      {status && !isLegacyOutcome && !needsReconciliation && <ImportPhaseGraphic currentPhase={phase} />}
+      {isLegacyOutcome && <p>Legacy import progress reported “{reportedPhase}”. A durable operation outcome and publication checkpoint are unavailable.</p>}
+      {status && !isLegacyOutcome && !isActive && !isTerminal && !canStartSetupImport(status) &&
+        <p>The server has not made a new setup import available.</p>}
 
-      {/* Action buttons */}
-      {isIdle && (
+      {canStartSetupImport(status) && (
         <div className="text-center py-4">
-          {startError && (
-            <div className="rs-bn rs-bn--danger mb-4 bg-red-900/30 border border-red-700 rounded-lg p-4 text-sm text-red-300">
-              {startError}
-            </div>
-          )}
           <button
-            onClick={handleStart}
-            disabled={starting}
+            onClick={start}
+            disabled={actionsDisabled}
             className="rs-btn rs-btn--primary px-8 py-3 bg-blue-600 rs-text-on-accent hover:bg-blue-700 rounded-lg text-base font-medium transition-colors shadow-lg disabled:opacity-50"
           >
-            {starting ? (
-              <span className="flex items-center space-x-2">
-                <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
-                <span>Starting Import...</span>
-              </span>
-            ) : '▶ Start Full Import'}
+            {starting ? 'Starting import…' : isFailed ? 'Retry Import' : isCancelled ? 'Restart Import' : 'Start Full Import'}
           </button>
           <p className="text-xs text-gray-300 mt-3">This will import all SVN revisions as individual Git commits.</p>
         </div>
       )}
 
-      {/* Progress section */}
-      {(isActive || isComplete || isFailed || isCancelled) && (
+      {status && (isActive || isTerminal) && (
         <div className="space-y-4">
-          {status && <ImportProgressMeter status={status} name="Setup import" />}
-          <p className="text-sm text-gray-200">{isComplete ? 'Complete' : isFailed ? 'Failed' : isCancelled ? 'Cancelled' : 'Import in progress'}</p>
+          <ImportProgressMeter status={{ ...status, phase }} name="Setup import" />
+          <p className="text-sm text-gray-200">{lifecycle === 'running' && phase === 'idle' ? 'Running' : importStateLabel({ phase, lifecycle })}</p>
+          {status.operation_id && <p className="text-xs text-gray-400 font-mono">Operation {status.operation_id}</p>}
+          {isTerminal && status.busy && <p>Outcome recorded. The repository is still busy.</p>}
+          {identified && (
+            <dl className="grid gap-3 sm:grid-cols-2">
+              <ImportCheckpoint label="Local progress" revision={status.last_local_svn_rev} sha={status.last_local_git_sha} />
+              <ImportCheckpoint label="Confirmed publication" revision={status.last_confirmed_svn_rev} sha={status.last_confirmed_git_sha} />
+            </dl>
+          )}
 
           {/* Stats row */}
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-            <StatCard label="Revisions" value={`${status?.current_rev ?? 0} / ${status?.total_revs ?? 0}`} />
-            <StatCard label="Commits Created" value={String(status?.commits_created ?? 0)} />
-            <StatCard label="Current Files" value={String(status?.current_file_count ?? 0)} />
-            <StatCard label="LFS Files" value={String(status?.lfs_unique_count ?? 0)} />
-            <StatCard label="Batches Pushed" value={String(status?.batches_pushed ?? 0)} />
-          </div>
+          {status.has_worker_progress !== false && (
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+              <StatCard label="Revisions" value={`${status.current_rev ?? 0} / ${status.total_revs ?? 0}`} />
+              <StatCard label="Commits Created" value={String(status.commits_created ?? 0)} />
+              <StatCard label="Current Files" value={String(status.current_file_count ?? 0)} />
+              <StatCard label="LFS Files" value={String(status.lfs_unique_count ?? 0)} />
+              <StatCard label="Batches Pushed" value={String(status.batches_pushed ?? 0)} />
+            </div>
+          )}
 
           {/* Verification status */}
           {phase === 'verifying' && (
@@ -1868,23 +1846,22 @@ function ImportStep() {
             </div>
           )}
 
-          {/* Cancel / cancelling */}
           {isActive && (
             <div className="text-center space-y-2">
-              {status?.operation_id && (
-                <p className="text-xs text-gray-400 font-mono">Operation {status.operation_id}</p>
-              )}
               {isCancelling ? (
                 <p className="text-sm text-yellow-300">
-                  Cancellation requested — stopping. Published history is not undone.
+                  Stop requested. Waiting for the worker to finish. Published commits remain in place.
                 </p>
-              ) : (
+              ) : identified && canCancelSetupImport(status) && status.operation_id ? (
                 <button
-                  onClick={handleCancel}
-                  className="rs-btn rs-btn--quiet px-4 py-2 border border-red-600 text-red-400 hover:bg-red-900/30 rounded-lg text-sm transition-colors"
+                  onClick={() => { if (status.operation_id) void cancel(status.operation_id); }}
+                  disabled={actionsDisabled}
+                  className="rs-btn rs-btn--quiet px-4 py-2 border border-red-600 text-red-400 hover:bg-red-900/30 rounded-lg text-sm transition-colors disabled:opacity-50"
                 >
                   Cancel Import
                 </button>
+              ) : (
+                <p>This import is read-only here. {identified ? 'The setup worker cannot confirm it can stop this operation.' : 'The server has not identified a setup operation to stop.'}</p>
               )}
             </div>
           )}
@@ -1914,7 +1891,7 @@ function ImportStep() {
           className="bg-gray-950 border border-gray-700 rounded-lg p-4 h-[400px] overflow-y-auto font-mono text-sm leading-relaxed"
         >
           {(!status?.log_lines || status.log_lines.length === 0) ? (
-            <p className="text-gray-400 italic">Waiting for import to start...</p>
+            <p className="text-gray-400 italic">No worker log reported.</p>
           ) : (
             status.log_lines.map((line, i) => (
               <div key={i} className={`whitespace-pre-wrap ${getLogLineColor(line)}`}>
@@ -1928,19 +1905,14 @@ function ImportStep() {
       {/* Server Monitor — visible during active import */}
       {(isActive || isComplete || isFailed) && <ServerMonitor />}
 
-      {/* Error display */}
-      {isFailed && status?.errors && status.errors.length > 0 && (
+      {(isFailed || needsReconciliation) && (
         <div className="rs-bn rs-bn--danger bg-red-900/30 border border-red-700 rounded-lg p-5">
-          <h3 className="rs-heading text-sm font-semibold text-red-300 mb-2">Errors</h3>
-          {status.errors.map((err, i) => (
+          <h3 className="rs-heading text-sm font-semibold text-red-300 mb-2">{needsReconciliation ? 'Reconciliation required' : 'Import failed'}</h3>
+          {needsReconciliation && <p>Review the recorded outcome and confirm the published Git history before starting another import.</p>}
+          {status?.outcome_detail && <p>{status.outcome_detail}</p>}
+          {status?.errors.filter(error => error !== status.outcome_detail).map((err, i) => (
             <p key={i} className="text-sm text-red-200">{err}</p>
           ))}
-          <button
-            onClick={handleStart}
-            className="rs-btn rs-btn--danger mt-3 px-4 py-2 bg-red-600 rs-text-on-danger hover:bg-red-700 rounded-lg text-sm transition-colors"
-          >
-            Retry Import
-          </button>
         </div>
       )}
 
@@ -1948,10 +1920,10 @@ function ImportStep() {
       {isComplete && (
         <div className="rs-bn rs-bn--ok bg-emerald-900/30 border border-emerald-700 rounded-lg p-6 text-center">
           <div className="text-4xl mb-3">✓</div>
-          <h3 className="rs-heading text-xl font-semibold text-emerald-300">Import Complete</h3>
-          <p className="text-gray-400 mt-2">
+          <h3 className="rs-heading text-xl font-semibold text-emerald-300">{status?.busy ? 'Completion recorded' : 'Import Complete'}</h3>
+          {status?.has_worker_progress !== false && <p className="text-gray-400 mt-2">
             {status?.commits_created} commit{status?.commits_created !== 1 ? 's' : ''} imported from {status?.total_revs} SVN revision{status?.total_revs !== 1 ? 's' : ''}
-          </p>
+          </p>}
           {(status?.lfs_unique_count ?? 0) > 0 && (
             <p className="text-gray-300 text-sm mt-1">{status?.lfs_unique_count} unique files tracked via Git LFS</p>
           )}
@@ -1972,15 +1944,9 @@ function ImportStep() {
       {/* Cancelled state */}
       {isCancelled && (
         <div className="rs-bn rs-bn--warn bg-yellow-900/30 border border-yellow-700 rounded-lg p-5 text-center">
-          <h3 className="rs-heading text-lg font-semibold text-yellow-300">Import Cancelled</h3>
-          <p className="text-gray-400 mt-1">{status?.commits_created} commits were imported before cancellation.</p>
+          <h3 className="rs-heading text-lg font-semibold text-yellow-300">{status?.busy ? 'Cancellation recorded' : 'Import Cancelled'}</h3>
+          <p className="text-gray-400 mt-1">Published commits remain in place.</p>
           <div className="flex justify-center space-x-3 mt-3">
-            <button
-              onClick={handleStart}
-              className="rs-btn rs-btn--primary px-4 py-2 bg-blue-600 rs-text-on-accent hover:bg-blue-700 rounded-lg text-sm transition-colors"
-            >
-              Restart Import
-            </button>
             <button
               onClick={() => navigate('/login')}
               className="rs-btn rs-btn--quiet px-4 py-2 border border-gray-600 text-gray-300 hover:bg-gray-700 rounded-lg text-sm transition-colors"
@@ -1990,6 +1956,19 @@ function ImportStep() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function ImportCheckpoint({ label, revision, sha }: { label: string; revision?: number | null; sha?: string | null }) {
+  return (
+    <div className="rounded-lg border border-gray-700 p-3">
+      <dt className="text-sm font-semibold">{label}</dt>
+      <dd className="break-all text-sm text-gray-300">
+        {revision != null && <span>SVN r{revision} </span>}
+        {sha && <code>{sha}</code>}
+        {revision == null && !sha && 'No checkpoint reported'}
+      </dd>
     </div>
   );
 }

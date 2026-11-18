@@ -418,6 +418,215 @@ async fn candidate_64c07_setup_wizard_busy_duplicate_cancel_idle_after_terminal(
     server.abort();
 }
 
+async fn cancel_selected(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    id: &str,
+) -> serde_json::Value {
+    client
+        .post(format!("http://{addr}/api/setup/import/cancel"))
+        .query(&[("operation_id", id)])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn rs19_status_keeps_legacy_checkpoints_read_only_and_reports_storage_errors() {
+    let (addr, state, server, _tmp, repo_id, _bare) = setup_wizard_fixture().await;
+    let client = authed_client();
+    let idle = setup_status(&client, addr).await;
+    assert_eq!(idle["can_start"], true, "{idle}");
+    assert_eq!(idle["can_cancel"], false);
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_svn_rev=4, last_git_sha='legacy-tip' WHERE id=?1",
+            [&repo_id],
+        )
+        .unwrap();
+    let key = format!("last_svn_rev_{repo_id}");
+    assert!(state.db.get_state(&key).unwrap().is_none());
+    assert_eq!(setup_status(&client, addr).await["can_start"], false);
+    assert!(
+        state.db.get_state(&key).unwrap().is_none(),
+        "polling wrote a checkpoint"
+    );
+    // The request still authenticates normally; corrupt only this fixture's
+    // operation document so a failed read cannot be reported as idle.
+    let op = state
+        .db
+        .create_import_operation(&repo_id, "fixture", "broken", "fixture")
+        .unwrap();
+    state
+        .db
+        .set_state(
+            &format!("import_operation_v1:document:{}", op.id),
+            "malformed",
+        )
+        .unwrap();
+    let response = client
+        .get(format!("http://{addr}/api/setup/import/status"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn rs19_stale_stop_never_cancels_a_successor_or_signals_its_worker() {
+    let (addr, state, server, tmp, repo_id, _bare) = setup_wizard_fixture().await;
+    let repo = state.db.get_repository(&repo_id).unwrap().unwrap();
+    let fingerprint = reposync_core::db::import_operations::import_target_fingerprint(
+        &repo,
+        &tmp.path().join("git-repo"),
+    );
+    let old = state
+        .db
+        .create_import_operation(&repo_id, "fixture", "first", &fingerprint)
+        .unwrap();
+    state.db.start_import_operation(&repo_id, &old.id).unwrap();
+    let client = authed_client();
+    let mut slot = state.import_progress.write().await;
+    slot.setup_operation_id = Some(old.id.clone());
+    slot.phase = ImportPhase::Importing;
+    let mut request = Box::pin(cancel_selected(&client, addr, &old.id));
+    // Deliver the HTTP request while the worker slot is held. It must validate
+    // both the durable identity and the owning signal after the slot changes.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut request)
+            .await
+            .is_err()
+    );
+    state
+        .db
+        .note_import_local(&repo_id, &old.id, 1, "fixture-tip", 1, 1)
+        .unwrap();
+    state
+        .db
+        .begin_import_publication(&repo_id, &old.id, "refs/heads/main", "fixture-tip")
+        .unwrap();
+    state
+        .db
+        .confirm_import_publication(&repo_id, &old.id, "fixture-tip")
+        .unwrap();
+    state
+        .db
+        .complete_import_operation(&repo_id, &old.id, 1, "fixture-tip")
+        .unwrap();
+    let next = state
+        .db
+        .create_import_operation(&repo_id, "fixture", "second", &fingerprint)
+        .unwrap();
+    *slot = ImportProgress::default();
+    slot.setup_operation_id = Some(next.id.clone());
+    slot.phase = ImportPhase::Connecting;
+    let next_signal = slot.cancel_signal.clone();
+    drop(slot);
+    let stale = request.await;
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert!(stale.get("operation_id").is_none());
+    assert_eq!(cancel_selected(&client, addr, "unknown").await["ok"], false);
+    assert!(!next_signal.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        state
+            .db
+            .get_import_operation(&repo_id, &next.id)
+            .unwrap()
+            .unwrap(),
+        next
+    );
+    let current = setup_status(&client, addr).await;
+    assert_eq!(current["operation_id"], next.id);
+    assert_eq!(current["has_worker_progress"], true);
+    assert_eq!(current["can_start"], false);
+    assert_eq!(current["can_cancel"], true);
+    let stop = cancel_selected(&client, addr, &next.id).await;
+    assert_eq!(stop["ok"], true, "{stop}");
+    assert_eq!(stop["lifecycle"], "cancel_requested");
+    assert_eq!(stop["operation_id"], next.id);
+    assert!(next_signal.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(setup_status(&client, addr).await["can_cancel"], false);
+    assert_eq!(
+        cancel_selected(&client, addr, &next.id).await["lifecycle"],
+        "cancel_requested"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn rs19_setup_does_not_expose_or_cancel_managed_full_or_snapshot_imports() {
+    let (addr, state, server, tmp, repo_id, _bare) = setup_wizard_fixture().await;
+    let repo = state.db.get_repository(&repo_id).unwrap().unwrap();
+    let fingerprint = reposync_core::db::import_operations::import_target_fingerprint(
+        &repo,
+        &tmp.path().join("repos").join(&repo_id).join("git-repo"),
+    );
+    let op = state
+        .db
+        .create_import_operation(&repo_id, "fixture", "managed", &fingerprint)
+        .unwrap();
+    state.db.start_import_operation(&repo_id, &op.id).unwrap();
+    state
+        .db
+        .note_import_local(&repo_id, &op.id, 3, "foreign-tip", 1, 1)
+        .unwrap();
+    let client = authed_client();
+    let signal = {
+        let mut p = state.import_progress.write().await;
+        p.setup_operation_id = Some("unrelated-setup-worker".into());
+        p.phase = ImportPhase::Importing;
+        p.commits_created = 91;
+        p.errors.push("unrelated worker detail".into());
+        p.cancel_signal.clone()
+    };
+    for snapshot in [false, true] {
+        if snapshot {
+            state
+                .db
+                .mark_snapshot_import_request(&repo_id, &op.id)
+                .unwrap();
+        }
+        let before = state
+            .db
+            .get_import_operation(&repo_id, &op.id)
+            .unwrap()
+            .unwrap();
+        let status = setup_status(&client, addr).await;
+        assert_eq!(status["busy"], true);
+        assert_eq!(status["can_cancel"], false);
+        assert_eq!(status["can_start"], false);
+        assert_eq!(status["has_worker_progress"], false);
+        assert!(status.get("operation_id").is_none());
+        assert!(status.get("last_local_svn_rev").is_none());
+        assert!(status.get("last_local_git_sha").is_none());
+        assert_eq!(status["commits_created"], 0);
+        assert_eq!(status["errors"], serde_json::json!([]));
+        assert_eq!(cancel_selected(&client, addr, &op.id).await["ok"], false);
+        assert_eq!(cancel_setup(&client, addr).await["ok"], false);
+        assert_eq!(
+            state
+                .db
+                .get_import_operation(&repo_id, &op.id)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert!(!signal.load(std::sync::atomic::Ordering::Acquire));
+    }
+    server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_64c07_setup_wizard_held_operation_refuses_duplicate_start() {
     if !svn_available() {
@@ -449,6 +658,9 @@ async fn candidate_64c07_setup_wizard_held_operation_refuses_duplicate_start() {
     let status = setup_status(&client, addr).await;
     assert_eq!(status["operation_id"], held.id);
     assert_eq!(status["lifecycle"], "cancelled");
+    assert_eq!(status["can_start"], false);
+    assert_eq!(status["can_cancel"], false);
+    assert_eq!(status["has_worker_progress"], false);
     assert_eq!(status["busy"], false, "{status}");
 
     let start: serde_json::Value = client
@@ -884,14 +1096,8 @@ async fn candidate_64c07_setup_wizard_connecting_barrier_busy_and_cancel() {
         .await
         .unwrap();
     assert_eq!(duplicate["ok"], false, "{duplicate}");
-    let cancel: serde_json::Value = client
-        .post(format!("http://{addr}/api/setup/import/cancel"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    assert_eq!(status["can_cancel"], true);
+    let cancel = cancel_selected(&client, addr, op_id).await;
     assert_eq!(cancel["lifecycle"], "cancel_requested", "{cancel}");
     let terminal = wait_terminal(&client, addr, op_id, &repo_id).await;
     assert_eq!(terminal["lifecycle"], "cancelled", "{terminal}");

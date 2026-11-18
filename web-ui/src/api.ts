@@ -423,29 +423,29 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  startImport: () =>
+  startImport: (signal?: AbortSignal) =>
     fetchJson<{
       ok: boolean;
       message: string;
       operation_id?: string;
       lifecycle?: ImportStatus['lifecycle'];
     }>('/setup/import', {
-      method: 'POST',
+      method: 'POST', signal,
     }),
 
   getSetupConfig: () => fetchJson<WizardSetupConfig>('/setup/config'),
 
-  getImportStatus: () =>
-    fetchJson<ImportStatus>('/setup/import/status'),
+  getImportStatus: (signal?: AbortSignal) =>
+    fetchJson<ImportStatus>('/setup/import/status', { signal }),
 
-  cancelImport: () =>
+  cancelImport: (operationId: string, signal?: AbortSignal) =>
     fetchJson<{
       ok: boolean;
       message: string;
       operation_id?: string;
       lifecycle?: ImportStatus['lifecycle'];
-    }>('/setup/import/cancel', {
-      method: 'POST',
+    }>(`/setup/import/cancel?operation_id=${encodeURIComponent(operationId)}`, {
+      method: 'POST', signal,
     }),
 
   resetAndReimport: () =>
@@ -974,6 +974,8 @@ export interface ImportStatus {
   busy?: boolean;
   cancelling?: boolean;
   can_start?: boolean;
+  can_cancel?: boolean;
+  has_worker_progress?: boolean;
   last_local_svn_rev?: number | null;
   last_local_git_sha?: string | null;
   last_confirmed_svn_rev?: number | null;
