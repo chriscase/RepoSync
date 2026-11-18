@@ -101,8 +101,8 @@ admin_password_env = "REPOSYNC_ADMIN_PASSWORD"
 mode = "direct"
 # Attempt automatic 3-way merge for non-overlapping changes
 auto_merge = true
-# Sync branch creation/deletion between SVN and Git
-sync_branches = true
+# Leave the branch list empty to keep the default scope of all branches.
+sync_branches = []
 # Sync tag creation between SVN and Git
 sync_tags = true
 
