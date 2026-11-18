@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createElement, type ReactElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
@@ -212,7 +213,12 @@ describe('#264 G12.10 a failed read of the saved configuration turns the form of
   });
 
   it('renders the page with the form on and no failure before the read settles', () => {
-    const html = renderToStaticMarkup(createElement(MemoryRouter, null, createElement(SetupWizard)));
+    const entries = new Map([['session_token', 'fixture-token'], ['user', JSON.stringify({id:'fixture-admin',username:'fixture-admin',role:'admin'})]]);
+    vi.stubGlobal('localStorage', {getItem:(key:string)=>entries.get(key) ?? null,setItem:(key:string,value:string)=>entries.set(key,value),removeItem:(key:string)=>entries.delete(key)});
+    const client = new QueryClient({defaultOptions:{queries:{retry:false}}});
+    let html: string;
+    try { html = renderToStaticMarkup(createElement(QueryClientProvider, {client}, createElement(MemoryRouter, null, createElement(SetupWizard)))); }
+    finally { client.clear(); vi.unstubAllGlobals(); }
     expect(html).toContain('RepoSync Setup');
     expect(html).toMatch(/<button class="rs-btn rs-btn--primary[^"]*">Get Started<\/button>/);
     expect(html).toContain('<fieldset class="min-w-0 disabled:opacity-60">');
