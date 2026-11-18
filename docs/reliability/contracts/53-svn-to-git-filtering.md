@@ -1,0 +1,245 @@
+# #53 SVN→Git path filtering (forward, incremental)
+
+Status: implemented on `claude/rs53-svn-to-git-filtering` from partial52 `dc03b8a`.
+Native cases are authored in `crates/core/tests/partial_sync_53.rs`; they need
+real `svn`, `svnadmin` and `git` and were **not run** on the authoring host (no
+Subversion installed). Qualification of those cases is the exact-head CI run.
+
+## What changes
+
+With non-empty `allowed_paths` or `blocked_patterns`, an SVN revision reaches
+Git only through its **selected** file content. Before this change the whole
+revision patch was applied and only log metadata was filtered.
+
+Forward and incremental only. There is no retroactive history cleanup, no
+reimport, no default-policy change, no #57 path rewriting, no Personal-scope
+(#55/#59) behavior, no UI/API/schema/version change and no dependency change.
+
+## Namespace
+
+Policy matching uses the existing canonical branch/Git-root-relative namespace
+and the existing component-aware `path_is_projected`. Changed-path log entries
+are mapped once by `checked_svn_path_identity` / `svn_log_path_to_branch_relative`
+(unchanged `fetch_svn_changes`). `svn diff` section paths are already relative
+to the client target URL and are used literally. There is no second trunk strip,
+no URL decoding, no substring rewrite and no prefix flattening.
+
+## Preparation (before Git fetch/reset and conflict detection)
+
+`prepare_svn_projection_53` keeps the actual fetch. When rules are active and a
+managed repository scope exists, it then:
+
+1. Observes the live SVN identity (`observe_live_svn_identity`). It calls the
+   real `OrdinaryWriterWindow::require_engine_scope` before and after one
+   read-only snapshot of scope, generation, writer epoch, pinned canonical
+   lineage and the repository's **admitted path policy**, outside any write
+   reservation. A live/pinned lineage mismatch refuses.
+   * The admitted policy is the registration row's `allowed_paths` /
+     `blocked_patterns`, parsed exactly as the daemon scheduler parses them
+     (JSON string arrays, NULL = empty, anything else refused). The engine's
+     rules must equal it, or preparation refuses. There is no second policy
+     store.
+2. Plans every fetched revision in order from its actual `svn diff`:
+   * The diff is split into node sections. Any text outside a section, or a
+     `---`/`+++` header naming another path, holds the revision.
+   * Every section must be covered by a changed-path log entry.
+   * A log entry that can reach the selection is validated against diff
+     evidence:
+     - `M` needs a section.
+     - `A`/`R`/`D` without an exact content section (a directory, or a file
+       missing its evidence) is expanded with a pinned `svn export` into an
+       owned temporary directory: `A` and copies at r, `D` at r-1, a plain
+       replace at both. Every selected file below it must have a content
+       section, or the revision is held.
+   * An SVN copy never deletes its source; only an actual delete in the
+     revision does. Each endpoint is classified on its own path.
+3. Builds the projected view. Every revision is kept with its metadata and
+   order. A ready revision's `changed_files` are its selected file endpoints;
+   a held or pending revision keeps its complete log view, so the unchanged
+   conflict detector stays conservative.
+
+Selected effect:
+
+| Selected evidence | Result |
+|---|---|
+| A selected content section with a hunk, a binary marker, or a file add/delete | **Content**: only the selected sections feed the unchanged apply/LFS/commit/push/observe/finalizer path |
+| No selected content; only plain property, empty-directory or root metadata changes (SVN's header-only `Index:` section for a property change carries no content) | **Zero**: filtered finalization |
+| Any selected `svn:executable` / `svn:special` add, change or delete, **regardless of other selected content** | **Held**: mode/symlink meaning has no conversion in the apply path, and applying the rest would lose it |
+| Unparseable diff, uncovered section, missing evidence, read/export failure | **Held** |
+
+A held revision stops the cycle at that revision with `HistoryBlocked`
+(`svn_projection_held`) and an audit row. Later revisions are not prepared and
+stay pending. A failed selected patch uses the existing stop at the durable
+frontier. Neither ever counts as filtering.
+
+Empty allowed **and** blocked rules, an empty fetch, or a call without a
+managed repository scope return no batch: the old code path runs unchanged.
+
+## Filtered finalization (atomic)
+
+A zero-effect plan mints a crate-private `VerifiedSvnProjection`. It:
+
+* has private fields;
+* has no `Serialize`/`Deserialize`;
+* has no Boolean, scalar or JSON constructor;
+* borrows the actual window and database.
+
+`Database::record_svn_filtered_mapping` checks the owner outside SQLite. Then,
+in ONE journal transaction, it:
+
+1. revalidates epoch, scope, generation, pinned lineage, and the admitted
+   path policy, re-read from the repository row (so a policy changed after
+   preparation is refused, not compared with itself);
+2. runs the shared begin core (`SvnFiltered`);
+3. runs the shared confirm core, whose filtered tail writes:
+   * the scoped v1 `no_git_content` SVN receipt and SVN watermark (the
+     projection proved there is no Git content under the active policy);
+   * the canonical `intentionally_filtered_no_target` outcome and checkpoint,
+     reason `svn_filtered_no_git_content`, policy snapshot, and no Git or
+     SVN target;
+   * the proven NULL `commit_map` row, through the single transaction-internal
+     `insert_proven_no_target_row_tx`;
+4. completes the operation and clears it as active.
+
+It never moves the inbound Git cursor, never records a Git SHA, never reports a
+remote effect and never increments the applied count. A write failure rolls
+back the operation, receipt, watermark, outcome and row together. Recovery is
+the next ordinary cycle's fresh observation; there is no blind replay and no
+cleared hold.
+
+The generic `begin_team_cycle_mapping` refuses `SvnFiltered`. The generic
+`confirm_team_cycle_mapping` (and `finalize_tx`) refuses it without the
+verified projection, including for a forged journal document. Legacy outcomes,
+their receipts and their finalization are unchanged.
+
+## Diagnostics
+
+`svn_to_git_filtered` audit rows and structured logs carry the revision, the
+repository scope, the source/included/excluded file-endpoint counts and a
+16-hex policy identity (a SHA-256 prefix of the policy snapshot). They carry
+no URL and no credential, and report no applied commit count.
+
+## Test map (`crates/core/tests/partial_sync_53.rs`)
+
+| Case | Covers |
+|---|---|
+| `sc01_…` | SC01: admitted paths/bytes only; excluded revision accounted in the scoped frontier |
+| `sc02_…` | SC02: no Git commit/ref/tree effect; typed no-target, exact NULL row, receipt, cursor; reopen + repeat with no extra rows |
+| `sc03_…` | SC03: straddling revision, selected bytes and deletes only, provenance, unrelated trees kept |
+| `sc04_…` | SC04: Git mixed commit to SVN, outside paths untouched (existing outbound projection) |
+| `sc05_…` | SC05: Git excluded-only commit, no SVN revision, existing receipt, quiet repeat |
+| `sc06_…` | SC06: SVN→Git→Git edit→SVN round trip, exact bytes, reopen, quiet repeat, no duplication |
+| `empty_policy_…` | Empty-policy legacy behavior |
+| `component_matching_…`, `blocked_rules_alone_…` | team vs team-other, spaces/`@`/dash/Unicode/`%41` literal names, blocked-only rules |
+| `ancestor_directory_delete_…` | Ancestor directory delete, admitted descendants only, no unrelated loss |
+| `copies_never_delete_sources_…` | Copy without delete, moves across the boundary, blocked endpoints |
+| `empty_directory_and_plain_property_…` | Empty directory and property evidence, Git-meaning property hold, later revisions pending |
+| `failed_selected_patch_…` | Selected patch failure is never filtering; later revision pending; recovery by an ordinary cycle |
+| `filtered_finalizer_write_fault_…` | Real file-backed SQLite write fault in the filtered finalizer, drop and reopen, atomic rollback, fresh-cycle finalization once |
+| `in_scope_conflict_…` | Pending Git plus in-scope conflict stays held (#73 handling unchanged) |
+| `replaced_svn_repository_identity_…` | Changed SVN UUID cannot mint filtered completion |
+| `r1_selected_content_with_a_selected_executable_change_on_another_file_holds` | RS53-R1: selected content plus a mode-only change on another selected file holds at the durable frontier; later revision pending |
+| `r1_selected_content_with_a_selected_symlink_holds` | RS53-R1: selected content plus a selected symlink (`svn:special`) holds at the durable frontier |
+| `r2_engine_policy_that_is_not_the_admitted_policy_is_refused_before_any_effect` | RS53-R2: engine rules differing from the admitted row policy refuse before any effect |
+| `r2_admitted_policy_change_refuses_the_stale_engine_and_a_fresh_engine_follows_it` | RS53-R2: an admitted-policy change refuses the stale engine with no effect; a fresh engine built from the row follows it |
+
+Unit tests cover the diff splitter, header/property/binary facts, selection
+reach and pinned-export walking (`sync_engine::svn_projection_53::tests`); the
+generic refusals and forged journal JSON (`team_cycle_mapping_operations::svn_filtered_tests`);
+and the NULL-row helper (`nullable_commit_map::insert_proven_no_target_row_tests`).
+The module tests also run the drift controls on a real file-backed database
+with a real writer window:
+* the mixed-content Git-meaning holds (RS53-R1);
+* engine/admitted policy mismatch at capture;
+* policy, malformed-policy, scope, generation and canonical-lineage drift after
+  capture;
+* another database, lease-epoch drift and an expired owner refusing the owner
+  check;
+* `record_svn_filtered_mapping` refusing drift with zero effects and then
+  committing once (RS53-R2).
+
+## Imported origin and its historical incarnation (RS53-IMPORTED-ORIGIN-HISTORICAL-INCARNATION-1)
+
+A snapshot import publishes commit B from SVN revision R. That provenance is
+stored as one `snapshot-import:<op_id>` origin row, written by
+`complete_import_tx`, and the import's journal document. Neither records the
+incarnation of the imported path. The incarnation is therefore observed
+genuinely at peg R, never inferred from stored fields. `SnapshotPin` gains no
+fields, and its optional copy fields stay revision-local data.
+
+* **Shared decoder** (`import_operations::snapshot_origin_evidence`). It is
+  read-only and takes the caller's connection, repository and B. It returns:
+  * `Absent` when nothing names B;
+  * `Refused(detail)` when a claim exists but a link is missing or contradicts
+    another. Required links: exactly one applied `svn_to_git` origin row; its
+    op id equal to the journal key, the journal id and the repository; a
+    supported version; Completed `snapshot_import`; one-revision counters;
+    local and confirmed revision and commit equal to R and B; no intent or
+    pending maps; operative = peg = R;
+  * `Verified(record)` otherwise, with a digest of the journal text.
+
+  Malformed documents and SQLite errors are errors, never absence.
+* **Historical observer** (`lineage_checkpoints::observe_historical_svn_identity_at`).
+  It reads `svn info URL@R` and the stop-on-copy history at peg R through the
+  configured client. Path identity and incarnation extraction are the live
+  observer's. Empty, out-of-range or non-descending history is refused. The
+  identity compares UUID, root, URL, branch path, creation revision and the
+  path-specific creation copy pair. Revision-number ordering or equality is
+  never used as proof.
+* **First pin (E3, `verify_or_pin_live_svn_identity`; public signature
+  unchanged).** Before the first canonical lineage row of the current scope
+  generation is pinned for a snapshot-backed Git baseline:
+  * the live UUID and URL must equal the pin's;
+  * the identity observed now at R must equal the live identity;
+  * the records must be unchanged after the SVN reads.
+
+  A refused origin, an unobservable history or any difference uses the existing
+  hold (`hold_unproved_identity`) before any lineage row is written. Existing
+  rows are never rewritten. No SQLite reservation is held across the SVN reads.
+  Record reads are one rolled-back read transaction that never mints a scope.
+* **Reader witness (E2).** Under an active policy, before history admission,
+  the engine prepares `ImportedOriginWitness53` under the actual ordinary
+  writer window:
+  * Bound records, read in one snapshot: the reader's split cursor copies, scope
+    and generation (with the documented `current_generation_read_only` branch
+    that resolved it), writer epoch, admitted policy, the repository's SVN URL
+    and Git branch, the verified origin of the inbound cursor B, and the full
+    current lineage, whose baseline is B and whose Git ref is the repository
+    branch.
+  * After the SVN reads (historical at R and live), the identity must equal the
+    pin, the live identity and the pinned lineage. Then the captured identity
+    (owner before and after one snapshot) and the records must be unchanged.
+  * The witness has private fields, no serde and no scalar or JSON constructor,
+    and it borrows the actual database and window.
+  * `team_git_checkpoint_with` adds one last alternative to the handled-cursor
+    proof: `witness.accepts`, which checks the same database, the reader's own
+    cursor copies, the live owner outside SQLite, and one fresh snapshot with
+    the captured identity and every record unchanged.
+  * The no-argument `team_git_checkpoint()` and `inspect_team_history()` are
+    the original readers with no witness.
+  * The emitted-column proof, ancestry, mirror, missing-object and
+    stale-receipt refusals all still apply. The reader returns B, never the
+    emitted tip, so all Git work after B stays eligible for projection and
+    replay.
+
+Coverage:
+* Native, authored and **not run** (no Subversion on the authoring host):
+  * `imported_branch_first_pins_its_incarnation_and_round_trips_with_pending_git`
+    (branch path, C < R; first pin and the filtered round trip with pending Git);
+  * `deleting_and_recreating_the_imported_uncopied_branch_holds_the_first_pin`
+    (N1);
+  * `recopying_the_imported_branch_from_the_same_source_holds_the_first_pin`
+    (N2).
+* Unit:
+  * `import_operations::snapshot_origin_tests` (decoder links and refusals);
+  * `lineage_checkpoints::imported_origin_identity_tests` (identity
+    comparisons);
+  * `sync_engine::svn_projection_53::tests`: witness record links, generation
+    branch, and consumption drift and owner refusals.
+
+## Not established here
+
+* Whole #60: Docker Compose, rewriting and Personal scenarios remain open.
+* Installed-version compatibility: the company installation's binary/build
+  digest, OS/arch, schema/mode and sanitized config/policy/journal shape are
+  not established. Historic 873/54 fixtures do not substitute.
