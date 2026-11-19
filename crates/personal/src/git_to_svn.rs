@@ -428,6 +428,47 @@ impl GitToSvnSync {
         }
     }
 
+    /// A stand-alone replay may have been confirmed before its one-commit PR
+    /// was discovered. Only the still-current verified SVN publication can
+    /// supply that member for the tree proof. It gains no PR-owned SVN range.
+    async fn confirmed_standalone_member(&self, merge_sha: &str, shas: &[&str]) -> Result<bool> {
+        let [sha] = shas else {
+            return Ok(false);
+        };
+        if !self.db.is_personal_git_sha_synced(sha)? {
+            return Ok(false);
+        }
+        let Some(op) = self.db.latest_svn_commit_operation(PERSONAL_REPO_ID)? else {
+            return Ok(false);
+        };
+        if op.state != SvnCommitOperationState::Completed
+            || op.personal_pr_sync_id.is_some()
+            || op.source_git_sha != *sha
+            || op.last_confirmed_svn_tree.as_ref() != Some(&op.intended_svn_tree)
+            || GitClient::new(&self.git_repo_path)?
+                .commit_parent_and_tree(merge_sha)?
+                .1
+                != op.source_git_tree
+        {
+            return Ok(false);
+        }
+        let info = self.svn.info().await?;
+        let target = svn_commit_target_fingerprint(
+            PERSONAL_REPO_ID,
+            &info.uuid,
+            self.svn.url(),
+            &info.url,
+            "{}",
+        );
+        if op.target_fingerprint != target || op.last_confirmed_svn_rev != Some(info.latest_rev) {
+            return Ok(false);
+        }
+        Ok(
+            observed_svn_tree_at_revision(&self.svn, info.latest_rev).await?
+                == op.intended_svn_tree,
+        )
+    }
+
     /// For a two-parent merge, the local Git objects independently identify the
     /// commits introduced by the PR, even on the first provider response.
     fn verify_merge_membership(
@@ -436,6 +477,7 @@ impl GitToSvnSync {
         shas: &[&str],
         commits: &[GitHubCommit],
         sync_id: i64,
+        standalone_confirmed: bool,
     ) -> Result<()> {
         let git = GitClient::new(&self.git_repo_path)?;
         let repo = git.repo();
@@ -473,7 +515,10 @@ impl GitToSvnSync {
         let prefix = self.db.confirmed_personal_pr_members(sync_id)?;
         let mut effective = Vec::new();
         for commit in commits {
-            if prefix.contains(&commit.sha) || self.commit_needs_replay(commit)? {
+            if standalone_confirmed
+                || prefix.contains(&commit.sha)
+                || self.commit_needs_replay(commit)?
+            {
                 effective.push(commit.sha.as_str());
             }
         }
@@ -511,8 +556,9 @@ impl GitToSvnSync {
             .context("failed to fetch PR commits")?;
         let merge_strategy = self.detect_merge_strategy(pr, &commits).await;
         let shas: Vec<_> = commits.iter().map(|commit| commit.sha.as_str()).collect();
+        let standalone_confirmed = self.confirmed_standalone_member(merge_sha, &shas).await?;
         let membership = self
-            .verify_merge_membership(merge_sha, &shas, &commits, sync_id)
+            .verify_merge_membership(merge_sha, &shas, &commits, sync_id, standalone_confirmed)
             .and_then(|()| {
                 Ok(self
                     .db
