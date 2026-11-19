@@ -387,6 +387,43 @@ impl GitToSvnSync {
         self.sync_pr(pr, merge_sha).await
     }
 
+    /// For a two-parent merge, the local Git objects independently identify the
+    /// commits introduced by the PR, even on the first provider response.
+    fn verify_merge_membership(&self, merge_sha: &str, shas: &[&str]) -> Result<()> {
+        let git = GitClient::new(&self.git_repo_path)?;
+        let repo = git.repo();
+        let merge = repo.find_commit(merge_sha.parse()?)?;
+        if merge.parent_count() != 2 {
+            return Ok(());
+        }
+
+        let order: HashMap<_, _> = shas.iter().enumerate().map(|(i, &sha)| (sha, i)).collect();
+        let mut introduced = repo.revwalk()?;
+        introduced.push(merge.parent_id(1)?)?;
+        introduced.hide(merge.parent_id(0)?)?;
+        let mut count = 0;
+        for oid in introduced {
+            let commit = repo.find_commit(oid?)?;
+            let index = order
+                .get(commit.id().to_string().as_str())
+                .context("provider commit list omits a commit introduced by the PR merge")?;
+            for parent in commit.parent_ids() {
+                if order
+                    .get(parent.to_string().as_str())
+                    .is_some_and(|p| p >= index)
+                {
+                    anyhow::bail!("provider commit list places a child before its parent");
+                }
+            }
+            count += 1;
+        }
+        anyhow::ensure!(
+            count == shas.len(),
+            "provider commit list has unrelated or duplicate members"
+        );
+        Ok(())
+    }
+
     /// Sync a single merged PR's commits to SVN.
     ///
     /// Returns the number of commits successfully replayed.
@@ -394,22 +431,8 @@ impl GitToSvnSync {
     async fn sync_pr(&self, pr: &PullRequest, merge_sha: &str) -> Result<u64> {
         let pr_branch = &pr.head.ref_name;
 
-        // Fetch the commits belonging to this PR.
-        let commits = self
-            .github
-            .get_pr_commits(&self.github_repo, pr.number)
-            .await
-            .context("failed to fetch PR commits")?;
-
-        if commits.is_empty() {
-            warn!(pr_number = pr.number, "PR has no commits, skipping");
-            return Ok(0);
-        }
-
-        // Detect merge strategy for metadata.
-        let merge_strategy = self.detect_merge_strategy(pr, &commits).await;
-
-        // Record PR sync as pending.
+        // A later poll must still account for this exact queue entry if fetching
+        // its first complete commit list fails or the process restarts.
         let sync_id = self
             .db
             .insert_pr_sync(
@@ -417,10 +440,38 @@ impl GitToSvnSync {
                 &pr.title,
                 pr_branch,
                 merge_sha,
-                &merge_strategy,
-                commits.len() as i64,
+                "unknown",
+                0,
             )
-            .context("failed to insert pr_sync_log entry")?;
+            .context("failed to record pending Personal PR")?;
+        let commits = self
+            .github
+            .get_pr_commits(&self.github_repo, pr.number)
+            .await
+            .context("failed to fetch PR commits")?;
+        let merge_strategy = self.detect_merge_strategy(pr, &commits).await;
+        let shas: Vec<_> = commits.iter().map(|commit| commit.sha.as_str()).collect();
+        let membership = self
+            .verify_merge_membership(merge_sha, &shas)
+            .and_then(|()| {
+                Ok(self
+                    .db
+                    .bind_personal_pr_commits(sync_id, &merge_strategy, &shas)?)
+            });
+        if let Err(error) = membership {
+            self.db
+                .insert_audit_log(
+                    "git_to_svn_pr_membership",
+                    Some("git_to_svn"),
+                    None,
+                    Some(merge_sha),
+                    None,
+                    Some(&error.to_string()),
+                    false,
+                )
+                .ok();
+            return Err(error);
+        }
 
         let echo_ctx = TeamEchoContext {
             db: self.db.as_ref(),
@@ -449,7 +500,6 @@ impl GitToSvnSync {
                     continue;
                 }
                 Ok(EchoDisposition::DeferPendingJournal) => {
-                    let _ = self.db.abandon_pending_pr_sync(sync_id);
                     anyhow::bail!(
                         "pending personal svn-to-git journal for {}; deferring git-to-svn replay",
                         commit.sha

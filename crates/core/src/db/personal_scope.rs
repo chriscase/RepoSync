@@ -7,6 +7,7 @@
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::git_push_operations::GitPushOperation;
@@ -278,6 +279,60 @@ impl Database {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Pin the first complete ordered list. A zero count on a pending PR means
+    /// the list was unavailable. Legacy nonzero counts still constrain retries.
+    pub fn bind_personal_pr_commits(
+        &self,
+        id: i64,
+        strategy: &str,
+        shas: &[&str],
+    ) -> Result<(), DatabaseError> {
+        if shas.is_empty()
+            || shas
+                .iter()
+                .any(|sha| sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()))
+            || shas.iter().collect::<std::collections::HashSet<_>>().len() != shas.len()
+        {
+            return Err(DatabaseError::Other(
+                "empty, invalid or duplicate Personal PR commit list".into(),
+            ));
+        }
+        let mut hash = Sha256::new();
+        for sha in shas {
+            hash.update(sha.as_bytes());
+        }
+        let digest = hex::encode(hash.finalize());
+        let key = format!("personal_pr_commits_v1:{id}");
+        self.immediate_transaction(|tx| {
+            let count: i64 = tx.query_row(
+                "SELECT commit_count FROM pr_sync_log WHERE id=?1 AND status='pending'",
+                [id],
+                |r| r.get(0),
+            )?;
+            let pinned: Option<String> = tx
+                .query_row("SELECT value FROM kv_state WHERE key=?1", [&key], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            if (count != 0 && count != shas.len() as i64)
+                || pinned.as_ref().is_some_and(|old| old != &digest)
+            {
+                return Err(DatabaseError::Other(
+                    "Personal PR commit list changed since its first complete observation".into(),
+                ));
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)",
+                params![key, digest, Utc::now().to_rfc3339()],
+            )?;
+            tx.execute(
+                "UPDATE pr_sync_log SET commit_count=?2,merge_strategy=CASE WHEN merge_strategy='unknown' THEN ?3 ELSE merge_strategy END WHERE id=?1",
+                params![id, shas.len() as i64, strategy],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Discard an unstarted retry. Once a revision is confirmed, keep its PR
     /// identity and range for the next attempt.
     pub fn abandon_pending_pr_sync(&self, id: i64) -> Result<(), DatabaseError> {
@@ -295,6 +350,10 @@ impl Database {
                 })?;
             if start.is_none() {
                 tx.execute("DELETE FROM pr_sync_log WHERE id=?1", [id])?;
+                tx.execute(
+                    "DELETE FROM kv_state WHERE key=?1",
+                    [format!("personal_pr_commits_v1:{id}")],
+                )?;
             }
             Ok(())
         })

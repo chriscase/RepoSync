@@ -80,6 +80,9 @@ enum ProviderView {
     IncompleteDag,
     PendingBeyondCap,
     PendingMissing,
+    EmptyDag,
+    ShortDag,
+    ReorderedDag,
 }
 
 async fn pr_provider(
@@ -149,6 +152,16 @@ async fn pr_provider(
                     continuation = Some(format!(
                         "{server_url}/repos/test/test-repo/pulls/3/commits?page=2"
                     ));
+                }
+                (ProviderView::EmptyDag, "pulls/3/commits") => body = "[]".into(),
+                (ProviderView::ShortDag, "pulls/3/commits") => {
+                    let commits: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+                    body = json!([commits[0]]).to_string();
+                }
+                (ProviderView::ReorderedDag, "pulls/3/commits") => {
+                    let mut commits: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+                    commits.swap(0, 1);
+                    body = json!(commits).to_string();
                 }
                 (ProviderView::PendingBeyondCap, "pulls") => {
                     let page: usize = query
@@ -352,6 +365,8 @@ async fn candidate_r10_personal_merge_dag_replays_across_restart() {
     git_cmd(&git, &["merge", "--no-ff", "feature", "-m", "Merge PR"]);
     let merge = git_sha(&git);
     git_cmd(&git, &["checkout", "-b", "later"]);
+    std::fs::write(git.join("earlier.txt"), "updated by later PR\n").unwrap();
+    git_cmd(&git, &["add", "--", "earlier.txt"]);
     let later = add_file(&git, "later.txt", "later\n", "Later PR");
     git_cmd(&git, &["checkout", "main"]);
     git_cmd(&git, &["merge", "--no-ff", "later", "-m", "Merge later PR"]);
@@ -422,6 +437,34 @@ async fn candidate_r10_personal_merge_dag_replays_across_restart() {
         assert_mappings(&db, "git_to_svn", &first[..1]);
         assert!(!db.is_personal_pr_synced(&historical_merge).unwrap());
         assert!(!db.is_personal_pr_synced(&tip).unwrap());
+        let pr = db.list_pr_syncs(2).unwrap().remove(0);
+        assert_eq!(
+            (
+                pr.pr_number,
+                pr.status.as_str(),
+                pr.commit_count,
+                pr.svn_rev_start
+            ),
+            (3, "pending", 0, None)
+        );
+    }
+    {
+        let engine = open();
+        let db = Database::new(&path).unwrap();
+        *view.lock().unwrap() = ProviderView::PendingMissing;
+        let absent = engine.run_cycle().await.unwrap();
+        assert_eq!((absent.prs_processed, absent.git_to_svn_count), (0, 0));
+        assert_eq!(svn_youngest(&url), baseline + 1);
+        assert_mappings(&db, "git_to_svn", &first[..1]);
+        *view.lock().unwrap() = ProviderView::ShortDag;
+        let unproven = engine.run_cycle().await.unwrap();
+        assert_eq!(
+            (unproven.prs_processed, unproven.git_to_svn_count),
+            (0, 0),
+            "unadvertised first-page prefix must not complete a real merge"
+        );
+        assert_eq!(svn_youngest(&url), baseline + 1);
+        assert_mappings(&db, "git_to_svn", &first[..1]);
         *view.lock().unwrap() = ProviderView::Complete;
         std::fs::create_dir(&obstructed).unwrap();
         let stats = engine.run_cycle().await.unwrap();
@@ -494,6 +537,19 @@ async fn candidate_r10_personal_merge_dag_replays_across_restart() {
     assert_eq!((missing.git_to_svn_count, missing.prs_processed), (0, 0));
     assert_eq!(svn_youngest(&url), baseline + 2);
     assert_mappings(&db, "git_to_svn", &first);
+    for changed in [
+        ProviderView::EmptyDag,
+        ProviderView::ShortDag,
+        ProviderView::ReorderedDag,
+    ] {
+        *view.lock().unwrap() = changed;
+        let rejected = engine.run_cycle().await.unwrap();
+        assert_eq!((rejected.prs_processed, rejected.git_to_svn_count), (0, 0));
+        assert_eq!(svn_youngest(&url), baseline + 2);
+        assert_mappings(&db, "git_to_svn", &first);
+        assert!(!db.is_personal_pr_synced(&merge).unwrap());
+        assert!(!db.is_personal_pr_synced(&tip).unwrap());
+    }
     *view.lock().unwrap() = ProviderView::Complete;
     let stats = engine.run_cycle().await.unwrap();
     assert_eq!(
@@ -578,12 +634,17 @@ async fn candidate_r10_personal_merge_dag_replays_across_restart() {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(errors.len(), 4, "unexpected failed phases: {errors:?}");
+        assert_eq!(errors.len(), 9, "unexpected failed phases: {errors:?}");
         assert_eq!(errors[0].0, "git_to_svn_incomplete_pr");
         assert!(errors[0].1.contains("incomplete commit list for PR #3"));
-        assert_eq!(errors[1].0, "git_to_svn_error");
-        assert!(errors[2].1.contains("incomplete pull-request discovery"));
-        assert!(errors[3].1.contains("pending Personal PR #3 is missing"));
+        assert!(errors[1].1.contains("pending Personal PR #3 is missing"));
+        assert_eq!(errors[2].0, "git_to_svn_pr_membership");
+        assert_eq!(errors[3].0, "git_to_svn_error");
+        assert!(errors[4].1.contains("incomplete pull-request discovery"));
+        assert!(errors[5].1.contains("pending Personal PR #3 is missing"));
+        assert!(errors[6..]
+            .iter()
+            .all(|(action, _)| action == "git_to_svn_pr_membership"));
     }
     let mut checked_trees = BTreeMap::new();
     for rev in baseline..=baseline + 5 {
@@ -599,7 +660,7 @@ async fn candidate_r10_personal_merge_dag_replays_across_restart() {
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         json!({"case":"R10_PERSONAL_MERGE_DAG_RESTART","status":"PASS",
-        "mode":"personal","import":imported,"earlier_pr_merge":base,"pr_merge":merge,"tip":tip,"historical_merge":historical_merge,"discovery_pages":pages.load(Ordering::SeqCst),"earlier_before_incomplete":1,"missing_pending_zero_writes":true,"mappings":expected,"restart_after":first,
+        "mode":"personal","import":imported,"earlier_pr_merge":base,"pr_merge":merge,"tip":tip,"historical_merge":historical_merge,"discovery_pages":pages.load(Ordering::SeqCst),"earlier_before_incomplete":1,"first_unadvertised_prefix_refused":true,"missing_pending_zero_writes":true,"changed_lists_refused":3,"mappings":expected,"restart_after":first,
         "reopened_commits":stats.git_to_svn_count,"svn_trees":checked_trees,
         "pr_range":[baseline+2,baseline+4],"quiet_cycles":2})
     );
