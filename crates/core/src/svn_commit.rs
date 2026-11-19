@@ -503,6 +503,7 @@ mod identity_tests {
             operation_type: "git_to_svn".into(),
             initiator_id: "test".into(),
             request_id: "req".into(),
+            personal_pr_sync_id: None,
             target_fingerprint: "fp".into(),
             created_at: "2020-01-01T00:00:00Z".into(),
             updated_at: "2020-01-01T00:00:00Z".into(),

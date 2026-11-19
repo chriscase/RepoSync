@@ -2197,7 +2197,7 @@ impl Database {
 
     // -- pr_sync_log (personal branch mode) ---------------------------------
 
-    /// Insert a new PR sync log entry (status = 'pending').
+    /// Begin or resume the pending replay for this exact PR and merge commit.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_pr_sync(
         &self,
@@ -2209,24 +2209,36 @@ impl Database {
         commit_count: i64,
     ) -> Result<i64, DatabaseError> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO pr_sync_log (pr_number, pr_title, pr_branch, merge_sha, merge_strategy,
-             commit_count, status, detected_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
-            params![
-                pr_number,
-                pr_title,
-                pr_branch,
-                merge_sha,
-                merge_strategy,
-                commit_count,
-                now
-            ],
-        )?;
-        let id = conn.last_insert_rowid();
-        debug!(id, pr_number, merge_sha, "inserted pr_sync_log entry");
-        Ok(id)
+        self.immediate_transaction(|tx| {
+            if let Some(id) = tx
+                .query_row(
+                    "SELECT id FROM pr_sync_log WHERE pr_number=?1 AND merge_sha=?2
+                 AND status='pending' ORDER BY id DESC LIMIT 1",
+                    params![pr_number, merge_sha],
+                    |row| row.get(0),
+                )
+                .optional()?
+            {
+                return Ok(id);
+            }
+            tx.execute(
+                "INSERT INTO pr_sync_log (pr_number, pr_title, pr_branch, merge_sha, merge_strategy,
+                 commit_count, status, detected_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+                params![
+                    pr_number,
+                    pr_title,
+                    pr_branch,
+                    merge_sha,
+                    merge_strategy,
+                    commit_count,
+                    now
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
+            debug!(id, pr_number, merge_sha, "inserted pr_sync_log entry");
+            Ok(id)
+        })
     }
 
     /// Mark a PR sync as completed with the SVN revision range.
@@ -2239,7 +2251,10 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
         let changed = conn.execute(
-            "UPDATE pr_sync_log SET status = 'completed', svn_rev_start = ?1, svn_rev_end = ?2,
+            "UPDATE pr_sync_log SET status = 'completed',
+             svn_rev_start = CASE WHEN ?1 > 0 AND svn_rev_start IS NOT NULL THEN MIN(svn_rev_start, ?1)
+                                  ELSE COALESCE(svn_rev_start, ?1) END,
+             svn_rev_end = MAX(COALESCE(svn_rev_end, ?2), ?2),
              completed_at = ?3 WHERE id = ?4",
             params![svn_rev_start, svn_rev_end, now, id],
         )?;

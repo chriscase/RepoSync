@@ -32,6 +32,9 @@ use reposync_personal::git_to_svn::{
 };
 use reposync_personal::svn_to_git::{personal_git_push_fixture_env_key, SvnToGitSync};
 
+#[path = "support/r10_merge_dag.rs"]
+mod r10_merge_dag;
+
 // ===========================================================================
 // Helper functions
 // ===========================================================================

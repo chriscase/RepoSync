@@ -660,6 +660,12 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "R10_PERSONAL_MERGE_DAG_RESTART",
+      "binary": "integration",
+      "test": "r10_merge_dag::candidate_r10_personal_merge_dag_replays_across_restart",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "R66_TEAM_CONTINUATION_RESTART",
       "binary": "team_mode_e2e",
       "test": "candidate_r66_team_history_continuation_survives_restart",

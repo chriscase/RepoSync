@@ -47,6 +47,9 @@ pub struct SvnCommitOperation {
     pub operation_type: String,
     pub initiator_id: String,
     pub request_id: String,
+    /// Personal PR attempt that owns this publication, when replayed through PR polling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personal_pr_sync_id: Option<i64>,
     pub target_fingerprint: String,
     pub created_at: String,
     pub updated_at: String,
@@ -342,6 +345,20 @@ fn personal_finalize_tx(
             ],
         )?;
     }
+    // Attribute the revision in the same transaction as the confirmed mapping.
+    // A later PR containing the same SHA must not inherit this revision.
+    if let Some(id) = op.personal_pr_sync_id {
+        let updated = tx.execute(
+            "UPDATE pr_sync_log SET svn_rev_start=COALESCE(svn_rev_start, ?2), svn_rev_end=?2
+             WHERE id=?1 AND status='pending'",
+            params![id, svn_rev],
+        )?;
+        if updated != 1 {
+            return Err(DatabaseError::Other(
+                "missing pending Personal PR for confirmed SVN revision".into(),
+            ));
+        }
+    }
     let now = Utc::now().to_rfc3339();
     op.state = SvnCommitOperationState::Completed;
     op.last_confirmed_svn_rev = Some(svn_rev);
@@ -429,7 +446,30 @@ impl Database {
         &self,
         intent: SvnCommitIntent<'_>,
     ) -> Result<SvnCommitOperation, DatabaseError> {
+        self.begin_svn_commit_for_pr(intent, None)
+    }
+
+    /// Bind a Personal replay to its pending PR so confirmation can update its
+    /// revision range even after a held journal is reopened.
+    pub fn begin_svn_commit_for_pr(
+        &self,
+        intent: SvnCommitIntent<'_>,
+        personal_pr_sync_id: Option<i64>,
+    ) -> Result<SvnCommitOperation, DatabaseError> {
         self.transaction(|tx| {
+            if let Some(id) = personal_pr_sync_id {
+                if intent.repo_id != super::personal_scope::PERSONAL_SCOPE_KEY
+                    || !tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM pr_sync_log WHERE id=?1 AND status='pending')",
+                        [id],
+                        |row| row.get::<_, bool>(0),
+                    )?
+                {
+                    return Err(DatabaseError::Other(
+                        "Personal SVN intent requires its pending PR".into(),
+                    ));
+                }
+            }
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
                 tx,
                 intent.repo_id,
@@ -455,7 +495,9 @@ impl Database {
                         "git-to-svn commit repository mismatch".into(),
                     ));
                 }
-                let same_intent = existing.source_git_sha == intent.source_git_sha
+                let same_intent = (existing.personal_pr_sync_id.is_none()
+                    || existing.personal_pr_sync_id == personal_pr_sync_id)
+                    && existing.source_git_sha == intent.source_git_sha
                     && existing.source_git_parent == intent.source_git_parent.map(str::to_owned)
                     && existing.source_git_tree == intent.source_git_tree
                     && existing.target_svn_uuid == intent.target_svn_uuid
@@ -490,6 +532,7 @@ impl Database {
                 operation_type: "git_to_svn_commit".into(),
                 initiator_id: intent.initiator_id.into(),
                 request_id: intent.request_id.into(),
+                personal_pr_sync_id,
                 target_fingerprint: intent.target_fingerprint.into(),
                 created_at: now.clone(),
                 updated_at: now,

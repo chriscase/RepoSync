@@ -6,7 +6,7 @@
 //! `personal` id on upgrade unless a managed repository already owns that id.
 
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::git_push_operations::GitPushOperation;
@@ -267,20 +267,26 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// Remove a pending PR sync row left by a defer bail so the PR can retry.
+    /// Discard an unstarted retry. Once a revision is confirmed, keep its PR
+    /// identity and range for the next attempt.
     pub fn abandon_pending_pr_sync(&self, id: i64) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        let changed = conn.execute(
-            "DELETE FROM pr_sync_log WHERE id = ?1 AND status = 'pending'",
-            params![id],
-        )?;
-        if changed == 0 {
-            return Err(DatabaseError::NotFound {
-                entity: "pr_sync_log".into(),
-                id: id.to_string(),
-            });
-        }
-        Ok(())
+        self.immediate_transaction(|tx| {
+            let start: Option<i64> = tx
+                .query_row(
+                    "SELECT svn_rev_start FROM pr_sync_log WHERE id=?1 AND status='pending'",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| DatabaseError::NotFound {
+                    entity: "pr_sync_log".into(),
+                    id: id.to_string(),
+                })?;
+            if start.is_none() {
+                tx.execute("DELETE FROM pr_sync_log WHERE id=?1", [id])?;
+            }
+            Ok(())
+        })
     }
 
     /// True when this repository has an applied Git→SVN receipt for the emitted SVN revision.

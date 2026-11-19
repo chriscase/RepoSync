@@ -333,15 +333,13 @@ impl GitHubClient {
         let since = since.map(|s| s.to_string());
         let resp = self
             .retry_request(|| {
-                let mut req = self.auth(self.http.get(&first_url)).query(&[
+                self.auth(self.http.get(&first_url)).query(&[
                     ("state", "closed"),
                     ("base", base.as_str()),
                     ("per_page", "100"),
-                ]);
-                if since.is_some() {
-                    req = req.query(&[("sort", "updated"), ("direction", "desc")]);
-                }
-                req
+                    ("sort", "updated"),
+                    ("direction", "desc"),
+                ])
             })
             .await?;
 
@@ -370,7 +368,15 @@ impl GitHubClient {
         // Filter to only merged PRs, optionally after a timestamp
         let merged: Vec<PullRequest> = all_prs
             .into_iter()
-            .filter(|pr| pr.merged == Some(true))
+            // GitHub list responses identify merges by merged_at; the detail-only
+            // merged flag is optional on compatible providers. Honor an explicit false.
+            .filter(|pr| {
+                pr.merged.unwrap_or_else(|| {
+                    pr.merged_at
+                        .as_deref()
+                        .is_some_and(|date| chrono::DateTime::parse_from_rfc3339(date).is_ok())
+                })
+            })
             .filter(|pr| {
                 if let Some(ref since_dt) = since {
                     pr.merged_at
@@ -403,6 +409,9 @@ impl GitHubClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
+        if Self::parse_next_link(resp.headers()).is_some() {
+            return Err(GitHubError::IncompletePrCommitList { pr_number });
+        }
         let commits: Vec<GitHubCommit> = resp.json().await?;
         debug!(count = commits.len(), pr_number, "fetched PR commits");
         Ok(commits)

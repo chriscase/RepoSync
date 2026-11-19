@@ -101,7 +101,7 @@ them. `fetch_git_changes` records the same durable block when its second-line
 | Durable `has_more` across restart | **proven** — linear `candidate_r66_team_history_continuation_survives_restart`; merge-DAG `candidate_r66_merge_dag_continuation_survives_restart` (`git_replay_continuation_{repo}` pins admitted R and handled set); missing-row idempotency `candidate_r66_merge_dag_continuation_missing_row_idempotent` |
 | Drain Git batches past SVN-only commits | **proven** — `candidate_r66_drain_git_batch_past_svn_only` (metadata-only SVN defers only on file-content delta) |
 | Conflict detection gating | **proven** — `candidate_r66_incomplete_conflict_coverage_fail_closed` and `sync_engine::tests::incomplete_conflict_coverage_fails_closed`; outer gate compares post-filter `conflict_coverage.len()` against applicable pending commits |
-| Personal Git→SVN engine-cycle merge-DAG replay | **NOT RUN** — inspect admission is proven; PR-based replay is a separate surface |
+| Personal Git→SVN engine-cycle merge-DAG replay | **Proven for a single-page PR backlog.** `r10_merge_dag::candidate_r10_personal_merge_dag_replays_across_restart` drives two already-merged PRs through polling. The engine reopens after the first DAG parent reaches SVN and preserves both parents and the merge resolution. |
 
 Baseline R09 still demonstrates that the original pull-then-walk path
 duplicates rewritten history. Candidate R09 cases reject replacement and
@@ -183,8 +183,9 @@ Still required before claiming #66:
   `pending_frontier::non_ancestor_tip_fails_closed`)
 - equal-looking content with different provenance (already partly R09 amend)
 - SVN mergeinfo-only versus UUID/path incarnation (R15 remains PARTIAL)
-- personal Git→SVN engine-cycle proof for qualified merge-DAG admission (inspect
-  admission is proven; PR-based replay is a separate surface)
+- Personal commit lists that span provider pages. The replay proof uses three
+  commits in the DAG PR. The client requests 100 per page and refuses a response advertising another page before replay.
+  The Team 1,001-commit qualification uses its own continuation mechanism.
 
 Assert zero unwanted remote changes and stable checkpoints on rejection, and
 no duplicates on accepted ordinary replay. The coworker’s exact production

@@ -245,17 +245,11 @@ impl GitToSvnSync {
             .await
             .context("failed to ensure SVN working copy")?;
 
-        // Determine the "since" timestamp from the last completed PR sync.
-        let since = self
-            .db
-            .get_last_pr_sync_time()
-            .context("failed to query last PR sync time")?;
-        let since_ref = since.as_deref();
-
-        // Fetch recently merged PRs targeting the default branch.
+        // The same completed-merge-SHA boundary as PrMonitor, including retries
+        // that were already merged when another PR completed locally.
         let merged_prs = self
             .github
-            .get_merged_pull_requests(&self.github_repo, &self.default_branch, since_ref)
+            .get_merged_pull_requests(&self.github_repo, &self.default_branch, None)
             .await
             .context("failed to fetch merged pull requests")?;
 
@@ -422,7 +416,10 @@ impl GitToSvnSync {
             }
 
             replayed_any = true;
-            match self.replay_commit(commit, pr.number, pr_branch).await {
+            match self
+                .replay_pr_commit(commit, pr.number, pr_branch, Some(sync_id))
+                .await
+            {
                 Ok(svn_rev) => {
                     if first_svn_rev.is_none() {
                         first_svn_rev = Some(svn_rev);
@@ -455,14 +452,8 @@ impl GitToSvnSync {
                         "failed to replay commit to SVN"
                     );
 
-                    let err_text = format!("{:#}", e);
-                    if err_text.contains("reconciliation_required") {
-                        // durable hold already recorded; leave pr_sync_log pending
-                    } else {
-                        // Abandon the pending row so the next sync pass retries this SHA.
-                        let _ = self.db.abandon_pending_pr_sync(sync_id);
-                    }
-
+                    // Retry the same PR row. A journal may still need to confirm
+                    // its first revision after this engine has stopped.
                     // Audit failure.
                     let _ = self.db.insert_audit_log(
                         "git_to_svn_error",
@@ -523,6 +514,17 @@ impl GitToSvnSync {
         commit: &GitHubCommit,
         pr_number: u64,
         pr_branch: &str,
+    ) -> Result<i64> {
+        self.replay_pr_commit(commit, pr_number, pr_branch, None)
+            .await
+    }
+
+    async fn replay_pr_commit(
+        &self,
+        commit: &GitHubCommit,
+        pr_number: u64,
+        pr_branch: &str,
+        pr_sync_id: Option<i64>,
     ) -> Result<i64> {
         if let Some(op) = self
             .db
@@ -669,7 +671,7 @@ impl GitToSvnSync {
             let git_author = commit.commit.author.name.as_str();
             let op = self
                 .db
-                .begin_git_to_svn_commit(SvnCommitIntent {
+                .begin_svn_commit_for_pr(SvnCommitIntent {
                     repo_id: PERSONAL_REPO_ID,
                     initiator_id: "personal_worker",
                     request_id: &request_id,
@@ -688,7 +690,7 @@ impl GitToSvnSync {
                     intended_svn_tree: &intended_svn_tree,
                     author: &self.svn_author,
                     source_message: &commit.commit.message,
-                })
+                }, pr_sync_id)
                 .with_context(|| {
                     format!(
                         "failed to record git-to-svn commit intent for {}",
