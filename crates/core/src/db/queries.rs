@@ -3339,15 +3339,15 @@ impl Database {
 
     /// Increment the total_errors counter for a repository.
     pub fn increment_repo_error_count(&self, repo_id: &str) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        let conn = conn.unchecked_transaction()?;
-        require_mutable_pair(&conn, repo_id)?;
-        conn.execute(
-            "UPDATE repositories SET total_errors = total_errors + 1 WHERE id = ?1",
-            params![repo_id],
-        )?;
+        self.immediate_transaction(|tx| {
+            require_mutable_pair(tx, repo_id)?;
+            tx.execute(
+                "UPDATE repositories SET total_errors = total_errors + 1 WHERE id = ?1",
+                params![repo_id],
+            )?;
+            Ok(())
+        })?;
         debug!(repo_id, "incremented repo error count");
-        conn.commit()?;
         Ok(())
     }
 

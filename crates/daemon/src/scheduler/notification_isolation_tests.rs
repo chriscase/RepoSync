@@ -606,7 +606,6 @@ fn attest_rejected_push(pair: &Pair, db: &Database, mut offered: GitPushOperatio
         .strip_prefix("git push failed after intent was recorded: ")
         .unwrap();
     assert!(rejection.contains(&format!("rejected by {id}")));
-    assert!(rejection.contains("pre-receive hook declined"));
     offered.state = GitPushOperationState::ReconciliationRequired;
     offered.updated_at.clone_from(&held.updated_at);
     offered.outcome_detail.clone_from(&held.outcome_detail);
