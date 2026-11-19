@@ -35,9 +35,20 @@ cargo test -p reposync-daemon scheduler::notification_isolation_tests::r17_concu
 
 Expect one passing test. Two repositories share a Git branch name, an SVN revision number and a file path. Each has its own SVN repository and bare Git origin.
 
-The test subscribes to the scheduler’s in-process event channel before either worker starts. Two scheduler ticks admit the workers in sequence. Before the test releases either push, it requires both Git receive hooks to be waiting, both push operations to be active in SQLite, and both refs to point to their original commits. It releases the pushes in reverse admission order. For each completion event, the test checks the repository identity and commit details against the fixture’s source revision, applied SQLite mapping and Git history. A separate trial admitted both workers on one tick. One worker reported `database is locked`, leaving that admission case open.
+The test subscribes to the scheduler’s in-process event channel before either worker starts. Two scheduler ticks admit the workers in sequence. Before the test releases either push, it requires both Git receive hooks to be waiting, both push operations to be active in SQLite, and both refs to point to their original commits. It releases the pushes in reverse admission order. For each completion event, the test checks the repository identity and commit details against the fixture’s source revision, applied SQLite mapping and Git history.
 
-`R17_SVNSERVE_NOTIFICATION_ISOLATION` remains **PARTIAL**. That native case checks each stored webhook URL and searches status and audit records for the other repository’s markers. The daemon test above observes the event before delivery. The Teams listener selects one global destination, so delivery to separate repository-specific destinations remains unqualified.
+To exercise two repositories becoming due on the same scheduler tick, run each case and expect one pass per command.
+
+```sh
+cargo test -p reposync-daemon scheduler::notification_isolation_tests::r17_same_tick_pushes_complete_for_both_repositories -- --exact
+cargo test -p reposync-daemon scheduler::notification_isolation_tests::r17_same_tick_rejections_count_one_error_per_repository -- --exact
+```
+
+Both workers reach their Git receive hooks before either ref changes. The fixture releases both hooks before joining the workers. After successful pushes, each repository must be idle with one new commit, one applied receipt and its own r2 checkpoint. When both receive hooks reject, each repository must retain its r1 Git ref and checkpoint, record a reconciliation hold and count one error.
+
+Earlier runs exposed SQLite contention both before the push, when inserting the intent, and after publication, when inserting the receipt. In the latter case the attempt to record a reconciliation hold could also fail. A rejected push also exposed a repository left at `applying` after its journal entered `reconciliation_required`. Another rejected push recorded a reconciliation hold and terminal status but missed its error count. Push intent creation, ordinary team push confirmation, updates to an active push journal, repository status changes and error-count increments now reserve the SQLite writer before their checks. The workers can still push to their separate Git repositories concurrently.
+
+`R17_SVNSERVE_NOTIFICATION_ISOLATION` remains **PARTIAL**. That native case checks each stored webhook URL and searches status and audit records for the other repository’s markers. The daemon tests observe events before delivery. The Teams listener selects one global destination, so delivery to separate repository-specific destinations remains unqualified.
 
 ## Regenerating the human scenario file
 
