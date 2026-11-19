@@ -330,9 +330,13 @@ async fn r04_receipted_rename_preserves_newer_pause_and_import() {
     rename_races_pause(true).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn r04_changed_target_refuses_stale_import_before_enrollment() {
-    const NEXT: &str = "refs/heads/managed-next";
+async fn registration_change_before_enrollment(
+    case: &str,
+    edit: Value,
+    expected_branch: &str,
+    expected_username: &str,
+) {
+    let reference = format!("refs/heads/{expected_branch}");
     const CHANGED: &str =
         "repository import target changed before admission; review the current settings and retry";
     let (addr, state, server, tmp, id, bare) = import_fixture().await;
@@ -340,6 +344,8 @@ async fn r04_changed_target_refuses_stale_import_before_enrollment() {
     let url = format!("http://{addr}/api/repos/{id}");
     let repo = state.db.get_repository(&id).unwrap().unwrap();
     assert_eq!(repo.git_branch, "main");
+    assert_eq!(repo.svn_username, "fixture");
+    assert!(repo.svn_url.starts_with("file://"));
     let svn_key = format!("last_svn_rev_{id}");
     let initial_svn_kv = state.db.get_state(&svn_key).unwrap();
     let initial_git_kv = inbound_git_sha_kv(&state.db, &id);
@@ -372,9 +378,10 @@ async fn r04_changed_target_refuses_stale_import_before_enrollment() {
         "the handler must hold the worker slot after its initial target read"
     );
     assert!(state.db.latest_import_operation(&id).unwrap().is_none());
-    let (status, updated) = put(&client, &url, &json!({"git_branch":"managed-next"})).await;
+    let (status, updated) = put(&client, &url, &edit).await;
     assert_eq!(status, StatusCode::OK, "{updated}");
-    assert_eq!(updated["git_branch"], "managed-next");
+    assert_eq!(updated["git_branch"], expected_branch);
+    assert_eq!(updated["svn_username"], expected_username);
     let (_, (status, refused), workers) = pending.finish().await;
     let peer = Database::new(tmp.path().join("reposync.db")).unwrap();
     let observed = String::from_utf8(refs()).unwrap();
@@ -403,30 +410,58 @@ async fn r04_changed_target_refuses_stale_import_before_enrollment() {
     assert!(peer.list_commit_map(1).unwrap().is_empty());
     assert_eq!(peer.count_sync_records().unwrap(), 0);
     let current = peer.get_repository(&id).unwrap().unwrap();
-    assert_eq!(current.git_branch, "managed-next");
+    assert_eq!(current.git_branch, expected_branch);
+    assert_eq!(current.svn_username, expected_username);
+    assert_eq!(current.svn_url, repo.svn_url);
     assert_eq!(updated["updated_at"], current.updated_at);
     assert!(observed.is_empty() && !offers.exists() && !worktree.exists());
 
     let fresh_id = start_full_import(&client, &url).await;
     join_import(&state).await;
-    let mapped = assert_completed_at(tmp.path(), &bare, &id, &fresh_id, true, NEXT);
+    let mapped = assert_completed_at(tmp.path(), &bare, &id, &fresh_id, true, &reference);
+    assert_eq!(
+        peer.get_repository(&id).unwrap().unwrap().svn_username,
+        expected_username
+    );
     let tip = &mapped[2].1;
     assert_eq!(
         String::from_utf8(refs()).unwrap(),
-        format!("{NEXT} {tip}\n")
+        format!("{reference} {tip}\n")
     );
     let fresh_offer = fs::read_to_string(offers).unwrap();
     assert_eq!(
         fresh_offer,
-        format!("{} {tip} {NEXT}\n", "0".repeat(tip.len()))
+        format!("{} {tip} {reference}\n", "0".repeat(tip.len()))
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         json!({
-            "case":"R04_TARGET_CHANGE_BEFORE_IMPORT_ADMISSION","repo_id":id,"stale_start_http":status.as_u16(),
+            "case":case,"repo_id":id,"stale_start_http":status.as_u16(),
             "stale_workers":workers,"stale_operation_documents":documents,"stale_bare_refs":observed,
             "fresh_operation_id":fresh_id,"fresh_receive_offer":fresh_offer.trim_end(),"mapped_revisions":mapped
         })
     );
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r04_changed_target_refuses_stale_import_before_enrollment() {
+    registration_change_before_enrollment(
+        "R04_TARGET_CHANGE_BEFORE_IMPORT_ADMISSION",
+        json!({"git_branch":"managed-next"}),
+        "managed-next",
+        "fixture",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r04_changed_username_refuses_stale_import_before_enrollment() {
+    registration_change_before_enrollment(
+        "R04_USERNAME_CHANGE_BEFORE_IMPORT_ADMISSION",
+        json!({"svn_username":"alternate-fixture-reader"}),
+        "main",
+        "alternate-fixture-reader",
+    )
+    .await;
 }
