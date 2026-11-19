@@ -6372,9 +6372,15 @@ async fn candidate_r10_over_1000_pending_commits_default_cap() {
     let mid = assert_linear_batch_frontier(&fixture, &before, &chain[..1000], &tip).await;
     let mut endpoints = check_linear_batch_trees(&fixture, before.svn_rev, &chain, 0..1000).await;
 
-    // reopen_pair creates new Git, SVN and SQLite clients; replacement drops
-    // the original engine before the new one can advance the continuation.
-    fixture.engine = reopen_pair(&fixture);
+    let config = fixture.engine.config().clone();
+    drop(fixture.engine);
+    fixture.engine = open_persisted_pair(
+        config,
+        &fixture.db_path,
+        &fixture.bridge,
+        &fixture.svn_url,
+        &fixture.repo_id,
+    );
     let key = GitReplayContinuation::state_key(&fixture.repo_id);
     let state = fixture
         .engine
@@ -10871,19 +10877,35 @@ fn svn_youngest(url: &str) -> i64 {
 }
 
 fn reopen_pair(fixture: &QualifiedPair) -> SyncEngine {
-    let db = Database::new(&fixture.db_path).unwrap();
+    open_persisted_pair(
+        fixture.engine.config().clone(),
+        &fixture.db_path,
+        &fixture.bridge,
+        &fixture.svn_url,
+        &fixture.repo_id,
+    )
+}
+
+fn open_persisted_pair(
+    config: AppConfig,
+    db_path: &Path,
+    bridge: &Path,
+    svn_url: &str,
+    repo_id: &str,
+) -> SyncEngine {
+    let db = Database::new(db_path).unwrap();
     db.initialize().unwrap();
     db.hold_interrupted_svn_commits().unwrap();
     db.hold_interrupted_git_pushes().unwrap();
-    let git = GitClient::new(&fixture.bridge).unwrap();
+    let git = GitClient::new(bridge).unwrap();
     let mut engine = SyncEngine::new(
-        fixture.engine.config().clone(),
+        config,
         db,
-        SvnClient::new(&fixture.svn_url, "", ""),
+        SvnClient::new(svn_url, "", ""),
         git,
         Arc::new(make_identity_mapper()),
     );
-    engine.set_repo_id(fixture.repo_id.clone());
+    engine.set_repo_id(repo_id.to_owned());
     engine
 }
 
