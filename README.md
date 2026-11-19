@@ -26,7 +26,7 @@ Full bidirectional sync for entire teams. Runs as a server daemon on a VM with a
 
 ### Personal Branch Mode
 
-Individual developer SVN-to-Git bridge. Runs on your laptop, imports SVN history into a GitHub repo, and uses a PR-based workflow so every SVN sync is reviewable before merging. No server required. This is the right choice when you want to work in Git personally while your team stays on SVN.
+Personal mode runs on your laptop. It mirrors SVN changes to your Git branch and sends changes from merged GitHub pull requests back to SVN.
 
 See [docs/personal-branch/](docs/personal-branch/) for the full Personal Branch Mode documentation.
 
@@ -47,15 +47,20 @@ See [docs/personal-branch/](docs/personal-branch/) for the full Personal Branch 
 
 ## Personal Branch Mode -- Quick Start
 
-Get up and running in three commands:
+Create your Personal configuration with the interactive wizard.
 
 ```bash
-reposync personal init                           # Interactive setup wizard
-reposync personal import --full                  # Import SVN history to GitHub
-reposync personal start                          # Start sync daemon
+reposync personal init
 ```
 
-The `init` wizard walks you through connecting your SVN repo and GitHub repo, configuring branch names, and setting up your identity mapping. Once `import --full` completes, `start` launches a background sync daemon on your laptop that watches for new SVN commits and creates PRs in your GitHub repo.
+Before your first import, edit `~/.config/reposync/personal.toml`. Under `[personal]`, set `data_dir` to an absolute path you can write, such as `/home/alex/.local/share/reposync` for user `alex`. This directory holds your database and Git checkout. In the shell where you will run the bridge, set the environment variables named by the wizard.
+
+```bash
+reposync personal import --full
+reposync personal start
+```
+
+`start` runs in the foreground. From another terminal, run `reposync personal status` to inspect the bridge or `reposync personal stop` to stop it. [Personal quick start](docs/personal-branch/quickstart.md)
 
 ## Team Mode -- Quick Start
 
@@ -86,16 +91,15 @@ docker pull ghcr.io/chriscase/reposync:latest
 
 ### Configure
 
+These commands assume the binaries are on your `PATH`. A source build places them in `target/release/`. To generate a new configuration, choose an existing directory you can write. The examples use `/etc/reposync`. If you already have a configuration file, edit it directly.
+
 ```bash
-# Generate a default config file
-reposync init --config /etc/reposync/config.toml
-
-# Edit with your SVN and GitHub details
+reposync init --output /etc/reposync/config.toml
 $EDITOR /etc/reposync/config.toml
-
-# Set up author mappings
-$EDITOR /etc/reposync/authors.toml
+reposync validate --config /etc/reposync/config.toml
 ```
+
+Set your SVN and GitHub details before validation. To use an author mapping file, set `mapping_file = "/etc/reposync/authors.toml"` in `[identity]` and create that file with your mappings. The full example includes this optional setting. [Example configuration](config.example.toml) · [Team getting started](docs/getting-started.md)
 
 ### Run
 
@@ -124,7 +128,7 @@ reposync-daemon --config /etc/reposync/config.toml
 
 ### Access the Dashboard
 
-Open `http://your-server:8080` in your browser. Log in with the configured password or GitHub OAuth.
+Open the dashboard at the address configured by `[web].listen`. The generated configuration uses `http://127.0.0.1:3000` on the daemon host. The example below uses port 8080. Log in with the configured password or GitHub OAuth.
 
 ## Configuration
 
@@ -203,7 +207,7 @@ reposync status                              # Show sync status
 reposync conflicts list                      # List active conflicts
 reposync conflicts resolve <id> --accept git # Resolve from CLI
 reposync sync now                            # Trigger immediate sync
-reposync identity list                       # Show author mappings
+reposync identity lookup jsmith              # Look up one SVN user's Git identity
 reposync audit --limit 20                    # Recent sync history
 ```
 

@@ -90,12 +90,13 @@ curl -s -X POST http://your-reposync-server:8080/webhook/svn \
 
 ## Step 4: Create the Configuration
 
+For a new configuration, choose an existing directory you can write. The commands below assume `/etc/reposync` is writable by the account generating the file. If your installation already provides `config.toml`, go straight to editing it.
+
 ```bash
-sudo mkdir -p /etc/reposync /var/lib/reposync
-reposync init --config /etc/reposync/config.toml
+reposync init --output /etc/reposync/config.toml
 ```
 
-Edit `/etc/reposync/config.toml`:
+Edit `/etc/reposync/config.toml` with your endpoints and a data directory the daemon can write. The generated `[web].listen` is `127.0.0.1:3000`. This example uses port 8080. [Full example configuration](../config.example.toml)
 
 ```toml
 [daemon]
@@ -123,9 +124,15 @@ auth_mode = "simple"
 admin_password_env = "REPOSYNC_ADMIN_PASSWORD"
 ```
 
+Validate the edited file before startup.
+
+```bash
+reposync validate --config /etc/reposync/config.toml
+```
+
 ## Step 5: Set Up Author Mappings
 
-Create `/etc/reposync/authors.toml`:
+If you use a mapping file, set `mapping_file` in `[identity]` as shown above and create `/etc/reposync/authors.toml` with your mappings.
 
 ```toml
 [authors]
@@ -170,7 +177,7 @@ reposync-daemon --config /etc/reposync/config.toml
 
 ## Step 8: Verify
 
-1. Open `http://your-server:8080` — you should see the dashboard
+1. Open the dashboard using the configured address. For the generated settings, use `http://127.0.0.1:3000` on the daemon host. For the example above, use `http://your-server:8080`.
 2. Make a commit to SVN — it should appear in Git within 15 seconds
 3. Push a commit to Git — it should appear in SVN within 15 seconds
 4. Check the audit log: `reposync audit --limit 5`
@@ -180,6 +187,6 @@ reposync-daemon --config /etc/reposync/config.toml
 - **Daemon won't start**: Check `journalctl -u reposync -f` for errors
 - **SVN auth failure**: Verify credentials with `svn info --username sync-service <url>`
 - **GitHub auth failure**: Verify token with `curl -H "Authorization: token <TOKEN>" <api_url>/user`
-- **Author not mapped**: Check `reposync identity list` and add missing entries
+- For an unexpected author mapping, run `reposync identity lookup jsmith --config /etc/reposync/config.toml` with the SVN username you want to check.
 
 See [troubleshooting.md](troubleshooting.md) for more.

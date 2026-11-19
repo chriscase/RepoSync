@@ -1,28 +1,19 @@
 # Personal Branch Mode: Configuration Reference
 
-Personal Branch Mode is configured via a TOML file. The default location is:
-
-```
-~/.config/reposync/personal.toml
-```
-
-You can override the config file path with the `--config` flag on any command:
+Personal commands read `~/.config/reposync/personal.toml` by default. To work with another file, write it with `init --output`, then pass `--personal-config` before the action each time you use it.
 
 ```bash
-reposync personal start --config /path/to/my-config.toml
-```
-
-Or set the `REPOSYNC_CONFIG` environment variable:
-
-```bash
-export REPOSYNC_CONFIG="/path/to/my-config.toml"
+reposync personal init --output "$HOME/.config/reposync/work.toml"
+reposync personal --personal-config "$HOME/.config/reposync/work.toml" status
 ```
 
 ## Full Configuration File
 
+For a new setup, replace the example `data_dir` with an absolute path you own. Personal uses this directory for `personal.db` and the `git-repo` checkout. The TOML loader treats a leading `~/` literally, so its location depends on the directory from which you ran the command. For an existing installation, use the absolute path to the directory that already holds its database and checkout.
+
 ```toml
 [personal]
-data_dir = "~/.local/share/reposync"
+data_dir = "/home/jdoe/.local/share/reposync"
 poll_interval_secs = 30
 
 [svn]
@@ -69,7 +60,7 @@ General settings for the Personal Branch Mode daemon.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `data_dir` | string | `"~/.local/share/reposync"` | Directory where RepoSync stores its SQLite database, cloned repositories, and sync state. Tilde (`~`) is expanded to your home directory. |
+| `data_dir` | string | `"~/.local/share/reposync"` | Directory for the SQLite database, Git checkout and sync state. The fallback value is a literal relative path. Set an absolute path for a new setup. |
 | `poll_interval_secs` | integer | `30` | How often (in seconds) the daemon checks SVN for new revisions and GitHub for merged PRs. Lower values give faster sync but increase load on both servers. |
 | `log_level` | string | `"info"` | Minimum tracing level: `trace`, `debug`, `info`, `warn`, `error`. Applied as the default filter when the `RUST_LOG` environment variable is not set. If `RUST_LOG` is set, it takes precedence. |
 
@@ -251,13 +242,9 @@ Reload your shell or run `source ~/.zshrc` before starting the daemon.
 
 ## Config File Location
 
-The daemon searches for the config file in this order:
+The wizard creates the config file's parent directory when needed. For a custom location, select the file explicitly for import, start, status and stop, for example `reposync personal --personal-config "/path/to/personal.toml" import --full`.
 
-1. Path specified by `--config` flag
-2. Path in the `REPOSYNC_CONFIG` environment variable
-3. `~/.config/reposync/personal.toml` (default)
-
-The `reposync personal init` wizard writes to the default location. The parent directory is created automatically if it does not exist.
+If an older wizard wrote a literal `~/` directory beneath its working directory, pass the absolute path of that existing config to `--personal-config`. Keep the data directory pointed at the existing Personal storage.
 
 ---
 
@@ -269,6 +256,7 @@ The simplest setup for mirroring an SVN trunk to a personal GitHub.com repo:
 
 ```toml
 [personal]
+data_dir = "/home/jdoe/.local/share/reposync"
 poll_interval_secs = 30
 
 [svn]
@@ -294,7 +282,7 @@ For organizations running GitHub Enterprise on their own infrastructure:
 
 ```toml
 [personal]
-data_dir = "~/.local/share/reposync"
+data_dir = "/home/jdoe/.local/share/reposync"
 poll_interval_secs = 15
 
 [svn]
@@ -339,6 +327,7 @@ For workflows where low latency matters and you want minimal metadata in commit 
 
 ```toml
 [personal]
+data_dir = "/home/jdoe/.local/share/reposync"
 poll_interval_secs = 10
 
 [svn]
@@ -369,6 +358,7 @@ Exclude build artifacts, IDE files, and large binaries from sync:
 
 ```toml
 [personal]
+data_dir = "/home/jdoe/.local/share/reposync"
 poll_interval_secs = 60
 
 [svn]

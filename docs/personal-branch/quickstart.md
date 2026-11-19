@@ -9,7 +9,7 @@ Before you begin, make sure you have:
 - **SVN CLI** (`svn`) version 1.8+ installed and on your PATH
 - **Git** version 2.20+ installed
 - **Rust toolchain** (if building from source) -- install via [rustup](https://rustup.rs/)
-- **A GitHub account** with a repository to use as the mirror (or the daemon will create one)
+- **A GitHub account** with a repository to use as the mirror, or permission to create one during import
 - **A GitHub Personal Access Token** with `repo` scope -- [create one here](https://github.com/settings/tokens)
 - **SVN credentials** for the repository you want to mirror
 
@@ -39,87 +39,43 @@ reposync --version
 
 ## Step 2: Initialize Configuration
 
-Run the interactive setup wizard:
+Run the interactive wizard to write `~/.config/reposync/personal.toml`.
 
 ```bash
 reposync personal init
 ```
 
-The wizard will prompt you for:
+Enter the SVN URL and username, GitHub API URL and repository, developer identity, polling interval and import mode. When prompted for credentials, enter the names of the environment variables that hold them. The defaults are `REPOSYNC_SVN_PASSWORD` and `REPOSYNC_GITHUB_TOKEN`. Set the corresponding values in the environment used for the import and daemon.
 
-1. **SVN repository URL** -- the full URL to the path you want to mirror (e.g., `https://svn.company.com/repos/project/trunk`)
-2. **SVN username** -- your SVN login
-3. **SVN password** -- stored in an environment variable (the wizard will tell you which one to set)
-4. **GitHub token** -- your Personal Access Token with `repo` scope
-5. **GitHub repository** -- in `owner/repo` format (e.g., `jdoe/project-mirror`)
-6. **Poll interval** -- how often to check SVN for new commits (default: 30 seconds)
+For a new installation, set `data_dir` under the existing `[personal]` section to an absolute path you own, for example `data_dir = "/home/jdoe/.local/share/reposync"`. A leading `~/` in TOML names a literal `~` directory under the working directory. For an existing installation, keep using the directory containing its `personal.db` and `git-repo`.
 
-The wizard writes its configuration to `~/.config/reposync/personal.toml`. You can edit this file directly afterward.
-
-**Set your secrets as environment variables** (add these to your shell profile):
-
-```bash
-export SVN_PASSWORD="your-svn-password"
-export GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
-```
+To use a custom config file, write it with `reposync personal init --output "/path/to/personal.toml"`. On subsequent commands put `--personal-config "/path/to/personal.toml"` immediately after `personal`, before the action.
 
 ## Step 3: Import SVN History
 
-Pull the full SVN history into your GitHub mirror:
+Choose the command that matches your wizard selection. To import the full revision history, run this command.
 
 ```bash
 reposync personal import --full
 ```
 
-This clones the SVN repository, converts the history to Git commits, and pushes everything to your GitHub repository. Depending on the size of your SVN history, this may take anywhere from a few seconds to several hours.
-
-You will see progress output as revisions are converted:
-
-```
-Importing SVN history...
-  r1 -> git abc1234 (Initial project structure)
-  r2 -> git def5678 (Add build system)
-  ...
-  r847 -> git 9fa3b21 (Latest commit)
-Import complete: 847 revisions -> 847 commits
-Pushed to github.com/jdoe/project-mirror
-```
+For the wizard’s default snapshot selection, run `reposync personal import --snapshot` to create a single starting commit from the current SVN tree. The import connects to SVN and GitHub and reports the imported commit count when it finishes.
 
 ## Step 4: Start the Sync Daemon
 
-Start the background sync process:
+After the import completes, start the polling loop in a terminal and leave it running.
 
 ```bash
-reposync personal start
+reposync personal start --foreground
 ```
 
-The daemon runs in the foreground by default. To run it in the background:
-
-```bash
-reposync personal start --daemon
-```
-
-Check that it is running:
+From a second terminal with the same config and environment, inspect the daemon and its stored sync positions.
 
 ```bash
 reposync personal status
 ```
 
-You should see output like:
-
-```
-Personal sync daemon: running (PID 12345)
-SVN URL:    https://svn.company.com/repos/project/trunk
-GitHub:     jdoe/project-mirror
-Last SVN poll:  2 seconds ago
-Last sync:      r847 <-> abc1234
-```
-
-To stop the daemon later:
-
-```bash
-reposync personal stop
-```
+When you are ready to stop syncing, press Ctrl-C in the first terminal or run `reposync personal stop` in the second.
 
 ## Step 5: Work with Branches and PRs
 
