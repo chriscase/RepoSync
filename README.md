@@ -55,9 +55,10 @@ reposync personal init
 
 Before your first import, edit `~/.config/reposync/personal.toml`. Under `[personal]`, set `data_dir` to an absolute path you can write, such as `/home/alex/.local/share/reposync` for user `alex`. This directory holds your database and Git checkout. In the shell where you will run the bridge, set the environment variables named by the wizard.
 
+Run the import command printed by the wizard. Its default, `reposync personal import --snapshot`, starts with the current SVN tree. Choose `reposync personal import --full` if you want the revision history. Once the import completes, start polling.
+
 ```bash
-reposync personal import --full
-reposync personal start
+reposync personal start --foreground
 ```
 
 `start` runs in the foreground. From another terminal, run `reposync personal status` to inspect the bridge or `reposync personal stop` to stop it. [Personal quick start](docs/personal-branch/quickstart.md)
@@ -82,7 +83,14 @@ curl -fsSL https://github.com/chriscase/RepoSync/releases/latest/download/instal
 git clone https://github.com/chriscase/RepoSync.git
 cd RepoSync
 cargo build --release
+npm ci --prefix web-ui
+npm run build --prefix web-ui
+mkdir -p target/release/static
+cp -R web-ui/dist/. target/release/static/
+export PATH="$PWD/target/release:$PATH"
 ```
+
+The dashboard build uses Node.js 22 and npm. If you move the daemon, put the built `static/` directory beside its executable.
 
 **Docker:**
 ```bash
@@ -126,9 +134,13 @@ docker run -d \
 reposync-daemon --config /etc/reposync/config.toml
 ```
 
-### Access the Dashboard
+The daemon runs in the foreground and takes the environment variables named in the configuration from its shell. The supplied systemd service reads `/etc/reposync/env` for service launches. Use a second terminal for CLI commands and pass the same configuration path.
+
+### Import the First Repository
 
 Open the dashboard at the address configured by `[web].listen`. The generated configuration uses `http://127.0.0.1:3000` on the daemon host. The example below uses port 8080. Log in with the configured password or GitHub OAuth.
+
+On a fresh Team database the daemon registers the SVN and Git repository from the configuration. As an administrator, open **Repositories**, select that registration, and find **SVN Import** on **Overview**. Use an empty Git repository for the new mirror. Choose **Start full history import** and wait for **SVN Import Complete**. Normal polling begins once RepoSync has verified the SVN revision and its Git commit. [Team import and verification](docs/getting-started.md#step-8-import-and-verify)
 
 ## Configuration
 

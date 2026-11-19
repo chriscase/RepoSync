@@ -19,14 +19,10 @@ poll_interval_secs = 30
 [svn]
 url = "https://svn.company.com/repos/project/trunk"
 username = "jdoe"
-# Use ONE of the following (password_env is recommended):
-# password = "secret"
 password_env = "SVN_PASSWORD"
 
 [github]
 api_url = "https://api.github.com"
-# Use ONE of the following (token_env is recommended):
-# token = "ghp_xxxx"
 token_env = "GITHUB_TOKEN"
 repo = "jdoe/project-mirror"
 
@@ -78,10 +74,7 @@ Connection details for the SVN repository you want to mirror.
 |-----|------|----------|---------|-------------|
 | `url` | string | yes | -- | Full SVN URL to mirror. This should point to the specific path you want (e.g., `trunk`, a branch, or the repo root). |
 | `username` | string | yes | -- | Your SVN username. |
-| `password` | string | no | -- | SVN password in plaintext. **Not recommended** -- use `password_env` instead. If both are set, `password` takes precedence. |
-| `password_env` | string | no | -- | Name of an environment variable that contains your SVN password. This is the recommended approach. |
-
-You must provide either `password` or `password_env`. If neither is set, the daemon will fail to start.
+| `password_env` | string | yes | -- | Name of the environment variable that holds the SVN password. |
 
 ### [github]
 
@@ -90,11 +83,8 @@ Connection details for the GitHub repository used as the Git mirror.
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
 | `api_url` | string | no | `"https://api.github.com"` | GitHub API base URL. Use `https://api.github.com` for GitHub.com. For GitHub Enterprise Server, use `https://github.yourcompany.com/api/v3`. |
-| `token` | string | no | -- | GitHub Personal Access Token in plaintext. **Not recommended** -- use `token_env` instead. Requires `repo` scope. If both are set, `token` takes precedence. |
-| `token_env` | string | no | -- | Name of an environment variable that contains your GitHub token. This is the recommended approach. |
+| `token_env` | string | yes | -- | Name of the environment variable that holds the GitHub Personal Access Token. |
 | `repo` | string | yes | -- | Target GitHub repository in `owner/name` format (e.g., `jdoe/project-mirror`). |
-
-You must provide either `token` or `token_env`. If neither is set, the daemon will fail to start.
 
 ### [developer]
 
@@ -211,32 +201,14 @@ Behavioral options that control how files and changes are synced.
 
 ## Environment Variables
 
-Fields ending in `_env` tell RepoSync to read the actual value from an environment variable at startup. This keeps secrets out of config files.
+Set `svn.password_env` and `github.token_env` to the names of the environment variables supplied to the Personal CLI. The loader reads the values from those variables when it opens the configuration.
 
-| Config Field | Recommended Env Var | Description |
-|--------------|-------------------|-------------|
-| `svn.password_env` | `SVN_PASSWORD` | Your SVN password |
-| `github.token_env` | `GITHUB_TOKEN` | Your GitHub Personal Access Token |
+| Config field | Name in the example above | Default name in the wizard |
+|--------------|---------------------------|----------------------------|
+| `svn.password_env` | `SVN_PASSWORD` | `REPOSYNC_SVN_PASSWORD` |
+| `github.token_env` | `GITHUB_TOKEN` | `REPOSYNC_GITHUB_TOKEN` |
 
-You can use any environment variable name you want. The config field value is the **name** of the variable, not the secret itself.
-
-**Example:** if your config contains `password_env = "MY_SVN_PASS"`, then set the variable:
-
-```bash
-export MY_SVN_PASS="my-actual-password"
-```
-
-### Setting Environment Variables
-
-Add these to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) so they persist across sessions:
-
-```bash
-# RepoSync secrets
-export SVN_PASSWORD="your-svn-password"
-export GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
-```
-
-Reload your shell or run `source ~/.zshrc` before starting the daemon.
+Supply the SVN password and GitHub token under your chosen names in the environment used for import and sync.
 
 ---
 
@@ -404,11 +376,9 @@ For quick reference, here are all fields and their defaults:
 | `personal.log_level` | `"info"` |
 | `svn.url` | *(required, no default)* |
 | `svn.username` | *(required, no default)* |
-| `svn.password` | *(none)* |
-| `svn.password_env` | *(none)* |
+| `svn.password_env` | *(required, no default)* |
 | `github.api_url` | `"https://api.github.com"` |
-| `github.token` | *(none)* |
-| `github.token_env` | *(none)* |
+| `github.token_env` | *(required, no default)* |
 | `github.repo` | *(required, no default)* |
 | `developer.name` | *(required, no default)* |
 | `developer.email` | *(required, no default)* |

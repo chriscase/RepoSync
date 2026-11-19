@@ -20,13 +20,21 @@ curl -fsSL https://github.com/chriscase/RepoSync/releases/latest/download/instal
 
 ### Option B: Build from Source
 
+Use Node.js 22 and npm to build the React dashboard. The daemon reads `static/index.html` and its assets from a `static/` directory beside the executable.
+
 ```bash
 git clone https://github.com/chriscase/RepoSync.git
 cd RepoSync
 cargo build --release
+npm ci --prefix web-ui
+npm run build --prefix web-ui
 sudo install -m 755 target/release/reposync-daemon /usr/local/bin/
 sudo install -m 755 target/release/reposync /usr/local/bin/
+sudo install -d -m 755 /usr/local/bin/static
+sudo cp -R web-ui/dist/. /usr/local/bin/static/
 ```
+
+If you run the binaries in place, copy the contents of `web-ui/dist/` into `target/release/static/` instead.
 
 ### Option C: Docker
 
@@ -81,6 +89,8 @@ curl -s -X POST http://your-reposync-server:8080/webhook/svn \
 
 ## Step 3: Prepare Your GitHub Repository
 
+Create an empty Git repository for the initial SVN import. Leave the target branch absent, including any starter README or license commit that would create it. RepoSync checks this before publishing the mirror.
+
 1. Create a **Personal Access Token** (or GitHub App) with `repo` scope
 2. Set up a **webhook** on the GitHub repository:
    - URL: `http://your-reposync-server:8080/webhook/github`
@@ -96,7 +106,7 @@ For a new configuration, choose an existing directory you can write. The command
 reposync init --output /etc/reposync/config.toml
 ```
 
-Edit `/etc/reposync/config.toml` with your endpoints and a data directory the daemon can write. The generated `[web].listen` is `127.0.0.1:3000`. This example uses port 8080. [Full example configuration](../config.example.toml)
+Edit `/etc/reposync/config.toml` with your endpoints. Use an absolute `[daemon].data_dir` the daemon can write. This directory holds the Team database and repository checkouts. The generated `[web].listen` is `127.0.0.1:3000`. This example uses port 8080. [Full example configuration](../config.example.toml)
 
 ```toml
 [daemon]
@@ -124,7 +134,7 @@ auth_mode = "simple"
 admin_password_env = "REPOSYNC_ADMIN_PASSWORD"
 ```
 
-Validate the edited file before startup.
+Validate the edited file before startup. This checks the configuration locally. Review the reported settings before connecting to the repositories.
 
 ```bash
 reposync validate --config /etc/reposync/config.toml
@@ -170,17 +180,21 @@ sudo chown reposync:reposync /etc/reposync/env
 sudo systemctl enable --now reposync
 ```
 
-Or run directly:
+For a direct foreground run, export the variables named in your configuration in that shell. The supplied systemd service reads `/etc/reposync/env` itself.
+
 ```bash
 reposync-daemon --config /etc/reposync/config.toml
 ```
 
-## Step 8: Verify
+## Step 8: Import and Verify
 
-1. Open the dashboard using the configured address. For the generated settings, use `http://127.0.0.1:3000` on the daemon host. For the example above, use `http://your-server:8080`.
-2. Make a commit to SVN — it should appear in Git within 15 seconds
-3. Push a commit to Git — it should appear in SVN within 15 seconds
-4. Check the audit log: `reposync audit --limit 5`
+1. Open the dashboard as an administrator. On the daemon host, use `http://127.0.0.1:3000` for the generated settings or `http://127.0.0.1:8080` for the example above.
+2. Open **Repositories**. On the first start with an empty repository list, the daemon registers the SVN and Git pair from the configuration under its Git repository name. Select that entry. On **Settings**, check the SVN path, Git target branch, and **Credentials** for any access the repositories require.
+3. On **Overview**, find **SVN Import**. Keep **Full SVN history** selected and choose **Start full history import** to replay the SVN branch into Git. To start at a single revision, choose **Snapshot at pinned SVN revision**, enter the revision or `HEAD`, and choose **Start snapshot import**. Earlier SVN history stays outside that snapshot.
+4. Wait for **SVN Import Complete** and check the target Git branch. The scheduler skips a fresh registration until it has a verified mapping from an SVN revision to a Git commit. If the import reports an error or a hold, inspect the repository's import details before proceeding.
+5. For a direct-sync pair, check the next ordinary SVN change on the Git branch and the next ordinary Git change on the SVN branch. **Sync Records** on the repository overview shows the processed commits. The generated polling interval is 60 seconds and the example above uses 15 seconds. Allow time for the next eligible poll and the sync itself.
+
+To read recent audit entries, run `reposync audit --limit 5 --config /etc/reposync/config.toml` in another terminal on the daemon host. Use the same configuration path you passed to the daemon.
 
 ## Troubleshooting
 

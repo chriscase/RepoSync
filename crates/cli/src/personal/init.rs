@@ -396,7 +396,7 @@ auto_merge = true
     println!("  3. Run the initial import:");
     println!("       reposync personal --personal-config {config_arg} import --{import_mode}");
     println!("  4. Start syncing in this terminal:");
-    println!("       reposync personal --personal-config {config_arg} start");
+    println!("       reposync personal --personal-config {config_arg} start --foreground");
     println!();
 
     Ok(())
