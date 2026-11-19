@@ -31,6 +31,11 @@ PARENT_TIP = "b" * 40
 TOKEN = "test-token-value"
 REFRESH_OP = "78cb373c-d795-4a4e-9839-296a4878e0e4"
 DROP_REPLY = object()
+# Digest-bound response from pair_refresh::execute_refusal on 2147ae3.
+LEGACY_EXECUTE_REFUSAL = (
+    "refresh_execute_not_implemented: update-pair-from-parent execution is a later slice and was not started. "
+    "No durable job was created and no external Git or SVN write was performed. plan_digest="
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -230,12 +235,7 @@ class ClientTests(unittest.TestCase):
             body = json.loads(record["body"] or "{}")
             calls["n"] += 1
             if body.get("execute") is True:
-                return 400, {
-                    "error": (
-                        "refresh_execute_not_implemented: update-pair-from-parent "
-                        f"execution is a later slice. plan_digest={DIGEST}"
-                    )
-                }
+                return 400, {"error": LEGACY_EXECUTE_REFUSAL + DIGEST}
             approved = plan()
             approved["approval"] = {
                 "eligible": True,
@@ -442,6 +442,11 @@ class ClientTests(unittest.TestCase):
             return reply
 
         server = self.start(respond)
+        definite_refusals = {
+            "explicit-refusal": "refresh_execute_not_implemented",
+            "unattached-service": "execute_rejected",
+            "admin-required": "unauthorized",
+        }
         for case, reply in (
             ("lost-preview", DROP_REPLY),
             ("lost-submit", DROP_REPLY),
@@ -449,14 +454,29 @@ class ClientTests(unittest.TestCase):
             ("failed-server-reply", (500, {"error": "refresh_execute_not_implemented"})),
             ("malformed-success", (200, {})),
             ("contradictory-success", (200, {"operation_id": "other-operation", "lifecycle": "completed"})),
+            # The current v1 handler maps run_admitted_local errors to HTTP 400
+            # even if SVN was published before the protected Git update failed.
+            ("protected-ref", (400, {"error": "protected ref rejected the integration update"})),
+            ("empty-conflict", (409, {})),
+            ("running-conflict", (409, {"operation_id": "expected-operation", "lifecycle": "running",
+                                        "durable_job_started": True})),
+            ("embedded-refusal", (400, {"error": "protected publication is waiting for reconciliation: "
+                                                 "refresh_execute_not_implemented"})),
+            ("partial-refusal", (400, {"error": "refresh_execute_not_implemented: update-pair-from-parent "
+                                                f"execution is a later slice. plan_digest={DIGEST}"})),
+            ("different-plan", (400, {"error": LEGACY_EXECUTE_REFUSAL + OTHER_DIGEST})),
+            ("context-mismatch", (400, {"error": "reanchor requires an explicit approval digest"})),
+            ("conflicting-refusal", (401, {"error": "admin access required", "operation_id": "expected-operation"})),
+            ("generic-not-found", (404, {"error": "upstream lookup failed"})),
             ("explicit-refusal", (400, {"error": "refresh_execute_not_implemented"})),
+            ("unattached-service", (400, {"error": "refresh service is not attached"})),
+            ("admin-required", (401, {"error": "admin access required"})),
         ):
             with self.subTest(case=case):
                 server.records.clear()
                 key = f"{case}-request"
-                args = ["--pair-id", "pair1", "--idempotency-key", key, "--expected-plan-digest", DIGEST]
-                if case == "contradictory-success":
-                    args += ["--operation-id", "expected-operation"]
+                args = ["--pair-id", "pair1", "--idempotency-key", key, "--expected-plan-digest", DIGEST,
+                        "--operation-id", "expected-operation"]
                 proc = self.run_cli(server, "execute", *args)
                 sent = case != "lost-preview"
                 self.assertEqual([(r["method"], r["path"]) for r in server.records],
@@ -478,19 +498,19 @@ class ClientTests(unittest.TestCase):
                 if not sent:
                     self.assertEqual(report["outcome"], "service_unavailable")
                     self.assertIs(report["durable_job_started"], False)
-                elif case == "explicit-refusal":
-                    self.assertEqual(report["outcome"], "refresh_execute_not_implemented")
+                elif case in definite_refusals:
+                    self.assertEqual(report["outcome"], definite_refusals[case])
                     self.assertIs(report["durable_job_started"], False)
                 else:
                     self.assertEqual(report["outcome"], "submission_unknown", report)
                     self.assertEqual(proc.returncode, client.EXIT_UNAVAILABLE)
                     self.assertEqual(report.get("http_status"), None if reply is DROP_REPLY else reply[0])
                     self.assertIsNone(report["durable_job_started"])
-                    self.assertIsNone(report["operation_id"])
-                    self.assertIsNone(report.get("request_id"))
+                self.assertIsNone(report["operation_id"])
+                self.assertIsNone(report.get("request_id"))
+                self.assertEqual(report["expected_operation_id"], "expected-operation")
+                if sent:
                     self.assertEqual(report["plan_digest"], DIGEST)
-                    if case == "contradictory-success":
-                        self.assertEqual(report["expected_operation_id"], "expected-operation")
 
     def test_latest_import_progress_is_not_a_named_operation(self):
         server = self.start(lambda _r: (200, payload))

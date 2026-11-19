@@ -267,9 +267,11 @@ def report(
         "idempotency_key": config.get("idempotency_key"),
         "operation": config.get("operation"),
         "operation_kind": config.get("operation_kind"),
-        "operation_id": extra.pop("operation_id", config.get("operation_id")),
+        "operation_id": extra.pop("operation_id", None if action == "execute" else config.get("operation_id")),
         "needs_reconciliation": extra.pop("needs_reconciliation", False),
     }
+    if action == "execute" and config.get("operation_id") is not None:
+        body["expected_operation_id"] = config["operation_id"]
     if config.get("request_id") is not None:
         body["request_id"] = config["request_id"]
     body.update(extra)
@@ -629,6 +631,53 @@ def refresh_request(client: ApiClient, config: dict, journal, previous, identity
     return approved_execute(client, config, payload, repeated)
 
 
+def definite_submit_refusal(config: dict, digest: str, status: int, payload) -> str | None:
+    # AppError emits exactly {"error": message}. The same handler wraps errors
+    # after an external write in HTTP 400, so neither a status code nor a word
+    # occurring in an error's detail can prove that admission was refused.
+    if not isinstance(payload, dict) or set(payload) != {"error"}:
+        return None
+    message = payload["error"]
+    if not isinstance(message, str):
+        return None
+    if status == 401 and message in {
+        "missing or invalid Authorization header", "user disabled", "session user unavailable",
+        "session expired or invalid", "admin access required",
+    }:
+        return "unauthorized"
+    if status == 403 and message == "initial setup required — please complete the setup wizard":
+        return "forbidden"
+    if status == 404 and message == f"repository {config['pair_id']} not found":
+        return "wrong_pair"
+    if status != 400:
+        return None
+    if message == "refresh service is not attached":
+        return "execute_rejected"
+
+    # The preview-only v1 server used these operation-specific refusals (#86).
+    # When it includes a digest the refusal must name this client's preview.
+    operation = config["operation"].strip().lower()
+    if operation in {"", "update_pair_from_parent", "update-from-parent", "update"}:
+        code = "refresh_execute_not_implemented"
+        detail = (
+            "update-pair-from-parent execution is a later slice and was not started. "
+            "No durable job was created and no external Git or SVN write was performed."
+        )
+        if message in {code, f"{code}: {detail} plan_digest={digest}"}:
+            return code
+    if operation in {"reanchor", "re-anchor", "re_anchor", "recreate", "re-create", "recreate_pair"}:
+        if message == "reanchor requires an explicit approval digest":
+            return "execute_rejected"
+        code = "reanchor_not_implemented"
+        detail = (
+            "recreate/re-anchor is a separate explicit mode and is NOT IMPLEMENTED. "
+            "It is not an alias for update-from-parent, reset, force-push, or removal of the old SVN path."
+        )
+        if message in {code, f"{code}: {detail}"}:
+            return code
+    return None
+
+
 def approved_execute(client: ApiClient, config: dict, preview_plan: dict, repeated: bool) -> dict:
     def unknown(http_status: int | None, outcome: str = "submission_unknown") -> dict:
         return report(
@@ -636,7 +685,6 @@ def approved_execute(client: ApiClient, config: dict, preview_plan: dict, repeat
             config=config, authenticated=True, http_status=http_status,
             execute_requested=True, durable_job_started=None, repeated=repeated,
             plan_digest=preview_plan["plan_digest"], operation_id=None,
-            expected_operation_id=config.get("operation_id"),
             message="The execution POST was attempted after preview. RepoSync acceptance is unknown.",
             operator_action=(
                 "Before retrying, ask the RepoSync administrator to inspect the durable operation "
@@ -659,41 +707,14 @@ def approved_execute(client: ApiClient, config: dict, preview_plan: dict, repeat
         )
     except ConnectionError:
         return unknown(None)
-    if status >= 500:
-        return unknown(status)
     if status in {301, 302, 303, 307, 308}:
         return unknown(status, "redirect_refused")
-
-    text = error_text(payload)
-    code = not_implemented_code(payload if isinstance(payload, dict) else None, text)
-    if status == 401:
+    refusal = definite_submit_refusal(config, preview_plan["plan_digest"], status, payload)
+    if refusal is not None:
         return rejected(
-            config,
-            "execute",
-            "unauthorized",
-            http_status=status,
-            execute_requested=True,
-        )
-    if status == 404:
-        return rejected(
-            config,
-            "execute",
-            "wrong_pair",
-            http_status=status,
-            execute_requested=True,
-            authenticated=True,
-        )
-    if 400 <= status < 500:
-        return rejected(
-            config,
-            "execute",
-            code or "execute_rejected",
-            http_status=status,
-            execute_requested=True,
-            authenticated=True,
-            durable_job_started=False,
-            message=text,
-            plan_digest=preview_plan.get("plan_digest"),
+            config, "execute", refusal, http_status=status, execute_requested=True,
+            authenticated=status not in {401, 403}, message=payload["error"],
+            plan_digest=preview_plan["plan_digest"], repeated=repeated,
         )
     if not 200 <= status < 300 or not isinstance(payload, dict):
         return unknown(status)
@@ -702,19 +723,6 @@ def approved_execute(client: ApiClient, config: dict, preview_plan: dict, repeat
     # reads to that identity even if a repository's latest operation changes.
     try:
         check_status_scope(config, payload)
-        explicitly_declined = code or (
-            payload.get("ok") is False and payload.get("durable_job_started") is False
-        )
-        if explicitly_declined:
-            if (payload.get("operation_id") is not None or payload.get("lifecycle") is not None
-                    or payload.get("durable_job_started", False) is not False
-                    or payload.get("executed") is True or payload.get("published") is True):
-                return unknown(status)
-            return rejected(
-                config, "execute", code or "execute_rejected", http_status=status,
-                execute_requested=True, authenticated=True, message=text,
-                plan_digest=preview_plan["plan_digest"],
-            )
         operation_id = returned_operation_id(config, payload)
         lifecycle = payload.get("lifecycle")
         if (
@@ -723,6 +731,7 @@ def approved_execute(client: ApiClient, config: dict, preview_plan: dict, repeat
             or payload.get("ok", True) is not True
             or payload.get("durable_job_started", True) is not True
             or "error" in payload
+            or not_implemented_code(payload, "") is not None
         ):
             raise ValueError("invalid_response")
     except ValueError:
