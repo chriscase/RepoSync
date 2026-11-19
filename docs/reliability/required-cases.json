@@ -154,6 +154,12 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "R17_MANAGED_FULL_IMPORT_OVERLAP",
+      "binary": "server_freeze",
+      "test": "r17_managed_full_imports::two_full_imports_publish_independently",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "R17_SCOPE",
       "binary": "team_mode_e2e",
       "test": "candidate_r17_repository_cursors_remain_scoped",

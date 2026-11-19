@@ -16,10 +16,10 @@ const DEADLINE: Duration = Duration::from_secs(60);
 
 // Git runs pre-receive in the bare repository. Capture its actual old/new/ref
 // lines before any ref moves. Both the test and the hook have bounded waits.
-struct ReceiveGate(PathBuf);
+pub(super) struct ReceiveGate(PathBuf);
 
 impl ReceiveGate {
-    fn install(bare: &Path) -> Self {
+    pub(super) fn install(bare: &Path) -> Self {
         let hooks = bare.join("hooks");
         fs::create_dir_all(&hooks).unwrap();
         let hook = hooks.join("pre-receive");
@@ -43,7 +43,7 @@ done
         Self(hooks)
     }
 
-    async fn wait_for_offer(&self) -> String {
+    pub(super) async fn wait_for_offer(&self) -> String {
         tokio::time::timeout(DEADLINE, async {
             while !self.0.join("r04-ready").exists() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -104,7 +104,7 @@ fn assert_idle_disable(status: StatusCode, body: Value) {
     assert_eq!(body["managed_removal"], false);
 }
 
-fn main_ref(bare: &Path) -> Option<String> {
+pub(super) fn main_ref(bare: &Path) -> Option<String> {
     let repo = git2::Repository::open_bare(bare).unwrap();
     let result = repo.refname_to_id(MAIN);
     match result {
