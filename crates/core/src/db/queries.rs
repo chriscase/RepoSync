@@ -3311,15 +3311,15 @@ impl Database {
         repo_id: &str,
         status: &str,
     ) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        let conn = conn.unchecked_transaction()?;
-        require_mutable_pair(&conn, repo_id)?;
-        conn.execute(
-            "UPDATE repositories SET sync_status = ?1 WHERE id = ?2",
-            params![status, repo_id],
-        )?;
+        self.immediate_transaction(|tx| {
+            require_mutable_pair(tx, repo_id)?;
+            tx.execute(
+                "UPDATE repositories SET sync_status = ?1 WHERE id = ?2",
+                params![status, repo_id],
+            )?;
+            Ok(())
+        })?;
         debug!(repo_id, status, "updated repo sync status");
-        conn.commit()?;
         Ok(())
     }
 

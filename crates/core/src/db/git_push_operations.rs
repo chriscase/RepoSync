@@ -421,7 +421,9 @@ impl Database {
         &self,
         intent: GitPushIntent<'_>,
     ) -> Result<GitPushOperation, DatabaseError> {
-        self.transaction(|tx| {
+        // Wait for the WAL writer before reading the fences and active intent.
+        // A deferred read transaction can fail immediately on the journal insert.
+        self.immediate_transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
                 tx,
                 intent.repo_id,
@@ -632,7 +634,9 @@ impl Database {
         observed_git_sha: &str,
         observed_git_tree: &str,
     ) -> Result<GitPushOperation, DatabaseError> {
-        self.transaction(|tx| {
+        // The Git ref has already advanced. Reserve the writer before reading
+        // the active operation and recording its receipt and checkpoints.
+        self.immediate_transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
@@ -719,7 +723,7 @@ impl Database {
     where
         F: FnOnce(&mut GitPushOperation) -> Result<(), DatabaseError>,
     {
-        self.transaction(|tx| {
+        self.immediate_transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             let active = key("active", repo_id);
