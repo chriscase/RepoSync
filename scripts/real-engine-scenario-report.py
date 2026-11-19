@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -15,6 +16,7 @@ DEFAULT_CI_PARTIAL_ALLOWLIST = (
 REQUIRED_CASES_PATH = ROOT / "docs/reliability/required-cases.json"
 REAL_ENGINE_BINARY = "real_engine_scenarios"
 POST_WRITE_RECOVERY = "R01_SVNSERVE_POST_WRITE_RECOVERY"
+FINALIZED_HISTORY_CASES = ("historical_hold", "mirror_recovery", "contradictory_mirror_hold")
 
 PINNED_CI_PARTIAL_ALLOWLIST_IDS = frozenset(
     {
@@ -150,6 +152,57 @@ def ci_gate(summary_path: Path, allowlist_path: Path) -> tuple[int, list[str]]:
     return evaluate_ci_summary(summary, allowlist_path)
 
 
+def post_write_recovery_errors(status: str, detail: object) -> list[str]:
+    if not isinstance(detail, dict):
+        detail = {}
+    errors = []
+    recovery = detail.get("git_push_checkpoint_recovery")
+    if not isinstance(recovery, dict) or recovery.get("status") != "PASS":
+        errors.append("detail.git_push_checkpoint_recovery.status must be PASS")
+    history = detail.get("finalized_history")
+    history = history if isinstance(history, dict) else {}
+    registrations = [(name, history.get(name), "direct") for name in FINALIZED_HISTORY_CASES]
+    contradictory = history.get("contradictory_mirror_hold")
+    if isinstance(contradictory, dict) and contradictory.get("status") == "PASS":
+        registrations.append(("contradictory_mirror_hold.pr_registration", contradictory.get("pr_registration"), "pr"))
+    for name, proof, mode in registrations:
+        if not isinstance(proof, dict) or proof.get("status") != "PASS":
+            errors.append(f"detail.finalized_history.{name}.status must be PASS")
+        elif proof.get("registration_mode") != mode or proof.get("push_initiator") != "team_worker":
+            errors.append(f"detail.finalized_history.{name} requires registration_mode={mode} and push_initiator=team_worker")
+
+    if detail.get("bare_head_stable") is not True or detail.get("duplicate_mapping") is not False:
+        errors.append("requires a stable bare head and no duplicate mapping")
+    historical = history.get("historical_hold")
+    if isinstance(historical, dict):
+        # The native case copies these observations from the historical drill into its outer row.
+        mirrors = (("final_watermark", "repo_svn_rev"), ("expected_watermark", "canonical_svn_rev"),
+                   ("mapping_count", "r3_receipts"), ("mapped_git_sha", "mapped_git_sha"),
+                   ("bare_head_stable", "bare_head_stable"), ("recovery_error", "recovery_error"))
+        for outer, inner in mirrors:
+            if inner in historical and (outer not in detail or detail[outer] != historical[inner]):
+                errors.append(f"detail.{outer} disagrees with finalized_history.historical_hold.{inner}")
+
+    if status == "PASS":
+        if detail.get("recovery_ok") is not True:
+            errors.append("PASS requires detail.recovery_ok to be true")
+        expected = detail.get("expected_watermark")
+        final = detail.get("final_watermark")
+        if type(expected) is not int or type(final) is not int or expected <= 0 or final != expected:
+            errors.append("PASS requires matching positive integer expected_watermark and final_watermark")
+        count = detail.get("mapping_count")
+        sha = detail.get("mapped_git_sha")
+        if type(count) is not int or count != 1:
+            errors.append("PASS requires detail.mapping_count to be exactly one")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha) or sha == "0" * 40:
+            errors.append("PASS requires detail.mapped_git_sha to be a full Git commit ID")
+        elif isinstance(historical, dict) and historical.get("status") == "PASS" and sha != historical.get("published_git_sha"):
+            errors.append("PASS requires detail.mapped_git_sha to match finalized_history.historical_hold.published_git_sha")
+        if detail.get("recovery_error") is not None:
+            errors.append("PASS cannot have a recovery_error")
+    return [f"{POST_WRITE_RECOVERY}: {error}" for error in errors]
+
+
 def evaluate_ci_summary(summary: dict, allowlist_path: Path) -> tuple[int, list[str]]:
     try:
         allowed = load_ci_partial_allowlist(allowlist_path)
@@ -206,12 +259,7 @@ def evaluate_ci_summary(summary: dict, allowlist_path: Path) -> tuple[int, list[
         if isinstance(status, str):
             row_statuses.append(status)
         if case_id == POST_WRITE_RECOVERY and status in ("PASS", "PARTIAL"):
-            detail = row.get("detail")
-            recovery = (
-                detail.get("git_push_checkpoint_recovery") if isinstance(detail, dict) else None
-            )
-            if not isinstance(recovery, dict) or recovery.get("status") != "PASS":
-                errors.append(f"{case_id}: detail.git_push_checkpoint_recovery.status must be PASS")
+            errors.extend(post_write_recovery_errors(status, row.get("detail")))
         if status == "FAIL":
             errors.append(f"{case_id}: FAIL")
         elif status == "SKIP":
@@ -361,7 +409,18 @@ def run_self_test() -> None:
             for case_id in expected_ids
         ]
         post_write = next(row for row in rows if row["id"] == POST_WRITE_RECOVERY)
-        post_write["detail"] = {"git_push_checkpoint_recovery": {"status": "PASS"}}
+        direct = {"status": "PASS", "registration_mode": "direct", "push_initiator": "team_worker"}
+        post_write["detail"] = {
+            "recovery_ok": True, "expected_watermark": 3, "final_watermark": 3,
+            "mapping_count": 1, "mapped_git_sha": "abcd" * 10,
+            "bare_head_stable": True, "duplicate_mapping": False,
+            "git_push_checkpoint_recovery": {"status": "PASS"},
+            "finalized_history": {
+                "historical_hold": {**direct, "published_git_sha": "abcd" * 10},
+                "mirror_recovery": dict(direct),
+                "contradictory_mirror_hold": {**direct, "pr_registration": {**direct, "registration_mode": "pr"}},
+            },
+        }
         return rows
 
     with tempfile.TemporaryDirectory() as raw:
@@ -426,6 +485,8 @@ def run_self_test() -> None:
         for row in receiving_rows:
             if row["id"] in (POST_WRITE_RECOVERY, "R17_SVNSERVE_NOTIFICATION_ISOLATION"):
                 row["status"] = "PARTIAL"
+            if row["id"] == POST_WRITE_RECOVERY:
+                row["detail"].update(recovery_ok=False, final_watermark=1, mapping_count=0, mapped_git_sha=None)
         check_controlled(receiving_rows, "PARTIAL", "3", "PARTIAL")
         check_controlled(receiving_rows, "PARTIAL", "0", "FAIL")
         next(row for row in receiving_rows if row["id"] == POST_WRITE_RECOVERY).pop("detail")
@@ -452,27 +513,90 @@ def run_self_test() -> None:
         )
         assert code == 0 and not errs, (code, errs)
 
-        invalid_details = [
-            None,
-            {},
-            {"git_push_checkpoint_recovery": "PASS"},
-            {"git_push_checkpoint_recovery": {}},
-        ]
-        for status in ("FAIL", "PARTIAL", "NOT RUN", "SKIP"):
-            invalid_details.append({"git_push_checkpoint_recovery": {"status": status}})
         for outer_status in ("PASS", "PARTIAL"):
             rows = full_pass_rows()
             post_write = next(row for row in rows if row["id"] == POST_WRITE_RECOVERY)
             post_write["status"] = outer_status
-            code, errs = ci_gate(write_summary(tmp, rows, outer_status), allowlist_path)
-            assert code == 0 and not errs, (outer_status, errs)
+            detail = post_write["detail"]
+            detail["recovery_ok"] = outer_status == "PASS"
 
-            for malformed_detail in invalid_details:
-                post_write["detail"] = malformed_detail
-                code, errs = ci_gate(write_summary(tmp, rows, outer_status), allowlist_path)
-                assert code == 1 and any("git_push_checkpoint_recovery.status" in e for e in errs), (
-                    outer_status, malformed_detail, errs
+            def check_r01_errors(expected: list[str]) -> None:
+                path = write_summary(tmp, rows, outer_status)
+                code, errors = ci_gate(path, allowlist_path)
+                assert code == int(bool(expected)) and errors == expected, (outer_status, errors, expected)
+
+            check_r01_errors([])
+            history = detail["finalized_history"]
+            proof_fields = [(detail, "git_push_checkpoint_recovery", "detail")]
+            proof_fields.extend((history, name, "detail.finalized_history") for name in history)
+            proof_fields.append((history["contradictory_mirror_hold"], "pr_registration", "detail.finalized_history.contradictory_mirror_hold"))
+            for parent, key, prefix in proof_fields:
+                diagnostic = [f"{POST_WRITE_RECOVERY}: {prefix}.{key}.status must be PASS"]
+                valid = parent.pop(key)
+                check_r01_errors(diagnostic)
+                for invalid in ("PASS", {}, {"status": "FAIL"}, {"status": "PARTIAL"}, {"status": "NOT RUN"}):
+                    parent[key] = invalid
+                    check_r01_errors(diagnostic)
+                parent[key] = valid
+
+            checks = [(name, history[name], "direct") for name in FINALIZED_HISTORY_CASES]
+            checks.append(("contradictory_mirror_hold.pr_registration", history["contradictory_mirror_hold"]["pr_registration"], "pr"))
+            for name, proof, mode in checks:
+                diagnostic = [f"{POST_WRITE_RECOVERY}: detail.finalized_history.{name} requires registration_mode={mode} and push_initiator=team_worker"]
+                for key, invalid in (("registration_mode", "team"), ("push_initiator", "manual")):
+                    valid = proof.pop(key)
+                    check_r01_errors(diagnostic)
+                    proof[key] = invalid
+                    check_r01_errors(diagnostic)
+                    proof[key] = valid
+
+            detail["finalized_history"] = "PASS"
+            check_r01_errors([f"{POST_WRITE_RECOVERY}: detail.finalized_history.{name}.status must be PASS"
+                              for name in history])
+            detail["finalized_history"] = history
+            for key, invalid in (("bare_head_stable", False), ("duplicate_mapping", True)):
+                valid = detail[key]
+                detail[key] = invalid
+                check_r01_errors([f"{POST_WRITE_RECOVERY}: requires a stable bare head and no duplicate mapping"])
+                detail[key] = valid
+            history["historical_hold"]["repo_svn_rev"] = 1
+            check_r01_errors([f"{POST_WRITE_RECOVERY}: detail.final_watermark disagrees with finalized_history.historical_hold.repo_svn_rev"])
+            del history["historical_hold"]["repo_svn_rev"]
+            if outer_status == "PASS":
+                historical = history["historical_hold"]
+                published_sha = historical.pop("published_git_sha")
+                wrong_mapping = [f"{POST_WRITE_RECOVERY}: PASS requires detail.mapped_git_sha to match finalized_history.historical_hold.published_git_sha"]
+                check_r01_errors(wrong_mapping)
+                historical["published_git_sha"] = "1234" * 10
+                check_r01_errors(wrong_mapping)
+                historical["published_git_sha"] = published_sha
+                invalid_fields = (
+                    ("recovery_ok", (False, 1, "true"), "detail.recovery_ok to be true"),
+                    ("expected_watermark", (0, 2, True), "matching positive integer expected_watermark and final_watermark"),
+                    ("final_watermark", (0, 2, 3.0), "matching positive integer expected_watermark and final_watermark"),
+                    ("mapping_count", (0, 2, True), "detail.mapping_count to be exactly one"),
+                    ("mapped_git_sha", (None, "abc", "z" * 40, "0" * 40), "detail.mapped_git_sha to be a full Git commit ID"),
                 )
+                for key, invalid_values, reason in invalid_fields:
+                    diagnostic = [f"{POST_WRITE_RECOVERY}: PASS requires {reason}"]
+                    valid = detail.pop(key)
+                    check_r01_errors(diagnostic)
+                    for value in invalid_values:
+                        detail[key] = value
+                        check_r01_errors(diagnostic)
+                    detail[key] = valid
+
+                detail["recovery_error"] = "ambiguous_checkpoint"
+                check_r01_errors([f"{POST_WRITE_RECOVERY}: PASS cannot have a recovery_error"])
+                del detail["recovery_error"]
+
+                # Flipping both labels on the historical hold cannot substitute for repaired rows.
+                detail.update(final_watermark=1, mapping_count=0, mapped_git_sha=None)
+                check_r01_errors([
+                    f"{POST_WRITE_RECOVERY}: PASS requires matching positive integer expected_watermark and final_watermark",
+                    f"{POST_WRITE_RECOVERY}: PASS requires detail.mapping_count to be exactly one",
+                    f"{POST_WRITE_RECOVERY}: PASS requires detail.mapped_git_sha to be a full Git commit ID",
+                ])
 
         for outage_id in (git_id, svn_id):
             outage_partial = full_pass_rows()

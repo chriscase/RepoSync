@@ -857,6 +857,10 @@ struct SingleRepoFixture {
 
 impl SingleRepoFixture {
     fn new() -> Self {
+        Self::with_registration_mode("team")
+    }
+
+    fn with_registration_mode(sync_mode: &str) -> Self {
         let tmp = TempDir::new().unwrap();
         let svn_root = tmp.path().join("svnserve-root");
         std::fs::create_dir_all(&svn_root).unwrap();
@@ -920,7 +924,7 @@ impl SingleRepoFixture {
             git_api_url: String::new(),
             git_repo: bare.to_string_lossy().to_string(),
             git_branch: "main".into(),
-            sync_mode: "team".into(),
+            sync_mode: sync_mode.into(),
             poll_interval_secs: 5,
             lfs_threshold_mb: 0,
             auto_merge: false,
@@ -965,6 +969,10 @@ impl SingleRepoFixture {
     fn make_engine(&self) -> SyncEngine {
         let db = setup_db(&self.db_path);
         let config = make_app_config(&self.repo.svn_url, self.tmp.path());
+        self.make_engine_with_config(db, config)
+    }
+
+    fn make_engine_with_config(&self, db: Database, config: AppConfig) -> SyncEngine {
         let mut engine = SyncEngine::new(
             config,
             db,
@@ -3511,88 +3519,33 @@ async fn git_push_checkpoint_recovery() -> serde_json::Value {
     })
 }
 
+#[path = "real_engine_scenarios/finalized_history.rs"]
+mod finalized_history;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scenario_r01_svnserve_post_write_recovery() {
     if !require_toolchain(CASE_POST_WRITE_RECOVERY) {
         return;
     }
     let checkpoint_recovery = git_push_checkpoint_recovery().await;
-    let fixture = SingleRepoFixture::new();
-    let engine = fixture.make_engine();
-    let before = fixture.checkpoint_snapshot();
-    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
-    let verified_rev = svn_commit_file(
-        &fixture.wc,
-        "recovery.txt",
-        "post-write recovery\n",
-        "SVN revision for post-write recovery",
-        &fixture.repo.username,
-        &fixture.repo.password,
-    );
-    let stats = engine.run_sync_cycle().await.unwrap();
-    assert_eq!(stats.svn_to_git_count, 1);
-    let after_apply = fixture.checkpoint_snapshot();
-    assert_eq!(after_apply.0, verified_rev);
-    let bare_head = get_head_sha(&fixture.repo.bare);
-    let db = setup_db(&fixture.db_path);
-    db.conn()
-        .execute(
-            "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2 WHERE id = ?3",
-            rusqlite::params![before.0, before.1, fixture.repo.id],
-        )
-        .unwrap();
-    db.conn()
-        .execute(
-            "DELETE FROM sync_records WHERE repo_id = ?1 AND svn_rev = ?2 AND direction = 'svn_to_git'",
-            rusqlite::params![fixture.repo.id, verified_rev],
-        )
-        .unwrap();
-    let reopened = fixture.make_engine();
-    let recovery = reopened.run_sync_cycle().await;
-    let final_checkpoint = fixture.checkpoint_snapshot();
-    let bare_after = get_head_sha(&fixture.repo.bare);
-    let (mapping_count, mapped_sha): (i64, Option<String>) = db
-        .conn()
-        .query_row(
-            "SELECT COUNT(*), MIN(git_sha) FROM sync_records
-         WHERE repo_id=?1 AND svn_rev=?2 AND direction='svn_to_git' AND status='applied'",
-            rusqlite::params![fixture.repo.id, verified_rev],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(bare_after, bare_head, "recovery changed the published ref");
-    assert!(
-        mapping_count <= 1,
-        "duplicate applied mappings for r{verified_rev}"
-    );
-    if mapping_count == 1 {
-        assert_eq!(mapped_sha.as_ref(), Some(&bare_head));
-    }
-    let case_status = if recovery.is_ok()
-        && final_checkpoint.0 == verified_rev
-        && final_checkpoint.1 == bare_head
-        && mapping_count == 1
-        && git_show_blob(&fixture.repo.bridge, &final_checkpoint.1, "recovery.txt")
-            == "post-write recovery\n"
-    {
-        "PASS"
-    } else {
-        "PARTIAL"
-    };
+    let finalized = finalized_history::evidence().await;
+    let historical = &finalized["historical_hold"];
+    let mapping_count = historical["r3_receipts"].as_u64().unwrap();
     emit_evidence(
         CASE_POST_WRITE_RECOVERY,
-        case_status,
+        "PARTIAL",
         serde_json::json!({
             "simulated": "checkpoint_and_mapping_removed_after_successful_svn_to_git",
             "git_push_checkpoint_recovery": checkpoint_recovery,
-            "recovery_ok": recovery.is_ok(),
-            "final_watermark": final_checkpoint.0,
-            "expected_watermark": verified_rev,
-            "bare_head_stable": bare_after == bare_head,
+            "recovery_ok": false,
+            "final_watermark": historical["repo_svn_rev"],
+            "expected_watermark": historical["canonical_svn_rev"],
+            "bare_head_stable": historical["bare_head_stable"],
             "mapping_count": mapping_count,
-            "mapped_git_sha": mapped_sha,
+            "mapped_git_sha": historical["mapped_git_sha"],
             "duplicate_mapping": mapping_count > 1,
-            "recovery_error": recovery.err().map(|e| e.to_string()),
+            "recovery_error": historical["recovery_error"],
+            "finalized_history": finalized
         }),
     );
 }

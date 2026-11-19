@@ -399,12 +399,6 @@ fn resolve_repo_import_baseline_inner(
     }
 
     let scoped_svn_key = format!("last_svn_rev_{repo_id}");
-    let scoped_svn = db
-        .get_state(&format!("last_svn_rev_{repo_id}"))?
-        .and_then(|value| value.parse::<i64>().ok());
-    let has_scoped_git =
-        crate::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)?.is_some();
-    let has_scoped_svn = scoped_svn.is_some_and(|rev| rev > 0);
 
     // Team sync checkpoints columns plus scoped `last_svn_rev_<repo>` without always
     // setting `last_sync_at` or `last_git_sha_<repo>`.
@@ -421,13 +415,25 @@ fn resolve_repo_import_baseline_inner(
                 return Ok(RepoImportBaseline::Pending);
             }
 
-            let mut scoped_svn_rev =
-                kv_state_value_tx(tx, &scoped_svn_key)?.and_then(|value| value.parse::<i64>().ok());
-            let has_scoped_svn = scoped_svn_rev.is_some_and(|rev| rev > 0);
-            if !has_scoped_svn && backfill_missing_svn_cursor {
+            let scoped_value = kv_state_value_tx(tx, &scoped_svn_key)?;
+            let mut scoped_svn_rev = scoped_value
+                .as_deref()
+                .and_then(|value| value.parse::<i64>().ok());
+            if scoped_svn_rev.is_none_or(|rev| rev <= 0) && backfill_missing_svn_cursor {
                 super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
                     tx, repo_id,
                 )?;
+                if scoped_value.is_none() {
+                    let finalized = super::git_push_operations::later_finalized_svn_checkpoint(
+                        tx, repo_id, column_svn_rev,
+                    )?;
+                    if let Some(finalized) = finalized {
+                        return Ok(RepoImportBaseline::ReconciliationRequired {
+                            reason: "conflicting_finalized_svn_checkpoint".into(),
+                            detail: format!("repository column is r{column_svn_rev}, but the completed SVN-to-Git push and scoped mapping record r{finalized}; reconcile before recreating the missing SVN cursor"),
+                        });
+                    }
+                }
                 let now = Utc::now().to_rfc3339();
                 tx.execute(
                     "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
@@ -452,6 +458,12 @@ fn resolve_repo_import_baseline_inner(
         });
     }
 
+    let has_scoped_git =
+        crate::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)?.is_some();
+    let has_scoped_svn = db
+        .get_state(&scoped_svn_key)?
+        .and_then(|value| value.parse::<i64>().ok())
+        .is_some_and(|rev| rev > 0);
     if has_scoped_git {
         return Ok(RepoImportBaseline::ReconciliationRequired {
             reason: "orphan_scoped_import_checkpoint".into(),
@@ -1387,6 +1399,8 @@ mod tests {
     use super::*;
     use crate::db::watermark_recovery::recover_repo_watermark_from_global_migration;
     use rusqlite::params;
+
+    mod finalized_svn_checkpoint;
 
     #[test]
     fn retained_effects_require_local_or_published_prefix() {
