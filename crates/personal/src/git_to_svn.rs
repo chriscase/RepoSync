@@ -48,6 +48,8 @@ const PERSONAL_REPO_ID: &str = PERSONAL_SCOPE_KEY;
 /// Personal-mode no-target receipt projection (empty ruleset).
 const PERSONAL_NO_TARGET_PROJECTION: &str = "{}";
 
+const PR_COMMIT_PAGE_SIZE: usize = 100;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -275,11 +277,11 @@ impl GitToSvnSync {
                     let member = newest_first
                         .last_mut()
                         .context("missing PR for its linear span")?;
-                    anyhow::ensure!(
-                        member.interior.len() < 99,
-                        "incomplete single-page rebase span"
-                    );
-                    member.interior.push(cursor.id().to_string());
+                    // The 100th interior already proves a >100-member PR.
+                    // Retain that bounded witness and defer the hold to its turn.
+                    if member.interior.len() < PR_COMMIT_PAGE_SIZE {
+                        member.interior.push(cursor.id().to_string());
+                    }
                 } else if truncated {
                     return Err(GitHubError::IncompletePrDiscovery.into());
                 } else {
@@ -604,6 +606,12 @@ impl GitToSvnSync {
                 0,
             )
             .context("failed to record pending Personal PR")?;
+        if interior.len() >= PR_COMMIT_PAGE_SIZE {
+            return Err(GitHubError::IncompletePrCommitList {
+                pr_number: pr.number,
+            }
+            .into());
+        }
         let commits = self
             .github
             .get_pr_commits(&self.github_repo, pr.number)

@@ -79,6 +79,7 @@ async fn request_path(stream: &mut TcpStream) -> String {
 enum ProviderView {
     Complete,
     IncompleteDag,
+    OversizedLater,
     EarlierOnly,
     PendingBeyondCap,
     CoveredBeyondCap,
@@ -162,6 +163,14 @@ async fn pr_provider(
                         .filter(|row| row["number"] == 2 || row["number"] == 1)
                         .collect::<Vec<_>>())
                     .to_string();
+                }
+                (ProviderView::OversizedLater, "pulls/2/commits") => {
+                    let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+                    assert_eq!(rows.len(), 101);
+                    body = json!(&rows[..100]).to_string();
+                    continuation = Some(format!(
+                        "{server_url}/repos/test/test-repo/pulls/2/commits?page=2"
+                    ));
                 }
                 (ProviderView::IncompleteDag, "pulls/3/commits") => {
                     let commits: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
@@ -392,6 +401,11 @@ async fn rewritten_provider_shas_hold_before_first_svn_revision() {
     qualify_pr_backlog(BacklogCase::RebaseOriginalIds).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn later_oversized_linear_pr_holds_only_at_its_turn() {
+    qualify_pr_backlog(BacklogCase::OversizedLinear).await;
+}
+
 #[derive(PartialEq, Eq)]
 enum BacklogCase {
     Restart,
@@ -403,6 +417,7 @@ enum BacklogCase {
     UpgradePrefix,
     Rebase,
     RebaseOriginalIds,
+    OversizedLinear,
 }
 
 async fn qualify_pr_backlog(case: BacklogCase) {
@@ -464,6 +479,61 @@ async fn qualify_pr_backlog(case: BacklogCase) {
             1
         );
         provider.join().unwrap();
+    }
+    if case == BacklogCase::OversizedLinear {
+        git_cmd(&git, &["checkout", "-b", "earlier"]);
+        let first = add_file(&git, "early.txt", "early\n", "Earlier PR");
+        git_cmd(&git, &["checkout", "main"]);
+        git_cmd(
+            &git,
+            &["merge", "--no-ff", "earlier", "-m", "Merge earlier PR"],
+        );
+        let earlier = git_sha(&git);
+        let mut members = Vec::new();
+        for n in 1..=101 {
+            members.push(add_file(
+                &git,
+                "pending.txt",
+                &n.to_string(),
+                &format!("Pending member {n}"),
+            ));
+        }
+        git_cmd(&git, &["push", "origin", "main"]);
+        let refs: Vec<_> = members.iter().map(String::as_str).collect();
+        let tip = members.last().unwrap();
+        let (api, provider) = pr_provider(
+            &git,
+            &[("earlier", &earlier, &[&first]), ("long", tip, &refs)],
+            Arc::new(Mutex::new(ProviderView::OversizedLater)),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        config.github.api_url = api.clone();
+        let db = Database::new(&path).unwrap();
+        for cycle in 0..2 {
+            let engine = PersonalSyncEngine::new(
+                config.clone(),
+                Database::new(&path).unwrap(),
+                svn.clone(),
+                GitClient::new(&git).unwrap(),
+                github(&api),
+            );
+            let result = engine.run_cycle().await.unwrap();
+            assert_eq!(
+                (result.prs_processed, result.git_to_svn_count),
+                (u64::from(cycle == 0), u64::from(cycle == 0)),
+                "101-member later rebase cannot prevent the earlier PR write"
+            );
+            assert_mappings(&db, "git_to_svn", &[(2, &first)]);
+            assert_eq!(svn_youngest(&url), 2);
+            assert_eq!(svn_tree(&svn, 2).await, git_tree(&bare, &earlier));
+            assert!(db
+                .unfinished_personal_prs()
+                .unwrap()
+                .contains(&(2, tip.clone())));
+        }
+        provider.abort();
+        return;
     }
     if matches!(case, BacklogCase::Rebase | BacklogCase::RebaseOriginalIds) {
         git_cmd(&git, &["checkout", "-b", "topic"]);
