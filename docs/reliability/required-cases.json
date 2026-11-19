@@ -1099,6 +1099,7 @@
     {"id":"R04_PLAIN_PUT_PAUSE_FIRST", "binary":"server_freeze", "test":"r04_import_disable::settings_put::r04_plain_rename_preserves_newer_pause_and_import", "tier":"candidate_regression"},
     {"id":"R04_RECEIPTED_PUT_PAUSE_FIRST", "binary":"server_freeze", "test":"r04_import_disable::settings_put::r04_receipted_rename_preserves_newer_pause_and_import", "tier":"candidate_regression"},
     {"id":"R04_TARGET_CHANGE_BEFORE_IMPORT_ADMISSION", "binary":"server_freeze", "test":"r04_import_disable::settings_put::r04_changed_target_refuses_stale_import_before_enrollment", "tier":"candidate_regression"},
+    {"id":"R04_USERNAME_CHANGE_BEFORE_IMPORT_ADMISSION", "binary":"server_freeze", "test":"r04_import_disable::settings_put::r04_changed_username_refuses_stale_import_before_enrollment", "tier":"candidate_regression"},
     {"id":"64B_LOCAL_MISSING", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_missing_local_object_blocks_remote_confirmation", "tier":"candidate_regression"},
     {"id":"64B_MALFORMED", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_unsupported_v1_document_is_preserved", "tier":"candidate_regression"},
     {"id":"64B_ATOMIC_FAILURE", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_finalization_failure_rolls_back_publication_receipt", "tier":"candidate_regression"},

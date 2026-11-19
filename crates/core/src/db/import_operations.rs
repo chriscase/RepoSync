@@ -17,8 +17,13 @@ const SETUP_OWNER_KEY: &str = "import_operation_v1:setup_owner";
 
 enum ImportEnrollment<'a> {
     Journal,
-    Managed { workdir: &'a Path },
-    Setup { data_dir: &'a Path },
+    Managed {
+        workdir: &'a Path,
+        svn_username: &'a str,
+    },
+    Setup {
+        data_dir: &'a Path,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -753,7 +758,10 @@ impl Database {
             initiator_id,
             request_id,
             &import_target_fingerprint(repo, workdir),
-            ImportEnrollment::Managed { workdir },
+            ImportEnrollment::Managed {
+                workdir,
+                svn_username: &repo.svn_username,
+            },
         )
     }
 
@@ -814,9 +822,20 @@ impl Database {
                     ));
                 }
             }
-            if let ImportEnrollment::Managed { workdir } = target {
+            if let ImportEnrollment::Managed {
+                workdir,
+                svn_username,
+            } = target
+            {
                 let current = transaction_target_fingerprint(tx, repo_id, workdir)?;
-                if !current.is_some_and(|(current, _)| current == fingerprint) {
+                // The durable v1 fingerprint predates this check. Compare the
+                // prepared SVN login here without storing it in the journal.
+                let same_login: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM repositories WHERE id = ?1 AND svn_username = ?2)",
+                    params![repo_id, svn_username],
+                    |row| row.get(0),
+                )?;
+                if !same_login || !current.is_some_and(|(current, _)| current == fingerprint) {
                     return Err(DatabaseError::ImportTargetChanged);
                 }
             }
