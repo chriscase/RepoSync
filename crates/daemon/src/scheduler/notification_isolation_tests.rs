@@ -421,3 +421,94 @@ async fn r17_concurrent_sync_events_match_their_repository() {
         json!({"transport":"in_process_broadcast","events":events,"repositories":published})
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r17_same_tick_pushes_complete_for_both_repositories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let first_id = "r17-same-tick-alpha";
+    let (mut scheduler, _) = scheduler_fixture(&tmp, first_id, "2000-01-01T00:00:00Z");
+    let local_base = format!("file://{}", root.display());
+    scheduler.app_config.github.api_url = local_base.clone();
+    scheduler.app_config.github.git_base_url = Some(local_base);
+    scheduler.app_config.identity.email_domain = Some("example.invalid".into());
+    let template = scheduler.db.get_repository(first_id).unwrap().unwrap();
+    let pairs = [
+        Pair::prepare(root, &scheduler.db, template.clone(), "same-tick-alpha"),
+        Pair::prepare(root, &scheduler.db, template, "same-tick-beta"),
+    ];
+    let (sender, mut receiver) = broadcast::channel(8);
+    scheduler.ws_broadcast = sender;
+    scheduler.maybe_run_repo_cycles().await;
+    let workers = std::mem::take(&mut *scheduler.sync_handles.lock().await);
+
+    let both_offered = time::timeout(Duration::from_secs(15), async {
+        while workers.len() == 2 && workers.iter().all(|worker| !worker.is_finished()) {
+            if pairs.iter().all(|pair| pair.bare.join("offer").is_file()) {
+                return true;
+            }
+            time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    let held = both_offered.then(|| {
+        pairs.each_ref().map(|pair| {
+            assert_eq!(
+                command(&pair.bare, "git", &["rev-parse", "refs/heads/main"]),
+                pair.row.last_git_sha
+            );
+            scheduler
+                .db
+                .active_git_push_operation(&pair.row.id)
+                .unwrap()
+                .expect("offered push must have an active journal")
+        })
+    });
+    let no_early_event = receiver.is_empty();
+    // Release both native pushes before waiting for either worker to finish.
+    for pair in &pairs {
+        fs::write(pair.bare.join("release"), "").unwrap();
+    }
+    time::timeout(Duration::from_secs(15), async {
+        for worker in workers {
+            worker.await.expect("same-tick worker panicked");
+        }
+    })
+    .await
+    .expect("same-tick workers timed out after releasing both hooks");
+
+    let mut events = Vec::new();
+    loop {
+        match receiver.try_recv() {
+            Ok(raw) => events.push(serde_json::from_str::<Value>(&raw).unwrap()),
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => panic!("same-tick broadcast lost events: {error}"),
+        }
+    }
+    let expected = pairs.each_ref().map(Pair::expected_event);
+    assert!(
+        events_match(&events, &expected),
+        "expected {expected:?}, received {events:?}"
+    );
+    assert!(no_early_event, "completion before releasing both offers");
+    let [alpha_op, beta_op] = held.expect("both same-tick workers must overlap at pre-receive");
+    assert_ne!(alpha_op.id, beta_op.id);
+    let reopened = Database::new(root.join("reposync.db")).unwrap();
+    for pair in &pairs {
+        let row = reopened.get_repository(&pair.row.id).unwrap().unwrap();
+        assert_eq!(row.sync_status, "idle", "{}", pair.row.id);
+    }
+    let published = [
+        pairs[0].attest_push(&reopened, alpha_op),
+        pairs[1].attest_push(&reopened, beta_op),
+    ];
+    assert_ne!(published[0]["scope_uuid"], published[1]["scope_uuid"]);
+    assert_ne!(published[0]["svn_uuid"], published[1]["svn_uuid"]);
+    assert_ne!(published[0]["tip"], published[1]["tip"]);
+    eprintln!(
+        "R17_SAME_TICK_PUSH_EVIDENCE {}",
+        json!({"events":events,"repositories":published})
+    );
+}

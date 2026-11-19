@@ -836,6 +836,8 @@ impl GitPushOperation {
 mod tests {
     use super::*;
 
+    mod contention_tests;
+
     fn sample_intent<'a>() -> GitPushIntent<'a> {
         GitPushIntent {
             repo_id: "pair",
