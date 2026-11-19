@@ -6218,18 +6218,133 @@ async fn candidate_r10_over_1000_pending_commits_batched() {
     );
 }
 
-/// 1001 linear commits drain through team `run_sync_cycle` at
-/// [`DEFAULT_PENDING_COMMIT_CAP`](reposync_core::pending_frontier::DEFAULT_PENDING_COMMIT_CAP)
-/// (1000). No `PendingCapGuard` is installed. The cap-3 test above does not
-/// cover this path.
+/// Compare the independent Git source chain with both forms of durable team mapping.
+/// Reading every row also catches duplicated, reordered or prematurely mapped commits.
+async fn assert_linear_batch_frontier(
+    fixture: &QualifiedPair,
+    before: &PairSnapshot,
+    published: &[String],
+    tip: &str,
+) -> PairSnapshot {
+    use reposync_core::db::lineage_checkpoints::{
+        git_source_key, load_canonical_lineage, load_directional_checkpoint, load_mapping_outcome,
+        CheckpointDirection::GitToSvn, MappingOutcome::AppliedAndVerified,
+    };
+    let snapshot = fixture.snapshot().await;
+    let last = published.last().unwrap();
+    let revision = before.svn_rev + published.len() as i64;
+    assert_eq!(snapshot.svn_rev, revision);
+    assert_eq!(snapshot.remote_sha, tip);
+    assert_eq!(&snapshot.bridge_sha, last);
+    assert_eq!(&snapshot.watermark.1, last);
+    assert_eq!(snapshot.kv_cursor.as_ref(), Some(last));
+    assert_eq!(
+        snapshot.mapping_count,
+        before.mapping_count + published.len() as i64
+    );
+
+    let db = fixture.engine.db();
+    let lineage = load_canonical_lineage(db, &fixture.repo_id)
+        .unwrap()
+        .unwrap();
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare(
+            "SELECT svn_rev, git_sha, direction, status FROM sync_records
+             WHERE repo_id=?1 AND svn_rev>?2 ORDER BY svn_rev, id",
+        )
+        .unwrap();
+    let mut rows = stmt
+        .query(rusqlite::params![fixture.repo_id, before.svn_rev])
+        .unwrap();
+    for (i, sha) in published.iter().enumerate() {
+        let rev = before.svn_rev + i as i64 + 1;
+        let row = rows.next().unwrap().expect("missing replay mapping");
+        assert_eq!(row.get::<_, i64>(0).unwrap(), rev);
+        assert_eq!(&row.get::<_, String>(1).unwrap(), sha, "source at r{rev}");
+        assert_eq!(row.get::<_, String>(2).unwrap(), "git_to_svn");
+        assert_eq!(row.get::<_, String>(3).unwrap(), "applied");
+        let mapping = load_mapping_outcome(
+            &conn,
+            &lineage.scope_uuid,
+            lineage.generation,
+            GitToSvn,
+            &git_source_key(sha),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (mapping.outcome, mapping.target_svn_rev),
+            (AppliedAndVerified, Some(rev))
+        );
+    }
+    assert!(
+        rows.next().unwrap().is_none(),
+        "unexpected extra replay mapping"
+    );
+    if last != tip {
+        assert!(
+            load_mapping_outcome(
+                &conn,
+                &lineage.scope_uuid,
+                lineage.generation,
+                GitToSvn,
+                &git_source_key(tip)
+            )
+            .unwrap()
+            .is_none(),
+            "unreplayed tip already has a canonical mapping"
+        );
+    }
+    let checkpoint =
+        load_directional_checkpoint(&conn, &lineage.scope_uuid, lineage.generation, GitToSvn)
+            .unwrap()
+            .unwrap();
+    assert_eq!(checkpoint.handled_source_key, git_source_key(last));
+    assert_eq!(
+        (checkpoint.outcome, checkpoint.target_svn_rev),
+        (AppliedAndVerified, Some(revision))
+    );
+    snapshot
+}
+
+/// Check the complete byte tree at each newly published revision. Keep the oldest
+/// and batch-end tree digests in the evidence without printing all 1001 commits.
+async fn check_linear_batch_trees(
+    fixture: &QualifiedPair,
+    baseline: i64,
+    chain: &[String],
+    positions: std::ops::Range<usize>,
+) -> Vec<serde_json::Value> {
+    let end = positions.end;
+    let mut endpoints = Vec::new();
+    for index in positions {
+        let sha = &chain[index];
+        let rev = baseline + index as i64 + 1;
+        let source = tracked_tree_at(&fixture.bare, sha);
+        assert_eq!(
+            source["backlog.txt"],
+            format!("pending line {index}\n").as_bytes()
+        );
+        assert_eq!(
+            svn_tree(fixture, rev).await,
+            source,
+            "Git {sha} versus SVN r{rev}"
+        );
+        if index == 0 || index + 1 == end {
+            endpoints.push(serde_json::json!({"position":index + 1, "git":sha, "svn":rev, "tree":tree_hashes(&source)}));
+        }
+    }
+    endpoints
+}
+
+/// Qualify the actual 1000-commit default batch, then reopen the production
+/// engine and its SQLite state to finish the last commit and two quiet cycles.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_over_1000_pending_commits_default_cap() {
-    assert_eq!(
-        reposync_core::pending_frontier::DEFAULT_PENDING_COMMIT_CAP,
-        1000,
-        "this replay is the default cap of 1000, not a test override"
-    );
-    let fixture = QualifiedPair::new().await;
+    use reposync_core::pending_frontier::{GitReplayContinuation, DEFAULT_PENDING_COMMIT_CAP};
+    assert_eq!(DEFAULT_PENDING_COMMIT_CAP, 1000);
+    let mut fixture = QualifiedPair::new().await;
     let synced = fixture.developer_commit("feature.txt", "first version\n", "Handled Git baseline");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     assert_eq!(
@@ -6243,59 +6358,75 @@ async fn candidate_r10_over_1000_pending_commits_default_cap() {
     );
     let before = fixture.snapshot().await;
     let (tip, chain) = build_linear_commit_chain(&fixture, 1001);
+    let range = format!("{synced}..{tip}");
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-list", "--reverse", &range]),
+        chain.join("\n")
+    );
     assert_eq!(chain.len(), 1001);
 
     let first = fixture.engine.run_sync_cycle().await.unwrap();
-    assert_eq!(
-        first.git_to_svn_count, 1000,
-        "first batch must replay the default cap, not a reduced override"
-    );
+    assert_eq!((first.git_to_svn_count, first.svn_to_git_count), (1000, 0));
     assert_eq!(first.git_pending_total, 1001);
-    assert!(
-        first.git_replay_has_more,
-        "1001 commits leave one commit pending"
+    assert!(first.git_replay_has_more);
+    let mid = assert_linear_batch_frontier(&fixture, &before, &chain[..1000], &tip).await;
+    let mut endpoints = check_linear_batch_trees(&fixture, before.svn_rev, &chain, 0..1000).await;
+
+    // reopen_pair creates new Git, SVN and SQLite clients; replacement drops
+    // the original engine before the new one can advance the continuation.
+    fixture.engine = reopen_pair(&fixture);
+    let key = GitReplayContinuation::state_key(&fixture.repo_id);
+    let state = fixture
+        .engine
+        .db()
+        .get_state(&key)
+        .unwrap()
+        .expect("persisted partial batch");
+    let continuation: GitReplayContinuation = serde_json::from_str(&state).unwrap();
+    assert_eq!(continuation.p_origin, synced);
+    assert_eq!(continuation.r_admitted, tip);
+    assert!(!continuation.merge_dag);
+    assert_eq!(
+        fixture
+            .engine
+            .db()
+            .get_repo_watermark(&fixture.repo_id)
+            .unwrap(),
+        mid.watermark
     );
-    let after_first = fixture.snapshot().await;
-    assert_eq!(after_first.watermark.1, chain[999]);
-    assert_eq!(after_first.bridge_sha, chain[999]);
-    assert_ne!(after_first.bridge_sha, tip);
-    assert_eq!(after_first.svn_rev, before.svn_rev + 1000);
 
     let second = fixture.engine.run_sync_cycle().await.unwrap();
-    assert_eq!(
-        second.git_to_svn_count, 1,
-        "final batch drains the last commit"
-    );
+    assert_eq!((second.git_to_svn_count, second.svn_to_git_count), (1, 0));
     assert!(!second.git_replay_has_more);
-    let after_second = fixture.snapshot().await;
-    assert_eq!(after_second.watermark.1, tip);
-    assert_eq!(after_second.bridge_sha, tip);
-    assert_eq!(after_second.svn_rev, before.svn_rev + 1001);
-    assert_eq!(
-        after_second.mapping_count,
-        before.mapping_count + 1001,
-        "each replayed Git commit must add a mapping"
-    );
+    let done = assert_linear_batch_frontier(&fixture, &before, &chain, &tip).await;
+    endpoints.extend(check_linear_batch_trees(&fixture, before.svn_rev, &chain, 1000..1001).await);
+    assert!(fixture.engine.db().get_state(&key).unwrap().is_none());
 
-    let idle = fixture.engine.run_sync_cycle().await.unwrap();
-    assert_eq!((idle.git_to_svn_count, idle.svn_to_git_count), (0, 0));
-    assert!(!idle.git_replay_has_more);
+    let mut quiet_watermarks = Vec::new();
+    for _ in 0..2 {
+        let idle = fixture.engine.run_sync_cycle().await.unwrap();
+        assert_eq!((idle.git_to_svn_count, idle.svn_to_git_count), (0, 0));
+        assert!(!idle.git_replay_has_more);
+        let quiet = assert_linear_batch_frontier(&fixture, &before, &chain, &tip).await;
+        assert_eq!(quiet.repo_sync_count, done.repo_sync_count);
+        assert_eq!(quiet.remote_tree, done.remote_tree);
+        assert_eq!(quiet.bridge_tree, done.bridge_tree);
+        assert!(fixture.engine.db().get_state(&key).unwrap().is_none());
+        quiet_watermarks.push(quiet.watermark);
+    }
+    assert_eq!(quiet_watermarks[0], quiet_watermarks[1]);
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
-            "case":"R10_DEFAULT_CAP_1001",
-            "p":synced,
-            "r":tip,
-            "batch_cap":1000,
-            "pending_total":1001,
-            "batches":[1000,1],
-            "cap_override":false,
-            "svn_revision_before_after":before.svn_rev,
-            "svn_revision_final":after_second.svn_rev,
-            "mapping_before":before.mapping_count,
-            "mapping_after":after_second.mapping_count,
-            "mapping_delta":1001,
-            "continuation":true
+            "case":"R10_DEFAULT_CAP_1001", "p":synced, "r":tip,
+            "batch_cap":DEFAULT_PENDING_COMMIT_CAP, "pending_total":first.git_pending_total,
+            "batches":[first.git_to_svn_count,second.git_to_svn_count], "cap_override":false,
+            "svn_revision_before_after":before.svn_rev, "svn_revision_final":done.svn_rev,
+            "mapping_before":before.mapping_count, "mapping_after":done.mapping_count,
+            "mapping_delta":done.mapping_count-before.mapping_count, "continuation":true,
+            "reopened_p":continuation.p_origin, "reopened_r":continuation.r_admitted,
+            "mid_watermark":mid.watermark, "final_watermark":done.watermark,
+            "checked_git_svn_trees":chain.len(), "endpoints":endpoints, "quiet_watermarks":quiet_watermarks
         })
     );
 }
