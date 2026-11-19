@@ -43,6 +43,10 @@ use reposync_web::AppState;
 #[path = "support/r04_import_disable.rs"]
 mod r04_import_disable;
 
+#[cfg(unix)]
+#[path = "support/r17_managed_full_imports.rs"]
+mod r17_managed_full_imports;
+
 fn inbound_git_sha_kv(db: &Database, repo_id: &str) -> Option<String> {
     reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)
         .expect("read inbound git sha kv")
@@ -1636,20 +1640,14 @@ async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing(
     provider_handle.abort();
 }
 
-/// Disposable real SVN history, local bare Git target, v12 file database and
-/// the actual repository routes. No provider or production credentials.
-async fn import_fixture() -> (
-    SocketAddr,
-    Arc<AppState>,
-    TestServerGuard,
-    tempfile::TempDir,
-    String,
-    std::path::PathBuf,
-) {
+fn seed_import_history(
+    root: &Path,
+    name: &str,
+    contents: [&str; 2],
+) -> (String, std::path::PathBuf) {
     use std::process::Command;
-    let tmp = tempfile::tempdir().unwrap();
-    let svn_repo = tmp.path().join("svn-repo");
-    let bare = tmp.path().join("local").join("history.git");
+    let svn_repo = root.join("svn-repo");
+    let bare = root.join("local").join(format!("{name}.git"));
     std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
     assert!(Command::new("svnadmin")
         .args(["create", svn_repo.to_str().unwrap()])
@@ -1669,7 +1667,7 @@ async fn import_fixture() -> (
         .status()
         .unwrap()
         .success());
-    let checkout = tmp.path().join("svn-wc");
+    let checkout = root.join("svn-wc");
     assert!(Command::new("svn")
         .args([
             "checkout",
@@ -1679,7 +1677,7 @@ async fn import_fixture() -> (
         .status()
         .unwrap()
         .success());
-    std::fs::write(checkout.join("history.txt"), "first\n").unwrap();
+    std::fs::write(checkout.join("history.txt"), contents[0]).unwrap();
     assert!(Command::new("svn")
         .args(["add", "history.txt"])
         .current_dir(&checkout)
@@ -1692,7 +1690,7 @@ async fn import_fixture() -> (
         .status()
         .unwrap()
         .success());
-    std::fs::write(checkout.join("history.txt"), "second\n").unwrap();
+    std::fs::write(checkout.join("history.txt"), contents[1]).unwrap();
     assert!(Command::new("svn")
         .args(["commit", "-m", "second", "--username", "fixture"])
         .current_dir(&checkout)
@@ -1704,7 +1702,21 @@ async fn import_fixture() -> (
         .status()
         .unwrap()
         .success());
+    (svn_url, bare)
+}
 
+/// Disposable real SVN history, local bare Git target, v12 file database and
+/// the actual repository routes. No provider or production credentials.
+async fn import_fixture() -> (
+    SocketAddr,
+    Arc<AppState>,
+    TestServerGuard,
+    tempfile::TempDir,
+    String,
+    std::path::PathBuf,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (svn_url, bare) = seed_import_history(tmp.path(), "history", ["first\n", "second\n"]);
     let config = minimal_config(tmp.path());
     let db = Database::new(tmp.path().join("reposync.db")).unwrap();
     db.initialize().unwrap();
@@ -1746,14 +1758,24 @@ async fn import_fixture() -> (
         .layer(axum::extract::Extension(refresh))
         .with_state(state.clone());
     let (addr, server) = spawn_isolated_test_server(app);
+    let id = register_import_history(addr, tmp.path(), &svn_url, "history").await;
+    (addr, state, server, tmp, id, bare)
+}
+
+async fn register_import_history(
+    addr: SocketAddr,
+    root: &Path,
+    svn_url: &str,
+    name: &str,
+) -> String {
     let client = authed_client();
     let response = client
         .post(format!("http://{addr}/api/repos"))
         .json(&serde_json::json!({
-            "name":"history", "svn_url":svn_url, "svn_branch":"trunk",
+            "name":name, "svn_url":svn_url, "svn_branch":"trunk",
             "svn_username":"fixture", "git_provider":"gitea",
-            "git_api_url":format!("file://{}", tmp.path().display()),
-            "git_repo":"local/history", "git_branch":"main",
+            "git_api_url":format!("file://{}", root.display()),
+            "git_repo":format!("local/{name}"), "git_branch":"main",
         }))
         .send()
         .await
@@ -1762,14 +1784,7 @@ async fn import_fixture() -> (
     let body = response.text().await.unwrap();
     assert!(status.is_success(), "{}", body);
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
-    (
-        addr,
-        state,
-        server,
-        tmp,
-        created["id"].as_str().unwrap().to_string(),
-        bare,
-    )
+    created["id"].as_str().unwrap().to_owned()
 }
 
 #[cfg(feature = "reliability-browser")]
