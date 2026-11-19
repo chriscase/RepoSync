@@ -306,14 +306,17 @@ pub(super) async fn run() -> Value {
     assert_equal_content(&svn_repo, meta, recreated);
 
     let unchanged_source = svnlook_at(&svn_repo, "tree", &["--show-ids", "--full-paths"]);
+    let before_first_hold = reflog(&f);
+    assert_eq!(before_first_hold, publish_log);
     let diagnostic = cold_hold(&f, &before, &replacement).await;
+    let after_first_hold = reflog(&f);
+    assert_eq!(after_first_hold, before_first_hold);
     assert_eq!(records(&f, &receipt_key), established);
     assert_eq!(youngest(&svn_repo), recreated);
     assert_eq!(
         svnlook_at(&svn_repo, "tree", &["--show-ids", "--full-paths"]),
         unchanged_source
     );
-    assert_eq!(reflog(&f), publish_log);
     files_at(&f, &[(".gitkeep", ""), ("origin.txt", "SVN origin\n")]);
 
     // Queue independent, valid work on each side while the same pair is held.
@@ -352,6 +355,8 @@ pub(super) async fn run() -> Value {
 
     let pending_source = svnlook_at(&svn_repo, "tree", &["--show-ids", "--full-paths"]);
     let second = cold_hold(&f, &before, &replacement).await;
+    let after_second_hold = reflog(&f);
+    assert_eq!(after_second_hold, external_log);
     assert_eq!(second, diagnostic);
     assert_eq!(records(&f, &receipt_key), established);
     assert_eq!(youngest(&svn_repo), pending_svn);
@@ -380,7 +385,8 @@ pub(super) async fn run() -> Value {
         !repo.bridge.join("svn-pending.txt").exists()
             && !repo.bridge.join("git-pending.txt").exists()
     );
-    assert_eq!(reflog(&f), external_log);
+    let first_poll_updates = after_first_hold.lines().count() - before_first_hold.lines().count();
+    let second_poll_updates = after_second_hold.lines().count() - external_log.lines().count();
 
     json!({
         "svn_uuid": replacement.uuid,
@@ -404,6 +410,6 @@ pub(super) async fn run() -> Value {
         "diagnostic_source_key": diagnostic["key"],
         "diagnostic_outcome_id": diagnostic["id"],
         "held_cycles": 2,
-        "engine_ref_updates": 0
+        "bare_main_updates_during_held_polls": first_poll_updates + second_poll_updates
     })
 }
