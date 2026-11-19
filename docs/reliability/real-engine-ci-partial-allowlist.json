@@ -2,13 +2,11 @@
   "suite": "real-engine-scenarios",
   "description": "Scenario IDs whose PARTIAL status is expected on loopback svnserve CI and must not fail the Build & Test gate when they are the only non-PASS rows.",
   "allowed_partial_scenario_ids": [
-    "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE",
     "R01_SVNSERVE_POST_WRITE_RECOVERY",
     "R16_SVNSERVE_SVN_REMOTE_RECREATION",
     "R17_SVNSERVE_NOTIFICATION_ISOLATION"
   ],
   "rationale": {
-    "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE": "Loopback fixture proves transport failure blocking and unchanged checkpoint; full R16 remote-recreation catalog remains open (remote_transport_failed).",
     "R01_SVNSERVE_POST_WRITE_RECOVERY": "Simulated checkpoint/mapping loss after SVN→Git hits conflicting_import_checkpoint; #64/#23 post-write recovery on svnserve remains open.",
     "R16_SVNSERVE_SVN_REMOTE_RECREATION": "Recreated loopback svnserve UUID at the same URL may still complete a cycle without blocking; checkpoint/mapping evidence recorded as PARTIAL when not blocked.",
     "R17_SVNSERVE_NOTIFICATION_ISOLATION": "SyncEngine does not read per-repo teams_webhook_url or deliver Notifier events on svnserve cycles; only webhook-field persistence and sync_status/audit confinement are observed."

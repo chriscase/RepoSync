@@ -15,7 +15,6 @@ REAL_ENGINE_BINARY = "real_engine_scenarios"
 
 PINNED_CI_PARTIAL_ALLOWLIST_IDS = frozenset(
     {
-        "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE",
         "R01_SVNSERVE_POST_WRITE_RECOVERY",
         "R16_SVNSERVE_SVN_REMOTE_RECREATION",
         "R17_SVNSERVE_NOTIFICATION_ISOLATION",
@@ -257,6 +256,7 @@ def run_self_test() -> None:
     allowed = load_ci_partial_allowlist(allowlist_path)
     git_id = "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE"
     svn_id = "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE"
+    recreation_id = "R16_SVNSERVE_SVN_REMOTE_RECREATION"
     assert allowed == PINNED_CI_PARTIAL_ALLOWLIST_IDS, (allowed, PINNED_CI_PARTIAL_ALLOWLIST_IDS)
     json_ids = {
         str(item)
@@ -311,15 +311,17 @@ def run_self_test() -> None:
         )
         assert code == 0 and not errs, (code, errs)
 
-        for row in allowlisted_partial:
-            if row["id"] == svn_id:
-                row["status"] = "PARTIAL"
-        code, errs = ci_gate(
-            write_summary(tmp, allowlisted_partial, "PARTIAL"), allowlist_path
-        )
-        assert code == 1 and any(
-            e.startswith(f"{svn_id}: PARTIAL not on CI allowlist") for e in errs
-        ), (code, errs)
+        for outage_id in (git_id, svn_id):
+            outage_partial = full_pass_rows()
+            for row in outage_partial:
+                if row["id"] == outage_id:
+                    row["status"] = "PARTIAL"
+            code, errs = ci_gate(
+                write_summary(tmp, outage_partial, "PARTIAL"), allowlist_path
+            )
+            assert code == 1 and any(
+                e.startswith(f"{outage_id}: PARTIAL not on CI allowlist") for e in errs
+            ), (code, errs)
 
         surprise = full_pass_rows()
         for row in surprise:
@@ -330,17 +332,19 @@ def run_self_test() -> None:
 
         failed = full_pass_rows()
         for row in failed:
-            if row["id"] == git_id:
+            if row["id"] == recreation_id:
                 row["status"] = "FAIL"
         code, errs = ci_gate(write_summary(tmp, failed, "FAIL"), allowlist_path)
-        assert code != 0 and errs, (code, errs)
+        assert code == 1 and f"{recreation_id}: FAIL" in errs, (code, errs)
 
         not_run = full_pass_rows()
         for row in not_run:
-            if row["id"] == git_id:
+            if row["id"] == recreation_id:
                 row["status"] = "NOT RUN"
         code, errs = ci_gate(write_summary(tmp, not_run, "NOT RUN"), allowlist_path)
-        assert code != 0 and errs, (code, errs)
+        assert code == 1 and any(
+            e.startswith(f"{recreation_id}: NOT RUN") for e in errs
+        ), (code, errs)
 
         duplicate = full_pass_rows()
         duplicate.append({"id": expected_ids[0], "status": "PASS"})
@@ -368,12 +372,8 @@ def run_self_test() -> None:
             "overall PARTIAL but every scenario row is PASS" in e for e in errs
         ), (code, errs)
 
-        stamped_pass_with_partial_rows = full_pass_rows()
-        for row in stamped_pass_with_partial_rows:
-            if row["id"] == git_id:
-                row["status"] = "PARTIAL"
         code, errs = ci_gate(
-            write_summary(tmp, stamped_pass_with_partial_rows, "PASS"), allowlist_path
+            write_summary(tmp, allowlisted_partial, "PASS"), allowlist_path
         )
         assert code != 0 and any(
             "overall PASS but scenario rows include FAIL or PARTIAL" in e for e in errs
