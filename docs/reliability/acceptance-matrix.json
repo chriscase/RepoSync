@@ -493,7 +493,8 @@
       "tier": "actual_engine",
       "required_case_ids": [
         "R01_METADATA_ONLY",
-        "R15_SVNSERVE_ORDINARY_MERGE"
+        "R15_SVNSERVE_ORDINARY_MERGE",
+        "R15_SVNSERVE_RECREATED_TRUNK_HOLD"
       ],
       "supporting_case_ids": [
         "ECHO_IDENTITY_REIMPORT_RESET",
@@ -505,7 +506,7 @@
       "open": [
         "Automatic echo-generation bump on UUID/path swap remains unclaimed (ECHO_IDENTITY_SVN_UUID_AUTO / ECHO_IDENTITY_PATH_RECREATION); operational canonical lineage now holds the pair instead (RS63_SVN_UUID_IDENTITY_HOLD / RS63_PATH_INCARNATION_HOLD)"
       ],
-      "evidence": "R01_METADATA_ONLY covers an SVN property change. R15_SVNSERVE_ORDINARY_MERGE follows a real feature-to-trunk content merge and a separate record-only merge through the managed team engine. Revisions confined to the feature branch leave the managed frontier intact. The content merge produces one mapped Git commit. The record-only merge changes svn:mergeinfo and records a scoped no_git_content receipt with no Git ref update. A subsequent trunk edit publishes once after restart, followed by two quiet cycles.",
+      "evidence": "R01_METADATA_ONLY covers an SVN property change. R15_SVNSERVE_ORDINARY_MERGE follows a real feature-to-trunk content merge and a separate record-only merge through the managed team engine. Revisions confined to the feature branch leave the managed frontier intact. The content merge produces one mapped Git commit. The record-only merge changes svn:mergeinfo and records a scoped no_git_content receipt with no Git ref update. A subsequent trunk edit publishes once after restart, followed by two quiet cycles. R15_SVNSERVE_RECREATED_TRUNK_HOLD exercises a recreated managed trunk at the same UUID and URL. Cold polls record svn_identity_changed, retain the original applied and no-target evidence, and leave ordinary Git and SVN work pending on their respective sides.",
       "diagnostic_expected_baseline_failure": false
     },
     {

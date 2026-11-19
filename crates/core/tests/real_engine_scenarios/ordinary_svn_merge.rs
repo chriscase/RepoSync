@@ -22,7 +22,7 @@ const MERGED: &str = "source change for the ordinary merge\n";
 const RECORDED: &str = "only in the feature working copy\n";
 const CHILD: &str = "ordinary work after the record-only merge\n";
 
-fn svn(f: &SingleRepoFixture, args: &[&str]) {
+pub(super) fn svn(f: &SingleRepoFixture, args: &[&str]) {
     let output = Command::new("svn")
         .current_dir(&f.wc)
         .args(args)
@@ -44,7 +44,7 @@ fn svn(f: &SingleRepoFixture, args: &[&str]) {
     );
 }
 
-fn managed_engine(f: &SingleRepoFixture) -> SyncEngine {
+pub(super) fn managed_engine(f: &SingleRepoFixture) -> SyncEngine {
     let db = Database::new(&f.db_path).unwrap();
     let row = db.get_repository(&f.repo.id).unwrap().unwrap();
     assert_eq!(row.svn_branch, "trunk");
@@ -58,7 +58,7 @@ fn managed_engine(f: &SingleRepoFixture) -> SyncEngine {
     f.make_engine_with_config(db, config)
 }
 
-fn youngest(repo: &Path) -> i64 {
+pub(super) fn youngest(repo: &Path) -> i64 {
     svnlook_at(repo, "youngest", &[]).trim().parse().unwrap()
 }
 
@@ -72,7 +72,7 @@ fn assert_revision(repo: &Path, rev: i64, message: &str, changed_paths: &[&str])
     );
 }
 
-fn file_at(repo: &Path, rev: i64, path: &str) -> String {
+pub(super) fn file_at(repo: &Path, rev: i64, path: &str) -> String {
     svnlook_at(repo, "cat", &["-r", &rev.to_string(), path])
 }
 
@@ -84,7 +84,7 @@ fn mergeinfo(repo: &Path, rev: i64) -> String {
     )
 }
 
-fn files_at(f: &SingleRepoFixture, expected_files: &[(&str, &str)]) {
+pub(super) fn files_at(f: &SingleRepoFixture, expected_files: &[(&str, &str)]) {
     let (tip, tree) = git_main_commit_and_tree(&f.repo.bare);
     assert_eq!(git_main_commit_and_tree(&f.repo.bridge), (tip, tree));
     let bare = git2::Repository::open_bare(&f.repo.bare).unwrap();
@@ -106,13 +106,13 @@ fn files_at(f: &SingleRepoFixture, expected_files: &[(&str, &str)]) {
     }
 }
 
-fn reflog(f: &SingleRepoFixture) -> String {
+pub(super) fn reflog(f: &SingleRepoFixture) -> String {
     std::fs::read_to_string(f.repo.bare.join("logs/refs/heads/main")).unwrap()
 }
 
 // Read every scoped document, including its ID and timestamps. A stable latest
 // pointer alone cannot exclude an extra terminal operation.
-fn journal_documents(f: &SingleRepoFixture, pattern: &str) -> Vec<String> {
+pub(super) fn journal_documents(f: &SingleRepoFixture, pattern: &str) -> Vec<String> {
     let db = Database::new(&f.db_path).unwrap();
     let conn = db.conn();
     let mut docs = conn
@@ -127,7 +127,7 @@ fn journal_documents(f: &SingleRepoFixture, pattern: &str) -> Vec<String> {
         .unwrap()
 }
 
-fn assert_publication(
+pub(super) fn assert_publication(
     f: &SingleRepoFixture,
     ledger: &OutageLedger,
     rev: i64,
@@ -168,7 +168,7 @@ fn assert_publication(
     sha
 }
 
-fn check_frontier(f: &SingleRepoFixture, ledger: &OutageLedger, rev: i64, sha: &str) {
+pub(super) fn check_frontier(f: &SingleRepoFixture, ledger: &OutageLedger, rev: i64, sha: &str) {
     let db = Database::new(&f.db_path).unwrap();
     let key = format!("last_svn_rev_{}", f.repo.id);
     assert_eq!(db.get_state(&key).unwrap(), Some(rev.to_string()));
@@ -184,7 +184,7 @@ fn check_frontier(f: &SingleRepoFixture, ledger: &OutageLedger, rev: i64, sha: &
     );
 }
 
-async fn cycle(engine: &SyncEngine, imports: usize) {
+pub(super) async fn cycle(engine: &SyncEngine, imports: usize) {
     let stats = engine.run_sync_cycle().await.unwrap();
     assert_eq!(
         (stats.svn_to_git_count, stats.git_to_svn_count),

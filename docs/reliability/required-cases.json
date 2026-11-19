@@ -1211,6 +1211,7 @@
     {"id":"RS11_SETUP_IMPORT_CONFIG_REMOTE_IGNORES_MANAGED_CHAIN", "binary":"setup_wizard_busy", "test":"candidate_rs11_setup_import_config_remote_ignores_managed_chain", "tier":"candidate_regression"},
     {"id":"RS11_SETUP_IMPORT_CONFIG_REMOTE_KEEPS_ORIGIN_ON_REVOCATION", "binary":"setup_wizard_busy", "test":"candidate_rs11_setup_import_config_remote_keeps_origin_on_revocation", "tier":"candidate_regression"},
     {"id":"R15_SVNSERVE_ORDINARY_MERGE","binary":"real_engine_scenarios","test":"scenario_r15_ordinary_svn_merge_and_mergeinfo","tier":"candidate_regression"},
+    {"id":"R15_SVNSERVE_RECREATED_TRUNK_HOLD","binary":"real_engine_scenarios","test":"scenario_r15_recreated_trunk_holds_after_restart","tier":"candidate_regression"},
     {"id":"R01_SVNSERVE_LARGE_MESSAGE_RETRY","binary":"real_engine_scenarios","test":"scenario_r01_svnserve_large_message_retry","tier":"candidate_regression"}
   ],
   "separate_qualification_profiles": [
