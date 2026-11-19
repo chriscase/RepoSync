@@ -25,6 +25,20 @@ The deployed executable/schema is **NOT ESTABLISHED**. No live acceptance is aut
 
 Host catalog PASS is not enterprise or live acceptance. Qualification tiers, the #41 go/no-go checklist, and the candidate report Chris uses to decide are in [the enterprise soak runbook](../enterprise-soak-runbook.md) and [candidate-report-template.md](candidate-report-template.md). Until the installed version is known, that version's migration coverage stays **NOT RUN**. local/offline PASS is not enterprise/live PASS.
 
+### R17 scheduler completion events
+
+On Unix, run the daemon test from the repository root with Git and Subversion installed.
+
+```sh
+cargo test -p reposync-daemon scheduler::notification_isolation_tests::r17_concurrent_sync_events_match_their_repository -- --exact
+```
+
+Expect one passing test. Two repositories share a Git branch name, an SVN revision number and a file path. Each has its own SVN repository and bare Git origin.
+
+The test subscribes to the scheduler’s in-process event channel before either worker starts. Two scheduler ticks admit the workers in sequence. Before the test releases either push, it requires both Git receive hooks to be waiting, both push operations to be active in SQLite, and both refs to point to their original commits. It releases the pushes in reverse admission order. For each completion event, the test checks the repository identity and commit details against the fixture’s source revision, applied SQLite mapping and Git history. A separate trial admitted both workers on one tick. One worker reported `database is locked`, leaving that admission case open.
+
+`R17_SVNSERVE_NOTIFICATION_ISOLATION` remains **PARTIAL**. That native case checks each stored webhook URL and searches status and audit records for the other repository’s markers. The daemon test above observes the event before delivery. The Teams listener selects one global destination, so delivery to separate repository-specific destinations remains unqualified.
+
 ## Regenerating the human scenario file
 
 ```sh
