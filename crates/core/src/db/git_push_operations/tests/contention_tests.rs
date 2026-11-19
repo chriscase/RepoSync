@@ -222,3 +222,22 @@ fn reconciliation_status_reserves_writer_before_checking_repository() {
     assert_eq!(db.active_git_push_operation("pair").unwrap(), Some(held));
     assert_unadvanced(&db);
 }
+
+#[test]
+fn error_count_reserves_writer_before_checking_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("reposync.db");
+    let db = journal(&path);
+    pr245_3_register(&db, "sibling", "file:///sibling");
+    db.update_repo_sync_status("pair", "reconciliation_required")
+        .unwrap();
+    let (db, ()) = while_writer_is_busy(&path, db, |db| db.increment_repo_error_count("pair"));
+    let pair = db.get_repository("pair").unwrap().unwrap();
+    assert_eq!(pair.total_errors, 1);
+    assert_eq!(pair.sync_status, "reconciliation_required");
+    assert_eq!(
+        db.get_repository("sibling").unwrap().unwrap().total_errors,
+        0
+    );
+    assert_unadvanced(&db);
+}

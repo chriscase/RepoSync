@@ -422,21 +422,23 @@ async fn r17_concurrent_sync_events_match_their_repository() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn r17_same_tick_pushes_complete_for_both_repositories() {
-    let tmp = tempfile::tempdir().unwrap();
+fn same_tick_fixture(tmp: &tempfile::TempDir, labels: [&str; 2]) -> (Scheduler, [Pair; 2]) {
     let root = tmp.path();
-    let first_id = "r17-same-tick-alpha";
-    let (mut scheduler, _) = scheduler_fixture(&tmp, first_id, "2000-01-01T00:00:00Z");
+    let first_id = format!("r17-{}", labels[0]);
+    let (mut scheduler, _) = scheduler_fixture(tmp, &first_id, "2000-01-01T00:00:00Z");
     let local_base = format!("file://{}", root.display());
     scheduler.app_config.github.api_url = local_base.clone();
     scheduler.app_config.github.git_base_url = Some(local_base);
     scheduler.app_config.identity.email_domain = Some("example.invalid".into());
-    let template = scheduler.db.get_repository(first_id).unwrap().unwrap();
-    let pairs = [
-        Pair::prepare(root, &scheduler.db, template.clone(), "same-tick-alpha"),
-        Pair::prepare(root, &scheduler.db, template, "same-tick-beta"),
-    ];
+    let template = scheduler.db.get_repository(&first_id).unwrap().unwrap();
+    let pairs = labels.map(|label| Pair::prepare(root, &scheduler.db, template.clone(), label));
+    (scheduler, pairs)
+}
+
+async fn run_same_tick(
+    scheduler: &mut Scheduler,
+    pairs: &[Pair; 2],
+) -> ([GitPushOperation; 2], Vec<Value>) {
     let (sender, mut receiver) = broadcast::channel(8);
     scheduler.ws_broadcast = sender;
     scheduler.maybe_run_repo_cycles().await;
@@ -468,7 +470,7 @@ async fn r17_same_tick_pushes_complete_for_both_repositories() {
     });
     let no_early_event = receiver.is_empty();
     // Release both native pushes before waiting for either worker to finish.
-    for pair in &pairs {
+    for pair in pairs {
         fs::write(pair.bare.join("release"), "").unwrap();
     }
     time::timeout(Duration::from_secs(15), async {
@@ -487,15 +489,27 @@ async fn r17_same_tick_pushes_complete_for_both_repositories() {
             Err(error) => panic!("same-tick broadcast lost events: {error}"),
         }
     }
+    assert!(
+        no_early_event,
+        "event before releasing both offers: {events:?}"
+    );
+    let active =
+        held.unwrap_or_else(|| panic!("workers did not overlap at pre-receive: {events:?}"));
+    assert_ne!(active[0].id, active[1].id);
+    (active, events)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r17_same_tick_pushes_complete_for_both_repositories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut scheduler, pairs) = same_tick_fixture(&tmp, ["same-tick-alpha", "same-tick-beta"]);
+    let ([alpha_op, beta_op], events) = run_same_tick(&mut scheduler, &pairs).await;
     let expected = pairs.each_ref().map(Pair::expected_event);
     assert!(
         events_match(&events, &expected),
         "expected {expected:?}, received {events:?}"
     );
-    assert!(no_early_event, "completion before releasing both offers");
-    let [alpha_op, beta_op] = held.expect("both same-tick workers must overlap at pre-receive");
-    assert_ne!(alpha_op.id, beta_op.id);
-    let reopened = Database::new(root.join("reposync.db")).unwrap();
+    let reopened = Database::new(tmp.path().join("reposync.db")).unwrap();
     for pair in &pairs {
         let row = reopened.get_repository(&pair.row.id).unwrap().unwrap();
         assert_eq!(row.sync_status, "idle", "{}", pair.row.id);
@@ -511,4 +525,134 @@ async fn r17_same_tick_pushes_complete_for_both_repositories() {
         "R17_SAME_TICK_PUSH_EVIDENCE {}",
         json!({"events":events,"repositories":published})
     );
+}
+
+fn attest_rejected_push(pair: &Pair, db: &Database, mut offered: GitPushOperation) -> Value {
+    let id = &pair.row.id;
+    let baseline = &pair.row.last_git_sha;
+    let source = pair.expected_event(); // Checks the immutable source r2 and its file bytes.
+    let source_commit = &source["commits"][0];
+    assert_eq!(offered.state, GitPushOperationState::Running);
+    assert_eq!(&offered.repo_id, id);
+    assert_eq!(offered.source_svn_rev, 2);
+    assert_eq!(source_commit["author"], offered.source_svn_author);
+    assert_eq!(source_commit["message"], offered.source_svn_message);
+    assert_eq!(&offered.pre_push_git_sha, baseline);
+    assert_ne!(&offered.intended_local_git_sha, baseline);
+    assert_eq!(
+        fs::read_to_string(pair.bare.join("offer")).unwrap(),
+        format!(
+            "{baseline} {} refs/heads/main\n",
+            offered.intended_local_git_sha
+        )
+    );
+    let git = |args: &[&str]| command(&pair.bare, "git", args);
+    assert_eq!(
+        git(&["for-each-ref", "--format=%(refname) %(objectname)"]),
+        format!("refs/heads/main {baseline}")
+    );
+    assert_eq!(git(&["rev-list", "--count", "--all"]), "1");
+    assert_eq!(
+        command_bytes(&pair.bare, "git", &["show", "main:payload.txt"]),
+        command_bytes(
+            &pair.svn,
+            "svnlook",
+            &[
+                "cat",
+                "-r",
+                "1",
+                pair.svn.to_str().unwrap(),
+                "trunk/payload.txt"
+            ]
+        )
+    );
+    assert_eq!(db.get_repo_watermark(id).unwrap(), (1, baseline.clone()));
+    assert_eq!(
+        db.get_state(&format!("last_svn_rev_{id}"))
+            .unwrap()
+            .as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(db, id)
+            .unwrap()
+            .as_ref(),
+        Some(baseline)
+    );
+    let lineage = load_canonical_lineage(db, id).unwrap().unwrap();
+    assert_eq!(lineage.svn_uuid, pair.uuid);
+    {
+        let conn = db.conn();
+        let counts: (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COUNT(CASE WHEN svn_rev=1 AND git_sha=?2 AND author=?3 AND message='baseline'
+                    AND status='applied' AND direction='svn_to_git' THEN 1 END)
+             FROM sync_records WHERE repo_id=?1",
+            rusqlite::params![id, baseline, pair.author], |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap();
+        assert_eq!(counts, (1, 1));
+        assert!(load_mapping_outcome(
+            &conn,
+            &lineage.scope_uuid,
+            lineage.generation,
+            CheckpointDirection::SvnToGit,
+            &svn_source_key(2)
+        )
+        .unwrap()
+        .is_none());
+    }
+    let held = db.active_git_push_operation(id).unwrap().unwrap();
+    let detail = held.outcome_detail.as_deref().unwrap();
+    let rejection = detail
+        .strip_prefix("git push failed after intent was recorded: ")
+        .unwrap();
+    assert!(rejection.contains(&format!("rejected by {id}")));
+    assert!(rejection.contains("pre-receive hook declined"));
+    offered.state = GitPushOperationState::ReconciliationRequired;
+    offered.updated_at.clone_from(&held.updated_at);
+    offered.outcome_detail.clone_from(&held.outcome_detail);
+    assert_eq!(
+        held, offered,
+        "durable rejection must retain the offered operation"
+    );
+    let error = format!("svn-to-git push reconciliation required (push_outcome_uncertain): git push failed after durable intent: {rejection}");
+    json!({"type":"repo_sync_failed","repo_id":id,"repo_name":pair.row.name,
+           "error":reposync_core::errors::sanitize_error_message(&error),"is_permanent":false})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r17_same_tick_rejections_count_one_error_per_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut scheduler, pairs) =
+        same_tick_fixture(&tmp, ["same-tick-reject-alpha", "same-tick-reject-beta"]);
+    for pair in &pairs {
+        let hook = format!(
+            "{HOLD_PUSH}echo 'rejected by {}' >&2\nexit 1\n",
+            pair.row.id
+        );
+        fs::write(pair.bare.join("hooks/pre-receive"), hook).unwrap();
+    }
+    let ([alpha, beta], events) = run_same_tick(&mut scheduler, &pairs).await;
+    let reopened = Database::new(tmp.path().join("reposync.db")).unwrap();
+    let expected = [
+        attest_rejected_push(&pairs[0], &reopened, alpha),
+        attest_rejected_push(&pairs[1], &reopened, beta),
+    ];
+    assert!(
+        events_match(&events, &expected),
+        "expected {expected:?}, received {events:?}"
+    );
+    for pair in &pairs {
+        let row = reopened.get_repository(&pair.row.id).unwrap().unwrap();
+        assert_eq!(
+            row.sync_status, "reconciliation_required",
+            "{}",
+            pair.row.id
+        );
+        assert_eq!(
+            (row.total_syncs, row.total_errors),
+            (0, 1),
+            "{}",
+            pair.row.id
+        );
+    }
 }
