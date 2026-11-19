@@ -20,7 +20,7 @@ use reposync_core::db::import_operations::{
 use reposync_core::db::late_pair_publish_operations::late_pair_publish_fingerprint;
 use reposync_core::db::queries::{
     AuditLogInput, CredentialChainState, RepositorySaveError, RepositorySaveKind,
-    RepositorySaveReceipt,
+    RepositorySaveReceipt, RepositorySettingsUpdate,
 };
 use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
 use reposync_core::db::Database;
@@ -143,45 +143,6 @@ fn default_60() -> i64 {
 
 fn default_true() -> bool {
     true
-}
-
-fn present_nullable_string<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<Option<String>>, D::Error> {
-    Option::<String>::deserialize(deserializer).map(Some)
-}
-
-#[derive(Deserialize, Serialize)]
-struct UpdateRepoRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    save_request_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    expected_updated_at: Option<String>,
-    name: Option<String>,
-    svn_url: Option<String>,
-    svn_branch: Option<String>,
-    svn_username: Option<String>,
-    git_provider: Option<String>,
-    git_api_url: Option<String>,
-    git_repo: Option<String>,
-    git_branch: Option<String>,
-    sync_mode: Option<String>,
-    poll_interval_secs: Option<i64>,
-    lfs_threshold_mb: Option<i64>,
-    auto_merge: Option<bool>,
-    enabled: Option<bool>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "present_nullable_string"
-    )]
-    allowed_paths: Option<Option<String>>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "present_nullable_string"
-    )]
-    blocked_patterns: Option<Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -580,7 +541,7 @@ async fn update_repo(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
-    Json(body): Json<UpdateRepoRequest>,
+    Json(body): Json<RepositorySettingsUpdate>,
 ) -> Result<Json<RepoDetail>, AppError> {
     let (user_id, role) = validate_session_with_role(
         &state,
@@ -593,10 +554,8 @@ async fn update_repo(
     }
 
     let payload = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.to_string()))?;
-    let request_id = body.save_request_id.clone();
-    let expected_updated_at = body.expected_updated_at.clone();
     let db = &state.db;
-    if let Some(ref request_id) = request_id {
+    if let Some(request_id) = &body.save_request_id {
         if let Some(receipt) = db
             .verified_repository_save_receipt(
                 &user_id,
@@ -616,7 +575,8 @@ async fn update_repo(
             return Ok(Json(result));
         }
     }
-    reject_held_import(db, &id)?;
+    db.require_repository_import_released(&id)
+        .map_err(|e| save_error(e.into()))?;
     if db
         .managed_remove_blocks_new_work(&id)
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -627,66 +587,12 @@ async fn update_repo(
         ));
     }
 
-    let existing = db
-        .get_repository(&id)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
-        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
-
-    let now = Utc::now().to_rfc3339();
-    let updated = reposync_core::models::Repository {
-        id: id.clone(),
-        name: body.name.unwrap_or(existing.name),
-        svn_url: body.svn_url.unwrap_or(existing.svn_url),
-        svn_branch: body.svn_branch.unwrap_or(existing.svn_branch),
-        svn_username: body.svn_username.unwrap_or(existing.svn_username),
-        git_provider: body.git_provider.unwrap_or(existing.git_provider),
-        git_api_url: body.git_api_url.unwrap_or(existing.git_api_url),
-        git_repo: body.git_repo.unwrap_or(existing.git_repo),
-        git_branch: body.git_branch.unwrap_or(existing.git_branch),
-        sync_mode: body.sync_mode.unwrap_or(existing.sync_mode),
-        poll_interval_secs: body
-            .poll_interval_secs
-            .unwrap_or(existing.poll_interval_secs),
-        lfs_threshold_mb: body.lfs_threshold_mb.unwrap_or(existing.lfs_threshold_mb),
-        auto_merge: body.auto_merge.unwrap_or(existing.auto_merge),
-        enabled: body.enabled.unwrap_or(existing.enabled),
-        created_by: existing.created_by,
-        parent_id: existing.parent_id,
-        created_at: existing.created_at,
-        updated_at: now,
-        last_svn_rev: existing.last_svn_rev,
-        last_git_sha: existing.last_git_sha,
-        last_sync_at: existing.last_sync_at,
-        sync_status: existing.sync_status,
-        total_syncs: existing.total_syncs,
-        total_errors: existing.total_errors,
-        allowed_paths: body.allowed_paths.unwrap_or(existing.allowed_paths),
-        blocked_patterns: body.blocked_patterns.unwrap_or(existing.blocked_patterns),
-        consecutive_errors: existing.consecutive_errors,
-        teams_webhook_url: existing.teams_webhook_url,
-    };
-
-    if let Some(request_id) = request_id {
-        let receipt = db
-            .update_repository_once(
-                &updated,
-                &user_id,
-                &request_id,
-                expected_updated_at.as_deref(),
-                &payload,
-            )
-            .map_err(save_error)?;
-        let current = db
-            .get_repository(&id)
-            .map_err(|e| AppError::Internal(e.to_string()))?
-            .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
-        let mut result = RepoDetail::from(current);
-        result.save_receipt = Some(receipt);
-        return Ok(Json(result));
-    }
-    db.update_repository(&updated)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(Json(RepoDetail::from(updated)))
+    let (current, receipt) = db
+        .save_repository_settings(&id, &user_id, body, &payload)
+        .map_err(save_error)?;
+    let mut detail = RepoDetail::from(current);
+    detail.save_receipt = receipt;
+    Ok(Json(detail))
 }
 
 async fn delete_repo(
@@ -3050,6 +2956,9 @@ fn save_error(error: RepositorySaveError) -> AppError {
         RepositorySaveError::InvalidRequest => AppError::BadRequest(error.to_string()),
         RepositorySaveError::Conflict => AppError::Conflict(error.to_string()),
         RepositorySaveError::NotFound => AppError::NotFound(error.to_string()),
+        RepositorySaveError::Database(DatabaseError::ImportBlocksDisable) => {
+            AppError::BadRequest(error.to_string())
+        }
         RepositorySaveError::Database(_) => AppError::Internal(error.to_string()),
     }
 }

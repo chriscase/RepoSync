@@ -1848,7 +1848,10 @@ fn active_import_id(conn: &Connection, repo_id: &str) -> Result<Option<String>, 
     read_value(conn, &format!("import_operation_v1:active:{repo_id}"))
 }
 
-fn require_import_released(conn: &Connection, repo_id: &str) -> Result<(), DatabaseError> {
+pub(super) fn require_import_released(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<(), DatabaseError> {
     if active_import_id(conn, repo_id)?.is_some() {
         return Err(DatabaseError::ImportBlocksDisable);
     }
@@ -2066,11 +2069,16 @@ impl Database {
             .map_err(|error| DatabaseError::Other(format!("invalid removal tombstone: {error}")))
     }
 
+    /// Refuse an already visible import hold without competing with its writer.
+    pub fn require_repository_import_released(&self, repo_id: &str) -> Result<(), DatabaseError> {
+        require_import_released(&self.conn(), repo_id)
+    }
+
     /// Narrow legacy DELETE: clear `enabled` only. Does not create a removal
     /// journal and does not delete mappings, secrets, files, or remotes.
     pub fn legacy_disable_repository(&self, repo_id: &str) -> Result<bool, DatabaseError> {
         // A visible owner can be refused without competing with its finalizer.
-        require_import_released(&self.conn(), repo_id)?;
+        self.require_repository_import_released(repo_id)?;
         self.immediate_transaction(|tx| {
             // The import may have enrolled since the first read.
             require_import_released(tx, repo_id)?;
