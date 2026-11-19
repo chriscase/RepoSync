@@ -14,7 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn command(dir: &Path, program: &str, args: &[&str]) -> String {
+fn command_bytes(dir: &Path, program: &str, args: &[&str]) -> Vec<u8> {
     let output = Command::new(program)
         .args(args)
         .current_dir(dir)
@@ -25,7 +25,11 @@ fn command(dir: &Path, program: &str, args: &[&str]) -> String {
         "{program} {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8(output.stdout)
+    output.stdout
+}
+
+fn command(dir: &Path, program: &str, args: &[&str]) -> String {
+    String::from_utf8(command_bytes(dir, program, args))
         .unwrap()
         .trim_end_matches('\n')
         .to_owned()
@@ -249,8 +253,12 @@ impl Pair {
             "U   trunk/payload.txt"
         );
         assert_eq!(
-            svnlook(&["cat", "-r", "2", repo_path, "trunk/payload.txt"]),
-            self.content
+            command_bytes(
+                &self.svn,
+                "svnlook",
+                &["cat", "-r", "2", repo_path, "trunk/payload.txt"]
+            ),
+            self.content.as_bytes()
         );
         json!({
             "type":"repo_sync_completed", "repo_id":self.row.id, "repo_name":self.row.name,
@@ -273,7 +281,10 @@ impl Pair {
             git(&["ls-tree", "-r", "--name-only", "main"]),
             "payload.txt"
         );
-        assert_eq!(git(&["show", "main:payload.txt"]), self.content);
+        assert_eq!(
+            command_bytes(&self.bare, "git", &["show", "main:payload.txt"]),
+            self.content.as_bytes()
+        );
         assert_eq!(
             fs::read_to_string(self.bare.join("offer")).unwrap(),
             format!("{parent} {tip} refs/heads/main\n")
