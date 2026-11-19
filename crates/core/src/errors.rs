@@ -488,6 +488,12 @@ pub enum DatabaseError {
     #[error("repository has active or unresolved import work")]
     ImportBlocksDisable,
 
+    /// The registration no longer identifies the target a managed import inspected.
+    #[error(
+        "repository import target changed before admission; review the current settings and retry"
+    )]
+    ImportTargetChanged,
+
     /// A record was not found.
     #[error("{entity} not found: {id}")]
     NotFound { entity: String, id: String },

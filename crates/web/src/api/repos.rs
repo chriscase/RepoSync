@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use reposync_core::db::git_push_operations::GitPushOperationState;
 use reposync_core::db::import_operations::{
-    import_target_fingerprint, resolve_repo_import_baseline, ImportOperation, ImportOperationState,
-    RepoImportBaseline, SnapshotPin,
+    resolve_repo_import_baseline, ImportOperation, ImportOperationState, RepoImportBaseline,
+    SnapshotPin,
 };
 use reposync_core::db::late_pair_publish_operations::late_pair_publish_fingerprint;
 use reposync_core::db::queries::{
@@ -1227,6 +1227,7 @@ fn reject_held_import(db: &Database, repo_id: &str) -> Result<(), AppError> {
 
 fn import_write_error(error: DatabaseError) -> AppError {
     match error {
+        DatabaseError::ImportTargetChanged => AppError::Conflict(error.to_string()),
         DatabaseError::Other(message) => AppError::BadRequest(message),
         other => AppError::Internal(format!("import operation persistence failed: {other}")),
     }
@@ -1606,9 +1607,8 @@ async fn start_repo_import(
         .join("repos")
         .join(&id)
         .join("git-repo");
-    let fingerprint = import_target_fingerprint(&repo, &workdir);
     let operation = db
-        .create_import_operation(&id, &user_id, &request_id, &fingerprint)
+        .create_managed_import_operation(&repo, &user_id, &request_id, &workdir)
         .map_err(import_write_error)?;
     let operation_id = operation.id.clone();
     let mut preparation_guard = ImportPreparationGuard {
