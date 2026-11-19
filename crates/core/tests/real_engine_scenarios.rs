@@ -1589,57 +1589,235 @@ async fn scenario_r16_svnserve_git_remote_unreachable() {
     if !require_toolchain(CASE_GIT_REMOTE) {
         return;
     }
+    const SENTINEL: &str = "baseline Git edit\n";
     let fixture = SingleRepoFixture::new();
+    let repo = &fixture.repo;
+    let svn = SvnClient::new(&repo.svn_url, &repo.username, &repo.password);
+    let svn_dir = fixture.tmp.path().join("svnserve-root").join(&repo.id);
     let engine = fixture.make_engine();
-    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
-    let missing = fixture.tmp.path().join("missing-remote.git");
-    git_cli(
-        &fixture.repo.bridge,
-        &["remote", "set-url", "origin", missing.to_str().unwrap()],
+    let initial = engine.run_sync_cycle().await.unwrap();
+    assert_eq!((initial.svn_to_git_count, initial.git_to_svn_count), (1, 0));
+
+    // A real seed commit supplies both a nonempty inbound cursor and a
+    // sentinel independent of the two edits that will wait behind the outage.
+    git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
+    let seed_sha = fixture.developer_commit("origin.txt", SENTINEL, "Establish Git sentinel");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let seed = engine.run_sync_cycle().await.unwrap();
+    assert_eq!((seed.svn_to_git_count, seed.git_to_svn_count), (0, 1));
+    let settled = engine.run_sync_cycle().await.unwrap();
+    assert_eq!((settled.svn_to_git_count, settled.git_to_svn_count), (0, 0));
+
+    let first = fixture.developer_commit("queued.txt", "first edit\n", "Queued Git edit one");
+    let second = fixture.developer_commit("queued.txt", "second edit\n", "Queued Git edit two");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let bridge = git_main_commit_and_tree(&repo.bridge);
+    let source = git_main_commit_and_tree(&repo.bare);
+    assert_eq!(bridge.0.to_string(), seed_sha);
+    assert_eq!(source.0.to_string(), second);
+    let assert_origin = || {
+        let git = git2::Repository::open(&repo.bridge).unwrap();
+        let remote = git.find_remote("origin").unwrap();
+        assert_eq!(remote.url(), repo.bare.to_str());
+    };
+    let info = svn.info().await.unwrap();
+    let seed_rev = info.latest_rev;
+    assert_eq!(seed_rev, repo.svn_rev + 1);
+    let svn_state = || {
+        assert_eq!(svnlook_at(&svn_dir, "uuid", &[]).trim(), info.uuid);
+        assert_eq!(svnlook_at(&svn_dir, "cat", &["origin.txt"]), SENTINEL);
+        let youngest: i64 = svnlook_at(&svn_dir, "youngest", &[])
+            .trim()
+            .parse()
+            .unwrap();
+        (
+            youngest,
+            svnlook_at(&svn_dir, "tree", &["--full-paths", "--show-ids"]),
+        )
+    };
+    let before_svn = svn_state();
+    assert_eq!(before_svn.0, seed_rev);
+    let before = outage_ledger(&fixture);
+    assert_eq!(before.inbound_git.as_deref(), Some(seed_sha.as_str()));
+    assert_eq!(before.watermark, (repo.svn_rev, seed_sha.clone()));
+    assert_eq!(before.lineage.svn_uuid, info.uuid);
+    assert_eq!(
+        before.svn_checkpoint.handled_source_key,
+        svn_source_key(repo.svn_rev)
     );
-    let before = fixture.checkpoint_snapshot();
-    let bridge_before = get_head_sha(&fixture.repo.bridge);
-    let mappings_before: i64 = setup_db(&fixture.db_path).count_sync_records().unwrap();
-    let svn_before = SvnClient::new(
-        &fixture.repo.svn_url,
-        &fixture.repo.username,
-        &fixture.repo.password,
-    )
-    .info()
-    .await
-    .unwrap()
-    .latest_rev;
-    let result = engine.run_sync_cycle().await;
-    assert!(
-        matches!(&result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "remote_transport_failed"),
-        "unreachable git remote must block without reset: {result:?}"
+    assert_eq!(
+        before.git_checkpoint.as_ref().unwrap().handled_source_key,
+        git_source_key(&seed_sha)
     );
-    let bridge_after = get_head_sha(&fixture.repo.bridge);
-    let checkpoint_after = fixture.checkpoint_snapshot();
-    let svn_after = SvnClient::new(
-        &fixture.repo.svn_url,
-        &fixture.repo.username,
-        &fixture.repo.password,
-    )
-    .info()
-    .await
-    .unwrap()
-    .latest_rev;
-    let mappings_after = setup_db(&fixture.db_path).count_sync_records().unwrap();
-    assert_eq!(bridge_after, bridge_before);
-    assert_eq!(checkpoint_after, before);
-    assert_eq!(svn_after, svn_before);
-    assert_eq!(mappings_after, mappings_before);
+
+    // Move the actual local bare repository. Both clients keep their configured
+    // origin, and the parked repository is available for read-only inspection.
+    assert_origin();
+    let parked = fixture.tmp.path().join("parked-origin.git");
+    std::fs::rename(&repo.bare, &parked).unwrap();
+    let history_block = || {
+        let db = Database::new(&fixture.db_path).unwrap();
+        let key =
+            reposync_core::history_inspect::history_block_key_for_repo(&db, &repo.id).unwrap();
+        reposync_core::history_inspect::load_history_block(&db, &key).unwrap()
+    };
+    let outage_reason = "remote_transport_failed";
+    // Run the existing engine first, then open another while the origin is still absent.
+    for engine in std::iter::once(engine).chain(std::iter::once_with(|| fixture.make_engine())) {
+        let failure =
+            tokio::time::timeout(std::time::Duration::from_secs(30), engine.run_sync_cycle())
+                .await
+                .expect("Git outage cycle timed out")
+                .unwrap_err();
+        assert!(
+            matches!(&failure, SyncError::HistoryBlocked { reason, .. } if reason == outage_reason),
+            "{failure}"
+        );
+        drop(engine);
+        assert!(
+            !repo.bare.try_exists().unwrap(),
+            "engine recreated the unavailable origin"
+        );
+        assert_origin();
+        assert_eq!(git_main_commit_and_tree(&parked), source);
+        assert_eq!(git_main_commit_and_tree(&repo.bridge), bridge);
+        assert_eq!(svn_state(), before_svn);
+        assert_eq!(outage_ledger(&fixture), before);
+        let block = history_block().expect("scoped Git history block");
+        assert_eq!(block["repo_id"], repo.id);
+        assert_eq!(block["p_handled"], seed_sha);
+        assert_eq!(block["o_prior_observed"], seed_sha);
+        assert_eq!(block["l_bridge"], seed_sha);
+        assert!(block["r_fresh_remote"].is_null());
+        assert_eq!(block["reason"], outage_reason);
+        assert_eq!(block["durable"], false);
+    }
+
+    std::fs::rename(&parked, &repo.bare).unwrap();
+    assert_origin();
+    assert_eq!(git_main_commit_and_tree(&repo.bare), source);
+    let reopened = fixture.make_engine();
+    let recovered = reopened.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        (recovered.svn_to_git_count, recovered.git_to_svn_count),
+        (0, 2)
+    );
+    assert!(history_block().is_none());
+    assert_origin();
+    assert_eq!(git_main_commit_and_tree(&repo.bare), source);
+    assert_eq!(git_main_commit_and_tree(&repo.bridge), source);
+    let first_rev = seed_rev + 1;
+    let last_rev = seed_rev + 2;
+    let info_after = svn.info().await.unwrap();
+    assert_eq!(
+        (&info_after.url, &info_after.uuid, info_after.latest_rev),
+        (&info.url, &info.uuid, last_rev)
+    );
+    let after = outage_ledger(&fixture);
+    assert_eq!(after.lineage, before.lineage);
+    assert_eq!(after.svn_checkpoint, before.svn_checkpoint);
+    assert_eq!(after.inbound_git.as_deref(), Some(second.as_str()));
+    assert_eq!(after.watermark, (repo.svn_rev, second.clone()));
+    let checkpoint = after.git_checkpoint.as_ref().unwrap();
+    assert_eq!(checkpoint.handled_source_key, git_source_key(&second));
+    assert_eq!(checkpoint.target_svn_rev, Some(last_rev));
+    assert_eq!(checkpoint.outcome, MappingOutcome::AppliedAndVerified);
+    assert_eq!(after.commit_map, before.commit_map);
+    for (current, prior) in [
+        (&after.sync_records, &before.sync_records),
+        (&after.outcomes, &before.outcomes),
+    ] {
+        assert!(current.starts_with(prior), "pre-outage row changed");
+        assert_eq!(current.len(), prior.len() + 2);
+    }
+    let log = svn.log(first_rev, last_rev).await.unwrap();
+    assert_eq!(log.len(), 2);
+    let original = git2::Repository::open(&repo.bare).unwrap();
+    for (i, (sha, parent, rev, subject, bytes, action)) in [
+        (
+            &first,
+            &seed_sha,
+            first_rev,
+            "Queued Git edit one",
+            "first edit\n",
+            "A",
+        ),
+        (
+            &second,
+            &first,
+            last_rev,
+            "Queued Git edit two",
+            "second edit\n",
+            "M",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let commit = original.find_commit(sha.parse().unwrap()).unwrap();
+        assert_eq!(commit.parent_count(), 1);
+        assert_eq!(commit.parent_id(0).unwrap().to_string(), *parent);
+        let record = &after.sync_records[before.sync_records.len() + i];
+        let outcome = &after.outcomes[before.outcomes.len() + i];
+        assert_eq!(record["sha"], *sha);
+        assert_eq!(record["revision"], rev);
+        assert_eq!(record["direction"], "git_to_svn");
+        assert_eq!(record["status"], "applied");
+        assert_eq!(outcome["key"], git_source_key(sha));
+        assert_eq!(outcome["target_svn_rev"], rev);
+        assert_eq!(outcome["direction"], "git_to_svn");
+        assert_eq!(outcome["outcome"], "applied_and_verified");
+
+        let entry = &log[i];
+        assert_eq!(entry.revision, rev);
+        assert_eq!(entry.message.lines().next(), Some(subject));
+        assert_eq!(
+            entry.message.lines().last().unwrap(),
+            format!("RepoSync-Git-SHA: {sha}")
+        );
+        assert_eq!(entry.changed_paths.len(), 1);
+        assert_eq!(
+            (
+                entry.changed_paths[0].action.as_str(),
+                entry.changed_paths[0].path.as_str()
+            ),
+            (action, "/queued.txt")
+        );
+        for (path, expected) in [
+            (".gitkeep", ""),
+            ("origin.txt", SENTINEL),
+            ("queued.txt", bytes),
+        ] {
+            assert_eq!(git_show_blob(&repo.bare, sha, path), expected);
+            assert_eq!(
+                svnlook_at(&svn_dir, "cat", &["-r", &rev.to_string(), path]),
+                expected
+            );
+        }
+    }
+    let after_svn = svn_state();
+    assert_eq!(after_svn.0, last_rev);
+    for _ in 0..2 {
+        let repeat = reopened.run_sync_cycle().await.unwrap();
+        assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+        assert_eq!(outage_ledger(&fixture), after);
+        assert_eq!(svn_state(), after_svn);
+        assert_eq!(git_main_commit_and_tree(&repo.bare), source);
+        assert_eq!(git_main_commit_and_tree(&repo.bridge), source);
+    }
     emit_evidence(
         CASE_GIT_REMOTE,
-        "PARTIAL",
+        "PASS",
         serde_json::json!({
-            "reason": "remote_transport_failed",
-            "checkpoint_before_after": [before, checkpoint_after],
-            "bridge_head_before_after": [bridge_before, bridge_after],
-            "svn_revision_before_after": [svn_before, svn_after],
-            "mapping_count_before_after": [mappings_before, mappings_after],
-            "note": "svnserve fixture covers local transport failure only",
+            "direction": "git_to_svn", "transport": "local_bare_repository",
+            "outage_reason": outage_reason, "outage_cycles": 2, "transient_block_cleared": true,
+            "remote_ref": "refs/heads/main", "restored_git_tip": second, "restored_git_tree": source.1.to_string(),
+            "queued_git_commits": [first, second], "applied_svn_revisions": [first_rev, last_rev],
+            "svn_uuid": info.uuid, "svn_youngest_before_after": [seed_rev, last_rev],
+            "scoped_inbound_git_before_after": [before.inbound_git, after.inbound_git],
+            "canonical_outcome_count_before_after": [before.outcomes.len(), after.outcomes.len()],
+            "sync_record_count_before_after": [before.sync_records.len(), after.sync_records.len()],
+            "verified_sentinel": "origin.txt", "repeat_noop_cycles": 2,
         }),
     );
 }
