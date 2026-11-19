@@ -2,10 +2,12 @@
 
 *Back to the [guide index](README.md).*
 
-This page lists exactly what the [#71](https://github.com/chriscase/RepoSync/issues/71)
-acceptance criteria ask for that this documentation outcome does **not**
-deliver, why, and what is safe to do meanwhile. Issue #71 stays open. Nothing
-here is split off or closed, and nothing below is described as implemented.
+This page records the scope of the source-pinned coworker guides in #247.
+Later reliability work supplied bounded local refresh and re-anchor in
+#258 and named operation status in #292. The current operator guide also
+covers optional local hook installation and removal. Issue #71 stays open.
+[Current status commands](../reliability/git-workflows.md#checking-status) ·
+[Local hooks](../reliability/git-workflows.md#local-hooks)
 
 The documentation outcome covers: Git-centric workflows for ordinary sync, late
 pairing, refresh requests, status and reconciliation; the SVN-origin rule with a
@@ -19,19 +21,18 @@ current-versus-planned FAQ. The items below are the remainder.
 | An **opt-in, manually triggered workflow or client** that requests a preview and an approved operation through the authenticated API, pinning repo and pair IDs, expected tips or plan identity, and an idempotency key, and reports the actual result | **Held.** This guide documents the underlying API calls directly and does not describe a qualified client. | The live refresh request and status integration depends on the **frozen #69** design, which this guide cannot establish. | Use the read-only previews in [Requesting a refresh](refresh.md) through an administrator. |
 | **Webhook handlers** that validate authenticity, authorize scope, deduplicate event IDs, and tolerate stale, out-of-order and missing events; `forced`, `before` and `after` as hints only | **Held.** Receivers exist and treat `forced` as a hint, but they check authenticity only if a secret happens to be configured, and track no delivery IDs. See [Ordinary sync](ordinary-sync.md#webhooks-that-already-exist). | Frozen #69 for anything that would trigger a refresh. | Don't rely on webhooks for correctness. Polling is what detects a rewrite. Don't create or change a webhook. |
 | **Workflow permissions** that are least-privilege and separate from user and admin credentials, with redaction, authenticated status and cancel, and declared network requirements for self-hosted or enterprise environments | **Held** with the workflow. Guidance appears only as cautions in [Branch policy](branch-policy-and-hooks.md#push-triggered-actions). | The workflow above. | Keep operation tokens away from any job that runs pull-request code. |
-| **Hook installation and removal** that preserve an existing `core.hooksPath` or hook chain, handle the `pre-rebase` arguments, linked worktrees and offline behavior, and never modify a user's clone automatically | **Held.** There is no installer. The behaviors a future one must handle are described in [Branch policy](branch-policy-and-hooks.md#local-hooks-useful-nudges-not-enforcement). | None beyond design and review. | Don't script changes to other people's clones. |
 | **Live application** of the branch-policy recommendation | **Not done, and not part of this work.** | An authorized administrator's decision (Chris or another admin), including any bypass grant. | Review the recommendation, rehearse on a throwaway repository, then decide. |
 | The **tests** listed in the issue (authorized request/status/cancel, wrong repo/pair/token, stale approval, repeated request, missing or out-of-order webhook, tampered signature, polling-only detection, untrusted branch input, unavailable service, hooks, protected-ref rejection) | **Not part of this documentation outcome.** No test or build was run for it. | The held code above. | n/a |
 | **Exact release support and sandbox evidence links** in the FAQ | **Partly.** The FAQ states plainly that no release exists and links the evidence that does exist. It cannot link a sandbox run of the held pieces, because none is claimed. | A tested release and a qualification run. | Read the [FAQ](faq.md#which-release-supports-this). |
 
 ## Unavailable behavior, by name
 
-These are refused or absent today. None has a bypass:
+The original documentation checkpoint recorded these limitations.
+The operator guide linked above describes subsequent changes.
 
 - Executing a refresh through the **v1** route: `refresh_execute_not_implemented`.
 - **Re-anchor or recreate** a pair: `reanchor_not_implemented`.
 - **Automatic or push-triggered refresh**, and any "auto-rebase the SVN side after a force push".
-- A **hook installer or remover**.
 - A **request workflow** or **client** this guide stands behind.
 - **Hardened webhook** deduplication and out-of-order handling.
 - **Live qualification** of any of the above, and **any release number** that supports them.

@@ -287,20 +287,65 @@ RepoSync's own ancestry checks still apply; a ruleset is not a substitute.
 
 ## Local hooks
 
-A `pre-rebase` hook can refuse a local rebase, and a `pre-push` hook can warn
-before a non-fast-forward publish. Both are optional. Users can skip them with
-`--no-verify` or by changing `core.hooksPath`. They are not enforcement.
+An operator can opt a clone into two local checks for one already-paired
+branch and one named Git remote. Registration is shared by all linked
+worktrees of that clone. Worktree-specific or conditional Git settings
+can affect which hooks run. Inspect the worktree you intend to use.
+The installer needs Python 3.9 or later on a POSIX host and Git with
+native configured hooks (`git hook list`, introduced in Git 2.54). It leaves
+`core.hooksPath`, other configured hooks and existing hook files in place.
+Git runs its existing hook-directory program at its original path and
+supplies the pre-push input to each hook. [Git hook ordering](https://git-scm.com/docs/git-hook)
 
-This slice does not install or remove hooks, does not change `core.hooksPath`,
-and does not modify a clone. A later guarded installer would have to preserve
-an existing hook chain, honor the branch name `pre-rebase` receives, and work
-with linked worktrees. That installer is not part of this change.
+Run these commands from the RepoSync source directory. Set `clone` to the
+worktree root of a clone you own. Replace `feature/widget` and `origin` with the
+existing local branch and configured remote you intend to guard.
+
+```sh
+python3 scripts/paired_branch_hooks.py install --repo "$clone" --branch feature/widget --remote origin
+python3 scripts/paired_branch_hooks.py status --repo "$clone"
+```
+
+Review the target and the affected worktrees. Repeat the install command
+with `--apply` to register the hooks. To remove them, preview the removal
+with `python3 scripts/paired_branch_hooks.py remove --repo "$clone"`, then
+repeat with `--apply`. A collision or an edited installation requires
+inspection. Keep the diagnostic and any local edits. Installation also
+requires every registered worktree to be accessible so the installer can
+check its effective hooks.
+
+Installation adds one repository-local `include.path` entry. It points to
+`reposync-paired-branch-hooks/hooks.config` under the common Git directory,
+alongside the installed guard and its branch and remote settings. Existing
+hook definitions and scripts keep their original locations. If installation
+was interrupted and status reports `staged`, repeat the same install with
+`--apply` to finish, or remove it. For a verified removal interrupted in
+state `removing`, repeat the removal with `--apply`. If you move an intact
+clone on the same filesystem, remove and reinstall to update its hook paths.
+
+| Git operation | What the hook checks |
+| --- | --- |
+| Rebase | Refuses a rebase targeting the named local branch. With no branch argument it uses the current worktree's symbolic HEAD. Other branches can still rebase. |
+| Push to the named remote | Checks each destination ref. For the paired ref it requires an existing advertised tip and local proof of a fast-forward. It refuses deletion, recreation, a rewrite or missing ancestry evidence. A different local source branch mapping into the same destination gets the same check. |
+
+The checks read local Git data and need no RepoSync service or network
+lookup. A normal push still connects to its configured destination. The
+checks cover Git clients that run these hooks in the opted-in clone.
+Another clone, a differently named remote or URL, or an explicit Git hook
+bypass can omit the check. Local history edits outside these hook events
+remain possible. The pre-rebase hook sees the direct target only.
+`git rebase --update-refs` can move another unchecked-out local branch
+as a side effect. A later push to the guarded destination still gets the
+pre-push check. Use the server-side recommendation above for host enforcement.
+
+To repeat the isolated operator tests with a supported Git on `PATH`, run
+`python3 scripts/test_paired_branch_hooks.py -v NativeHookTests`. They create
+temporary working repositories, linked worktrees and local bare push targets.
 
 ## Still later
 
 - Webhook signature checks, event deduplication, and live webhook configuration
 - Auto-triggered refresh on push
-- Hook installation
 - Applying the branch-policy recommendation
 - Qualification of refresh outside the supported local scope of #69
 - Closing #71 or #61

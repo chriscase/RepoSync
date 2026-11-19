@@ -8,8 +8,9 @@ refuse a bad update.
 
 > **This guide changes nothing.** It describes options and gives a recommendation.
 > It does not create or change a branch rule, ruleset, webhook, hook, workflow,
-> secret or bypass grant on any repository. Turning any of that on needs an
-> authorized administrator's decision (for this project, Chris or another admin).
+> secret or bypass grant on any repository. A developer can opt in their own
+> clone. Changing host rules, secrets or live integrations requires an
+> authorized administrator (for this project, Chris or another admin).
 
 ## The three mechanisms
 
@@ -70,10 +71,11 @@ Other things worth knowing when someone installs hooks by hand:
   or RepoSync a question needs the network and must decide what to do when it
   cannot reach it; "fail open" and "fail closed" are both defensible, but pick on purpose.
 
-**RepoSync supplies no hook installer or remover, and this guide installs
-nothing.** A guarded installer that preserves an existing hook chain is **held**
-(see [Held and unavailable](held-and-unavailable.md)). Do not modify other
-people's clones.
+The reliability branch now supplies an optional installer and remover.
+It registers native configured hooks for the clone and its linked worktrees.
+Changing `core.hooksPath` affects the traditional hook-directory row above.
+The configured hooks remain registered separately. Preview the change in
+your own clone before applying it. [Install, inspect or remove the local checks](../reliability/git-workflows.md#local-hooks)
 
 One thing that does exist: `GET /api/repos/{id}/hooks/pre-commit` returns a
 downloadable Git **`pre-commit`** script that checks staged files against that

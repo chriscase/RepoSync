@@ -14,7 +14,8 @@ includes commands for [checking status](../git-workflows.md#checking-status).
 | Manual workflow | `.github/workflows/git-operation-request.yml` is `workflow_dispatch` only |
 | Branch policy | Recommendation text only. No ruleset was applied |
 | Refresh execute | The client checks the v1 preview and its eligibility before submission. Local execution approved through RepoSync has a separate [execution contract](69-pair-refresh-execution-v2.md). |
-| Webhooks, hook install, push trigger | Not delivered |
+| Optional local hooks | Preview, install, inspect or remove the two clone-local guards using the [operator guide](../git-workflows.md#local-hooks). |
+| Webhooks and push trigger | Not delivered |
 
 The preview uses the parent and child IDs, expected tips, plan digest and
 idempotency key. For a named operation, status checks the identity and state
