@@ -12,10 +12,11 @@ DEFAULT_CI_PARTIAL_ALLOWLIST = (
 )
 REQUIRED_CASES_PATH = ROOT / "docs/reliability/required-cases.json"
 REAL_ENGINE_BINARY = "real_engine_scenarios"
+POST_WRITE_RECOVERY = "R01_SVNSERVE_POST_WRITE_RECOVERY"
 
 PINNED_CI_PARTIAL_ALLOWLIST_IDS = frozenset(
     {
-        "R01_SVNSERVE_POST_WRITE_RECOVERY",
+        POST_WRITE_RECOVERY,
         "R16_SVNSERVE_SVN_REMOTE_RECREATION",
         "R17_SVNSERVE_NOTIFICATION_ISOLATION",
     }
@@ -214,6 +215,13 @@ def ci_gate(summary_path: Path, allowlist_path: Path) -> tuple[int, list[str]]:
         status = row.get("status")
         if isinstance(status, str):
             row_statuses.append(status)
+        if case_id == POST_WRITE_RECOVERY and status in ("PASS", "PARTIAL"):
+            detail = row.get("detail")
+            recovery = (
+                detail.get("git_push_checkpoint_recovery") if isinstance(detail, dict) else None
+            )
+            if not isinstance(recovery, dict) or recovery.get("status") != "PASS":
+                errors.append(f"{case_id}: detail.git_push_checkpoint_recovery.status must be PASS")
         if status == "FAIL":
             errors.append(f"{case_id}: FAIL")
         elif status == "SKIP":
@@ -282,7 +290,10 @@ def run_self_test() -> None:
     import tempfile
 
     def full_pass_rows() -> list[dict]:
-        return [{"id": case_id, "status": "PASS"} for case_id in expected_ids]
+        rows = [{"id": case_id, "status": "PASS"} for case_id in expected_ids]
+        post_write = next(row for row in rows if row["id"] == POST_WRITE_RECOVERY)
+        post_write["detail"] = {"git_push_checkpoint_recovery": {"status": "PASS"}}
+        return rows
 
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
@@ -310,6 +321,28 @@ def run_self_test() -> None:
             write_summary(tmp, allowlisted_partial, "PARTIAL"), allowlist_path
         )
         assert code == 0 and not errs, (code, errs)
+
+        invalid_details = [
+            None,
+            {},
+            {"git_push_checkpoint_recovery": "PASS"},
+            {"git_push_checkpoint_recovery": {}},
+        ]
+        for status in ("FAIL", "PARTIAL", "NOT RUN", "SKIP"):
+            invalid_details.append({"git_push_checkpoint_recovery": {"status": status}})
+        for outer_status in ("PASS", "PARTIAL"):
+            rows = full_pass_rows()
+            post_write = next(row for row in rows if row["id"] == POST_WRITE_RECOVERY)
+            post_write["status"] = outer_status
+            code, errs = ci_gate(write_summary(tmp, rows, outer_status), allowlist_path)
+            assert code == 0 and not errs, (outer_status, errs)
+
+            for malformed_detail in invalid_details:
+                post_write["detail"] = malformed_detail
+                code, errs = ci_gate(write_summary(tmp, rows, outer_status), allowlist_path)
+                assert code == 1 and any("git_push_checkpoint_recovery.status" in e for e in errs), (
+                    outer_status, malformed_detail, errs
+                )
 
         for outage_id in (git_id, svn_id):
             outage_partial = full_pass_rows()

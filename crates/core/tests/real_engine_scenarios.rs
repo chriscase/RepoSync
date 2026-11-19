@@ -3311,11 +3311,212 @@ async fn scenario_r01_svnserve_failed_apply_retry() {
     run_svnserve_failed_apply_on_real_svnserve(true).await;
 }
 
+async fn git_push_checkpoint_recovery() -> serde_json::Value {
+    use reposync_core::auto_reconcile::{
+        reconcile_held_external_writes_with_resolved_credentials, HeldExternalWriteKind,
+    };
+    use reposync_core::db::git_push_operations::GitPushOperationState;
+
+    let fixture = SingleRepoFixture::new();
+    let repo = &fixture.repo;
+    let svn_dir = fixture.tmp.path().join("svnserve-root").join(&repo.id);
+    git_cli(&repo.bare, &["config", "core.logAllRefUpdates", "true"]);
+    let reflog = || std::fs::read_to_string(repo.bare.join("logs/refs/heads/main")).unwrap();
+    let engine = fixture.make_engine();
+    let baseline = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        (baseline.svn_to_git_count, baseline.git_to_svn_count),
+        (1, 0)
+    );
+    let before = outage_ledger(&fixture);
+    let (parent, parent_tree) = git_main_commit_and_tree(&repo.bare);
+    let prior_log = reflog();
+    let registration = |db: &Database| db.get_repository(&repo.id).unwrap().unwrap();
+    let syncs_before = registration(engine.db()).total_syncs;
+    let rev = svn_commit_file(
+        &fixture.wc,
+        "recovery.txt",
+        "one published change\n",
+        "R01 checkpoint interruption",
+        &repo.username,
+        &repo.password,
+    );
+    assert_eq!(rev, before.watermark.0 + 1);
+    assert!(before.sync_records.iter().all(|r| r["revision"] != rev));
+    assert!(before
+        .outcomes
+        .iter()
+        .all(|o| o["key"] != svn_source_key(rev)));
+    let svn_state = || {
+        (
+            svnlook_at(&svn_dir, "uuid", &[]),
+            svnlook_at(&svn_dir, "youngest", &[]),
+            svnlook_at(&svn_dir, "tree", &["--show-ids", "--full-paths"]),
+        )
+    };
+    let source = svn_state();
+    assert_eq!(source.0.trim(), before.lineage.svn_uuid);
+    assert_eq!(source.1.trim(), rev.to_string());
+
+    // On this engine's private connection the receipt is inserted before this
+    // update. Returning an error rolls the whole finalization transaction back.
+    const FAULT: &str = "R01 checkpoint interrupted after receipt insertion";
+    let interrupt_checkpoint = format!(
+        "CREATE TEMP TRIGGER interrupt_checkpoint AFTER UPDATE OF last_svn_rev ON main.repositories
+         WHEN NEW.id='repo_sync' AND NEW.last_svn_rev={rev}
+         AND EXISTS (SELECT 1 FROM sync_records WHERE repo_id=NEW.id AND svn_rev={rev}
+                     AND direction='svn_to_git' AND status='applied')
+         BEGIN SELECT RAISE(ABORT,'{FAULT}'); END;"
+    );
+    engine
+        .db()
+        .conn()
+        .execute_batch(&interrupt_checkpoint)
+        .unwrap();
+    let error = engine.run_sync_cycle().await.unwrap_err();
+    assert!(
+        matches!(&error, SyncError::GitPushHeld { reason, detail }
+            if reason == "checkpoint_write_failed" && detail.contains(FAULT)),
+        "{error}"
+    );
+    let held = engine
+        .db()
+        .active_git_push_operation(&repo.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.state, GitPushOperationState::ReconciliationRequired);
+    assert_eq!(held.repo_id, repo.id);
+    assert_eq!(held.source_svn_rev, rev);
+    assert_eq!(held.pre_push_git_sha, parent.to_string());
+    assert_eq!(held.pre_push_git_tree, Some(parent_tree.to_string()));
+    assert!(!held.resume_authorized);
+    assert!(held.last_confirmed_git_sha.is_none() && held.last_confirmed_git_tree.is_none());
+    assert_eq!(outage_ledger(&fixture), before);
+    assert_eq!(svn_state(), source);
+    assert_eq!(registration(engine.db()).total_syncs, syncs_before);
+    let published = git_main_commit_and_tree(&repo.bare);
+    let bare = git2::Repository::open_bare(&repo.bare).unwrap();
+    let commit = bare.find_commit(published.0).unwrap();
+    assert_eq!(commit.parent_count(), 1);
+    assert_eq!(commit.parent_id(0).unwrap(), parent);
+    let sha = published.0.to_string();
+    let tree = published.1.to_string();
+    assert_eq!(held.intended_local_git_sha, sha);
+    assert_eq!(held.intended_local_git_tree, tree);
+    assert_eq!(held.intended_local_git_parent, Some(parent.to_string()));
+    assert_eq!(git_main_commit_and_tree(&repo.bridge), published);
+    for (path, bytes) in [
+        ("origin.txt", "SVN origin\n"),
+        ("recovery.txt", "one published change\n"),
+    ] {
+        assert_eq!(git_show_blob(&repo.bare, &sha, path), bytes);
+        assert_eq!(
+            svnlook_at(&svn_dir, "cat", &["-r", &rev.to_string(), path]),
+            bytes
+        );
+    }
+    let published_log = reflog();
+    let update = published_log.strip_prefix(&prior_log).unwrap();
+    assert_eq!(update.lines().count(), 1);
+    assert!(update.starts_with(&format!("{parent} {sha} ")));
+    drop(engine); // Also removes the connection-local trigger.
+
+    let reopened = fixture.make_engine();
+    let db = reopened.db();
+    db.hold_interrupted_git_pushes().unwrap();
+    assert_eq!(
+        db.active_git_push_operation(&repo.id).unwrap(),
+        Some(held.clone())
+    );
+    let blocked = reopened.run_sync_cycle().await.unwrap_err();
+    assert!(
+        matches!(blocked, SyncError::GitPushHeld { reason, .. } if reason == "reconciliation_required")
+    );
+    assert_eq!(outage_ledger(&fixture), before);
+    assert_eq!(reflog(), published_log);
+    let reg = registration(db);
+    let reconcile =
+        || reconcile_held_external_writes_with_resolved_credentials(db, &reg, Some(&repo.bridge));
+    let result = reconcile().await.unwrap();
+    let [attempt] = result.attempts.as_slice() else {
+        panic!("expected one reconcile: {result:?}")
+    };
+    assert_eq!(attempt.kind, HeldExternalWriteKind::SvnToGitPush);
+    assert_eq!(attempt.operation_id, held.id);
+    assert!(attempt.finalized && !attempt.resume_authorized && !attempt.skipped);
+    assert!(db.active_git_push_operation(&repo.id).unwrap().is_none());
+    let completed = db
+        .get_git_push_operation(&repo.id, &held.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.state, GitPushOperationState::Completed);
+    assert_eq!(completed.last_confirmed_git_sha.as_ref(), Some(&sha));
+    assert_eq!(completed.last_confirmed_git_tree.as_ref(), Some(&tree));
+    let after = outage_ledger(&fixture);
+    assert_eq!(after.watermark, (rev, sha.clone()));
+    assert_eq!(after.svn_checkpoint.handled_source_key, svn_source_key(rev));
+    assert_eq!(after.svn_checkpoint.target_git_sha.as_ref(), Some(&sha));
+    assert_eq!(
+        after.svn_checkpoint.outcome,
+        MappingOutcome::AppliedAndVerified
+    );
+    assert_eq!(after.lineage, before.lineage);
+    assert_eq!(after.inbound_git, before.inbound_git);
+    assert_eq!(after.git_checkpoint, before.git_checkpoint);
+    assert_eq!(after.commit_map, before.commit_map);
+    let [receipt] = after
+        .sync_records
+        .strip_prefix(before.sync_records.as_slice())
+        .unwrap()
+    else {
+        panic!("expected one new receipt")
+    };
+    assert_eq!(receipt["revision"], rev);
+    assert_eq!(receipt["sha"], sha);
+    assert_eq!(receipt["direction"], "svn_to_git");
+    assert_eq!(receipt["status"], "applied");
+    let [outcome] = after
+        .outcomes
+        .strip_prefix(before.outcomes.as_slice())
+        .unwrap()
+    else {
+        panic!("expected one new canonical outcome")
+    };
+    assert_eq!(outcome["key"], svn_source_key(rev));
+    assert_eq!(outcome["sha"], sha);
+    assert_eq!(outcome["direction"], "svn_to_git");
+    assert_eq!(outcome["outcome"], "applied_and_verified");
+    assert_eq!(registration(db).total_syncs, syncs_before + 1);
+    assert!(reconcile().await.unwrap().attempts.is_empty());
+    for _ in 0..2 {
+        let quiet = reopened.run_sync_cycle().await.unwrap();
+        assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
+        assert_eq!(outage_ledger(&fixture), after);
+        assert_eq!(registration(db).total_syncs, syncs_before + 1);
+        assert_eq!(
+            db.latest_git_push_operation(&repo.id).unwrap().as_ref(),
+            Some(&completed)
+        );
+        assert_eq!(git_main_commit_and_tree(&repo.bare), published);
+        assert_eq!(git_main_commit_and_tree(&repo.bridge), published);
+        assert_eq!(reflog(), published_log);
+        assert_eq!(svn_state(), source);
+    }
+    serde_json::json!({
+        "status": "PASS", "operation_id": held.id, "svn_revision": rev, "svn_uuid": source.0.trim(),
+        "held_reason": "checkpoint_write_failed", "git_parent": parent.to_string(),
+        "published_git_sha": sha, "published_git_tree": tree, "bare_ref_updates": update.lines().count(),
+        "receipt_id": receipt["id"], "canonical_outcome_id": outcome["id"],
+        "sync_count_before_after": [syncs_before, registration(db).total_syncs], "quiet_cycles": 2
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scenario_r01_svnserve_post_write_recovery() {
     if !require_toolchain(CASE_POST_WRITE_RECOVERY) {
         return;
     }
+    let checkpoint_recovery = git_push_checkpoint_recovery().await;
     let fixture = SingleRepoFixture::new();
     let engine = fixture.make_engine();
     let before = fixture.checkpoint_snapshot();
@@ -3350,15 +3551,27 @@ async fn scenario_r01_svnserve_post_write_recovery() {
     let recovery = reopened.run_sync_cycle().await;
     let final_checkpoint = fixture.checkpoint_snapshot();
     let bare_after = get_head_sha(&fixture.repo.bare);
-    let duplicate_bare_push = bare_after != bare_head
-        && db.conn().query_row(
-            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND svn_rev = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+    let (mapping_count, mapped_sha): (i64, Option<String>) = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*), MIN(git_sha) FROM sync_records
+         WHERE repo_id=?1 AND svn_rev=?2 AND direction='svn_to_git' AND status='applied'",
             rusqlite::params![fixture.repo.id, verified_rev],
-            |row| row.get::<_, i64>(0),
-        ).unwrap() > 1;
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(bare_after, bare_head, "recovery changed the published ref");
+    assert!(
+        mapping_count <= 1,
+        "duplicate applied mappings for r{verified_rev}"
+    );
+    if mapping_count == 1 {
+        assert_eq!(mapped_sha.as_ref(), Some(&bare_head));
+    }
     let case_status = if recovery.is_ok()
         && final_checkpoint.0 == verified_rev
-        && !duplicate_bare_push
+        && final_checkpoint.1 == bare_head
+        && mapping_count == 1
         && git_show_blob(&fixture.repo.bridge, &final_checkpoint.1, "recovery.txt")
             == "post-write recovery\n"
     {
@@ -3371,11 +3584,14 @@ async fn scenario_r01_svnserve_post_write_recovery() {
         case_status,
         serde_json::json!({
             "simulated": "checkpoint_and_mapping_removed_after_successful_svn_to_git",
+            "git_push_checkpoint_recovery": checkpoint_recovery,
             "recovery_ok": recovery.is_ok(),
             "final_watermark": final_checkpoint.0,
             "expected_watermark": verified_rev,
             "bare_head_stable": bare_after == bare_head,
-            "duplicate_mapping": duplicate_bare_push,
+            "mapping_count": mapping_count,
+            "mapped_git_sha": mapped_sha,
+            "duplicate_mapping": mapping_count > 1,
             "recovery_error": recovery.err().map(|e| e.to_string()),
         }),
     );
