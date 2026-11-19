@@ -108,13 +108,15 @@ pub(super) fn observe(
         assert_eq!(second.id_new().to_string(), *tip);
     }
 
-    let db = Database::new(root.join("reposync.db")).unwrap();
+    let db = Database::open_existing_read_only(root.join("reposync.db")).unwrap();
     let op = db
         .get_import_operation(repo_id, operation_id)
         .unwrap()
         .unwrap();
     assert_eq!(op.repo_id, repo_id);
     assert_eq!(op.id, operation_id);
+    assert_eq!(op.initiator_id, "legacy");
+    assert_eq!(op.request_id, super::REQUEST);
     assert_eq!(op.operation_type, "full_import");
     assert_eq!(op.total_revisions, Some(youngest as u64));
     assert_eq!(op.processed_revisions, length as u64);
@@ -172,10 +174,12 @@ pub(super) fn observe(
         assert_eq!(git_cursor, None);
     }
     let prefix_map_ids: Vec<_> = rows.iter().take(PREFIX).map(|row| row.id).collect();
+    let suffix_map_ids: Vec<_> = rows.iter().skip(PREFIX).map(|row| row.id).collect();
     json!({
+        "initiator_id": op.initiator_id, "request_id": op.request_id,
         "history_length": length, "prefix_sha": prefix, "tip": tip, "suffix": &history[PREFIX..],
         "ref_updates": reflog.len(), "pending_maps": pending.len(), "durable_maps": rows.len(),
-        "prefix_map_ids": prefix_map_ids, "checkpoint": checkpoint,
+        "prefix_map_ids": prefix_map_ids, "suffix_map_ids": suffix_map_ids, "checkpoint": checkpoint,
         "svn_uuid": uuid.trim(), "svn_youngest": youngest,
     })
 }

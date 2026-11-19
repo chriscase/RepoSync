@@ -255,11 +255,18 @@ impl App {
         let complete = self.observation(&id, Phase::Completed);
         assert_eq!(complete["prefix_sha"], held["prefix_sha"]);
         assert_eq!(complete["svn_uuid"], held["svn_uuid"]);
-        assert_eq!(complete["prefix_map_ids"], verified["prefix_map_ids"]);
+        let verified_prefix = verified["prefix_map_ids"].as_array().unwrap();
+        assert_eq!(verified_prefix.len(), 50);
+        assert_eq!(complete["prefix_map_ids"].as_array(), Some(verified_prefix));
         json!({"held":held,"verified":verified,"completed":complete})
     }
 
-    async fn quiet(self, id: String) {
+    async fn quiet(self, id: String, before_restart: Value) {
+        assert_eq!(
+            self.observation(&id, Phase::Completed),
+            before_restart,
+            "restart changed the completed import before the first request"
+        );
         let before = self.snapshot();
         let status = self.status(&id, "completed", false).await;
         assert_eq!(status["last_confirmed_git_sha"], before.1);
@@ -343,7 +350,9 @@ async fn published_prefix_resumes_after_restart() {
 
     let (addr, state, server) = reopen(&case.root).await;
     let app = App::new(&case, addr, state);
-    app.run(&mut tmp, |app| app.quiet(id.clone())).await;
+    let before_restart = receipts["completed"].clone();
+    app.run(&mut tmp, |app| app.quiet(id.clone(), before_restart))
+        .await;
     server.abort();
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
