@@ -861,6 +861,10 @@ impl SingleRepoFixture {
     }
 
     fn with_registration_mode(sync_mode: &str) -> Self {
+        Self::on_svn_branch(sync_mode, "")
+    }
+
+    fn on_svn_branch(sync_mode: &str, branch: &str) -> Self {
         let tmp = TempDir::new().unwrap();
         let svn_root = tmp.path().join("svnserve-root");
         std::fs::create_dir_all(&svn_root).unwrap();
@@ -877,11 +881,38 @@ impl SingleRepoFixture {
             .unwrap()
             .success());
         write_svnserve_auth(&repo_dir, user, pass);
-        let svn_url = daemon.repo_url(id);
+        let root_url = daemon.repo_url(id);
+        let svn_url = if branch.is_empty() {
+            root_url.clone()
+        } else {
+            let url =
+                reposync_core::svn::operand::configured_branch_url(&root_url, branch).unwrap();
+            let created = Command::new("svn")
+                .args([
+                    "mkdir",
+                    &url,
+                    "-m",
+                    "Create managed branch",
+                    "--username",
+                    user,
+                    "--password",
+                    pass,
+                    "--non-interactive",
+                    "--no-auth-cache",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                created.status.success(),
+                "svn mkdir: {}",
+                String::from_utf8_lossy(&created.stderr)
+            );
+            url
+        };
         let wc = tmp.path().join("wc");
         svn_checkout(&svn_url, &wc, user, pass);
-        svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor", user, pass);
-        svn_commit_file(
+        let anchor = svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor", user, pass);
+        let svn_rev = svn_commit_file(
             &wc,
             "origin.txt",
             "SVN origin\n",
@@ -917,8 +948,8 @@ impl SingleRepoFixture {
         db.insert_repository(&Repository {
             id: id.into(),
             name: id.into(),
-            svn_url: svn_url.clone(),
-            svn_branch: String::new(),
+            svn_url: root_url,
+            svn_branch: branch.to_owned(),
             svn_username: user.into(),
             git_provider: "local".into(),
             git_api_url: String::new(),
@@ -933,7 +964,7 @@ impl SingleRepoFixture {
             parent_id: None,
             created_at: now.clone(),
             updated_at: now.clone(),
-            last_svn_rev: 1,
+            last_svn_rev: anchor,
             last_git_sha: initial_git_sha.clone(),
             last_sync_at: None,
             sync_status: "idle".into(),
@@ -951,7 +982,7 @@ impl SingleRepoFixture {
             svn_url,
             username: user.into(),
             password: pass.into(),
-            svn_rev: 2,
+            svn_rev,
             bridge,
             bare,
             initial_git_sha,
@@ -3517,6 +3548,17 @@ async fn git_push_checkpoint_recovery() -> serde_json::Value {
         "receipt_id": receipt["id"], "canonical_outcome_id": outcome["id"],
         "sync_count_before_after": [syncs_before, registration(db).total_syncs], "quiet_cycles": 2
     })
+}
+
+#[path = "real_engine_scenarios/ordinary_svn_merge.rs"]
+mod ordinary_svn_merge;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r15_ordinary_svn_merge_and_mergeinfo() {
+    const CASE: &str = "R15_SVNSERVE_ORDINARY_MERGE";
+    if require_toolchain(CASE) {
+        emit_evidence(CASE, "PASS", ordinary_svn_merge::run().await);
+    }
 }
 
 #[path = "real_engine_scenarios/finalized_history.rs"]

@@ -46,6 +46,24 @@ For a historical hold, keep the affected pair paused. Capture its repository ID,
 
 Preserve a consistent database copy. Compare its scope and generation, SVN UUID and path incarnation, directional checkpoint, applied row and completed operation with the SVN revision and full Git commit, tree and branch from read-only repository history. The matching journal, mapping and histories confirm that r3 was published. The deleted receipt's identity and a safe restart cursor for the damaged registration still require independent proof. Escalate the discrepancy before resuming sync. Recovery of the lost applied receipt remains open under [#61](https://github.com/chriscase/RepoSync/issues/61) and [#62](https://github.com/chriscase/RepoSync/issues/62). See the [lineage and checkpoints contract](contracts/63-lineage-checkpoints.md).
 
+### R15 ordinary SVN merges
+
+Run the managed trunk fixture with Git and Subversion installed. It creates a disposable svnserve repository and bare Git origin.
+
+```sh
+cargo test -p reposync-core --test real_engine_scenarios scenario_r15_ordinary_svn_merge_and_mergeinfo -- --exact --nocapture
+```
+
+Require one passing test and exactly one `RELIABILITY_EVIDENCE` record with case `R15_SVNSERVE_ORDINARY_MERGE` and status `PASS`. Missing tools produce a `NOT RUN` record. The same case is required by the real-engine suite. Its source branch contains work outside trunk, so the SVN repository’s youngest revision can be ahead of the managed cursor. The fixture checks which changes actually reach trunk and Git.
+
+| Source operation | Expected observation |
+| --- | --- |
+| Merge a content change from the feature branch into trunk | SVN records the trunk revision and its mergeinfo. Git receives one commit whose parent is the previous published commit. The applied receipt maps the **trunk merge revision** to that commit. |
+| Use `svn merge --record-only` for a separate feature revision | Trunk mergeinfo advances. The feature content stays on its source branch. RepoSync records a no-target outcome for the trunk revision, preserves the Git ref and creates no applied Git mapping for it. |
+| Reopen the engine and sync a subsequent ordinary trunk edit | The edit reaches Git once. Two unchanged cycles preserve the refs, SVN history and mapping records. |
+
+R15 remains **PARTIAL**. Repository replacement and same-path recreation have separate lineage checks. Automatic generation changes for those events remain unqualified.
+
 ### R17 scheduler completion events
 
 On Unix, run the daemon test from the repository root with Git and Subversion installed.
