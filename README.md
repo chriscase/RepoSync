@@ -111,6 +111,8 @@ Set your SVN and GitHub details before validation. To use an author mapping file
 
 ### Run
 
+Before the first start on a fresh database, supply a unique, nonempty `REPOSYNC_ADMIN_PASSWORD` in the daemon's environment. The daemon uses it to create the initial `admin` account. Later starts keep the existing account password. The supplied systemd unit and the Docker command below read `/etc/reposync/env`. For a direct run, export the variable in the invoking shell.
+
 **As a systemd service:**
 ```bash
 sudo cp scripts/reposync.service /etc/systemd/system/

@@ -158,7 +158,11 @@ Any unmapped SVN user `foo` will default to `foo <foo@company.com>`.
 
 ## Step 6: Set Up Secrets
 
-Create `/etc/reposync/env`:
+Before the first start on a fresh database, set `REPOSYNC_ADMIN_PASSWORD` to a unique, nonempty password in the daemon's environment. The daemon uses this variable when it creates its initial `admin` account. An existing account keeps its password across restarts.
+
+If you generated the file with an older CLI and have yet to start the daemon, check `[web].admin_password_env`. Use `admin_password_env = "REPOSYNC_ADMIN_PASSWORD"` so the configuration and first-run setup use the same variable.
+
+For the supplied systemd service, create `/etc/reposync/env` with your own values.
 
 ```bash
 REPOSYNC_SVN_PASSWORD=your-svn-service-account-password
