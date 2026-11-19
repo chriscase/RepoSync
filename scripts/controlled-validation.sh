@@ -3,7 +3,7 @@
 # RepoSync Controlled-Environment Validation Script
 # ============================================================================
 # Non-interactive, CI-safe, one-command validation of the full sync pipeline
-# using local-only resources (file:// SVN repos, local Git repos).
+# using disposable file:// and loopback SVN repositories and local Git repositories.
 # Produces a timestamped forensic artifact bundle suitable for human review
 # and AI-assisted analysis.
 #
@@ -18,7 +18,7 @@
 #   scripts/controlled-validation.sh --help       # show usage
 #
 # Output: artifacts/controlled-validation/<UTC_TIMESTAMP>/
-# Exit code: 0 on all PASS, non-zero on any FAIL (partial artifacts preserved)
+# Exit codes: 0 PASS, 1 FAIL, 2 NOT RUN, 3 PARTIAL.
 # ============================================================================
 
 set -euo pipefail
@@ -27,17 +27,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-ARTIFACT_DIR="$REPO_ROOT/artifacts/controlled-validation/$TIMESTAMP"
-EVENTS_FILE="$ARTIFACT_DIR/events.ndjson"
-TIMELINE_LOG="$ARTIFACT_DIR/timeline.log"
-SUMMARY_FILE="$ARTIFACT_DIR/summary.md"
-MANIFEST_FILE="$ARTIFACT_DIR/manifest.json"
-
 # Defaults
 QUICK_MODE=false
 
-# Phase-level counters (build, cargo-test, clippy, log-probe, redaction)
+# Completed phases with a PASS or FAIL verdict.
 PHASE_PASS=0
 PHASE_FAIL=0
 
@@ -66,7 +59,17 @@ done
 # Helpers
 # ============================================================================
 
-mkdir -p "$ARTIFACT_DIR"
+TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+ARTIFACT_ROOT="$REPO_ROOT/artifacts/controlled-validation"
+mkdir -p "$ARTIFACT_ROOT"
+ARTIFACT_DIR="$ARTIFACT_ROOT/$TIMESTAMP"
+if ! mkdir "$ARTIFACT_DIR" 2>/dev/null; then
+    ARTIFACT_DIR=$(mktemp -d "$ARTIFACT_ROOT/$TIMESTAMP.XXXXXX")
+fi
+EVENTS_FILE="$ARTIFACT_DIR/events.ndjson"
+TIMELINE_LOG="$ARTIFACT_DIR/timeline.log"
+SUMMARY_FILE="$ARTIFACT_DIR/summary.md"
+MANIFEST_FILE="$ARTIFACT_DIR/manifest.json"
 
 log() {
     local msg="[$(date -u +%H:%M:%S)] $*"
@@ -102,7 +105,7 @@ record_scenario() {
     fi
 }
 
-# Accumulate per-phase results.  These track the 6 top-level phases.
+# Accumulate results for the summary table.
 declare -a PHASE_NAMES=()
 declare -a PHASE_RESULTS=()
 
@@ -112,7 +115,7 @@ record_phase() {
     PHASE_RESULTS+=("$result")
     if [[ "$result" == "PASS" ]]; then
         PHASE_PASS=$((PHASE_PASS + 1))
-    else
+    elif [[ "$result" == "FAIL" ]]; then
         PHASE_FAIL=$((PHASE_FAIL + 1))
     fi
 }
@@ -171,7 +174,7 @@ log "Preflight: all tools available"
 # ============================================================================
 log ""
 log "──────────────────────────────────────────────────────────────"
-log "Phase 1/6: Build workspace"
+log "Phase 1/7: Build workspace"
 log "──────────────────────────────────────────────────────────────"
 
 BUILD_DIR="$ARTIFACT_DIR/build"
@@ -199,7 +202,7 @@ fi
 # ============================================================================
 log ""
 log "──────────────────────────────────────────────────────────────"
-log "Phase 2/6: Cargo test --workspace"
+log "Phase 2/7: Cargo test --workspace"
 log "──────────────────────────────────────────────────────────────"
 
 TEST_DIR="$ARTIFACT_DIR/cargo-test"
@@ -225,7 +228,7 @@ fi
 # ============================================================================
 log ""
 log "──────────────────────────────────────────────────────────────"
-log "Phase 3/6: Clippy (zero warnings)"
+log "Phase 3/7: Clippy (zero warnings)"
 log "──────────────────────────────────────────────────────────────"
 
 CLIPPY_DIR="$ARTIFACT_DIR/clippy"
@@ -252,7 +255,7 @@ fi
 # ============================================================================
 log ""
 log "──────────────────────────────────────────────────────────────"
-log "Phase 4/6: Local SVN scenario matrix"
+log "Phase 4/7: Local SVN scenario matrix"
 log "──────────────────────────────────────────────────────────────"
 
 WORK_DIR=$(mktemp -d)
@@ -364,7 +367,7 @@ fi
 # ============================================================================
 log ""
 log "──────────────────────────────────────────────────────────────"
-log "Phase 5/6: Log-probe (spawn-based black-box)"
+log "Phase 5/7: Log-probe (spawn-based black-box)"
 log "──────────────────────────────────────────────────────────────"
 
 PROBE_DIR="$ARTIFACT_DIR/log-probe"
@@ -458,33 +461,27 @@ log "─────────────────────────
 
 REAL_ENGINE_DIR="$ARTIFACT_DIR/real-engine-scenarios"
 mkdir -p "$REAL_ENGINE_DIR"
+run_dir="$REAL_ENGINE_DIR/$TIMESTAMP"
 emit_event "real-engine-scenarios" "start" "running" 0
-if scripts/real-engine-scenario-suite.sh > "$REAL_ENGINE_DIR/suite.log" 2>&1; then
-    emit_event "real-engine-scenarios" "complete" "pass" 0
-    log "  ✅ Real-engine scenario suite PASS"
-    record_phase "Real-engine scenarios" "PASS"
-else
-    suite_exit=$?
-    if grep -q '"overall": "NOT RUN"' "$REAL_ENGINE_DIR"/*/summary.json 2>/dev/null || grep -q '"overall": "NOT RUN"' artifacts/real-engine-scenarios/*/summary.json 2>/dev/null; then
-        emit_event "real-engine-scenarios" "complete" "not_run" 0
-        log "  ⏭  Real-engine scenario suite NOT RUN (missing tools)"
-        record_phase "Real-engine scenarios" "NOT RUN"
-    else
-        emit_event "real-engine-scenarios" "complete" "fail" 0
-        log "  ❌ Real-engine scenario suite FAIL — see $REAL_ENGINE_DIR/suite.log"
-        record_phase "Real-engine scenarios" "FAIL"
-    fi
-    if [[ $suite_exit -ne 2 ]]; then
-        : # keep overall FAIL when scenarios failed
-    fi
-fi
+suite_exit=0
+scripts/real-engine-scenario-suite.sh --output-dir "$run_dir" > "$REAL_ENGINE_DIR/suite.log" 2>&1 || suite_exit=$?
+phase_result=$(python3 scripts/real-engine-scenario-report.py controlled-status \
+    "$run_dir/summary.json" "$suite_exit" 2>> "$REAL_ENGINE_DIR/suite.log") || phase_result=FAIL
+case "$phase_result" in
+    PASS)      event_status=pass;    EXIT_CODE=0 ;;
+    "NOT RUN") event_status=not_run; EXIT_CODE=2 ;;
+    PARTIAL)   event_status=partial; EXIT_CODE=3 ;;
+    *)         phase_result=FAIL; event_status=fail; EXIT_CODE=1 ;;
+esac
+emit_event "real-engine-scenarios" "complete" "$event_status" 0 "suite_exit=$suite_exit"
+log "  Real-engine scenario suite $phase_result — see $REAL_ENGINE_DIR/suite.log"
+record_phase "Real-engine scenarios" "$phase_result"
 
 # ============================================================================
 # Summary
 # ============================================================================
 TOTAL_PHASES=${#PHASE_NAMES[@]}
-OVERALL="PASS"
-EXIT_CODE=0
+OVERALL="$phase_result"
 if [[ $PHASE_FAIL -gt 0 || $SCENARIO_FAIL -gt 0 ]]; then
     OVERALL="FAIL"
     EXIT_CODE=1
@@ -520,7 +517,7 @@ cat > "$SUMMARY_FILE" <<SUMMARY
 ${SUMMARY_ROWS}
 ## Notes
 
-This validation uses **local-only** resources (file:// SVN, local Git, no network).
+The SVN fixtures use file:// or loopback svnserve. The Git fixtures use local repositories. Cargo requires a populated dependency cache to run offline.
 For real GitHub Enterprise + SVN validation, run:
 \`\`\`bash
 scripts/ghe-live-validation.sh --dry-run    # preflight
