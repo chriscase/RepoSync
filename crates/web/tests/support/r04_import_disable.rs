@@ -123,9 +123,21 @@ fn assert_completed(
     op_id: &str,
     enabled: bool,
 ) -> Vec<(i64, String)> {
+    assert_completed_at(tmp, bare, id, op_id, enabled, MAIN)
+}
+
+fn assert_completed_at(
+    tmp: &Path,
+    bare: &Path,
+    id: &str,
+    op_id: &str,
+    enabled: bool,
+    reference: &str,
+) -> Vec<(i64, String)> {
     let reopened = Database::new(tmp.join("reposync.db")).unwrap();
     let repo = reopened.get_repository(id).unwrap().unwrap();
     assert_eq!(repo.enabled, enabled);
+    assert_eq!(format!("refs/heads/{}", repo.git_branch), reference);
     assert!(reopened.managed_removal(id).unwrap().is_none());
     assert!(reopened.removal_tombstone(id).unwrap().is_none());
     assert!(reopened.active_import_operation(id).unwrap().is_none());
@@ -143,7 +155,7 @@ fn assert_completed(
             bare.to_str().unwrap(),
             "rev-list",
             "--reverse",
-            MAIN,
+            reference,
         ],
     ))
     .unwrap();
