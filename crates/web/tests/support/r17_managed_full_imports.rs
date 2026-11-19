@@ -111,6 +111,16 @@ impl Pair {
         )
     }
 
+    fn assert_checkout(&self, tip: &str) {
+        let checkout = Repository::open(&self.checkout).unwrap();
+        let head = checkout.head().unwrap();
+        assert_eq!(head.target().unwrap().to_string(), tip);
+        assert_eq!(
+            std::fs::read_to_string(self.checkout.join("history.txt")).unwrap(),
+            self.contents[1]
+        );
+    }
+
     fn held(
         &self,
         db: &Database,
@@ -141,18 +151,15 @@ impl Pair {
             .unwrap()
             .iter()
             .all(|r| r.repo_id.as_deref() != Some(self.id.as_str())));
-        let checkout = Repository::open(&self.checkout).unwrap();
-        assert_eq!(checkout.head().unwrap().target().unwrap().to_string(), tip);
-        assert_eq!(
-            std::fs::read_to_string(self.checkout.join("history.txt")).unwrap(),
-            self.contents[1]
-        );
+        self.assert_checkout(tip);
         op
     }
 
     fn completed(&self, db: &Database, held: &ImportOperation, offer: &str) -> Value {
         let op = db.latest_import_operation(&self.id).unwrap().unwrap();
-        assert!(db.active_import_operation(&self.id).unwrap().is_none());
+        // The typed lookup can also return None for a pointer to a peer's document.
+        let active_key = format!("import_operation_v1:active:{}", self.id);
+        assert_eq!(db.get_state(&active_key).unwrap(), None);
         assert_eq!(op.id, held.id);
         assert_eq!(op.repo_id, self.id);
         assert_eq!(op.request_id, REQUEST);
@@ -161,6 +168,7 @@ impl Pair {
         assert!(op.pending_commit_maps.is_empty());
         assert_eq!(op.last_confirmed_svn_rev, Some(3));
         let tip = main_ref(&self.bare).unwrap();
+        self.assert_checkout(&tip);
         assert_eq!(op.last_confirmed_git_sha.as_deref(), Some(tip.as_str()));
         assert_eq!(held.intended_git_sha.as_deref(), Some(tip.as_str()));
         let checkpoint = db.get_repo_watermark(&self.id).unwrap();
