@@ -193,14 +193,20 @@ Still required before claiming #66:
   before any SVN write for the PR. The first complete list pins the ordered SHAs.
   Empty, shortened or reordered retries keep the queue at that PR.
 - Discovery reads up to ten pages of PRs in creation order. A repeated PR number
-  across pages or an omitted pending PR holds the queue. At the cap, replay can
-  proceed if every first-parent commit after the import boundary has a listed or
+  across pages or an omitted pending PR holds the queue. Even on the final page,
+  an unexplained earlier default-branch step holds the next listed PR. At the cap,
+  replay can proceed if every first-parent commit after the import boundary has a listed or
   previously completed PR, or an ordinary SVN-origin publication with a matching
   confirmed push, scoped receipt and mapping. An uncovered step holds publication. A database that
   lacks the legacy Git watermark can use the current scoped Git watermark written
   by the Personal importer, backed by a matching receipt and mapping. A reimport
   replaces the scoped watermark. A legacy database with neither import watermark
   needs inspection. Messages in SVN history cannot establish the import boundary.
+- An upgrade can recover one first member of an old pending two-parent PR when
+  its current SVN revision and exported tree match the latest confirmed unlinked
+  journal, and the original worker audit attributes that revision and SHA to the PR.
+  The matching scoped mapping and applied receipt remain required. Missing proof,
+  multiple unlinked prefix revisions or intervening SVN revisions require inspection.
   The Team 1,001-commit qualification uses its own continuation mechanism.
 
 Assert zero unwanted remote changes and stable checkpoints on rejection, and

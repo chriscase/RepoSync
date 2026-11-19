@@ -377,6 +377,11 @@ async fn prior_squash_mapping_cannot_mask_later_sibling_resolution() {
     qualify_pr_backlog(BacklogCase::PreviouslyPublishedSibling).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upgrade_resumes_one_attributable_legacy_pr_member() {
+    qualify_pr_backlog(BacklogCase::UpgradePrefix).await;
+}
+
 #[derive(PartialEq, Eq)]
 enum BacklogCase {
     Restart,
@@ -385,6 +390,7 @@ enum BacklogCase {
     InboundAtCap,
     OuterResolution,
     PreviouslyPublishedSibling,
+    UpgradePrefix,
 }
 
 async fn qualify_pr_backlog(case: BacklogCase) {
@@ -611,6 +617,92 @@ async fn qualify_pr_backlog(case: BacklogCase) {
         (baseline + 1, earlier.as_str()),
         (baseline + 2, left.as_str()),
     ];
+    if case == BacklogCase::UpgradePrefix {
+        *view.lock().unwrap() = ProviderView::Complete;
+        std::fs::create_dir(&obstructed).unwrap();
+        {
+            let engine = open();
+            engine.run_cycle().await.unwrap();
+        }
+        std::fs::remove_dir(&obstructed).unwrap();
+        let db = Database::new(&path).unwrap();
+        assert_mappings(&db, "git_to_svn", &first);
+        let pr = db
+            .list_pr_syncs(3)
+            .unwrap()
+            .into_iter()
+            .find(|pr| pr.merge_sha == merge)
+            .unwrap();
+        assert_eq!((pr.svn_rev_start, pr.svn_rev_end), (Some(3), Some(3)));
+        let op = db
+            .latest_svn_commit_operation(PERSONAL_SCOPE_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(op.source_git_sha, left);
+        {
+            // Keep the real writes, mappings, receipts and original producer audit.
+            // Strip only fields the old binary did not persist.
+            let conn = db.conn();
+            assert_eq!(conn.execute("UPDATE kv_state SET value=json_remove(value,'$.personal_pr_sync_id') WHERE key=?1",[format!("git_to_svn_commit_v1:document:{}",op.id)]).unwrap(),1);
+            assert_eq!(
+                conn.execute(
+                    "DELETE FROM kv_state WHERE key=?1",
+                    [format!("personal_pr_commits_v1:{}", pr.id)]
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.execute(
+                    "UPDATE pr_sync_log SET svn_rev_start=NULL,svn_rev_end=NULL WHERE id=?1",
+                    [pr.id]
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(conn.execute("UPDATE audit_log SET success=0 WHERE action='git_to_svn_commit' AND git_sha=?1",[&left]).unwrap(),1);
+        }
+        drop(db);
+        let held = open().run_cycle().await.unwrap();
+        assert_eq!((held.prs_processed, held.git_to_svn_count), (0, 0));
+        assert_eq!(svn_youngest(&url), 3);
+        let db = Database::new(&path).unwrap();
+        assert_mappings(&db, "git_to_svn", &first);
+        assert_eq!(db.conn().execute("UPDATE audit_log SET success=1 WHERE action='git_to_svn_commit' AND git_sha=?1",[&left]).unwrap(),1);
+        drop(db);
+        let resumed = open().run_cycle().await.unwrap();
+        assert_eq!(
+            (resumed.prs_processed, resumed.git_to_svn_count),
+            (2, 3),
+            "attributable confirmed legacy prefix must resume without republication"
+        );
+        let db = Database::new(&path).unwrap();
+        assert_mappings(
+            &db,
+            "git_to_svn",
+            &[
+                (2, &earlier),
+                (3, &left),
+                (4, &right),
+                (5, &resolution),
+                (6, &later),
+            ],
+        );
+        assert_eq!(svn_tree(&svn, 5).await, git_tree(&bare, &merge));
+        assert_eq!(svn_tree(&svn, 6).await, git_tree(&bare, &tip));
+        let p = db
+            .list_pr_syncs(3)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.merge_sha == merge)
+            .unwrap();
+        assert_eq!((p.svn_rev_start, p.svn_rev_end), (Some(3), Some(5)));
+        let quiet = open().run_cycle().await.unwrap();
+        assert_eq!((quiet.prs_processed, quiet.git_to_svn_count), (0, 0));
+        assert_eq!(svn_youngest(&url), 6);
+        provider.abort();
+        return;
+    }
     if case == BacklogCase::InboundAtCap {
         *view.lock().unwrap() = ProviderView::CoveredBeyondCap;
         let db = Database::new(&path).unwrap();
@@ -769,6 +861,15 @@ async fn qualify_pr_backlog(case: BacklogCase) {
             (gap.prs_processed, gap.git_to_svn_count),
             (0, 0),
             "unstarted earlier merge cannot be skipped on a capped scan"
+        );
+        assert_eq!(svn_youngest(&url), baseline + 1);
+        assert_mappings(&db, "git_to_svn", &first[..1]);
+        *view.lock().unwrap() = ProviderView::PendingMissing;
+        let stale = engine.run_cycle().await.unwrap();
+        assert_eq!(
+            (stale.prs_processed, stale.git_to_svn_count),
+            (0, 0),
+            "a final page cannot omit an earlier unstarted merge and release its successor"
         );
         assert_eq!(svn_youngest(&url), baseline + 1);
         assert_mappings(&db, "git_to_svn", &first[..1]);
@@ -984,10 +1085,11 @@ async fn qualify_pr_backlog(case: BacklogCase) {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(errors.len(), 11, "unexpected failed phases: {errors:?}");
+        assert_eq!(errors.len(), 12, "unexpected failed phases: {errors:?}");
         assert!(errors[0].1.contains("incomplete pull-request discovery"));
-        assert!(errors[1].1.contains("duplicate pull request"));
-        let errors = &errors[2..];
+        assert!(errors[1].1.contains("unaccounted first-parent"));
+        assert!(errors[2].1.contains("duplicate pull request"));
+        let errors = &errors[3..];
         assert_eq!(errors[0].0, "git_to_svn_incomplete_pr");
         assert!(errors[0].1.contains("incomplete commit list for PR #3"));
         assert!(errors[1].1.contains("pending Personal PR #3 is missing"));

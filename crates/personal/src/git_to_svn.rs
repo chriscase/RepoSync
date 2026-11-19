@@ -236,10 +236,14 @@ impl GitToSvnSync {
             }
         }
         let mut newest_first = Vec::new();
-        while (truncated || !pending.is_empty()) && cursor.id() != anchor.id() {
+        while (truncated || !pending.is_empty() || !newest_first.is_empty())
+            && cursor.id() != anchor.id()
+        {
             if let Some(pr) = pending.remove(&cursor.id()) {
                 newest_first.push(pr);
-            } else if truncated && !self.db.is_personal_pr_synced(&cursor.id().to_string())? {
+            } else if (truncated || !newest_first.is_empty())
+                && !self.db.is_personal_pr_synced(&cursor.id().to_string())?
+            {
                 // A direct, confirmed SVN-origin push also accounts for one step.
                 // An unknown commit could be an omitted earlier PR.
                 if cursor.parent_count() != 1
@@ -250,7 +254,13 @@ impl GitToSvnSync {
                         &cursor.parent_id(0)?.to_string(),
                     )?
                 {
-                    return Err(GitHubError::IncompletePrDiscovery.into());
+                    if truncated {
+                        return Err(GitHubError::IncompletePrDiscovery.into());
+                    }
+                    anyhow::bail!(
+                        "unaccounted first-parent commit {} before a discovered Personal PR",
+                        cursor.id()
+                    );
                 }
             }
             if cursor.parent_count() == 0 {
@@ -428,29 +438,47 @@ impl GitToSvnSync {
         }
     }
 
-    /// A stand-alone replay may have been confirmed before its one-commit PR
-    /// was discovered. Only the still-current verified SVN publication can
-    /// supply that member for the tree proof. It gains no PR-owned SVN range.
-    async fn confirmed_standalone_member(&self, merge_sha: &str, shas: &[&str]) -> Result<bool> {
-        let [sha] = shas else {
-            return Ok(false);
+    /// Prove one previously published member from an unlinked journal. A
+    /// multi-member upgrade additionally requires the old PR producer audit.
+    async fn verified_unlinked_first_revision(
+        &self,
+        id: i64,
+        merge_sha: &str,
+        shas: &[&str],
+    ) -> Result<Option<i64>> {
+        let Some(&sha) = shas.first() else {
+            return Ok(None);
         };
         if !self.db.is_personal_git_sha_synced(sha)? {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(op) = self.db.latest_svn_commit_operation(PERSONAL_REPO_ID)? else {
-            return Ok(false);
+            return Ok(None);
+        };
+        let Some(rev) = op.last_confirmed_svn_rev else {
+            return Ok(None);
         };
         if op.state != SvnCommitOperationState::Completed
             || op.personal_pr_sync_id.is_some()
-            || op.source_git_sha != *sha
+            || op.source_git_sha != sha
             || op.last_confirmed_svn_tree.as_ref() != Some(&op.intended_svn_tree)
-            || GitClient::new(&self.git_repo_path)?
-                .commit_parent_and_tree(merge_sha)?
-                .1
-                != op.source_git_tree
         {
-            return Ok(false);
+            return Ok(None);
+        }
+        let git = GitClient::new(&self.git_repo_path)?;
+        if git.commit_parent_and_tree(sha)?.1 != op.source_git_tree {
+            return Ok(None);
+        }
+        if shas.len() == 1 {
+            if git.commit_parent_and_tree(merge_sha)?.1 != op.source_git_tree {
+                return Ok(None);
+            }
+        } else if git.get_parent_count(merge_sha)? != 2
+            || !self
+                .db
+                .legacy_personal_pr_prefix_matches(id, sha, rev, shas.len())?
+        {
+            return Ok(None);
         }
         let info = self.svn.info().await?;
         let target = svn_commit_target_fingerprint(
@@ -460,13 +488,11 @@ impl GitToSvnSync {
             &info.url,
             "{}",
         );
-        if op.target_fingerprint != target || op.last_confirmed_svn_rev != Some(info.latest_rev) {
-            return Ok(false);
+        if op.target_fingerprint != target || rev != info.latest_rev {
+            return Ok(None);
         }
-        Ok(
-            observed_svn_tree_at_revision(&self.svn, info.latest_rev).await?
-                == op.intended_svn_tree,
-        )
+        let observed = observed_svn_tree_at_revision(&self.svn, info.latest_rev).await?;
+        Ok((observed == op.intended_svn_tree).then_some(rev))
     }
 
     /// For a two-parent merge, the local Git objects independently identify the
@@ -477,7 +503,7 @@ impl GitToSvnSync {
         shas: &[&str],
         commits: &[GitHubCommit],
         sync_id: i64,
-        standalone_confirmed: bool,
+        first_confirmed: bool,
     ) -> Result<()> {
         let git = GitClient::new(&self.git_repo_path)?;
         let repo = git.repo();
@@ -515,7 +541,7 @@ impl GitToSvnSync {
         let prefix = self.db.confirmed_personal_pr_members(sync_id)?;
         let mut effective = Vec::new();
         for commit in commits {
-            if standalone_confirmed
+            if (first_confirmed && shas.first() == Some(&commit.sha.as_str()))
                 || prefix.contains(&commit.sha)
                 || self.commit_needs_replay(commit)?
             {
@@ -556,13 +582,18 @@ impl GitToSvnSync {
             .context("failed to fetch PR commits")?;
         let merge_strategy = self.detect_merge_strategy(pr, &commits).await;
         let shas: Vec<_> = commits.iter().map(|commit| commit.sha.as_str()).collect();
-        let standalone_confirmed = self.confirmed_standalone_member(merge_sha, &shas).await?;
+        let unlinked = self
+            .verified_unlinked_first_revision(sync_id, merge_sha, &shas)
+            .await?;
         let membership = self
-            .verify_merge_membership(merge_sha, &shas, &commits, sync_id, standalone_confirmed)
+            .verify_merge_membership(merge_sha, &shas, &commits, sync_id, unlinked.is_some())
             .and_then(|()| {
-                Ok(self
-                    .db
-                    .bind_personal_pr_commits(sync_id, &merge_strategy, &shas)?)
+                Ok(self.db.bind_personal_pr_commits(
+                    sync_id,
+                    &merge_strategy,
+                    &shas,
+                    unlinked.filter(|_| shas.len() > 1),
+                )?)
             });
         if let Err(error) = membership {
             self.db

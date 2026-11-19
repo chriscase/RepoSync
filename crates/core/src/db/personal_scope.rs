@@ -302,6 +302,39 @@ impl Database {
         Ok(())
     }
 
+    /// The old poller wrote this audit after a confirmed PR member and before
+    /// attempting the next one. Stand-alone writers did not emit this record.
+    pub fn legacy_personal_pr_prefix_matches(
+        &self,
+        id: i64,
+        sha: &str,
+        rev: i64,
+        count: usize,
+    ) -> Result<bool, DatabaseError> {
+        Self::legacy_personal_pr_prefix_matches_tx(&self.conn(), id, sha, rev, count)
+    }
+
+    fn legacy_personal_pr_prefix_matches_tx(
+        conn: &Connection,
+        id: i64,
+        sha: &str,
+        rev: i64,
+        count: usize,
+    ) -> Result<bool, DatabaseError> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pr_sync_log p JOIN audit_log a
+             ON a.action='git_to_svn_commit' AND a.direction='git_to_svn' AND a.success=1
+             AND a.svn_rev=?3 AND a.git_sha=?2
+             AND a.details=printf('PR #%d: replayed commit %s as r%d',p.pr_number,substr(?2,1,8),?3)
+             JOIN commit_map m ON m.git_sha=?2 AND m.svn_rev=?3 AND m.repo_id=?5 AND m.direction='git_to_svn'
+             JOIN sync_records r ON r.git_sha=m.git_sha AND r.svn_rev=m.svn_rev AND r.repo_id=m.repo_id
+             AND r.direction=m.direction AND r.status='applied'
+             WHERE p.id=?1 AND p.status='pending' AND p.commit_count=?4
+             AND p.svn_rev_start IS NULL AND p.svn_rev_end IS NULL
+             AND NOT EXISTS(SELECT 1 FROM kv_state WHERE key=('personal_pr_commits_v1:' || p.id)))",
+            params![id,sha,rev,count as i64,PERSONAL_SCOPE_KEY], |row|row.get(0))?)
+    }
+
     /// Source members this exact PR already wrote. Earlier PRs may have mapped
     /// the same Git SHA and must not count as members applied in this PR.
     pub fn confirmed_personal_pr_members(
@@ -323,7 +356,18 @@ impl Database {
              AND json_extract(d.value,'$.source_git_sha')=m.git_sha
              AND json_extract(d.value,'$.last_confirmed_svn_rev')=m.svn_rev")?;
         let rows = stmt.query_map(params![PERSONAL_SCOPE_KEY, id], |row| row.get(0))?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut members = rows.collect::<Result<std::collections::HashSet<_>, _>>()?;
+        let legacy: Option<String> = conn.query_row(
+            "SELECT m.git_sha FROM kv_state k JOIN pr_sync_log p ON p.id=?1
+             JOIN commit_map m ON m.svn_rev=p.svn_rev_start AND m.git_sha=k.value
+             JOIN sync_records r ON r.repo_id=m.repo_id AND r.svn_rev=m.svn_rev AND r.git_sha=m.git_sha
+             WHERE k.key=('personal_pr_legacy_prefix_v1:' || p.id) AND m.repo_id=?2
+             AND m.direction='git_to_svn' AND r.direction=m.direction AND r.status='applied' LIMIT 1",
+            params![id,PERSONAL_SCOPE_KEY], |row|row.get(0)).optional()?;
+        if let Some(sha) = legacy {
+            members.insert(sha);
+        }
+        Ok(members)
     }
 
     /// True when personal mode has completed syncing this PR merge SHA.
@@ -356,6 +400,7 @@ impl Database {
         id: i64,
         strategy: &str,
         shas: &[&str],
+        legacy_first_revision: Option<i64>,
     ) -> Result<(), DatabaseError> {
         if shas.is_empty()
             || shas
@@ -390,6 +435,14 @@ impl Database {
                 return Err(DatabaseError::Other(
                     "Personal PR commit list changed since its first complete observation".into(),
                 ));
+            }
+            if let Some(rev) = legacy_first_revision {
+                if !Self::legacy_personal_pr_prefix_matches_tx(tx,id,shas[0],rev,shas.len())? {
+                    return Err(DatabaseError::Other("legacy Personal PR attribution is no longer proven".into()));
+                }
+                tx.execute("INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)",
+                    params![format!("personal_pr_legacy_prefix_v1:{id}"),shas[0],Utc::now().to_rfc3339()])?;
+                tx.execute("UPDATE pr_sync_log SET svn_rev_start=?2,svn_rev_end=?2 WHERE id=?1",params![id,rev])?;
             }
             tx.execute(
                 "INSERT OR IGNORE INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)",
