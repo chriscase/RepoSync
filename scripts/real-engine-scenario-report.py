@@ -45,28 +45,8 @@ def load_expected_real_engine_case_ids() -> list[str]:
     return sorted(load_expected_real_engine_tests())
 
 
-def evidence_detail(log_text: str, case_id: str | None, want_status: str) -> dict:
-    for line in log_text.splitlines():
-        if "RELIABILITY_EVIDENCE" not in line:
-            continue
-        payload = line.split("RELIABILITY_EVIDENCE", 1)[1].strip()
-        start = payload.find("{")
-        if start < 0:
-            continue
-        try:
-            obj, _end = json.JSONDecoder().raw_decode(payload[start:])
-        except json.JSONDecodeError:
-            continue
-        if obj.get("status") != want_status:
-            continue
-        if case_id is not None and obj.get("case") != case_id:
-            continue
-        detail = obj.get("detail", {})
-        return detail if isinstance(detail, dict) else {}
-    return {}
-
-
 def evidence_status(log_text: str, case_id: str) -> tuple[str | None, dict]:
+    result = None
     for line in log_text.splitlines():
         if "RELIABILITY_EVIDENCE" not in line:
             continue
@@ -80,28 +60,25 @@ def evidence_status(log_text: str, case_id: str) -> tuple[str | None, dict]:
             continue
         if obj.get("case") != case_id:
             continue
+        if result is not None:
+            return "FAIL", {"reason": "duplicate_evidence", "case": case_id}
         status = obj.get("status")
-        if status in {"PASS", "PARTIAL", "NOT RUN"}:
-            detail = obj.get("detail", {})
-            return status, detail if isinstance(detail, dict) else {}
-    return None, {}
+        if status not in ("PASS", "PARTIAL", "NOT RUN"):
+            return "FAIL", {"reason": "invalid_evidence_status", "case": case_id}
+        detail = obj.get("detail", {})
+        result = status, detail if isinstance(detail, dict) else {}
+    return result if result is not None else (None, {})
 
 
 def classify(log_path: Path, case_id: str, test_exit: int) -> tuple[str, dict]:
     text = log_path.read_text() if log_path.is_file() else ""
-    if '"status":"NOT RUN"' in text or '"status": "NOT RUN"' in text:
-        return "NOT RUN", evidence_detail(text, None, "NOT RUN")
     if test_exit == 0 and "test result: ok" in text:
         status, detail = evidence_status(text, case_id)
         if status is None:
             return "NOT RUN", {"reason": "missing_evidence", "case": case_id}
-        if status == "PARTIAL":
-            return "PARTIAL", detail
-        if status == "NOT RUN":
-            return "NOT RUN", detail
-        if detail:
-            return "PASS", detail
-        return "NOT RUN", {"reason": "missing_evidence_detail", "case": case_id}
+        if status == "PASS" and not detail:
+            return "NOT RUN", {"reason": "missing_evidence_detail", "case": case_id}
+        return status, detail
     tail = next((line for line in reversed(text.splitlines()) if line.strip()), "")
     return "FAIL", {"tail": tail[-500:]}
 
@@ -321,12 +298,12 @@ def controlled_status(summary_path: Path, suite_exit: str) -> tuple[str, list[st
             detail = row.get("detail")
             if not isinstance(detail, dict) or not detail:
                 return "FAIL", [f"{case_id}: missing scenario evidence detail"]
-            if row["status"] == "NOT RUN" and not (
-                isinstance(detail.get("reason"), str) and detail["reason"].strip()
-            ):
-                return "FAIL", [f"{case_id}: NOT RUN has no recorded reason"]
-            if missing and (detail.get("reason") != "missing_tool" or detail.get("tool") != missing):
-                return "FAIL", [f"{case_id}: scenario evidence disagrees with the missing tool"]
+            if row["status"] == "NOT RUN":
+                tool = detail.get("tool")
+                if detail.get("reason") != "missing_tool" or not isinstance(tool, str) or not tool.strip():
+                    return "FAIL", [f"{case_id}: NOT RUN requires a named missing tool"]
+                if missing and tool != missing:
+                    return "FAIL", [f"{case_id}: scenario evidence disagrees with the missing tool"]
         if counts[expected] == 0:
             return "FAIL", [f"overall {expected} has no corresponding scenario rows"]
 
@@ -418,6 +395,26 @@ def run_self_test() -> None:
         ]
         check_controlled(not_run_rows, "NOT RUN", "2", "NOT RUN")
         check_controlled(not_run_rows, "NOT RUN", "2", "NOT RUN", toolchain=unavailable)
+        # A completed Cargo invocation without its case receipt proves no result.
+        log_path = tmp / "test.log"
+        case_id = not_run_rows[0]["id"]
+        receipt = {"case": case_id, "status": "NOT RUN", "detail": not_run_rows[0]["detail"]}
+        cargo_ok = "test result: ok. 1 passed; 0 failed; 0 ignored;\n"
+        for case_receipt in (None, dict(receipt, status="PASS", detail={}), dict(receipt, case="other")):
+            marker = "RELIABILITY_EVIDENCE " + json.dumps(case_receipt) + "\n" if case_receipt else ""
+            log_path.write_text(marker + cargo_ok)
+            status, detail = classify(log_path, case_id, 0)
+            assert detail["reason"] in {"missing_evidence", "missing_evidence_detail"}
+            rows = [dict(row, status=status, detail=detail) for row in not_run_rows]
+            check_controlled(rows, "NOT RUN", "2", "FAIL")
+        log_path.write_text("RELIABILITY_EVIDENCE " + json.dumps(receipt) + "\n" + cargo_ok)
+        assert classify(log_path, case_id, 0) == ("NOT RUN", receipt["detail"])
+        assert classify(log_path, case_id, 1)[0] == "FAIL"
+        passed = dict(receipt, status="PASS", detail={"verified": True})
+        for earlier, expected_status in ((receipt, "FAIL"), (dict(receipt, case="other"), "PASS")):
+            log_path.write_text("".join("RELIABILITY_EVIDENCE " + json.dumps(r) + "\n"
+                                        for r in (earlier, passed)) + cargo_ok)
+            assert classify(log_path, case_id, 0)[0] == expected_status
         check_controlled([dict(not_run_rows[0], detail={"reason": ""}), *not_run_rows[1:]], "NOT RUN", "2", "FAIL")
         for wrong_tool in ("", "git"):
             check_controlled(not_run_rows, "NOT RUN", "2", "FAIL", toolchain={"status": "NOT RUN", "missing": wrong_tool})

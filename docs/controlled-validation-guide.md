@@ -78,7 +78,7 @@ The scenario suite drives the team sync engine against disposable SVN and Git re
 |--------------|----------------|----------------|
 | 0 | PASS | All phases passed. |
 | 1 | FAIL | A phase failed, or the current suite result lacks qualifying evidence. A missing, malformed or contradictory summary fails Phase 7. |
-| 2 | NOT RUN | Every required real-engine scenario reported NOT RUN and the earlier phases passed. |
+| 2 | NOT RUN | Every required real-engine scenario identified a missing tool and the earlier phases passed. A completed test without its required evidence makes Phase 7 fail. |
 | 3 | PARTIAL | The earlier phases passed and the CI gate accepted the suite's PARTIAL report. |
 
 An earlier phase failure takes precedence over a later PARTIAL or NOT RUN. For PASS and PARTIAL, Phase 7 applies the same evidence checks as CI. Every expected scenario must appear exactly once. A skipped or unrun scenario, a PARTIAL outside the allowlist, or missing required R01 checkpoint-recovery evidence makes the phase FAIL. The wrapper keeps a qualifying PARTIAL visible as exit 3. [Real-engine CI policy](reliability/acceptance-matrix.md)
