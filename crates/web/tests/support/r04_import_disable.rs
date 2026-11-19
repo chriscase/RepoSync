@@ -8,6 +8,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[path = "r04_settings_put.rs"]
+mod settings_put;
+
 const MAIN: &str = "refs/heads/main";
 const DEADLINE: Duration = Duration::from_secs(60);
 
