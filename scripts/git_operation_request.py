@@ -5,9 +5,8 @@ RepoSync remains the authority for locking, provenance, checkpoints, cancellatio
 and recovery. This client does not run ``svn merge``, edit SQLite, delete remotes,
 force-push, or interpolate branch names into a shell.
 
-The pair-refresh execute path is still refused by the server
-(``refresh_execute_not_implemented``). This client reports that result. It does
-not invent an execution job.
+A v1 refresh preview is not execution approval. Named v2 refresh status reads
+the durable receipt for the supplied child and request ID.
 """
 
 from __future__ import annotations
@@ -18,6 +17,8 @@ import os
 import re
 import sys
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,6 +48,17 @@ TERMINAL_LIFECYCLES = {
     "failed",
     "reconciliation_required",
 }
+WRITE_STATES = {"queued", "running", "completed", "failed", "reconciliation_required"}
+IMPORT_STATES = WRITE_STATES | {"cancel_requested", "cancelling", "cancelled"}
+IMPORT_PHASES = {
+    "idle", "connecting", "importing", "verifying", "final_push", "completed", "failed", "cancelled",
+}
+REFRESH_PHASES = {
+    "prepared", "svn_intent", "svn_observed", "git_intent", "git_observed",
+    "completed", "cancelled_before_publication", "no_op",
+}
+TERMINAL_STATES = TERMINAL_LIFECYCLES | {"cancelled_before_publication", "no_op"}
+REFRESH_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 RECONCILIATION_ACTION = (
     "reconciliation_required: compare the recorded operation with the remote "
     "and leave the hold in place. Do not force-push, delete the ref, edit "
@@ -256,6 +268,8 @@ def report(
         "operation_id": extra.pop("operation_id", config.get("operation_id")),
         "needs_reconciliation": extra.pop("needs_reconciliation", False),
     }
+    if config.get("request_id") is not None:
+        body["request_id"] = config["request_id"]
     body.update(extra)
     return body
 
@@ -333,6 +347,17 @@ def error_text(payload) -> str:
     return ""
 
 
+def request_segment(request: str) -> str:
+    # The service accepts opaque UTF-8 request IDs up to 256 bytes. Encode them
+    # as a single path segment, including dots that could form relative paths.
+    if not isinstance(request, str) or not request or len(request.encode()) > 256:
+        raise ValueError("invalid_request_id")
+    encoded = urllib.parse.quote(request, safe="")
+    if encoded == "." or ".." in encoded:
+        encoded = encoded.replace(".", "%2E")
+    return encoded
+
+
 def safe_status_path(path, repo_id: str | None, pair_id: str | None) -> str | None:
     if not isinstance(path, str):
         return None
@@ -384,9 +409,24 @@ def annotate_lifecycle(result: dict, lifecycle: str | None) -> None:
 def execute(config: dict) -> dict:
     action = config["action"]
     try:
+        # Check timing before a submission can be accepted. Values outside the
+        # system timer's range can also fail when passed to a socket or sleep.
+        interval = config.get("poll_interval", 0)
+        if not isinstance(interval, (int, float)) or not 0 <= interval <= threading.TIMEOUT_MAX:
+            raise ValueError("invalid_poll_interval")
+        attempts = config.get("poll_attempts", 20)
+        if type(attempts) is not int or attempts <= 0:
+            raise ValueError("invalid_poll_attempts")
+        timeout = config.get("timeout", 30)
+        if not isinstance(timeout, (int, float)) or not 0 < timeout <= threading.TIMEOUT_MAX:
+            raise ValueError("invalid_timeout")
         validate_branch(config.get("git_branch"))
         for label in ("repo_id", "pair_id", "operation_id"):
             check_id(config.get(label), label)
+        if config.get("request_id") is not None:
+            if action != "status" or config["operation_kind"] != "refresh":
+                raise ValueError("request_id_requires_refresh_status")
+            request_segment(config["request_id"])
         if config.get("idempotency_key") and not KEY_RE.fullmatch(config["idempotency_key"]):
             raise ValueError("invalid_idempotency_key")
         for label in ("expected_pair_tip", "expected_parent_tip"):
@@ -408,7 +448,10 @@ def execute(config: dict) -> dict:
         return rejected(config, action, "missing_base_url")
 
     journal = None
-    if config.get("journal_path"):
+    lookup = action == "status" and (
+        config["operation_kind"] != "refresh" or config.get("request_id") or config.get("operation_id")
+    )
+    if config.get("journal_path") and not lookup:
         try:
             journal = Journal(Path(config["journal_path"]))
         except ValueError as exc:
@@ -624,7 +667,7 @@ def approved_execute(client: ApiClient, config: dict, preview_plan: dict, repeat
             execute_requested=True,
             authenticated=True,
         )
-    if code or status >= 400:
+    if code or not 200 <= status < 300:
         return rejected(
             config,
             "execute",
@@ -645,120 +688,140 @@ def approved_execute(client: ApiClient, config: dict, preview_plan: dict, repeat
             authenticated=True,
         )
 
-    operation_id = payload.get("operation_id")
-    if operation_id is not None and not isinstance(operation_id, str):
-        operation_id = None
-    if operation_id:
-        try:
-            check_id(operation_id, "operation_id")
-        except ValueError:
-            return rejected(
-                config,
-                "execute",
-                "invalid_operation_id",
-                execute_requested=True,
-                authenticated=True,
-            )
-    lifecycle = payload.get("lifecycle") if isinstance(payload.get("lifecycle"), str) else None
+    # The submit response identifies the accepted operation. Pin all subsequent
+    # reads to that identity even if a repository's latest operation changes.
+    try:
+        check_status_scope(config, payload)
+        operation_id = returned_operation_id(config, payload)
+        lifecycle = payload.get("lifecycle")
+        if (
+            not isinstance(lifecycle, str)
+            or lifecycle not in IMPORT_STATES
+            or payload.get("ok", True) is not True
+            or payload.get("durable_job_started", True) is not True
+            or "error" in payload
+        ):
+            raise ValueError("invalid_response")
+    except ValueError as exc:
+        return rejected(
+            config, "execute", str(exc), http_status=status,
+            execute_requested=True, authenticated=True,
+        )
     result = report(
         ok=True,
         action="execute",
-        outcome=lifecycle or "execute_accepted",
+        outcome=lifecycle,
         exit_code=EXIT_OK,
         config=config,
         authenticated=True,
         http_status=status,
         execute_requested=True,
-        durable_job_started=bool(payload.get("durable_job_started") or operation_id),
+        durable_job_started=True,
         repeated=repeated,
         operation_id=operation_id,
         plan_digest=preview_plan.get("plan_digest"),
         lifecycle=lifecycle,
-        message="execute response received from RepoSync",
+        message="RepoSync accepted the operation",
+    )
+    if lifecycle in TERMINAL_LIFECYCLES:
+        finish_execution(result, lifecycle)
+        return result
+
+    path = safe_status_path(payload.get("status_path"), config.get("repo_id"), config.get("pair_id"))
+    target = poll_target(config, path, operation_id, payload.get("request_id"))
+    if target is None:
+        result.update(
+            ok=False, outcome="invalid_status_path", exit_code=EXIT_UNAVAILABLE,
+            message="Operation accepted; its outcome could not be verified",
+        )
+        return result
+    return poll_status(client, target, result)
+
+
+def finish_execution(result: dict, lifecycle: str) -> None:
+    success = lifecycle in {"completed", "no_op"}
+    result.update(
+        ok=success, outcome=lifecycle, lifecycle=lifecycle,
+        exit_code=EXIT_OK if success else EXIT_REJECTED,
     )
     annotate_lifecycle(result, lifecycle)
-    status_path = safe_status_path(
-        payload.get("status_path"), config.get("repo_id"), config.get("pair_id")
+
+
+def poll_target(config: dict, path: str | None, operation_id: str, request_id) -> dict | None:
+    if not path:
+        return None
+    parts = path.split("/")
+    if len(parts) == 6 and parts[:3] == ["", "api", "repos"]:
+        repo, kind, key = parts[3:]
+        if repo not in (config.get("repo_id"), config.get("pair_id")):
+            return None
+        if kind == "import" and key == "status":
+            return dict(config, operation_kind=kind, repo_id=repo, operation_id=operation_id)
+        if kind in {"svn-commit", "git-push"} and key == operation_id:
+            return dict(config, operation_kind=kind, repo_id=repo, operation_id=operation_id)
+    if len(parts) == 8 and parts[:7] == ["", "api", "v2", "repos", config.get("pair_id"), "refresh", "requests"]:
+        try:
+            raw = urllib.parse.unquote_to_bytes(parts[7])
+            lookup = raw.decode("utf-8")
+        except UnicodeError:
+            return None
+        if 0 < len(raw) <= 256 and request_id in (None, lookup):
+            return dict(config, operation_kind="refresh", request_id=lookup, operation_id=operation_id)
+    return None
+
+
+def poll_status(client: ApiClient, target: dict, result: dict) -> dict:
+    attempts = int(target.get("poll_attempts") or 20)
+    interval = float(target.get("poll_interval") or 0)
+    for attempt in range(attempts):
+        try:
+            observed = read_named_or_latest_status(client, target)
+        except ConnectionError:
+            result.update(
+                ok=False, outcome="service_unavailable", exit_code=EXIT_UNAVAILABLE, http_status=None,
+                message="Operation accepted; the status service is unavailable",
+            )
+            return result
+        result.update(
+            http_status=observed.get("http_status"), ok=observed["ok"], outcome=observed["outcome"],
+            exit_code=observed["exit_code"], authenticated=observed["authenticated"],
+        )
+        if not observed["ok"]:
+            result["message"] = "Operation accepted; its status could not be verified"
+            return result
+        lifecycle = observed["lifecycle"]
+        result.update(lifecycle=lifecycle, status=observed["status"])
+        if lifecycle in TERMINAL_STATES:
+            finish_execution(result, lifecycle)
+            return result
+        if interval and attempt + 1 < attempts:
+            time.sleep(interval)
+    result.update(
+        ok=False, outcome="poll_timeout", exit_code=EXIT_UNAVAILABLE,
+        message="Operation accepted; no verified terminal result before the polling limit",
     )
-    if operation_id and lifecycle not in TERMINAL_LIFECYCLES and status_path:
-        polled = poll_status(client, config, status_path)
-        result.update(polled)
-    elif lifecycle in TERMINAL_LIFECYCLES:
-        result["outcome"] = lifecycle
     return result
 
 
-def poll_status(client: ApiClient, config: dict, path: str) -> dict:
-    attempts = int(config.get("poll_attempts") or 20)
-    interval = float(config.get("poll_interval") or 0)
-    last = {}
-    for _ in range(attempts):
-        status, payload = client.call("GET", path, None, config.get("idempotency_key"))
-        if status == 401:
-            return {
-                "ok": False,
-                "outcome": "unauthorized",
-                "exit_code": EXIT_REJECTED,
-                "http_status": status,
-                "message": "status poll was rejected",
-            }
-        if status == 404:
-            return {
-                "ok": False,
-                "outcome": "wrong_repo",
-                "exit_code": EXIT_REJECTED,
-                "http_status": status,
-                "authenticated": True,
-            }
-        if status >= 500 or status in {301, 302, 303, 307, 308}:
-            return {
-                "ok": False,
-                "outcome": "service_unavailable" if status >= 500 else "redirect_refused",
-                "exit_code": EXIT_UNAVAILABLE,
-                "http_status": status,
-                "authenticated": True,
-            }
-        if not isinstance(payload, dict):
-            return {
-                "ok": False,
-                "outcome": "invalid_response",
-                "exit_code": EXIT_REJECTED,
-                "authenticated": True,
-            }
-        lifecycle = payload.get("lifecycle")
-        if not isinstance(lifecycle, str):
-            lifecycle = None
-        last = {
-            "ok": True,
-            "outcome": lifecycle or "status_ok",
-            "exit_code": EXIT_OK,
-            "authenticated": True,
-            "http_status": status,
-            "lifecycle": lifecycle,
-            "operation_id": payload.get("operation_id") or config.get("operation_id"),
-            "status": public_status(payload),
-        }
-        if lifecycle == "reconciliation_required":
-            last["needs_reconciliation"] = True
-            last["operator_action"] = RECONCILIATION_ACTION
-        if lifecycle in TERMINAL_LIFECYCLES or lifecycle is None:
-            return last
-        if interval:
-            import time
-
-            time.sleep(interval)
-    last["outcome"] = "poll_timeout"
-    last["ok"] = False
-    last["exit_code"] = EXIT_UNAVAILABLE
-    return last
-
-
-def public_status(payload: dict) -> dict:
+def public_status(payload: dict, kind: str) -> dict:
+    if kind == "refresh":
+        fields = ("version", "request_id", "operation_id", "child_id", "parent_id", "phase",
+                  "svn_revision", "git_sha")
+        return {field: payload[field] for field in fields}
     kept = {}
     for key in (
         "operation_id",
         "lifecycle",
         "phase",
+        "can_start",
+        "current_rev",
+        "total_revs",
+        "commits_created",
+        "batches_pushed",
+        "operation_type",
+        "source_svn_rev",
+        "source_git_sha",
+        "intended_local_git_sha",
         "ok",
         "message",
         "outcome_detail",
@@ -777,7 +840,9 @@ def public_status(payload: dict) -> dict:
 
 def status_request(client: ApiClient, config: dict, journal, previous, identity) -> dict:
     kind = config["operation_kind"]
-    if kind == "refresh":
+    if kind == "refresh" and config.get("request_id") is None:
+        if config.get("operation_id") is not None:
+            return rejected(config, "status", "missing_request_id")
         viewed = dict(config)
         viewed["action"] = "preview"
         result = refresh_request(client, viewed, journal, previous, identity)
@@ -785,19 +850,29 @@ def status_request(client: ApiClient, config: dict, journal, previous, identity)
         if result.get("ok"):
             result["outcome"] = "status_ok"
             result["message"] = (
-                "refresh has no durable job; status is a new authenticated preview"
+                "No named request was selected; this is a new authenticated preview"
             )
         return result
-    if kind == "import":
+    return read_named_or_latest_status(client, config)
+
+
+def read_named_or_latest_status(client: ApiClient, config: dict) -> dict:
+    kind = config["operation_kind"]
+    if kind == "refresh":
+        if not config.get("pair_id"):
+            return rejected(config, "status", "missing_pin")
+        segment = request_segment(config["request_id"])
+        path = f"/api/v2/repos/{config['pair_id']}/refresh/requests/{segment}"
+    elif kind == "import":
         if not config.get("repo_id"):
             return rejected(config, "status", "missing_pin")
         path = f"/api/repos/{urllib.parse.quote(config['repo_id'], safe='')}/import/status"
-    elif kind == "svn-commit":
+    elif kind in {"svn-commit", "git-push"}:
         if not config.get("repo_id") or not config.get("operation_id"):
             return rejected(config, "status", "missing_pin")
         path = (
             f"/api/repos/{urllib.parse.quote(config['repo_id'], safe='')}"
-            f"/svn-commit/{urllib.parse.quote(config['operation_id'], safe='')}"
+            f"/{kind}/{urllib.parse.quote(config['operation_id'], safe='')}"
         )
     else:
         return rejected(config, "status", "unsupported_operation_kind")
@@ -829,9 +904,7 @@ def cancel_request(client: ApiClient, config: dict) -> dict:
             http_status=status,
             execute_requested=False,
             durable_job_started=False,
-            message=(
-                "refresh_execute_not_implemented: no durable refresh job exists to cancel"
-            ),
+            message="This client does not cancel refresh operations",
         )
     if kind == "import":
         if not config.get("repo_id") or not config.get("operation_id"):
@@ -864,6 +937,82 @@ def cancel_request(client: ApiClient, config: dict) -> dict:
     return rejected(config, "cancel", "unsupported_operation_kind")
 
 
+def check_status_scope(config: dict, payload: dict) -> None:
+    # Managed import/push/commit handlers bind the repository in the route but
+    # do not echo it. If an envelope also names its scope it must agree.
+    for field, pin, refusal in (
+        ("repo_id", "repo_id", "wrong_repo"), ("parent_id", "repo_id", "wrong_repo"),
+        ("pair_id", "pair_id", "wrong_pair"), ("child_id", "pair_id", "wrong_pair"),
+    ):
+        if field in payload and config.get(pin) is not None and payload[field] != config[pin]:
+            raise ValueError(refusal)
+
+
+def returned_operation_id(config: dict, payload: dict) -> str:
+    operation_id = payload.get("operation_id")
+    if not isinstance(operation_id, str) or not ID_RE.fullmatch(operation_id):
+        raise ValueError("invalid_response")
+    if config.get("operation_id") is not None and operation_id != config["operation_id"]:
+        raise ValueError("wrong_operation")
+    return operation_id
+
+
+def refresh_phase(config: dict, payload: dict, operation_id: str) -> str:
+    if (
+        type(payload.get("version")) is not int or payload["version"] != 2
+        or not REFRESH_UUID.fullmatch(operation_id)
+        or not all(isinstance(payload.get(k), str) and payload[k] for k in ("request_id", "child_id", "parent_id"))
+    ):
+        raise ValueError("invalid_response")
+    if payload["request_id"] != config["request_id"]:
+        raise ValueError("wrong_request")
+    phase = payload.get("phase")
+    if not isinstance(phase, str) or phase not in REFRESH_PHASES:
+        raise ValueError("invalid_response")
+
+    # RefreshReceiptView exposes each confirmed coordinate once its publication
+    # is observed. A no-op or pre-publication cancellation has neither.
+    rev, sha = payload.get("svn_revision"), payload.get("git_sha")
+    if "svn_revision" not in payload or "git_sha" not in payload:
+        raise ValueError("invalid_response")
+    if phase in {"svn_observed", "git_intent", "git_observed", "completed"}:
+        if type(rev) is not int or rev <= 0:
+            raise ValueError("invalid_response")
+    elif rev is not None:
+        raise ValueError("invalid_response")
+    if phase in {"git_observed", "completed"}:
+        if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
+            raise ValueError("invalid_response")
+    elif sha is not None:
+        raise ValueError("invalid_response")
+    return phase
+
+
+def observed_lifecycle(config: dict, payload: dict) -> str | None:
+    kind = config["operation_kind"]
+    if "error" in payload or payload.get("ok", True) is not True:
+        raise ValueError("invalid_response")
+    if kind == "import" and "phase" in payload:
+        phase = payload.get("phase")
+        if not isinstance(phase, str) or phase not in IMPORT_PHASES:
+            raise ValueError("invalid_response")
+        if config.get("operation_id") is None and "operation_id" not in payload and "lifecycle" not in payload:
+            return None
+
+    operation_id = returned_operation_id(config, payload)
+    if kind == "refresh":
+        return refresh_phase(config, payload, operation_id)
+    if kind in {"git-push", "svn-commit"}:
+        journal_type = {"git-push": "svn_to_git_push", "svn-commit": "git_to_svn_commit"}[kind]
+        if "operation_type" in payload and payload["operation_type"] != journal_type:
+            raise ValueError("invalid_response")
+    state = payload.get("lifecycle")
+    allowed = IMPORT_STATES if kind == "import" else WRITE_STATES
+    if not isinstance(state, str) or state not in allowed:
+        raise ValueError("invalid_response")
+    return state
+
+
 def interpret_job_response(
     config: dict, action: str, status: int, payload, execute_requested: bool
 ) -> dict:
@@ -880,14 +1029,21 @@ def interpret_job_response(
     if status == 403:
         return rejected(config, action, "forbidden", http_status=status, authenticated=True)
     if status == 404:
-        outcome = "wrong_repo" if config["operation_kind"] != "refresh" else "wrong_pair"
+        kind = config["operation_kind"]
+        message = error_text(payload)
+        if kind == "refresh":
+            outcome = "receipt_not_found"
+        elif message == "repository not found" or (kind == "import" and action == "status"):
+            outcome = "wrong_repo"
+        else:
+            outcome = "operation_not_found"
         return rejected(
             config,
             action,
             outcome,
             http_status=status,
             authenticated=True,
-            message=error_text(payload),
+            message=message,
         )
     if status >= 500:
         return rejected(
@@ -897,7 +1053,7 @@ def interpret_job_response(
             http_status=status,
             authenticated=True,
         )
-    if status >= 400:
+    if not 200 <= status < 300:
         return rejected(
             config,
             action,
@@ -907,44 +1063,30 @@ def interpret_job_response(
             message=error_text(payload),
         )
     if not isinstance(payload, dict):
-        return rejected(config, action, "invalid_response", authenticated=True)
-    body_repo = payload.get("repo_id") or payload.get("parent_id")
-    if isinstance(body_repo, str) and config.get("repo_id") and body_repo != config["repo_id"]:
-        return rejected(
-            config,
-            action,
-            "wrong_repo",
-            authenticated=True,
-            http_status=status,
-        )
-    body_pair = payload.get("pair_id")
-    if isinstance(body_pair, str) and config.get("pair_id") and body_pair != config["pair_id"]:
-        return rejected(
-            config,
-            action,
-            "wrong_pair",
-            authenticated=True,
-            http_status=status,
-        )
-    lifecycle = payload.get("lifecycle") if isinstance(payload.get("lifecycle"), str) else None
-    operation_id = payload.get("operation_id") if isinstance(payload.get("operation_id"), str) else config.get(
-        "operation_id"
-    )
-    outcome = lifecycle or ("cancel_requested" if action == "cancel" else "status_ok")
+        return rejected(config, action, "invalid_response", authenticated=True, http_status=status)
+    try:
+        check_status_scope(config, payload)
+        lifecycle = observed_lifecycle(config, payload)
+        if action == "cancel" and (
+            payload.get("ok") is not True
+            or lifecycle not in TERMINAL_LIFECYCLES | {"cancel_requested"}
+        ):
+            raise ValueError("invalid_response")
+    except ValueError as exc:
+        return rejected(config, action, str(exc), http_status=status, authenticated=True)
     result = report(
         ok=True,
         action=action,
-        outcome=outcome,
+        outcome=lifecycle or "status_ok",
         exit_code=EXIT_OK,
         config=config,
         authenticated=True,
         http_status=status,
         execute_requested=execute_requested,
-        durable_job_started=lifecycle
-        not in {None, "completed", "cancelled", "failed", "reconciliation_required"},
-        operation_id=operation_id,
+        durable_job_started=lifecycle is not None and lifecycle not in TERMINAL_STATES,
+        operation_id=payload.get("operation_id"),
         lifecycle=lifecycle,
-        status=public_status(payload),
+        status=public_status(payload, config["operation_kind"]),
         message="RepoSync returned the operation result",
     )
     annotate_lifecycle(result, lifecycle)
@@ -986,27 +1128,31 @@ def parse_args(argv: list[str] | None) -> dict:
     parser.add_argument(
         "--operation-kind",
         default=nonempty(os.environ.get("REPOSYNC_OPERATION_KIND")) or "refresh",
-        choices=["refresh", "import", "svn-commit"],
+        choices=["refresh", "import", "svn-commit", "git-push"],
     )
     parser.add_argument(
         "--operation-id",
         default=nonempty(os.environ.get("REPOSYNC_OPERATION_ID")),
     )
     parser.add_argument(
+        "--request-id", default=os.environ.get("REPOSYNC_REQUEST_ID") or None,
+        help="Read this v2 refresh request receipt for --pair-id",
+    )
+    parser.add_argument(
         "--journal",
         default=nonempty(os.environ.get("REPOSYNC_REQUEST_JOURNAL"))
         or ".reposync/operation-journal.json",
     )
-    parser.add_argument("--timeout", type=float, default=float(os.environ.get("REPOSYNC_TIMEOUT", "30")))
+    parser.add_argument("--timeout", type=float, default=os.environ.get("REPOSYNC_TIMEOUT", "30"))
     parser.add_argument(
         "--poll-interval",
         type=float,
-        default=float(os.environ.get("REPOSYNC_POLL_INTERVAL", "0")),
+        default=os.environ.get("REPOSYNC_POLL_INTERVAL", "0"),
     )
     parser.add_argument(
         "--poll-attempts",
         type=int,
-        default=int(os.environ.get("REPOSYNC_POLL_ATTEMPTS", "20")),
+        default=os.environ.get("REPOSYNC_POLL_ATTEMPTS", "20"),
     )
     parser.add_argument(
         "--allow-insecure-http",
@@ -1029,6 +1175,7 @@ def parse_args(argv: list[str] | None) -> dict:
         "operation": args.operation,
         "operation_kind": args.operation_kind,
         "operation_id": args.operation_id,
+        "request_id": args.request_id,
         "journal_path": args.journal,
         "timeout": args.timeout,
         "poll_interval": args.poll_interval,

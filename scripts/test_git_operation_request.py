@@ -17,6 +17,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import git_operation_request as client
@@ -28,6 +29,7 @@ OTHER_DIGEST = "cd" * 32
 PAIR_TIP = "a" * 40
 PARENT_TIP = "b" * 40
 TOKEN = "test-token-value"
+REFRESH_OP = "78cb373c-d795-4a4e-9839-296a4878e0e4"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -300,9 +302,226 @@ class ClientTests(unittest.TestCase):
 
         server = self.start(respond)
         result = self.run_client(server, "execute")
-        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["outcome"], "invalid_status_path")
+        self.assertNotEqual(result["exit_code"], client.EXIT_OK)
+        self.assertEqual(result["operation_id"], "op123")
+        self.assertTrue(result["execute_requested"])
+        self.assertTrue(result["durable_job_started"])
         self.assertEqual(result["lifecycle"], "queued")
         self.assertTrue(all(item["method"] == "POST" for item in server.records))
+
+    def test_submitted_operation_poll_validates_identity_http_and_terminal_state(self):
+        def respond(record):
+            if record["method"] == "GET":
+                return status, payload
+            if json.loads(record["body"])["execute"]:
+                return 200, {
+                    "operation_id": "submitted", "lifecycle": "queued",
+                    "durable_job_started": True, "status_path": "/api/repos/repo1/import/status",
+                }
+            return 200, plan(
+                approval={"eligible": True, "reason": "approved", "binds_to": "plan_digest"},
+                execute_status="READY",
+            )
+
+        server = self.start(respond)
+        terminal = {"operation_id": "submitted", "lifecycle": "completed"}
+        for status, payload, expected in (
+            (200, terminal, "completed"),
+            (200, {**terminal, "lifecycle": "failed"}, "failed"),
+            (200, {**terminal, "lifecycle": "cancelled"}, "cancelled"),
+            (200, {**terminal, "lifecycle": "reconciliation_required"}, "reconciliation_required"),
+            (200, {**terminal, "operation_id": "different"}, "wrong_operation"),
+            (200, {"lifecycle": "completed"}, "invalid_response"),
+            (200, {"operation_id": "submitted"}, "invalid_response"),
+            (200, {**terminal, "lifecycle": "made_up"}, "invalid_response"),
+            (200, {"error": "no status available"}, "invalid_response"),
+            (200, {**terminal, "ok": False}, "invalid_response"),
+            (409, {**terminal, "error": "conflict"}, "request_rejected"),
+            (429, {"error": "rate limited"}, "request_rejected"),
+        ):
+            with self.subTest(http=status, body=payload):
+                server.records.clear()
+                result = self.run_client(server, "execute", poll_attempts=2)
+                self.assertEqual(result["outcome"], expected, result)
+                self.assertEqual(result["ok"], expected == "completed")
+                self.assertEqual(result["exit_code"] == client.EXIT_OK, expected == "completed")
+                self.assertEqual(result["operation_id"], "submitted")
+                self.assertTrue(result["execute_requested"])
+                self.assertTrue(result["durable_job_started"])
+                self.assertEqual(result["http_status"], status)
+                self.assertEqual([(r["method"], r["path"]) for r in server.records], [
+                    ("POST", "/api/repos/pair1/refresh"), ("POST", "/api/repos/pair1/refresh"),
+                    ("GET", "/api/repos/repo1/import/status"),
+                ])
+
+    def test_unusable_poll_settings_are_rejected_before_submission(self):
+        server = self.start(lambda _r: (404, {"error": "unexpected request"}))
+        for field, values in (
+            ("poll_attempts", (0, -1)),
+            ("poll_interval", (-1, float("nan"), float("inf"), 1e200)),
+            ("timeout", (0, -1, float("nan"), float("inf"), 1e200)),
+        ):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    result = self.run_client(server, "execute", **{field: value})
+                    self.assertEqual(result["outcome"], f"invalid_{field}", result)
+                    self.assertFalse(result["ok"])
+                    self.assertFalse(result["execute_requested"])
+                    self.assertNotEqual(result["exit_code"], client.EXIT_OK)
+                    self.assertEqual(server.records, [])
+
+    def test_latest_import_progress_is_not_a_named_operation(self):
+        server = self.start(lambda _r: (200, payload))
+        for phase in ("idle", "importing", "completed"):
+            with self.subTest(phase=phase):
+                # Progress is returned even when latest_import_operation is absent.
+                payload = {"phase": phase, "current_rev": 0, "total_revs": 0, "can_start": phase == "idle"}
+                latest = self.run_client(server, "status", operation_kind="import")
+                self.assertTrue(latest["ok"], latest)
+                self.assertIsNone(latest["operation_id"])
+                self.assertIsNone(latest["lifecycle"])
+                self.assertEqual(latest["status"]["phase"], phase)
+                named = self.run_client(server, "status", operation_kind="import", operation_id="wanted")
+                self.assertFalse(named["ok"], named)
+                self.assertNotEqual(named["exit_code"], client.EXIT_OK)
+        self.assertEqual([(r["method"], r["path"]) for r in server.records],
+                         [("GET", "/api/repos/repo1/import/status")] * 6)
+
+    def test_submitted_refresh_polls_its_own_v2_request(self):
+        path = "/api/v2/repos/pair1/refresh/requests/request-71"
+        receipt = {"version": 2, "request_id": "request-71", "operation_id": REFRESH_OP,
+                   "child_id": "pair1", "parent_id": "repo1", "phase": "no_op",
+                   "svn_revision": None, "git_sha": None}
+
+        def respond(record):
+            if record["method"] == "GET":
+                return 200, {**receipt, "request_id": returned_request}
+            if json.loads(record["body"])["execute"]:
+                return 200, {"request_id": "request-71", "operation_id": REFRESH_OP,
+                             "lifecycle": "queued", "status_path": path, "durable_job_started": True}
+            return 200, plan(approval={"eligible": True, "binds_to": "plan_digest"}, execute_status="READY")
+
+        server = self.start(respond)
+        for returned_request, expected in (("request-71", "no_op"), ("other-request", "wrong_request")):
+            with self.subTest(request=returned_request):
+                server.records.clear()
+                result = self.run_client(server, "execute")
+                self.assertEqual(result["outcome"], expected, result)
+                self.assertEqual(result["ok"], expected == "no_op")
+                self.assertEqual(result["operation_id"], REFRESH_OP)
+                self.assertEqual([(r["method"], r["path"]) for r in server.records],
+                                 [("POST", "/api/repos/pair1/refresh")] * 2 + [("GET", path)])
+
+    def test_named_import_and_write_journals_require_the_returned_operation(self):
+        server = self.start(lambda _r: (200, payload))
+        for kind, suffix, evidence in (
+            ("import", "import/status", {"phase": "failed", "can_start": False}),
+            ("svn-commit", "svn-commit/wanted", {"operation_type": "git_to_svn_commit", "last_confirmed_svn_rev": 11}),
+            ("git-push", "git-push/wanted", {"operation_type": "svn_to_git_push", "last_confirmed_git_sha": PAIR_TIP}),
+        ):
+            for returned, state in (
+                ("wanted", "reconciliation_required"), ("other", "completed"),
+                (None, "completed"), ("wanted", None), ("wanted", "unknown"),
+            ):
+                with self.subTest(kind=kind, returned=returned, state=state):
+                    payload = dict(evidence)
+                    if returned is not None:
+                        payload["operation_id"] = returned
+                    if state is not None:
+                        payload["lifecycle"] = state
+                    server.records.clear()
+                    result = self.run_client(server, "status", operation_kind=kind, operation_id="wanted")
+                    self.assertEqual([(r["method"], r["path"]) for r in server.records],
+                                     [("GET", f"/api/repos/repo1/{suffix}")])
+                    if returned == "wanted" and state == "reconciliation_required":
+                        self.assertTrue(result["ok"], result)
+                        self.assertTrue(result["needs_reconciliation"])
+                        self.assertEqual(result["lifecycle"], state)
+                    else:
+                        self.assertFalse(result["ok"], result)
+                        self.assertNotEqual(result["exit_code"], client.EXIT_OK)
+                        self.assertEqual(result["operation_id"], "wanted")
+                        self.assertNotIn("status", result)
+
+    def test_refresh_status_uses_request_lookup_and_checks_independent_pins(self):
+        receipt = {
+            "version": 2, "request_id": "refresh-request", "operation_id": REFRESH_OP,
+            "child_id": "pair1", "parent_id": "repo1",
+            "phase": "completed", "svn_revision": 12, "git_sha": PAIR_TIP,
+        }
+        server = self.start(lambda _r: (200, payload))
+        lookup = [("GET", "/api/v2/repos/pair1/refresh/requests/refresh-request")]
+        for phase, rev, sha in (
+            ("prepared", None, None), ("svn_observed", 12, None), ("git_observed", 12, PAIR_TIP),
+            ("completed", 12, PAIR_TIP), ("no_op", None, None),
+            ("cancelled_before_publication", None, None),
+        ):
+            with self.subTest(phase=phase):
+                payload = {**receipt, "phase": phase, "svn_revision": rev, "git_sha": sha}
+                server.records.clear()
+                result = self.run_client(server, "status", request_id="refresh-request",
+                                         operation_id=REFRESH_OP if phase == "completed" else None)
+                self.assertEqual([(r["method"], r["path"]) for r in server.records], lookup)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["request_id"], "refresh-request")
+                self.assertEqual(result["operation_id"], REFRESH_OP)
+                self.assertEqual(result["lifecycle"], phase)
+                self.assertEqual(result["status"]["phase"], phase)
+
+        for field, replacement in (
+            ("version", 1), ("request_id", "different-request"), ("child_id", "other-child"),
+            ("parent_id", "other-parent"), ("operation_id", "f140cc2f-4505-4849-bc80-827c8244fc95"),
+            ("phase", "imaginary"), ("phase", None), ("phase", "no_op"),
+            ("git_sha", None), ("svn_revision", None),
+        ):
+            with self.subTest(bad_field=field, value=replacement):
+                payload = {**receipt, field: replacement}
+                server.records.clear()
+                result = self.run_client(server, "status", request_id="refresh-request", operation_id=REFRESH_OP)
+                self.assertEqual([(r["method"], r["path"]) for r in server.records], lookup)
+                self.assertFalse(result["ok"], result)
+                self.assertNotEqual(result["exit_code"], client.EXIT_OK)
+                self.assertNotIn("status", result)
+
+        server.records.clear()
+        result = self.run_client(server, "status", operation_id=REFRESH_OP)
+        self.assertEqual(result["outcome"], "missing_request_id")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(server.records, [])
+
+    def test_named_receipt_not_found_does_not_fetch_a_plan_or_current_job(self):
+        server = self.start(lambda _r: (404, {"error": message}))
+        for kind, pins, route, message, expected in (
+            ("refresh", {"request_id": "known-request"}, "/api/v2/repos/pair1/refresh/requests/known-request",
+             "refresh request not found", "receipt_not_found"),
+            ("git-push", {"operation_id": "wanted"}, "/api/repos/repo1/git-push/wanted",
+             "svn-to-git push operation not found", "operation_not_found"),
+            ("svn-commit", {"operation_id": "wanted"}, "/api/repos/repo1/svn-commit/wanted",
+             "git-to-svn commit operation not found", "operation_not_found"),
+            ("git-push", {"operation_id": "wanted"}, "/api/repos/repo1/git-push/wanted",
+             "repository not found", "wrong_repo"),
+            ("svn-commit", {"operation_id": "wanted"}, "/api/repos/repo1/svn-commit/wanted",
+             "repository not found", "wrong_repo"),
+        ):
+            with self.subTest(kind=kind, error=message):
+                server.records.clear()
+                result = self.run_client(server, "status", operation_kind=kind, **pins)
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(result["outcome"], expected)
+                self.assertEqual(result["http_status"], 404)
+                self.assertEqual([(r["method"], r["path"]) for r in server.records], [("GET", route)])
+
+    def test_cli_accepts_distinct_refresh_ids_and_git_push_kind(self):
+        args = client.parse_args(["status", "--operation-kind", "refresh", "--request-id", "refresh-request",
+                                  "--operation-id", REFRESH_OP])
+        self.assertEqual((args["request_id"], args["operation_id"]), ("refresh-request", REFRESH_OP))
+        self.assertEqual(client.parse_args(["status", "--operation-kind", "git-push"])["operation_kind"], "git-push")
+        with patch.dict(os.environ, {"REPOSYNC_REQUEST_ID": "workflow-request",
+                                     "REPOSYNC_OPERATION_ID": REFRESH_OP}, clear=True):
+            args = client.parse_args(["status"])
+            self.assertEqual((args["request_id"], args["operation_id"]), ("workflow-request", REFRESH_OP))
 
     def test_authorized_import_status_and_cancel(self):
         def respond(record):
@@ -348,6 +567,40 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(cancelled["outcome"], "cancel_requested")
         self.assertTrue(all(item["authorization"] == f"Bearer {TOKEN}" for item in server.records))
 
+    def test_import_cancel_requires_a_matching_durable_reply(self):
+        server = self.start(lambda _r: (http, payload))
+        retained = {"ok": True, "operation_id": "wanted", "lifecycle": "completed",
+                    "message": "terminal outcome retained"}
+        for http, payload, expected in (
+            (200, retained, "completed"),
+            (200, {**retained, "lifecycle": "cancelled"}, "cancelled"),
+            (200, {**retained, "operation_id": "different"}, "wrong_operation"),
+            (200, {}, "invalid_response"),
+            (200, {"ok": True, "lifecycle": "cancel_requested"}, "invalid_response"),
+            (200, {"ok": True, "operation_id": "wanted"}, "invalid_response"),
+            (200, {"operation_id": "wanted", "lifecycle": "cancel_requested"}, "invalid_response"),
+            (200, {**retained, "lifecycle": "running"}, "invalid_response"),
+            (200, {**retained, "lifecycle": "made_up"}, "invalid_response"),
+            (200, {**retained, "error": "cancel refused"}, "invalid_response"),
+            (200, {**retained, "ok": False}, "invalid_response"),
+            (404, {"error": "repository not found"}, "wrong_repo"),
+            (404, {"error": "import operation not found for repository"}, "operation_not_found"),
+        ):
+            with self.subTest(http=http, body=payload):
+                server.records.clear()
+                result = self.run_client(server, "cancel", operation_kind="import", operation_id="wanted")
+                self.assertEqual(result["outcome"], expected, result)
+                self.assertEqual(result["http_status"], http)
+                self.assertEqual(result["operation_id"], "wanted")
+                success = expected in ("completed", "cancelled")
+                self.assertEqual(result["ok"], success)
+                self.assertEqual(result["exit_code"] == client.EXIT_OK, success)
+                if success:
+                    self.assertEqual(result["lifecycle"], expected)
+                    self.assertFalse(result["durable_job_started"])
+                self.assertEqual([(r["method"], r["path"]) for r in server.records],
+                                 [("POST", "/api/repos/repo1/import/wanted/cancel")])
+
     def test_reconciliation_required_is_visible(self):
         server = self.start(
             lambda record: (
@@ -381,7 +634,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "cancel_not_applicable")
         self.assertTrue(result["authenticated"])
         self.assertFalse(result["durable_job_started"])
-        self.assertIn("refresh_execute_not_implemented", result["message"])
+        self.assertIn("This client does not cancel refresh operations", result["message"])
         self.assertEqual([item["path"] for item in server.records], ["/api/auth/me"])
 
     def test_wrong_token(self):
@@ -583,6 +836,11 @@ class ClientTests(unittest.TestCase):
         ]
         body = "\n".join(code_lines)
         self.assertIn("workflow_dispatch:", body)
+        self.assertIn("      request_id:", body)
+        self.assertIn("          - git-push", body)
+        self.assertIn("REPOSYNC_REQUEST_ID: ${{ inputs.request_id }}", body)
+        self.assertIn("REPOSYNC_OPERATION_ID: ${{ inputs.operation_id }}", body)
+        self.assertIn("REPOSYNC_OPERATION_KIND: ${{ inputs.operation_kind }}", body)
         self.assertNotIn("pull_request", body)
         self.assertNotIn("\n  push:", "\n" + body)
         self.assertIn("contents: read", body)

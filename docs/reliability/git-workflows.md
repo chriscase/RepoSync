@@ -1,18 +1,16 @@
 # Git-centric RepoSync workflows
 
-This is the first slice of issue #71. It documents how to stay in Git and
-request RepoSync operations, and it adds an opt-in manual client. It does not
-close #71 or #61.
+Developers can work in Git and use RepoSync's manual client to request a
+preview, check a specific operation, or follow up when a repository is held.
 
 RepoSync is the authority for locking, provenance, checkpoints, cancellation,
 and recovery. GitHub Actions, a local script, and the web UI are clients. They
 call the authenticated HTTP API. They do not run `svn merge`, edit SQLite,
 delete remotes, or force-push.
 
-The session token is the same `Authorization: Bearer` token the UI sends.
-Refresh and late-pair routes require an admin session. Status and cancel
-require the initiating user or an admin. A missing, expired, or wrong token is
-rejected. Do not put the token in a URL, a log line, or a pull request.
+The client uses the same bearer session as the UI. The required role depends
+on the operation. The status table below lists who may read each record.
+Keep session tokens out of URLs, logs and pull requests.
 
 ## SVN-origin restriction
 
@@ -80,30 +78,23 @@ Content-Type: application/json
 }
 ```
 
-`dry_run` defaults to true. `dry_run: false` is a publish attempt and is
-refused with `publish_not_implemented`. This slice does not create the SVN
-branch, the child row, or a checkpoint. `auto_create_svn_branch` and
-`auto_create_git_branch` are ignored. The plan reports the pinned tips and
-whether the SVN-origin baseline was proved.
+This preview leaves the SVN branch, child registration and checkpoints
+untouched. The plan reports the pinned tips and whether RepoSync could
+prove the SVN-origin baseline. Publication is a separate operation with a
+durable journal. [Late-pair publication and recovery](contracts/67-late-pair-replay-publish.md)
 
 ## Requesting refresh
 
 `POST /api/repos/{pair_id}/refresh` with an admin bearer token is the same
 route the UI uses.
 
-| Request | Server result today |
-| --- | --- |
-| `{"operation":"update_pair_from_parent","execute":false}` | Preview. Pins both tips, the SVN revisions, and `plan_digest`. No durable job and no remote write. |
-| `execute: true` or `dry_run: false` | `refresh_execute_not_implemented`. No job is created. |
-| `operation` of `reanchor` or `recreate` | `reanchor_not_implemented`. |
-
-Issue #69 execution is not implemented. The manual client calls the preview
-route, checks the pins, and stops when the plan says execution is not
-approved. It does not invent an execute job. If a future server marks
-`approval.eligible` true and `execute_status` is not `NOT_IMPLEMENTED`, the
-client sends `execute: true` with the same token and idempotency key, then
-polls a same-origin status path only when that response includes one under
-`/api/` for the pinned repo or pair.
+A request with `execute: false` returns a read-only preview, including the
+current tips, SVN revisions and plan digest. The current v1 preview always
+marks execution ineligible, so the manual client's `execute` stops after
+checking those pins. RepoSync has a separate approval path for local Git
+directories and `file://` SVN repositories. Once the v2 service has a durable
+request, the manual client can read its receipt by ID.
+[Refresh execution contract](contracts/69-pair-refresh-execution-v2.md)
 
 Pin all of these on every preview:
 
@@ -121,19 +112,41 @@ with the same pins is sent again. If the digest moved, the client reports
 
 ## Checking status
 
-Refresh preview has no operation id. `status` with `operation_kind=refresh`
-repeats the authenticated preview and reports that plan. `durable_job_started`
-stays false.
+Use the repository's `scripts/git_operation_request.py` with your existing
+`REPOSYNC_BASE_URL` and `REPOSYNC_API_TOKEN`. Substitute the identifiers
+your RepoSync instance assigned.
 
-Durable operations that already exist are read with the same bearer token:
+| Kind | Record returned by the authenticated GET | Who can read it |
+| --- | --- | --- |
+| `import` | Latest import for `--repo-id`. Supply `--operation-id` to require that exact import. Without an ID the server can also return current progress with no durable operation. | Initiator or administrator, with administrator access required when no operation exists |
+| `svn-commit` | Git-to-SVN commit journal for `--repo-id` and `--operation-id` | Administrator |
+| `git-push` | SVN-to-Git push journal for `--repo-id` and `--operation-id` | Administrator |
+| `refresh` with `--request-id` | v2 receipt for that request on `--pair-id`. An optional `--repo-id` checks the parent, and an optional `--operation-id` checks the receipt's operation UUID. | Original actor with a current administrator session |
 
-| Kind | Route |
-| --- | --- |
-| Import | `GET /api/repos/{repo_id}/import/status` |
-| SVN commit | `GET /api/repos/{repo_id}/svn-commit/{operation_id}` |
+```sh
+python3 scripts/git_operation_request.py status --operation-kind import \
+  --repo-id "$repo" --operation-id "$import_op"
+python3 scripts/git_operation_request.py status --operation-kind git-push \
+  --repo-id "$repo" --operation-id "$push_op"
+python3 scripts/git_operation_request.py status --operation-kind refresh \
+  --repo-id "$parent" --pair-id "$child" --request-id "$request"
+```
 
-The client prints the lifecycle the server returned. It does not translate a
-transport error into success.
+For a named refresh, take the **request ID** from the original request.
+The operation UUID is a separate field. The GET looks up the v2 service's
+execution and no-op receipts. A local re-anchor returns its result directly
+and uses a different journal, so a 404 here cannot establish whether that
+re-anchor ran. With neither ID, refresh status
+repeats the read-only preview and requires its usual parent, child and
+idempotency key. A preview describes current inputs. A receipt reports the
+recorded phase of a specific request.
+
+A successful status read can report a failed, cancelled or held operation.
+Read the returned lifecycle or phase to determine the outcome. If a named
+import has been superseded, the latest-import route can no longer prove its
+state. The client exits nonzero for an identity mismatch, an invalid reply
+or a failed HTTP request. After an accepted submission, a failed poll also
+exits nonzero. Keep the accepted operation ID for a later status check.
 
 ## Responding to reconciliation-required
 
@@ -154,7 +167,7 @@ the branch from a laptop.
 Cancel is authenticated too. Import cancel is
 `POST /api/repos/{repo_id}/import/{operation_id}/cancel`. Refresh cancel
 checks the session at `GET /api/auth/me` and then reports
-`cancel_not_applicable`, because refresh execute never started a job.
+`cancel_not_applicable`. The manual client sends no refresh cancellation action.
 
 ## Manual client and workflow
 
@@ -172,9 +185,9 @@ python3 scripts/git_operation_request.py preview \
   --expected-parent-tip <sha>
 ```
 
-Use `execute`, `status`, or `cancel` as the subcommand. Pass
-`--operation-kind import` or `svn-commit` with `--operation-id` for those
-durable routes. `--git-branch` is compared with the JSON plan only. Values
+Use the status commands above to read durable operations. Use `cancel` with
+`--operation-kind import`, `--repo-id` and `--operation-id` to request import
+cancellation. `--git-branch` is compared with the JSON plan only. Values
 that contain shell metacharacters, a leading `-`, or `..` are rejected before
 any HTTP call.
 
@@ -196,8 +209,8 @@ chooses to enable the workflow should:
 Until those exist, dispatch has nowhere to send a token. This issue does not
 authorize creating the secrets, the environment, a runner, or a webhook.
 
-Refresh `execute` exits non-zero with `refresh_execute_not_implemented` while
-#69 execution is absent. A failed execute job is the honest result.
+An ineligible or unimplemented execute request exits nonzero with the
+server's refusal. Use the returned reason when deciding what to do next.
 
 ## Least privilege and redaction
 
@@ -280,5 +293,5 @@ with linked worktrees. That installer is not part of this change.
 - Auto-triggered refresh on push
 - Hook installation
 - Applying the branch-policy recommendation
-- Pair-refresh execution and re-anchor (#69)
+- Qualification of refresh outside the supported local scope of #69
 - Closing #71 or #61

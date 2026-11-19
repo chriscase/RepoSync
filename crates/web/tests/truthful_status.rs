@@ -141,6 +141,7 @@ token_env = ""
 
     let app = Router::new()
         .merge(api::status::routes())
+        .merge(api::repos::routes())
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -957,5 +958,133 @@ async fn rs199_timestamp_compatibility_preserves_unknown_and_missing_semantics()
             before_repo
         );
     }
+    server.abort();
+}
+
+#[tokio::test]
+async fn rs71_operator_status_reads_named_journals() {
+    use reposync_core::db::{
+        git_push_operations::GitPushIntent, svn_commit_operations::SvnCommitIntent,
+    };
+
+    let (addr, state, server, tmp) = status_fixture(&[
+        ("import", "idle"),
+        ("git-push", "idle"),
+        ("svn-commit", "idle"),
+    ])
+    .await;
+    let token = "rs71-fixture-admin";
+    actor_session(&state, token, "admin");
+    let actor = format!("actor-{token}");
+    let db = &state.db;
+    let sha = "a".repeat(40);
+    let tree = "b".repeat(40);
+    let old = db
+        .create_import_operation("import", &actor, "first", "target")
+        .unwrap();
+    db.start_import_operation("import", &old.id).unwrap();
+    db.note_import_local("import", &old.id, 1, &sha, 1, 1)
+        .unwrap();
+    db.begin_import_publication("import", &old.id, "refs/heads/main", &sha)
+        .unwrap();
+    db.confirm_import_publication("import", &old.id, &sha)
+        .unwrap();
+    db.complete_import_operation("import", &old.id, 1, &sha)
+        .unwrap();
+    let current = db
+        .create_import_operation("import", &actor, "second", "target")
+        .unwrap();
+    let push = db
+        .begin_svn_to_git_push(GitPushIntent {
+            repo_id: "git-push",
+            initiator_id: &actor,
+            request_id: "git-push",
+            target_fingerprint: "target",
+            source_svn_rev: 2,
+            source_svn_author: "fixture",
+            source_svn_message: "fixture",
+            pre_push_git_remote: "file:///fixture/git",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: &sha,
+            pre_push_git_tree: Some(&tree),
+            intended_local_git_sha: &"c".repeat(40),
+            intended_local_git_parent: Some(&sha),
+            intended_local_git_tree: &tree,
+        })
+        .unwrap();
+    db.hold_svn_to_git_reconciliation("git-push", &push.id, "fixture hold")
+        .unwrap();
+    let commit = db
+        .begin_git_to_svn_commit(SvnCommitIntent {
+            repo_id: "svn-commit",
+            initiator_id: &actor,
+            request_id: "svn-commit",
+            target_fingerprint: "target",
+            source_git_sha: &sha,
+            source_git_parent: None,
+            source_git_tree: &tree,
+            target_svn_uuid: "fixture-uuid",
+            target_svn_path: "file:///fixture/svn/trunk",
+            target_svn_root_url: "file:///fixture/svn",
+            target_svn_branch_path: "trunk",
+            pre_write_svn_rev: 1,
+            pre_write_svn_tree: &"d".repeat(64),
+            projection: "{}",
+            intended_changed_paths: vec![],
+            intended_svn_tree: &"e".repeat(64),
+            author: "fixture",
+            source_message: "fixture",
+        })
+        .unwrap();
+
+    let before = kv_snapshot(&state);
+    // Import exposes the latest operation at a repository-wide URL. A stale pin must
+    // fail even though its HTTP request succeeds and its original journal still exists.
+    for (kind, pin, outcome) in [
+        ("import", Some(&old.id), "wrong_operation"),
+        ("import", None, "queued"),
+        ("import", Some(&current.id), "queued"),
+        ("git-push", Some(&push.id), "reconciliation_required"),
+        ("svn-commit", Some(&commit.id), "running"),
+    ] {
+        let expected_id = pin.unwrap_or(&current.id);
+        let expected_code = if outcome == "wrong_operation" { 3 } else { 0 };
+        let mut cmd = tokio::process::Command::new("python3");
+        cmd.env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("REPOSYNC_API_TOKEN", token)
+            .current_dir(tmp.path())
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../scripts/git_operation_request.py"
+            ))
+            .args(["status", "--allow-insecure-http", "--timeout", "5"])
+            .args(["--base-url", &format!("http://{addr}")])
+            .args(["--operation-kind", kind, "--repo-id", kind]);
+        if let Some(id) = pin {
+            cmd.args(["--operation-id", id]);
+        }
+        let output = cmd.output().await.unwrap();
+        let result: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "invalid {kind} status JSON: {e}, stderr: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        assert_eq!(output.status.code(), Some(expected_code), "{result}");
+        assert_eq!(result["outcome"], outcome);
+        assert_eq!(result["operation_id"], expected_id.as_str());
+        assert_eq!(result["http_status"], 200);
+        assert_eq!(result["ok"], expected_code == 0);
+        if expected_code == 0 {
+            assert_eq!(result["status"]["operation_id"], expected_id.as_str());
+            assert_eq!(result["status"]["lifecycle"], outcome);
+        } else {
+            assert!(result.get("status").is_none());
+        }
+    }
+    assert_eq!(kv_snapshot(&state), before);
+    assert!(!tmp.path().join(".reposync/operation-journal.json").exists());
     server.abort();
 }

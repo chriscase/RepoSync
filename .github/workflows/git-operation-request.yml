@@ -22,16 +22,16 @@ on:
           - status
           - cancel
       repo_id:
-        description: "Pinned parent repository id"
+        description: "Repository id, or the parent id for a refresh"
         required: true
         type: string
       pair_id:
-        description: "Pinned child pair id"
-        required: true
+        description: "Child pair id for a refresh"
+        required: false
         type: string
       idempotency_key:
-        description: "Idempotency key bound to this pin set"
-        required: true
+        description: "Required for a refresh preview or execute request"
+        required: false
         type: string
       expected_plan_digest:
         description: "Pinned plan digest; required for execute"
@@ -46,11 +46,15 @@ on:
         required: false
         type: string
       operation_id:
-        description: "Durable operation id for import or svn-commit status/cancel"
+        description: "Operation id to match against the server record"
+        required: false
+        type: string
+      request_id:
+        description: "Request id for a recorded v2 refresh receipt"
         required: false
         type: string
       operation_kind:
-        description: "refresh, import, or svn-commit"
+        description: "Operation to look up (git-push supports status only)"
         required: true
         type: choice
         default: refresh
@@ -58,6 +62,7 @@ on:
           - refresh
           - import
           - svn-commit
+          - git-push
 
 permissions:
   contents: read
@@ -91,6 +96,7 @@ jobs:
           REPOSYNC_EXPECTED_PAIR_TIP: ${{ inputs.expected_pair_tip }}
           REPOSYNC_EXPECTED_PARENT_TIP: ${{ inputs.expected_parent_tip }}
           REPOSYNC_OPERATION_ID: ${{ inputs.operation_id }}
+          REPOSYNC_REQUEST_ID: ${{ inputs.request_id }}
           REPOSYNC_OPERATION_KIND: ${{ inputs.operation_kind }}
           REPOSYNC_REQUEST_JOURNAL: ${{ runner.temp }}/operation-journal.json
           REPOSYNC_POLL_INTERVAL: "2"
