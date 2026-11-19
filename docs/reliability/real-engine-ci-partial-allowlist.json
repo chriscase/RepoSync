@@ -7,7 +7,7 @@
     "R17_SVNSERVE_NOTIFICATION_ISOLATION"
   ],
   "rationale": {
-    "R01_SVNSERVE_POST_WRITE_RECOVERY": "Simulated checkpoint/mapping loss after SVN→Git hits conflicting_import_checkpoint; #64/#23 post-write recovery on svnserve remains open.",
+    "R01_SVNSERVE_POST_WRITE_RECOVERY": "The historical drill rewinds the repository checkpoint and removes its applied SVN→Git receipt. Recovery remains held with ambiguous_checkpoint because the legacy Git cursor lacks scoped provenance.",
     "R16_SVNSERVE_SVN_REMOTE_RECREATION": "Recreated loopback svnserve UUID at the same URL may still complete a cycle without blocking; checkpoint/mapping evidence recorded as PARTIAL when not blocked.",
     "R17_SVNSERVE_NOTIFICATION_ISOLATION": "SyncEngine does not read per-repo teams_webhook_url or deliver Notifier events on svnserve cycles; only webhook-field persistence and sync_status/audit confinement are observed."
   }
