@@ -39,6 +39,9 @@ jobs:
       - name: Git operation request client
         run: python3 scripts/test_git_operation_request.py
 
+      - name: Paired branch hooks in disposable Git repositories
+        run: python3 scripts/test_paired_branch_hooks.py -v NativeHookTests
+
       - name: Check formatting
         run: cargo fmt --check
 

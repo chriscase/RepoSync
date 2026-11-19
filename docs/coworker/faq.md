@@ -28,7 +28,7 @@ nothing here was observed on a running installation.
 | Re-anchor / recreate a pair | **Not implemented** (`reanchor_not_implemented`) | [Refresh](refresh.md), [Rewrites](history-rewrites-and-svn-merges.md) |
 | Automatic or push-triggered refresh | **Held / planned**; no safe auto-refresh is described or claimed | [Refresh](refresh.md) |
 | Opt-in manual request workflow and client | **Held** in this documentation lane | [Held and unavailable](held-and-unavailable.md) |
-| Hook installer / remover | **Held**; none exists | [Branch policy and hooks](branch-policy-and-hooks.md) |
+| Hook installer / remover | **Opt-in on the reliability branch** for one clone and its linked worktrees | [Preview, install and remove](../reliability/git-workflows.md#local-hooks) |
 | Branch rules for paired refs | **Recommendation only**; nothing applied | [Branch policy and hooks](branch-policy-and-hooks.md#recommendation-for-paired-refs) |
 | Downloadable Git `pre-commit` path-rule script | **In tree** | [Branch policy and hooks](branch-policy-and-hooks.md) |
 | A passing live qualification of any of the above | **Not claimed** | [Evidence](#what-evidence-exists-and-where-it-stops) |
@@ -47,9 +47,9 @@ pre-receive barrier. See [Branch policy](branch-policy-and-hooks.md#push-trigger
 
 ### Can a local Git hook stop it?
 
-Only on the machine that installed it, and only until someone passes `--no-verify`,
-changes `core.hooksPath`, uses a clone without the hook, or uses a tool that does
-not run it. It is a seatbelt, not a lock. See [Local hooks](branch-policy-and-hooks.md#local-hooks-useful-nudges-not-enforcement).
+The checks run in worktrees of the opted-in clone. A developer can bypass
+local hooks, use a different clone, or publish with another client. Only
+the host can apply a rule to pushes from every client. [Local checks and limits](../reliability/git-workflows.md#local-hooks)
 
 ### What can actually prevent it?
 
