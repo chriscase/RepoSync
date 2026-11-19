@@ -17,7 +17,7 @@ A scenario may be marked **PARTIAL** when named subcases pass and required issue
 
 ### Real-engine CI gate (loopback svnserve)
 
-`scripts/real-engine-scenario-suite.sh` still exits `3` whenever the rollup is **PARTIAL** so local runs stay honest. GitHub Actions runs `python3 scripts/real-engine-scenario-report.py ci-gate` on the emitted `artifacts/real-engine-scenarios/*/summary.json` afterward. The gate passes only when every scenario is **PASS**, or **PARTIAL** with an id listed in `docs/reliability/real-engine-ci-partial-allowlist.json` (today the two loopback R16 svnserve unreachable cases). Any **FAIL**, any **NOT RUN**, or any **PARTIAL** not on that allowlist keeps Build & Test red. Checker fixtures: `python3 scripts/real-engine-scenario-report.py self-test`.
+`scripts/real-engine-scenario-suite.sh` still exits `3` whenever the rollup is **PARTIAL** so local runs stay honest. GitHub Actions runs `python3 scripts/real-engine-scenario-report.py ci-gate` on the emitted `artifacts/real-engine-scenarios/*/summary.json` afterward. The gate passes only when every scenario is **PASS**, or **PARTIAL** with an ID in the [CI partial allowlist](real-engine-ci-partial-allowlist.json). Both R16 remote-unreachable scenarios must report **PASS**. Any **FAIL**, any **NOT RUN**, or any **PARTIAL** not on that allowlist keeps Build & Test red. Checker fixtures: `python3 scripts/real-engine-scenario-report.py self-test`.
 
 The deployed executable/schema is **NOT ESTABLISHED**. No live acceptance is authorized from this matrix.
 
