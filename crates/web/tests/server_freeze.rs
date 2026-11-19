@@ -202,30 +202,36 @@ struct TestServerGuard {
 
 impl TestServerGuard {
     fn abort(mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> Result<(), &'static str> {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
-        if let Some(thread) = self.thread.take() {
-            const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-            std::thread::spawn(move || {
-                let _ = thread.join();
-                let _ = done_tx.send(());
-            });
-            if done_rx.recv_timeout(JOIN_TIMEOUT).is_err() {
-                // Join did not finish in time; detach rather than hang Drop/abort.
-            }
-        }
+        let thread = self.thread.take().ok_or("server join handle unavailable")?;
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = done_tx.send(thread.join().map_err(|_| "server thread panicked"));
+            })
+            .map_err(|_| "could not start server join observer")?;
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                    "server thread did not join within five seconds"
+                }
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    "server join observer disconnected"
+                }
+            })?
     }
 }
 
 impl Drop for TestServerGuard {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 

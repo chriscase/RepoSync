@@ -96,6 +96,25 @@ impl App {
         }
     }
 
+    fn shutdown(self, mut server: TestServerGuard, tmp: &mut Option<TempDir>, stage: &str) {
+        let state = Arc::downgrade(&self.state);
+        drop(self); // Close the HTTP client before waiting for graceful shutdown.
+        let stopped = server.stop().and_then(|()| {
+            if state.upgrade().is_some() {
+                Err("old AppState is still owned")
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = stopped {
+            let path = tmp.take().unwrap().keep();
+            panic!(
+                "R04 {stage} shutdown failed: {error}; retained fixture at {}",
+                path.display()
+            );
+        }
+    }
+
     // The caller owns this server and tempdir throughout observation. Preserve the
     // fixture even if an HTTP failure occurs before the worker handle is registered.
     async fn run<T, F>(&self, tmp: &mut Option<TempDir>, check: impl FnOnce(Self) -> F) -> T
@@ -338,22 +357,20 @@ async fn published_prefix_resumes_after_restart() {
     let mut tmp = Some(tmp);
     let app = App::new(&case, addr, state);
     let (id, held) = app.run(&mut tmp, App::first_publication).await;
-    server.abort();
-    drop(app);
+    app.shutdown(server, &mut tmp, "held import");
 
     let (addr, state, server) = reopen(&case.root).await;
     let app = App::new(&case, addr, state);
     let op = id.clone();
     let receipts = app.run(&mut tmp, |app| app.resume(op, held)).await;
-    server.abort();
-    drop(app);
+    app.shutdown(server, &mut tmp, "completed import");
 
     let (addr, state, server) = reopen(&case.root).await;
     let app = App::new(&case, addr, state);
     let before_restart = receipts["completed"].clone();
     app.run(&mut tmp, |app| app.quiet(id.clone(), before_restart))
         .await;
-    server.abort();
+    app.shutdown(server, &mut tmp, "cold verification");
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         json!({
