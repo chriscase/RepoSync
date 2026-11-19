@@ -382,6 +382,16 @@ async fn upgrade_resumes_one_attributable_legacy_pr_member() {
     qualify_pr_backlog(BacklogCase::UpgradePrefix).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_personal_scan_accepts_proven_rebased_members() {
+    qualify_pr_backlog(BacklogCase::Rebase).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewritten_provider_shas_hold_before_first_svn_revision() {
+    qualify_pr_backlog(BacklogCase::RebaseOriginalIds).await;
+}
+
 #[derive(PartialEq, Eq)]
 enum BacklogCase {
     Restart,
@@ -391,6 +401,8 @@ enum BacklogCase {
     OuterResolution,
     PreviouslyPublishedSibling,
     UpgradePrefix,
+    Rebase,
+    RebaseOriginalIds,
 }
 
 async fn qualify_pr_backlog(case: BacklogCase) {
@@ -453,6 +465,115 @@ async fn qualify_pr_backlog(case: BacklogCase) {
         );
         provider.join().unwrap();
     }
+    if matches!(case, BacklogCase::Rebase | BacklogCase::RebaseOriginalIds) {
+        git_cmd(&git, &["checkout", "-b", "topic"]);
+        let first = add_file(&git, "one.txt", "one\n", "First PR member");
+        let second = add_file(&git, "two.txt", "two\n", "Second PR member");
+        git_cmd(&git, &["checkout", "main"]);
+        let mut landed = Vec::new();
+        for sha in [&first, &second] {
+            let result = std::process::Command::new("git")
+                .current_dir(&git)
+                .env("GIT_COMMITTER_DATE", "2002-01-01T00:00:00Z")
+                .args(["cherry-pick", sha])
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            landed.push(git_sha(&git));
+        }
+        assert_ne!(landed[0], first);
+        assert_ne!(landed[1], second);
+        git_cmd(&git, &["push", "origin", "main"]);
+        let offered: [&str; 2] = if case == BacklogCase::Rebase {
+            [&landed[0], &landed[1]]
+        } else {
+            [&first, &second]
+        };
+        let (api, provider) = pr_provider(
+            &git,
+            &[("topic", &landed[1], &offered)],
+            Arc::new(Mutex::new(ProviderView::Complete)),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        let open = |api: &str| {
+            let mut config = config.clone();
+            config.github.api_url = api.to_owned();
+            PersonalSyncEngine::new(
+                config,
+                Database::new(&path).unwrap(),
+                svn.clone(),
+                GitClient::new(&git).unwrap(),
+                github(api),
+            )
+        };
+        let engine = open(&api);
+        let result = engine.run_cycle().await.unwrap();
+        let db = Database::new(&path).unwrap();
+        if case == BacklogCase::RebaseOriginalIds {
+            assert_eq!((result.prs_processed, result.git_to_svn_count), (0, 0));
+            assert_mappings(&db, "git_to_svn", &[]);
+            assert_eq!(svn_youngest(&url), 1);
+            let reason:String=db.conn().query_row("SELECT details FROM audit_log WHERE action='git_to_svn_rebase_span' ORDER BY id DESC LIMIT 1",[],|r|r.get(0)).unwrap();
+            assert!(reason.contains("landed first-parent SHAs"));
+            assert!(db
+                .unfinished_personal_prs()
+                .unwrap()
+                .contains(&(1, landed[1].clone())));
+            provider.abort();
+            return;
+        }
+        assert_eq!(
+            (result.prs_processed, result.git_to_svn_count),
+            (1, 2),
+            "a contiguous rebase is one PR"
+        );
+        assert_mappings(&db, "git_to_svn", &[(2, &landed[0]), (3, &landed[1])]);
+        assert_eq!(svn_tree(&svn, 2).await, git_tree(&bare, &landed[0]));
+        assert_eq!(svn_tree(&svn, 3).await, git_tree(&bare, &landed[1]));
+        provider.abort();
+        let later = add_file(&git, "three.txt", "three\n", "Later PR");
+        git_cmd(&git, &["push", "origin", "main"]);
+        let (api, provider) = pr_provider(
+            &git,
+            &[
+                ("topic", &landed[1], &offered),
+                ("later", &later, &[&later]),
+            ],
+            Arc::new(Mutex::new(ProviderView::Complete)),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        let engine = open(&api);
+        let next = engine.run_cycle().await.unwrap();
+        assert_eq!(
+            (next.prs_processed, next.git_to_svn_count),
+            (1, 1),
+            "later PR after completed rebase"
+        );
+        assert_mappings(
+            &db,
+            "git_to_svn",
+            &[(2, &landed[0]), (3, &landed[1]), (4, &later)],
+        );
+        assert_eq!(svn_tree(&svn, 4).await, git_tree(&bare, &later));
+        let quiet = engine.run_cycle().await.unwrap();
+        assert_eq!((quiet.prs_processed, quiet.git_to_svn_count), (0, 0));
+        let failures: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM audit_log WHERE success=0", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(failures, 0);
+        assert_eq!(svn_youngest(&url), 4);
+        provider.abort();
+        return;
+    }
     let snapshot = git_sha(&git);
     if case == BacklogCase::InboundAtCap {
         svn_commit_file(
@@ -508,6 +629,11 @@ async fn qualify_pr_backlog(case: BacklogCase) {
         if case == BacklogCase::ConflictingSiblings {
             std::fs::write(git.join("shared.txt"), "right value\n").unwrap();
             git_cmd(&git, &["add", "--", "shared.txt"]);
+        }
+        if case == BacklogCase::UpgradePrefix {
+            // Y subsumes X's bytes. Tree equality alone cannot assign X's SVN revision.
+            std::fs::write(git.join("left.txt"), "left\n").unwrap();
+            git_cmd(&git, &["add", "--", "left.txt"]);
         }
         let right = add_file(&git, "right.txt", "right\n", "Right change");
         git_cmd(&git, &["checkout", "feature"]);

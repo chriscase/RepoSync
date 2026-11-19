@@ -206,7 +206,13 @@ Still required before claiming #66:
   its current SVN revision and exported tree match the latest confirmed unlinked
   journal, and the original worker audit attributes that revision and SHA to the PR.
   The matching scoped mapping and applied receipt remain required. Missing proof,
-  multiple unlinked prefix revisions or intervening SVN revisions require inspection.
+  multiple unlinked prefix revisions or intervening SVN revisions require inspection,
+  even if later members would mask a missing revision in the final tree.
+- For a multi-commit rebase, Personal can attribute contiguous first-parent steps
+  when the provider returns the exact landed SHAs. A later PR can cross those
+  confirmed steps. When only the original, rewritten SHAs are returned, Personal
+  holds before writing the first member. The original SHA and the landed SHA
+  need distinct provenance before that case can be resumed safely.
   The Team 1,001-commit qualification uses its own continuation mechanism.
 
 Assert zero unwanted remote changes and stable checkpoints on rejection, and

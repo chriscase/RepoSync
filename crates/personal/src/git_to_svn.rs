@@ -65,6 +65,13 @@ pub struct GitToSvnResult {
     pub prs_failed: u64,
 }
 
+struct OrderedPr {
+    pr: PullRequest,
+    // First-parent interior directly preceding a one-parent PR tip; prove
+    // this against the PR member list when the PR reaches the queue front.
+    interior: Vec<String>,
+}
+
 /// Syncs merged PR commits from Git back to SVN.
 pub struct GitToSvnSync {
     svn: SvnClient,
@@ -201,7 +208,7 @@ impl GitToSvnSync {
         prs: Vec<PullRequest>,
         admitted: &HistoryInspectAdmission,
         truncated: bool,
-    ) -> Result<Vec<PullRequest>> {
+    ) -> Result<Vec<OrderedPr>> {
         if prs.is_empty() && !truncated {
             return Ok(Vec::new());
         }
@@ -236,32 +243,53 @@ impl GitToSvnSync {
             }
         }
         let mut newest_first = Vec::new();
+        let mut contiguous_linear = false;
         while (truncated || !pending.is_empty() || !newest_first.is_empty())
             && cursor.id() != anchor.id()
         {
             if let Some(pr) = pending.remove(&cursor.id()) {
-                newest_first.push(pr);
+                contiguous_linear = cursor.parent_count() == 1;
+                newest_first.push(OrderedPr {
+                    pr,
+                    interior: Vec::new(),
+                });
             } else if (truncated || !newest_first.is_empty())
                 && !self.db.is_personal_pr_synced(&cursor.id().to_string())?
             {
                 // A direct, confirmed SVN-origin push also accounts for one step.
                 // An unknown commit could be an omitted earlier PR.
-                if cursor.parent_count() != 1
-                    || !self.db.is_confirmed_personal_push(
+                let ordinary = cursor.parent_count() == 1
+                    && self.db.is_confirmed_personal_push(
                         &self.default_branch,
                         &cursor.id().to_string(),
                         &cursor.tree_id().to_string(),
                         &cursor.parent_id(0)?.to_string(),
-                    )?
+                    )?;
+                if ordinary
+                    || self
+                        .db
+                        .is_completed_personal_pr_member(&cursor.id().to_string())?
                 {
-                    if truncated {
-                        return Err(GitHubError::IncompletePrDiscovery.into());
-                    }
+                    contiguous_linear = false;
+                } else if contiguous_linear && cursor.parent_count() == 1 {
+                    let member = newest_first
+                        .last_mut()
+                        .context("missing PR for its linear span")?;
+                    anyhow::ensure!(
+                        member.interior.len() < 99,
+                        "incomplete single-page rebase span"
+                    );
+                    member.interior.push(cursor.id().to_string());
+                } else if truncated {
+                    return Err(GitHubError::IncompletePrDiscovery.into());
+                } else {
                     anyhow::bail!(
                         "unaccounted first-parent commit {} before a discovered Personal PR",
                         cursor.id()
                     );
                 }
+            } else {
+                contiguous_linear = false;
             }
             if cursor.parent_count() == 0 {
                 anyhow::bail!(
@@ -358,12 +386,13 @@ impl GitToSvnSync {
         self.ensure_svn_working_copy()
             .await
             .context("failed to ensure SVN working copy")?;
-        for pr in &ordered {
+        for work in &ordered {
+            let pr = &work.pr;
             let merge_sha = pr
                 .merge_commit_sha
                 .as_deref()
                 .context("missing ordered PR merge SHA")?;
-            match self.sync_pr(pr, merge_sha).await {
+            match self.sync_pr(pr, merge_sha, &work.interior).await {
                 Ok(commit_count) => {
                     result.commits_synced += commit_count;
                     result.prs_synced += 1;
@@ -417,7 +446,7 @@ impl GitToSvnSync {
     #[doc(hidden)]
     #[allow(dead_code)]
     pub async fn sync_pr_for_test(&self, pr: &PullRequest, merge_sha: &str) -> Result<u64> {
-        self.sync_pr(pr, merge_sha).await
+        self.sync_pr(pr, merge_sha, &[]).await
     }
 
     fn commit_needs_replay(&self, commit: &GitHubCommit) -> Result<bool> {
@@ -559,7 +588,7 @@ impl GitToSvnSync {
     ///
     /// Returns the number of commits successfully replayed.
     #[instrument(skip(self, pr), fields(pr_number = pr.number, merge_sha = %merge_sha))]
-    async fn sync_pr(&self, pr: &PullRequest, merge_sha: &str) -> Result<u64> {
+    async fn sync_pr(&self, pr: &PullRequest, merge_sha: &str, interior: &[String]) -> Result<u64> {
         let pr_branch = &pr.head.ref_name;
 
         // A later poll must still account for this exact queue entry if fetching
@@ -582,6 +611,26 @@ impl GitToSvnSync {
             .context("failed to fetch PR commits")?;
         let merge_strategy = self.detect_merge_strategy(pr, &commits).await;
         let shas: Vec<_> = commits.iter().map(|commit| commit.sha.as_str()).collect();
+        if !interior.is_empty()
+            && !interior
+                .iter()
+                .rev()
+                .map(String::as_str)
+                .chain(std::iter::once(merge_sha))
+                .eq(shas.iter().copied())
+        {
+            let reason = "Personal rebase membership differs from the landed first-parent SHAs; inspect the source and destination history before replay";
+            self.db.insert_audit_log(
+                "git_to_svn_rebase_span",
+                Some("git_to_svn"),
+                None,
+                Some(merge_sha),
+                None,
+                Some(reason),
+                false,
+            )?;
+            anyhow::bail!(reason);
+        }
         let unlinked = self
             .verified_unlinked_first_revision(sync_id, merge_sha, &shas)
             .await?;

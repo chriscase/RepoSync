@@ -335,6 +335,21 @@ impl Database {
             params![id,sha,rev,count as i64,PERSONAL_SCOPE_KEY], |row|row.get(0))?)
     }
 
+    /// A completed PR's verified applied member can account for an interior
+    /// commit of its exact landed first-parent span on a later scan.
+    pub fn is_completed_personal_pr_member(&self, sha: &str) -> Result<bool, DatabaseError> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM commit_map m JOIN sync_records r
+             ON m.repo_id=r.repo_id AND m.git_sha=r.git_sha AND m.svn_rev=r.svn_rev
+             JOIN kv_state d ON d.key GLOB 'git_to_svn_commit_v1:document:*'
+             JOIN pr_sync_log p ON p.id=json_extract(d.value,'$.personal_pr_sync_id')
+             WHERE m.repo_id=?1 AND m.git_sha=?2 AND m.direction='git_to_svn'
+             AND r.status='applied' AND r.direction=m.direction AND p.status='completed'
+             AND json_extract(d.value,'$.state')='completed' AND json_extract(d.value,'$.repo_id')=m.repo_id
+             AND json_extract(d.value,'$.source_git_sha')=m.git_sha AND json_extract(d.value,'$.last_confirmed_svn_rev')=m.svn_rev)",
+            params![PERSONAL_SCOPE_KEY,sha], |r|r.get(0))?)
+    }
+
     /// Source members this exact PR already wrote. Earlier PRs may have mapped
     /// the same Git SHA and must not count as members applied in this PR.
     pub fn confirmed_personal_pr_members(
@@ -435,6 +450,31 @@ impl Database {
                 return Err(DatabaseError::Other(
                     "Personal PR commit list changed since its first complete observation".into(),
                 ));
+            }
+            if count > 0 && pinned.is_none() {
+                // The old engine did not persist its range or ordered digest.
+                // A later member can mask missing attribution in the final tree.
+                for (index, sha) in shas.iter().enumerate() {
+                    if index==0 && legacy_first_revision.is_some() { continue; }
+                    let ambiguous: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM (
+                         SELECT repo_id,svn_rev,git_sha FROM commit_map WHERE git_sha=?2 AND direction='git_to_svn'
+                         UNION SELECT repo_id,svn_rev,git_sha FROM sync_records WHERE git_sha=?2 AND direction='git_to_svn' AND status='applied'
+                         ) m WHERE (m.repo_id=?1 OR m.repo_id IS NULL OR (m.repo_id='personal' AND NOT EXISTS(SELECT 1 FROM repositories WHERE id='personal')))
+                         AND NOT EXISTS(
+                         SELECT 1 FROM kv_state d JOIN pr_sync_log other
+                           ON other.id=json_extract(d.value,'$.personal_pr_sync_id')
+                         WHERE d.key GLOB 'git_to_svn_commit_v1:document:*'
+                         AND json_extract(d.value,'$.repo_id')=m.repo_id
+                         AND json_extract(d.value,'$.source_git_sha')=m.git_sha
+                         AND json_extract(d.value,'$.last_confirmed_svn_rev')=m.svn_rev
+                         AND json_extract(d.value,'$.state')='completed'
+                         AND other.id<>?3 AND other.status='completed'))",
+                        params![PERSONAL_SCOPE_KEY, sha,id], |row|row.get(0))?;
+                    if ambiguous {
+                        return Err(DatabaseError::Other("unattributed mapped member in legacy pending Personal PR".into()));
+                    }
+                }
             }
             if let Some(rev) = legacy_first_revision {
                 if !Self::legacy_personal_pr_prefix_matches_tx(tx,id,shas[0],rev,shas.len())? {
