@@ -3715,13 +3715,13 @@ pub struct RepositorySettingsUpdate {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present_nullable_string"
     )]
-    allowed_paths: Option<Option<String>>,
+    pub allowed_paths: Option<Option<String>>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present_nullable_string"
     )]
-    blocked_patterns: Option<Option<String>>,
+    pub blocked_patterns: Option<Option<String>>,
 }
 
 impl RepositorySettingsUpdate {
