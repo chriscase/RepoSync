@@ -5,10 +5,11 @@
 //! SVN with metadata trailers (Git SHA, PR number, branch) for traceability
 //! and echo suppression.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use reposync_core::errors::SvnError;
+use reposync_core::errors::{GitHubError, SvnError};
 
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, instrument, warn};
@@ -25,7 +26,9 @@ use reposync_core::echo_suppression::{
 use reposync_core::file_policy::{FilePolicy, FilePolicyDecision};
 use reposync_core::git::github::{GitHubClient, GitHubCommit, PullRequest};
 use reposync_core::git::GitClient;
-use reposync_core::history_inspect::inspect_personal_history_with_http_auth;
+use reposync_core::history_inspect::{
+    inspect_personal_history_with_http_auth, HistoryInspectAdmission,
+};
 use reposync_core::path_projection::{
     project_git_to_svn_changeset, svn_path_identity, GitToSvnInputChange,
     ProjectedGitToSvnChangeset,
@@ -177,16 +180,7 @@ impl GitToSvnSync {
         Ok(())
     }
 
-    /// Run a full Git-to-SVN sync cycle.
-    ///
-    /// 1. Ensure the SVN working copy is checked out.
-    /// 2. Fetch recently merged PRs from GitHub.
-    /// 3. Skip any PRs whose merge SHA is already recorded in `pr_sync_log`.
-    /// 4. For each unsynced PR, replay its commits into the SVN working copy.
-    /// 5. Record results in `pr_sync_log` and `commit_map`.
-    ///
-    /// Returns a summary of what was synced.
-    fn ensure_personal_history_admitted(&self) -> Result<()> {
+    fn ensure_personal_history_admitted(&self) -> Result<HistoryInspectAdmission> {
         let http_auth_token = self.personal_history_http_auth();
         inspect_personal_history_with_http_auth(
             &self.db,
@@ -196,8 +190,61 @@ impl GitToSvnSync {
             http_auth_token.as_deref(),
             self.http_auth_token.as_deref(),
         )
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!(e))
+        .map_err(|e| anyhow::anyhow!(e))?
+        .context("missing Personal history admission")
+    }
+
+    /// Default-branch first-parent order is the order in which PRs landed.
+    /// Provider update order and merge wall clocks do not establish ancestry.
+    fn ordered_prs(&self, prs: Vec<PullRequest>, remote_tip: &str) -> Result<Vec<PullRequest>> {
+        if prs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The legacy Personal import watermark is authoritative only in a
+        // Personal database. Never borrow a global cursor from managed pairs.
+        self.db.require_legacy_import_watermarks_available()?;
+        let baseline = self
+            .db
+            .get_watermark("git_sha")?
+            .context("Personal PR replay needs the original import Git baseline")?;
+        let git = GitClient::new(&self.git_repo_path)?;
+        let repo = git.repo();
+        let anchor = repo.find_commit(baseline.parse()?)?;
+        let mut cursor = repo.find_commit(remote_tip.parse()?)?;
+        let mut pending = HashMap::new();
+        for pr in prs {
+            let sha = pr
+                .merge_commit_sha
+                .as_deref()
+                .context("merged PR is missing its merge SHA")?;
+            let oid = sha.parse()?;
+            if oid == anchor.id() || repo.graph_descendant_of(anchor.id(), oid)? {
+                continue;
+            }
+            if !repo.graph_descendant_of(oid, anchor.id())? {
+                anyhow::bail!("PR merge is unrelated to the Personal import baseline");
+            }
+            if pending.insert(oid, pr).is_some() {
+                anyhow::bail!("multiple unprocessed PRs claim the same merge commit");
+            }
+        }
+        let mut newest_first = Vec::new();
+        while !pending.is_empty() && cursor.id() != anchor.id() {
+            if let Some(pr) = pending.remove(&cursor.id()) {
+                newest_first.push(pr);
+            }
+            if cursor.parent_count() == 0 {
+                anyhow::bail!(
+                    "Personal import baseline is outside the admitted first-parent history"
+                );
+            }
+            cursor = cursor.parent(0)?;
+        }
+        if !pending.is_empty() {
+            anyhow::bail!("unprocessed PR merge is outside the admitted default-branch history");
+        }
+        newest_first.reverse();
+        Ok(newest_first)
     }
 
     #[instrument(skip(self), fields(repo = %self.github_repo))]
@@ -234,19 +281,15 @@ impl GitToSvnSync {
             }
         }
 
-        self.ensure_personal_history_admitted()
+        let admitted = self
+            .ensure_personal_history_admitted()
             .context("personal Git history inspection blocked git-to-svn sync")?;
 
         info!("starting git-to-svn sync cycle");
         let mut result = GitToSvnResult::default();
 
-        // Ensure SVN working copy exists before doing anything else.
-        self.ensure_svn_working_copy()
-            .await
-            .context("failed to ensure SVN working copy")?;
-
-        // The same completed-merge-SHA boundary as PrMonitor, including retries
-        // that were already merged when another PR completed locally.
+        // Rescan complete discovery. A local completion timestamp can fall after
+        // every provider merge in a backlog.
         let merged_prs = self
             .github
             .get_merged_pull_requests(&self.github_repo, &self.default_branch, None)
@@ -255,43 +298,39 @@ impl GitToSvnSync {
 
         info!(count = merged_prs.len(), "found merged pull requests");
 
-        if merged_prs.is_empty() {
-            debug!("no new merged PRs to sync");
+        for (number, sha) in self.db.unfinished_personal_prs()? {
+            if !merged_prs.iter().any(|pr| {
+                i64::try_from(pr.number).ok() == Some(number)
+                    && pr.merge_commit_sha.as_deref() == Some(&sha)
+            }) {
+                anyhow::bail!("pending Personal PR #{number} is missing from complete discovery");
+            }
+        }
+        let mut candidates = Vec::new();
+        for pr in merged_prs {
+            let sha = pr
+                .merge_commit_sha
+                .as_deref()
+                .context("merged PR lacks a merge SHA")?;
+            if self.db.is_personal_pr_synced(sha)? {
+                result.prs_skipped += 1;
+            } else {
+                candidates.push(pr);
+            }
+        }
+        let ordered = self.ordered_prs(candidates, &admitted.remote_tip)?;
+        if ordered.is_empty() {
             return Ok(result);
         }
-
-        // Process each merged PR (oldest first for correct ordering).
-        let mut prs_ordered: Vec<PullRequest> = merged_prs;
-        prs_ordered.sort_by(|a, b| {
-            let a_time = a.merged_at.as_deref().unwrap_or("");
-            let b_time = b.merged_at.as_deref().unwrap_or("");
-            a_time.cmp(b_time)
-        });
-
-        for pr in &prs_ordered {
-            let merge_sha = match &pr.merge_commit_sha {
-                Some(sha) => sha.clone(),
-                None => {
-                    warn!(
-                        pr_number = pr.number,
-                        "PR has no merge_commit_sha, skipping"
-                    );
-                    continue;
-                }
-            };
-
-            // Check if this PR merge has already been processed.
-            let already_synced = self
-                .db
-                .is_personal_pr_synced(&merge_sha)
-                .context("failed to check pr_sync_log")?;
-            if already_synced {
-                debug!(pr_number = pr.number, merge_sha = %merge_sha, "PR already synced, skipping");
-                result.prs_skipped += 1;
-                continue;
-            }
-
-            match self.sync_pr(pr, &merge_sha).await {
+        self.ensure_svn_working_copy()
+            .await
+            .context("failed to ensure SVN working copy")?;
+        for pr in &ordered {
+            let merge_sha = pr
+                .merge_commit_sha
+                .as_deref()
+                .context("missing ordered PR merge SHA")?;
+            match self.sync_pr(pr, merge_sha).await {
                 Ok(commit_count) => {
                     result.commits_synced += commit_count;
                     result.prs_synced += 1;
@@ -303,6 +342,21 @@ impl GitToSvnSync {
                 }
                 Err(e) => {
                     error!(pr_number = pr.number, error = %e, "failed to sync PR to SVN");
+                    if let Some(reason @ GitHubError::IncompletePrCommitList { .. }) =
+                        e.downcast_ref::<GitHubError>()
+                    {
+                        self.db
+                            .insert_audit_log(
+                                "git_to_svn_incomplete_pr",
+                                Some("git_to_svn"),
+                                None,
+                                Some(merge_sha),
+                                None,
+                                Some(&reason.to_string()),
+                                false,
+                            )
+                            .ok();
+                    }
                     result.prs_failed += 1;
                     // Ordering matters: once a PR aborts mid-apply, later PRs in this
                     // pass must not run until the held SHA retries successfully.
@@ -509,6 +563,7 @@ impl GitToSvnSync {
     ///
     /// Public for integration testing of the crash-safe journal path.
     #[instrument(skip(self, commit), fields(git_sha = %commit.sha))]
+    #[allow(dead_code)] // Public stand-alone journal entry point; PR polling also passes its row ID.
     pub async fn replay_commit(
         &self,
         commit: &GitHubCommit,

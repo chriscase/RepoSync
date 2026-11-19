@@ -267,6 +267,17 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Pending PRs that are still owed a completion, including legacy attempts.
+    pub fn unfinished_personal_prs(&self) -> Result<Vec<(i64, String)>, DatabaseError> {
+        let conn = self.conn();
+        let mut stmt=conn.prepare(
+            "SELECT DISTINCT p.pr_number,p.merge_sha FROM pr_sync_log p WHERE p.status='pending'
+             AND NOT EXISTS(SELECT 1 FROM pr_sync_log c WHERE c.status='completed' AND c.merge_sha=p.merge_sha)"
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Discard an unstarted retry. Once a revision is confirmed, keep its PR
     /// identity and range for the next attempt.
     pub fn abandon_pending_pr_sync(&self, id: i64) -> Result<(), DatabaseError> {

@@ -63,18 +63,23 @@ impl<'a> PrMonitor<'a> {
     /// replay into SVN. PRs whose `merge_commit_sha` has already been
     /// recorded in the database are silently skipped.
     pub async fn check_for_merged_prs(&self) -> Result<Vec<MergedPr>> {
-        // Local completion time can be newer than every remote merge in a
-        // backlog. Revisit the provider window and skip completed merge SHAs.
+        // Determine the "since" timestamp so we only look at recently merged PRs.
+        let since = self
+            .db
+            .get_last_pr_sync_time()
+            .context("failed to read last PR sync timestamp from database")?;
+
         info!(
             repo = %self.repo,
             base = %self.base_branch,
+            since = ?since,
             "checking for merged pull requests"
         );
 
         // Fetch merged PRs from GitHub.
         let pull_requests = self
             .github_client
-            .get_merged_pull_requests(&self.repo, &self.base_branch, None)
+            .get_merged_pull_requests(&self.repo, &self.base_branch, since.as_deref())
             .await
             .context("failed to fetch merged pull requests from GitHub")?;
 
