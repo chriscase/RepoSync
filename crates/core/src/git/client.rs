@@ -1017,6 +1017,59 @@ impl GitClient {
         Ok((parent, tree))
     }
 
+    /// Compare replay of the ordered first-parent deltas with the outer merge.
+    /// This reads Git trees only. Checking paths absent from the outer diff also
+    /// catches siblings that temporarily diverged and resolved back to the base.
+    pub fn first_parent_replay_matches_merge(
+        &self,
+        merge_sha: &str,
+        ordered: &[&str],
+    ) -> Result<bool, GitError> {
+        let changes = |commit: &git2::Commit<'_>| -> Result<_, GitError> {
+            let tree = commit.tree()?;
+            let parent = commit.parents().next().map(|p| p.tree()).transpose()?;
+            let diff = self
+                .repo
+                .diff_tree_to_tree(parent.as_ref(), Some(&tree), None)?;
+            let mut edits = std::collections::HashMap::new();
+            // Rename detection is off: removal of the old path and addition
+            // of the new one are independent entries in the composed tree.
+            for delta in diff.deltas() {
+                let new = delta.new_file();
+                let path = new
+                    .path()
+                    .or_else(|| delta.old_file().path())
+                    .ok_or_else(|| GitError::ApplyFailed("missing path in Git tree diff".into()))?;
+                let state = (delta.status() != git2::Delta::Deleted)
+                    .then(|| (new.id(), i32::from(new.mode())));
+                edits.insert(path.to_owned(), state);
+            }
+            Ok(edits)
+        };
+        let mut replayed = std::collections::HashMap::new();
+        for sha in ordered {
+            replayed.extend(changes(&self.repo.find_commit(Oid::from_str(sha)?)?)?);
+        }
+        let merge = self.repo.find_commit(Oid::from_str(merge_sha)?)?;
+        for (path, expected) in changes(&merge)? {
+            if replayed.remove(&path) != Some(expected) {
+                return Ok(false);
+            }
+        }
+        let merged_tree = merge.tree()?;
+        for (path, state) in replayed {
+            let expected = match merged_tree.get_path(&path) {
+                Ok(entry) => Some((entry.id(), entry.filemode())),
+                Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+                Err(e) => return Err(e.into()),
+            };
+            if state != expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Get the list of changed files for a specific commit.
     ///
     /// Actions are `A` (added), `M` (modified), `D` (deleted), or `R`

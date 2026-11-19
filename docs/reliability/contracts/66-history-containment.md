@@ -101,7 +101,7 @@ them. `fetch_git_changes` records the same durable block when its second-line
 | Durable `has_more` across restart | **proven** — linear `candidate_r66_team_history_continuation_survives_restart`; merge-DAG `candidate_r66_merge_dag_continuation_survives_restart` (`git_replay_continuation_{repo}` pins admitted R and handled set); missing-row idempotency `candidate_r66_merge_dag_continuation_missing_row_idempotent` |
 | Drain Git batches past SVN-only commits | **proven** — `candidate_r66_drain_git_batch_past_svn_only` (metadata-only SVN defers only on file-content delta) |
 | Conflict detection gating | **proven** — `candidate_r66_incomplete_conflict_coverage_fail_closed` and `sync_engine::tests::incomplete_conflict_coverage_fails_closed`; outer gate compares post-filter `conflict_coverage.len()` against applicable pending commits |
-| Personal Git→SVN engine-cycle merge-DAG replay | **NOT RUN** — inspect admission is proven; PR-based replay is a separate surface |
+| Personal Git→SVN engine-cycle merge-DAG replay | **Proven for a single-page PR backlog.** `r10_merge_dag::candidate_r10_personal_merge_dag_replays_across_restart` orders three post-import PRs by default-branch history, excludes a historical PR, and stops at an incomplete PR. After the first DAG parent reaches SVN, a fresh engine holds on incomplete discovery and resumes both sides and the resolution from the confirmed mapping. |
 
 Baseline R09 still demonstrates that the original pull-then-walk path
 duplicates rewritten history. Candidate R09 cases reject replacement and
@@ -183,8 +183,37 @@ Still required before claiming #66:
   `pending_frontier::non_ancestor_tip_fails_closed`)
 - equal-looking content with different provenance (already partly R09 amend)
 - SVN mergeinfo-only versus UUID/path incarnation (R15 remains PARTIAL)
-- personal Git→SVN engine-cycle proof for qualified merge-DAG admission (inspect
-  admission is proven; PR-based replay is a separate surface)
+- Personal commit lists that span provider pages. The replay proof uses three
+  commits in the DAG PR. The client requests 100 commits per page and records
+  the pending PR before requesting its list. A paginated response keeps it pending.
+  For a two-parent merge, the local Git graph must confirm every introduced commit
+  in parent-before-child order. Their ordered first-parent deltas must reproduce the
+  outer Git merge tree after accounting for previously handled commits. A sibling
+  conflict whose resolution would be lost holds
+  before any SVN write for the PR. The first complete list pins the ordered SHAs.
+  Empty, shortened or reordered retries keep the queue at that PR.
+- Discovery reads up to ten pages of PRs in creation order. A repeated PR number
+  across pages or an omitted pending PR holds the queue. Even on the final page,
+  an unexplained earlier default-branch step holds the next listed PR. At the cap,
+  replay can proceed if every first-parent commit after the import boundary has a listed or
+  previously completed PR, or an ordinary SVN-origin publication with a matching
+  confirmed push, scoped receipt and mapping. An uncovered step holds publication. A database that
+  lacks the legacy Git watermark can use the current scoped Git watermark written
+  by the Personal importer, backed by a matching receipt and mapping. A reimport
+  replaces the scoped watermark. A legacy database with neither import watermark
+  needs inspection. Messages in SVN history cannot establish the import boundary.
+- An upgrade can recover one first member of an old pending two-parent PR when
+  its current SVN revision and exported tree match the latest confirmed unlinked
+  journal, and the original worker audit attributes that revision and SHA to the PR.
+  The matching scoped mapping and applied receipt remain required. Missing proof,
+  multiple unlinked prefix revisions or intervening SVN revisions require inspection,
+  even if later members would mask a missing revision in the final tree.
+- For a multi-commit rebase, Personal can attribute contiguous first-parent steps
+  when the provider returns the exact landed SHAs. A later PR can cross those
+  confirmed steps. When only the original, rewritten SHAs are returned, Personal
+  holds before writing the first member. The original SHA and the landed SHA
+  need distinct provenance before that case can be resumed safely.
+  The Team 1,001-commit qualification uses its own continuation mechanism.
 
 Assert zero unwanted remote changes and stable checkpoints on rejection, and
 no duplicates on accepted ordinary replay. The coworker’s exact production

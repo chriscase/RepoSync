@@ -32,6 +32,9 @@ use reposync_personal::git_to_svn::{
 };
 use reposync_personal::svn_to_git::{personal_git_push_fixture_env_key, SvnToGitSync};
 
+#[path = "support/r10_merge_dag.rs"]
+mod r10_merge_dag;
+
 // ===========================================================================
 // Helper functions
 // ===========================================================================
@@ -5766,6 +5769,7 @@ async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
     let git_client = setup_git_with_bare_origin(&git_work, &bare);
     let imported_base = git_sha(&git_work);
     git_client.push("origin", "main").unwrap();
+    git_cmd(&git_work, &["checkout", "-b", "feature/x"]);
     std::fs::write(git_work.join("feature.txt"), "lost reply\n").unwrap();
     let oid = git_client
         .commit(
@@ -5777,6 +5781,12 @@ async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
         )
         .unwrap();
     let git_sha = oid.to_string();
+    git_cmd(&git_work, &["checkout", "main"]);
+    git_cmd(
+        &git_work,
+        &["merge", "--no-ff", "feature/x", "-m", "Merge recovered PR"],
+    );
+    let merge_sha = git_sha_at(&git_work, "refs/heads/main");
     git_client.push("origin", "main").unwrap();
     drop(git_client);
 
@@ -5851,8 +5861,7 @@ async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
         "finalize must checkpoint sync_records and commit_map for the Git SHA"
     );
 
-    let merge_sha = "f".repeat(40);
-    let (api_url, stub) = spawn_github_pr_sync_stub(&merge_sha, &git_sha);
+    let (api_url, stub) = spawn_github_pr_sync_stub(&merge_sha, &git_sha, &imported_base);
     let syncer3 = personal_git_to_svn_with_github_api(
         &svn_url,
         db_arc.clone(),
@@ -7539,6 +7548,7 @@ fn spawn_github_two_pr_sync_stub(
 fn spawn_github_pr_sync_stub(
     merge_sha: &str,
     pr_commit_sha: &str,
+    base_sha: &str,
 ) -> (String, std::thread::JoinHandle<()>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -7550,7 +7560,7 @@ fn spawn_github_pr_sync_stub(
             "html_url": "https://example.invalid/pr/1",
             "state": "closed",
             "head": {{"ref": "feature", "sha": "{pr_commit_sha}"}},
-            "base": {{"ref": "main", "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+            "base": {{"ref": "main", "sha": "{base_sha}"}},
             "merged": true,
             "merge_commit_sha": "{merge_sha}",
             "merged_at": "2025-01-02T00:00:00Z"
@@ -7579,7 +7589,7 @@ fn spawn_github_pr_sync_stub(
                 "committer": {{"name": "Test User", "email": "test@example.com", "date": null}}
             }},
             "parents": [
-                {{"sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+                {{"sha": "{base_sha}"}},
                 {{"sha": "{pr_commit_sha}"}}
             ]
         }}"#,
@@ -7943,7 +7953,7 @@ async fn test_personal_svn_to_git_imports_despite_foreign_commit_map_row() {
     );
 }
 
-/// Deferred PR sync must abandon pending pr_sync_log and retry after the journal finalizes.
+/// Deferred PR sync retains its pending row and retries after the journal finalizes.
 #[tokio::test]
 async fn test_personal_git_to_svn_retries_pr_after_journal_defer() {
     use reposync_core::config::GitProvider;
@@ -8004,7 +8014,7 @@ async fn test_personal_git_to_svn_retries_pr_after_journal_defer() {
         })
         .expect("seed running svn-to-git journal");
 
-    let (api_url, stub) = spawn_github_pr_sync_stub(&merge_sha, &pr_commit_sha);
+    let (api_url, stub) = spawn_github_pr_sync_stub(&merge_sha, &pr_commit_sha, &imported_base);
     let mut config = make_test_config(&svn_url, tmp.path());
     config.github.api_url = api_url;
     config.github.token = Some("test-token".into());
@@ -8054,7 +8064,10 @@ async fn test_personal_git_to_svn_retries_pr_after_journal_defer() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(pending, 0, "defer must abandon pending pr_sync_log row");
+    assert_eq!(
+        pending, 1,
+        "the deferred PR must retain its place until confirmed"
+    );
 
     db_arc
         .conn()

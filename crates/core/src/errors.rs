@@ -302,6 +302,12 @@ pub enum GitHubError {
     #[error("GitHub API error (HTTP {status}): {body}")]
     ApiError { status: u16, body: String },
 
+    /// The provider has more closed PR pages than the client can qualify.
+    #[error("incomplete pull-request discovery: additional pages remain after the 10-page limit")]
+    IncompletePrDiscovery,
+    /// The provider returned only a prefix of the PR's commits.
+    #[error("incomplete commit list for PR #{pr_number}: additional provider pages are required")]
+    IncompletePrCommitList { pr_number: u64 },
     /// Authentication token is missing or invalid.
     #[error("GitHub authentication failed: {0}")]
     AuthenticationFailed(String),

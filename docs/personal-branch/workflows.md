@@ -49,15 +49,24 @@ When your feature is ready, open a pull request targeting the default branch on 
 gh pr create --base main --title "Add search endpoint" --body "Implements full-text search with pagination"
 ```
 
-All three GitHub merge strategies are supported:
+Personal polls for merged PRs on the default branch. Replay depends on the commits the provider returns and the Git history available in the local clone.
 
-| Strategy | GitHub Button | What Happens in SVN |
-|----------|--------------|---------------------|
-| **Merge commit** | "Merge pull request" | Each PR commit is replayed individually to SVN |
-| **Squash merge** | "Squash and merge" | A single SVN commit is created with the squashed content |
-| **Rebase merge** | "Rebase and merge" | Each rebased commit is replayed individually to SVN |
+| GitHub action | Personal replay behavior |
+|---|---|
+| Merge pull request | For a two-parent merge, the complete single-page member list must account for the Git merge tree in replay order. The confirmed portion can survive a restart. |
+| Squash and merge | The poller reads the PR member list. A single eligible member can produce one SVN revision. The strategy label alone does not determine the revision count. |
+| Rebase and merge | A multi-commit linear span can replay when the provider returns the exact SHAs that landed on the default branch. If it returns the original SHAs and Git rewrote them, the PR stays pending. |
 
-After you merge the PR on GitHub, the daemon detects the merge on its next polling cycle (default: every 30 seconds) and replays the commits to SVN automatically.
+For future multi-commit PRs that need automatic Personal replay, use **Merge pull request** with a complete single-page member list. A PR with more than 100 members stays pending at its turn. Earlier verified PRs can complete first.
+
+### Inspecting a held rebase or upgrade
+
+1. Run `reposync personal pr-log` to identify the pending PR and its recorded revision range. Run `reposync personal log` for recent sync history. Record the PR number and last confirmed SVN revision, and obtain the merge SHA from the provider’s PR metadata.
+2. On an existing local clone, compare the provider's ordered PR commit IDs to the landed first-parent IDs. For example, `git rev-list --first-parent --reverse "$import_sha..$merge_sha"` shows the landed sequence from a known import through that PR. Record both sequences when the hashes differ.
+3. For an upgrade stopped after one member, retain a consistent backup of the Personal database and inspect the matching SVN revision. Automatic continuation requires the original successful PR audit, scoped mapping, applied receipt and confirmed journal, with the intended tree still at the SVN destination. The worker can then resume from the next member.
+4. If the hashes differ or the old prefix cannot be attributed, retain the pending row and pass the observed IDs, SVN range and audit details to the repository owner. This version has no automatic migration for distinct source and landed SHAs. Earlier versions may already have written a prefix. Repeating the poll cannot supply that missing authority. Preserve the existing revisions and checkpoints while qualifying an upgrade on a disposable copy.
+
+The [history-containment contract](../reliability/contracts/66-history-containment.md) describes the exact qualified boundaries.
 
 ### Merge Strategy Detection
 

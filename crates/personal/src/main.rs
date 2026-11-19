@@ -8,7 +8,6 @@ mod commit_format;
 mod daemon;
 mod engine;
 mod git_to_svn;
-mod pr_monitor;
 mod scheduler;
 mod signals;
 mod svn_to_git;
