@@ -492,7 +492,8 @@
       "candidate": "PARTIAL",
       "tier": "actual_engine",
       "required_case_ids": [
-        "R01_METADATA_ONLY"
+        "R01_METADATA_ONLY",
+        "R15_SVNSERVE_ORDINARY_MERGE"
       ],
       "supporting_case_ids": [
         "ECHO_IDENTITY_REIMPORT_RESET",
@@ -502,10 +503,9 @@
         "RS63_PATH_INCARNATION_HOLD"
       ],
       "open": [
-        "Normal SVN merge with mergeinfo is not a required exact case",
         "Automatic echo-generation bump on UUID/path swap remains unclaimed (ECHO_IDENTITY_SVN_UUID_AUTO / ECHO_IDENTITY_PATH_RECREATION); operational canonical lineage now holds the pair instead (RS63_SVN_UUID_IDENTITY_HOLD / RS63_PATH_INCARNATION_HOLD)"
       ],
-      "evidence": "A property-only SVN revision records an explicit no-target checkpoint and does not invent a Git commit. Revision-number jumps are not treated as Git rewrites by the team gate. Full R15 identity events remain open.",
+      "evidence": "R01_METADATA_ONLY covers an SVN property change. R15_SVNSERVE_ORDINARY_MERGE follows a real feature-to-trunk content merge and a separate record-only merge through the managed team engine. Revisions confined to the feature branch leave the managed frontier intact. The content merge produces one mapped Git commit. The record-only merge changes svn:mergeinfo and records a scoped no_git_content receipt with no Git ref update. A subsequent trunk edit publishes once after restart, followed by two quiet cycles.",
       "diagnostic_expected_baseline_failure": false
     },
     {
