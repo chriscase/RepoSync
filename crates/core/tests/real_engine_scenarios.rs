@@ -3561,6 +3561,17 @@ async fn scenario_r15_ordinary_svn_merge_and_mergeinfo() {
     }
 }
 
+#[path = "real_engine_scenarios/recreated_trunk.rs"]
+mod recreated_trunk;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r15_recreated_trunk_holds_after_restart() {
+    const CASE: &str = "R15_SVNSERVE_RECREATED_TRUNK_HOLD";
+    if require_toolchain(CASE) {
+        emit_evidence(CASE, "PASS", recreated_trunk::run().await);
+    }
+}
+
 #[path = "real_engine_scenarios/finalized_history.rs"]
 mod finalized_history;
 

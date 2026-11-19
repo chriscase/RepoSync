@@ -62,7 +62,19 @@ Require one passing test and exactly one `RELIABILITY_EVIDENCE` record with case
 | Use `svn merge --record-only` for a separate feature revision | Trunk mergeinfo advances. The feature content stays on its source branch. RepoSync records a no-target outcome for the trunk revision, preserves the Git ref and creates no applied Git mapping for it. |
 | Reopen the engine and sync a subsequent ordinary trunk edit | The edit reaches Git once. Two unchanged cycles preserve the refs, SVN history and mapping records. |
 
-R15 remains **PARTIAL**. Repository replacement and same-path recreation have separate lineage checks. Automatic generation changes for those events remain unqualified.
+### R15 recreated SVN trunk
+
+Run the independent same-path case with the same tools. The fixture owns its SVN repository, Git origin and SQLite database.
+
+```sh
+cargo test -p reposync-core --test real_engine_scenarios scenario_r15_recreated_trunk_holds_after_restart -- --exact --nocapture
+```
+
+Require one passing test and one `PASS` evidence record for `R15_SVNSERVE_RECREATED_TRUNK_HOLD`. The case begins with a completed Git publication and a metadata-only SVN receipt. While the engine is stopped, the fixture deletes its registered trunk and copies identical content back to the same URL. The UUID and files match the retired trunk. SVN history identifies the new branch by its creation revision and copy source.
+
+On a cold poll, expect `svn_identity_changed` and the persisted status `reconciliation_required`. The SVN-to-Git diagnostic checkpoint records `unknown_reconciliation_required` without a target. The handled SVN cursor stays at r4, and the original r3 applied mapping and r4 no-target receipt remain readable. On a second cold poll, an ordinary Git commit stays on its source branch and an edit to the recreated trunk stays in SVN. Compare the live and pinned creation revisions and copy sources when investigating this diagnostic.
+
+R15 remains **PARTIAL**. This case covers ordinary polling with no in-flight operation. Same-URL replacement of the whole repository has separate UUID tests. Automatic generation changes and adoption of a recreated path remain unqualified. [Lineage and checkpoints contract](contracts/63-lineage-checkpoints.md)
 
 ### R17 scheduler completion events
 
