@@ -37,7 +37,7 @@ RepoSync is configured via a TOML file, typically at `/etc/reposync/config.toml`
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|
-| `mapping_file` | string | yes | Path to authors.toml mapping file |
+| `mapping_file` | string | no | Path to the author mapping file, if used |
 | `email_domain` | string | no | Fallback domain for unmapped users |
 | `ldap_url` | string | no | LDAP server URL for automatic lookup |
 | `ldap_base_dn` | string | no | LDAP base DN for searches |
@@ -71,7 +71,7 @@ RepoSync is configured via a TOML file, typically at `/etc/reposync/config.toml`
 |-----|------|---------|-------------|
 | `mode` | string | `"direct"` | `"direct"` for auto-sync, `"pr"` for PR-gated |
 | `auto_merge` | boolean | `true` | Attempt 3-way merge for non-overlapping changes |
-| `sync_branches` | boolean | `true` | Sync branch creation/deletion |
+| `sync_branches` | array of strings | `[]` | Branch names to synchronize. An empty list selects all branches. |
 | `sync_tags` | boolean | `true` | Sync tag creation |
 
 ### [sync.pr] (only when mode = "pr")

@@ -26,7 +26,7 @@ Full bidirectional sync for entire teams. Runs as a server daemon on a VM with a
 
 ### Personal Branch Mode
 
-Individual developer SVN-to-Git bridge. Runs on your laptop, imports SVN history into a GitHub repo, and uses a PR-based workflow so every SVN sync is reviewable before merging. No server required. This is the right choice when you want to work in Git personally while your team stays on SVN.
+Personal mode runs on your laptop. It mirrors SVN changes to your Git branch and sends changes from merged GitHub pull requests back to SVN.
 
 See [docs/personal-branch/](docs/personal-branch/) for the full Personal Branch Mode documentation.
 
@@ -47,15 +47,21 @@ See [docs/personal-branch/](docs/personal-branch/) for the full Personal Branch 
 
 ## Personal Branch Mode -- Quick Start
 
-Get up and running in three commands:
+Create your Personal configuration with the interactive wizard.
 
 ```bash
-reposync personal init                           # Interactive setup wizard
-reposync personal import --full                  # Import SVN history to GitHub
-reposync personal start                          # Start sync daemon
+reposync personal init
 ```
 
-The `init` wizard walks you through connecting your SVN repo and GitHub repo, configuring branch names, and setting up your identity mapping. Once `import --full` completes, `start` launches a background sync daemon on your laptop that watches for new SVN commits and creates PRs in your GitHub repo.
+Before your first import, edit `~/.config/reposync/personal.toml`. Under `[personal]`, set `data_dir` to an absolute path you can write, such as `/home/alex/.local/share/reposync` for user `alex`. This directory holds your database and Git checkout. In the shell where you will run the bridge, set the environment variables named by the wizard.
+
+Run the import command printed by the wizard. Its default, `reposync personal import --snapshot`, starts with the current SVN tree. Choose `reposync personal import --full` if you want the revision history. Once the import completes, start polling.
+
+```bash
+reposync personal start --foreground
+```
+
+`start` runs in the foreground. From another terminal, run `reposync personal status` to inspect the bridge or `reposync personal stop` to stop it. [Personal quick start](docs/personal-branch/quickstart.md)
 
 ## Team Mode -- Quick Start
 
@@ -77,7 +83,14 @@ curl -fsSL https://github.com/chriscase/RepoSync/releases/latest/download/instal
 git clone https://github.com/chriscase/RepoSync.git
 cd RepoSync
 cargo build --release
+npm ci --prefix web-ui
+npm run build --prefix web-ui
+mkdir -p target/release/static
+cp -R web-ui/dist/. target/release/static/
+export PATH="$PWD/target/release:$PATH"
 ```
+
+The dashboard build uses Node.js 22 and npm. If you move the daemon, put the built `static/` directory beside its executable.
 
 **Docker:**
 ```bash
@@ -86,18 +99,19 @@ docker pull ghcr.io/chriscase/reposync:latest
 
 ### Configure
 
+These commands assume the binaries are on your `PATH`. A source build places them in `target/release/`. To generate a new configuration, choose an existing directory you can write. The examples use `/etc/reposync`. If you already have a configuration file, edit it directly.
+
 ```bash
-# Generate a default config file
-reposync init --config /etc/reposync/config.toml
-
-# Edit with your SVN and GitHub details
+reposync init --output /etc/reposync/config.toml
 $EDITOR /etc/reposync/config.toml
-
-# Set up author mappings
-$EDITOR /etc/reposync/authors.toml
+reposync validate --config /etc/reposync/config.toml
 ```
 
+Set your SVN and GitHub details before validation. To use an author mapping file, set `mapping_file = "/etc/reposync/authors.toml"` in `[identity]` and create that file with your mappings. The full example includes this optional setting. [Example configuration](config.example.toml) · [Team getting started](docs/getting-started.md)
+
 ### Run
+
+Before the first start on a fresh database, supply a unique, nonempty `REPOSYNC_ADMIN_PASSWORD` in the daemon's environment. The daemon uses it to create the initial `admin` account. Later starts keep the existing account password. The supplied systemd unit and the Docker command below read `/etc/reposync/env`. For a direct run, export the variable in the invoking shell.
 
 **As a systemd service:**
 ```bash
@@ -122,9 +136,13 @@ docker run -d \
 reposync-daemon --config /etc/reposync/config.toml
 ```
 
-### Access the Dashboard
+The daemon runs in the foreground and takes the environment variables named in the configuration from its shell. The supplied systemd service reads `/etc/reposync/env` for service launches. Use a second terminal for CLI commands and pass the same configuration path.
 
-Open `http://your-server:8080` in your browser. Log in with the configured password or GitHub OAuth.
+### Import the First Repository
+
+Open the dashboard at the address configured by `[web].listen`. The generated configuration uses `http://127.0.0.1:3000` on the daemon host. The example below uses port 8080. Log in with the configured password or GitHub OAuth.
+
+On a fresh Team database the daemon registers the SVN and Git repository from the configuration. As an administrator, open **Repositories**, select that registration, and find **SVN Import** on **Overview**. Use an empty Git repository for the new mirror. Choose **Start full history import** and wait for **SVN Import Complete**. Normal polling begins once RepoSync has verified the SVN revision and its Git commit. [Team import and verification](docs/getting-started.md#step-8-import-and-verify)
 
 ## Configuration
 
@@ -203,7 +221,7 @@ reposync status                              # Show sync status
 reposync conflicts list                      # List active conflicts
 reposync conflicts resolve <id> --accept git # Resolve from CLI
 reposync sync now                            # Trigger immediate sync
-reposync identity list                       # Show author mappings
+reposync identity lookup jsmith              # Look up one SVN user's Git identity
 reposync audit --limit 20                    # Recent sync history
 ```
 

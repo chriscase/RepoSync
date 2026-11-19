@@ -4,7 +4,7 @@
 
 Personal Branch Mode is a lightweight, single-developer configuration of RepoSync. It lets you mirror an SVN repository to your own GitHub account, work on feature branches with pull requests, and have merged commits automatically sync back to SVN -- all from a daemon running on your local machine.
 
-Instead of deploying a shared server with webhooks and identity mapping, Personal Branch Mode runs as a background process alongside your normal development tools. You get a full Git-native workflow (branches, PRs, code review) while your commits continue to land in SVN exactly where your team expects them.
+Instead of deploying a shared server with webhooks and identity mapping, Personal Branch Mode runs on your machine alongside your normal development tools. You get a full Git-native workflow (branches, PRs, code review) while your commits continue to land in SVN exactly where your team expects them.
 
 ## Who Is This For?
 
@@ -29,7 +29,7 @@ If your entire team is ready to move to Git, look at the full [team deployment](
 | Setup | Config files + server provisioning | Interactive CLI wizard |
 | SVN hook required | `pre-revprop-change` | None |
 
-Personal Branch Mode strips away everything you do not need when you are the only user. No server to maintain, no hooks to install on the SVN server, no ports to open. Just `reposync personal init` and you are running.
+Personal Branch Mode strips away everything you do not need when you are the only user. No server to maintain, no hooks to install on the SVN server, no ports to open. Run the setup wizard, import your SVN starting point, then start the local daemon.
 
 ## Data Flow
 
@@ -50,7 +50,7 @@ Personal Branch Mode strips away everything you do not need when you are the onl
 
 ### Bidirectional Sync
 
-SVN revisions flow into Git as commits on `main`. Merged PRs flow back to SVN as new revisions. Both directions run continuously in the background.
+SVN revisions flow into Git as commits on `main`. Merged PRs flow back to SVN as new revisions. Both directions run while the daemon is active.
 
 ### PR-Based Workflow
 
@@ -62,36 +62,13 @@ When the daemon pushes an SVN revision to GitHub, it records the mapping. When i
 
 ### Interactive CLI Setup Wizard
 
-Run `reposync personal init` to walk through configuration step by step. The wizard prompts for your SVN URL, credentials, GitHub token, and target repository. It validates connectivity at each step and writes the config file for you.
+Run `reposync personal init` to write your Personal TOML file. The wizard asks for repository URLs, developer identity, polling interval and import mode. For credentials, enter the **environment variable names** that will hold the SVN password and GitHub token. The import command connects to the repositories after you finish configuring them.
 
-```bash
-$ reposync personal init
-? SVN repository URL: https://svn.example.com/repos/project/trunk
-? SVN username: jdeveloper
-? SVN password: ********
-  Connecting to SVN... OK (r4521)
-? GitHub personal access token: ghp_xxxxxxxxxxxx
-? GitHub repository (owner/name): jdeveloper/project-mirror
-  Repository does not exist. Create it? [Y/n] Y
-  Created jdeveloper/project-mirror (private)
-  Performing initial import (4521 revisions)...
-  Config written to ~/.config/reposync/personal.toml
-  Run `reposync personal start` to begin syncing.
-```
+Before your first import, use an absolute `[personal].data_dir` and set the named environment variables. Run `reposync personal import --full` for revision history or `reposync personal import --snapshot` for the current tree. After the import completes, `reposync personal start --foreground` runs the polling loop in your terminal. [Personal quickstart](quickstart.md)
 
 ### Health Check Doctor Command
 
-The `reposync personal doctor` command validates your entire setup: SVN connectivity, GitHub token scopes, local Git state, daemon status, and sync lag. It reports problems with specific fix instructions.
-
-```bash
-$ reposync personal doctor
-[OK] SVN connection to https://svn.example.com/repos/project/trunk
-[OK] GitHub token has repo scope
-[OK] Local Git repo is clean
-[WARN] Daemon not running (last seen 2h ago)
-  Fix: run `reposync personal start`
-[OK] Sync lag: 0 revisions behind SVN, 0 commits behind GitHub
-```
+`reposync personal doctor` checks the local configuration and reports on the data directory, database, Git checkout, daemon and stored sync positions. Before the first import, the database and checkout may be absent.
 
 ### Conflict Detection and Resolution
 
@@ -99,7 +76,7 @@ If someone commits to SVN while you have unsynced PR merges (or vice versa), the
 
 ### Auto-Create GitHub Repository
 
-During initial setup, if the target GitHub repository does not exist, the wizard offers to create it for you (private by default). The initial import translates your SVN history into Git commits so you start with full history.
+The initial import checks whether the configured GitHub repository exists. If it is missing and `[github].auto_create` is enabled, the importer requests its creation using the configured privacy setting.
 
 ### Crash Recovery
 

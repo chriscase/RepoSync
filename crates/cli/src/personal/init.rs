@@ -276,8 +276,8 @@ poll_interval_secs = {poll_interval_secs}
 log_level = "info"
 
 # Directory for persistent data (database, working copies).
-# Defaults to a platform-appropriate location if omitted.
-# data_dir = "~/.local/share/reposync"
+# Set an absolute path before your first import so every command uses the same database.
+# data_dir = "/absolute/path/to/reposync-data"
 
 [svn]
 # SVN repository URL — typically the trunk URL.
@@ -348,9 +348,7 @@ sync_direct_pushes = false
 # Automatically merge conflicts when a clean 3-way merge is possible.
 auto_merge = true
 
-# --- Initial Import ---
-# Import mode: "snapshot" (latest revision only) or "full" (entire history).
-# import_mode = "{import_mode}"
+# For the initial import, use the --{import_mode} flag selected in the wizard.
 "##,
         poll_interval_secs = poll_interval_secs,
         svn_url = escape_toml_string(&svn_url),
@@ -392,11 +390,13 @@ auto_merge = true
         github_token_env
     );
     println!();
-    println!("  2. Validate the config:");
-    println!("       reposync personal validate --config {}", output_path);
-    println!();
-    println!("  3. Start syncing:");
-    println!("       reposync personal start --config {}", output_path);
+    println!("  2. In the new config, set [personal].data_dir to an absolute directory.");
+    // Quote the filename as one POSIX shell argument, including embedded apostrophes.
+    let config_arg = format!("'{}'", output_path.replace('\'', "'\\''"));
+    println!("  3. Run the initial import:");
+    println!("       reposync personal --personal-config {config_arg} import --{import_mode}");
+    println!("  4. Start syncing in this terminal:");
+    println!("       reposync personal --personal-config {config_arg} start --foreground");
     println!();
 
     Ok(())

@@ -93,7 +93,7 @@ pub enum ConflictAction {
 /// Run a personal subcommand.
 pub async fn run_personal(cmd: PersonalCommands, config_path: &str) -> Result<()> {
     match cmd {
-        PersonalCommands::Init { output } => init::run_init(&output).await,
+        PersonalCommands::Init { output } => init::run_init(&expand_tilde(&output)).await,
 
         PersonalCommands::Import { snapshot, full: _ } => {
             let config = load_config(config_path)?;
