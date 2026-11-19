@@ -1,9 +1,10 @@
 //! Safety and recovery of scoped SVN cursors after a completed team sync.
 use super::{
     git_cli, git_main_commit_and_tree, git_path_missing, git_show_blob, git_symbolic_ref,
-    outage_ledger, svn_commit_file, svn_source_key, svnlook_at, Database, MappingOutcome,
-    OutageLedger, SingleRepoFixture, SyncError,
+    make_app_config, outage_ledger, svn_commit_file, svn_source_key, svnlook_at, Database,
+    MappingOutcome, OutageLedger, SingleRepoFixture, SyncEngine, SyncError,
 };
+use reposync_core::config::SyncMode;
 use reposync_core::db::git_push_operations::{GitPushOperation, GitPushOperationState};
 use reposync_core::db::import_operations::{
     repo_import_baseline_is_pending_read_only, resolve_repo_import_baseline, RepoImportBaseline,
@@ -21,6 +22,7 @@ struct FinalizedHistory {
     bare_reflog: String,
     svn_tree: String,
     total_syncs: i64,
+    registration_mode: String,
 }
 
 const FINALIZED_CHANGES: [(&str, &str, &str); 3] = [
@@ -131,6 +133,9 @@ fn snapshot(f: &SingleRepoFixture, published: i64, youngest: i64) -> FinalizedHi
         let commit = bare.find_commit(sha.parse().unwrap()).unwrap();
         assert_eq!(op.state, GitPushOperationState::Completed);
         assert_eq!(op.source_svn_rev, revision);
+        assert_eq!(op.initiator_id, "team_worker");
+        assert_eq!(op.request_id, format!("svn-r{revision}"));
+        assert_eq!(op.pre_push_git_remote, "origin");
         assert_eq!(op.pre_push_git_branch, "main");
         assert_eq!(op.pre_push_git_sha, parent);
         assert_eq!(op.intended_local_git_parent.as_ref(), Some(&parent));
@@ -167,6 +172,7 @@ fn snapshot(f: &SingleRepoFixture, published: i64, youngest: i64) -> FinalizedHi
     for (line, expected) in bare_reflog.lines().zip(&expected_ref_updates) {
         assert!(line.starts_with(expected), "{line}");
     }
+    let registration = db.get_repository(&repo.id).unwrap().unwrap();
     FinalizedHistory {
         ledger,
         operations,
@@ -174,7 +180,8 @@ fn snapshot(f: &SingleRepoFixture, published: i64, youngest: i64) -> FinalizedHi
         handled_git_baseline,
         bare_reflog,
         svn_tree: svnlook_at(&svn, "tree", &["--show-ids", "--full-paths"]),
-        total_syncs: db.get_repository(&repo.id).unwrap().unwrap().total_syncs,
+        total_syncs: registration.total_syncs,
+        registration_mode: registration.sync_mode,
     }
 }
 
@@ -193,14 +200,26 @@ fn queue_finalized_change(f: &SingleRepoFixture, revision: i64) {
     );
 }
 
-async fn finalized_r3_fixture() -> SingleRepoFixture {
-    let f = SingleRepoFixture::new();
+// The managed scheduler uses the service SyncConfig independently of the registration's
+// Git push strategy. It sets the registered branch and passes the repository ID to SyncEngine.
+fn managed_engine(f: &SingleRepoFixture) -> SyncEngine {
+    let db = Database::new(&f.db_path).unwrap();
+    let registration = db.get_repository(&f.repo.id).unwrap().unwrap();
+    let mut config = make_app_config(&f.repo.svn_url, f.tmp.path());
+    assert_eq!(config.sync.mode, SyncMode::Direct);
+    config.svn.trunk_path.clear();
+    config.github.default_branch = registration.git_branch;
+    f.make_engine_with_config(db, config)
+}
+
+async fn finalized_r3_fixture(registration_mode: &str) -> SingleRepoFixture {
+    let f = SingleRepoFixture::with_registration_mode(registration_mode);
     git_cli(&f.repo.bare, &["config", "core.logAllRefUpdates", "true"]);
     assert_eq!(
         f.checkpoint_snapshot(),
         (1, f.repo.initial_git_sha.clone(), None)
     );
-    let engine = f.make_engine();
+    let engine = managed_engine(&f);
     for rev in 2..=3 {
         if rev == 3 {
             queue_finalized_change(&f, rev);
@@ -254,8 +273,8 @@ enum Damage {
     RewoundSvnAndMissingMirror,
 }
 
-async fn history_hold(damage: Damage) -> Value {
-    let f = finalized_r3_fixture().await;
+async fn history_hold(damage: Damage, registration_mode: &str) -> Value {
+    let f = finalized_r3_fixture(registration_mode).await;
     // The historical case had just r3. Queue a real child for the distinct
     // missing-mirror case so a falsely admitted sync would have work to do.
     let youngest = if damage == Damage::RewoundPairAndDeletedReceipt {
@@ -266,6 +285,7 @@ async fn history_hold(damage: Damage) -> Value {
     };
     let mut expected = snapshot(&f, 3, youngest);
     verify_finalized_receipts(&expected);
+    assert_eq!(expected.registration_mode, registration_mode);
     let baseline = f.repo.initial_git_sha.clone();
     let db = Database::new(&f.db_path).unwrap();
     let (baseline_reason, cycle_reason) = if damage == Damage::RewoundPairAndDeletedReceipt {
@@ -326,7 +346,7 @@ async fn history_hold(damage: Damage) -> Value {
 
     let mut recovery_error = String::new();
     for attempt in 1..=2 {
-        let error = f.make_engine().run_sync_cycle().await.unwrap_err();
+        let error = managed_engine(&f).run_sync_cycle().await.unwrap_err();
         assert!(
             matches!(&error, SyncError::HistoryBlocked { reason, .. } if reason == cycle_reason),
             "{error}"
@@ -358,6 +378,8 @@ async fn history_hold(damage: Damage) -> Value {
         "status": "PASS",
         "baseline_reason": baseline_reason,
         "cycle_reason": cycle_reason,
+        "registration_mode": expected.registration_mode,
+        "push_initiator": r3.initiator_id,
         "held_cycles": 2,
         "recovery_error": recovery_error,
         "repo_svn_rev": expected.ledger.watermark.0,
@@ -380,10 +402,11 @@ async fn history_hold(damage: Damage) -> Value {
 }
 
 async fn mirror_recovery() -> Value {
-    let f = finalized_r3_fixture().await;
+    let f = finalized_r3_fixture("direct").await;
     queue_finalized_change(&f, 4);
     let mut before = snapshot(&f, 3, 4);
     verify_finalized_receipts(&before);
+    assert_eq!(before.registration_mode, "direct");
     remove_finalized_mirror(&f);
     before.mirror = None;
     assert_eq!(snapshot(&f, 3, 4), before);
@@ -407,7 +430,7 @@ async fn mirror_recovery() -> Value {
         "only the missing SVN mirror may change"
     );
     drop(db);
-    let stats = f.make_engine().run_sync_cycle().await.unwrap();
+    let stats = managed_engine(&f).run_sync_cycle().await.unwrap();
     assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (1, 0));
     let after = snapshot(&f, 4, 4);
     verify_finalized_receipts(&after);
@@ -430,7 +453,7 @@ async fn mirror_recovery() -> Value {
         1
     );
     for _ in 0..2 {
-        let quiet = f.make_engine().run_sync_cycle().await.unwrap();
+        let quiet = managed_engine(&f).run_sync_cycle().await.unwrap();
         assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
         assert_eq!(snapshot(&f, 4, 4), after);
     }
@@ -439,6 +462,8 @@ async fn mirror_recovery() -> Value {
     json!({
         "status": "PASS",
         "repaired_svn_revision": r3.source_svn_rev,
+        "registration_mode": before.registration_mode,
+        "push_initiator": r3.initiator_id,
         "child_svn_revision": child.source_svn_rev,
         "svn_uuid": before.ledger.lineage.svn_uuid,
         "scope_uuid": before.ledger.lineage.scope_uuid,
@@ -455,9 +480,13 @@ async fn mirror_recovery() -> Value {
 }
 
 pub(super) async fn evidence() -> Value {
-    let historical = history_hold(Damage::RewoundPairAndDeletedReceipt).await;
+    let historical = history_hold(Damage::RewoundPairAndDeletedReceipt, "direct").await;
     let mirror = mirror_recovery().await;
-    let contradictory = history_hold(Damage::RewoundSvnAndMissingMirror).await;
+    let mut contradictory = history_hold(Damage::RewoundSvnAndMissingMirror, "direct").await;
+    let pr_registration = history_hold(Damage::RewoundSvnAndMissingMirror, "pr").await;
+    assert_ne!(contradictory["scope_uuid"], pr_registration["scope_uuid"]);
+    assert_ne!(contradictory["svn_uuid"], pr_registration["svn_uuid"]);
+    contradictory["pr_registration"] = pr_registration;
     json!({
         "historical_hold": historical,
         "mirror_recovery": mirror,

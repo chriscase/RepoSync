@@ -29,15 +29,16 @@ def suite_summary(overall, timestamp):
             status = overall
         detail = {"fixture": True}
         if entry["id"] == "R01_SVNSERVE_POST_WRITE_RECOVERY" and status == "PASS":
+            direct = {"status": "PASS", "registration_mode": "direct", "push_initiator": "team_worker"}
             detail = {
                 "recovery_ok": True, "expected_watermark": 3, "final_watermark": 3,
                 "mapping_count": 1, "mapped_git_sha": "abcd" * 10,
                 "bare_head_stable": True, "duplicate_mapping": False,
                 "git_push_checkpoint_recovery": {"status": "PASS"},
                 "finalized_history": {
-                    "historical_hold": {"status": "PASS", "published_git_sha": "abcd" * 10},
-                    "mirror_recovery": {"status": "PASS"},
-                    "contradictory_mirror_hold": {"status": "PASS"},
+                    "historical_hold": {**direct, "published_git_sha": "abcd" * 10},
+                    "mirror_recovery": dict(direct),
+                    "contradictory_mirror_hold": {**direct, "pr_registration": {**direct, "registration_mode": "pr"}},
                 },
             }
         if status == "NOT RUN":

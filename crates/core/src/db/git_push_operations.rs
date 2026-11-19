@@ -12,6 +12,7 @@ use crate::errors::DatabaseError;
 use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
 
 const PREFIX: &str = "svn_to_git_push_v1:";
+const MANAGED_PUSH_CONFIRMED: &str = "SVN-to-Git push verified and recorded";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,11 +119,15 @@ pub(super) fn later_finalized_svn_checkpoint(
         load_directional_checkpoint, load_mapping_outcome, svn_source_key, CheckpointDirection,
         MappingOutcome,
     };
+    use super::personal_scope::PERSONAL_SCOPE_KEY;
     use super::repo_scope_identity::{
         legacy_repo_echo_generation_kv_key, repo_echo_generation_kv_key,
         LEGACY_REPO_ID_KV_READS_KEY,
     };
 
+    if repo_id == PERSONAL_SCOPE_KEY {
+        return Ok(None);
+    }
     let canonical_tables: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('canonical_lineage','canonical_checkpoints','canonical_mapping_outcomes')",
         [], |r| r.get(0),
@@ -159,7 +164,7 @@ pub(super) fn later_finalized_svn_checkpoint(
             "SELECT scope_uuid, git_branch, EXISTS (
              SELECT 1 FROM repositories other WHERE other.id<>r.id AND
                 (other.scope_uuid=r.scope_uuid OR other.id=r.scope_uuid OR other.scope_uuid=r.id))
-         FROM repositories r WHERE id=?1 AND sync_mode='team'",
+         FROM repositories r WHERE id=?1",
             [repo_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -238,6 +243,13 @@ pub(super) fn later_finalized_svn_checkpoint(
     let checkpoint = load_directional_checkpoint(tx, &scope, generation, direction)?
         .filter(|checkpoint| checkpoint.handled_source_key == source);
     let mapping = load_mapping_outcome(tx, &scope, generation, direction, &source)?;
+    if (checkpoint.is_some() || mapping.is_some())
+        && (op.initiator_id != "team_worker"
+            || op.request_id != format!("svn-r{}", op.source_svn_rev)
+            || op.outcome_detail.as_deref() != Some(MANAGED_PUSH_CONFIRMED))
+    {
+        return Err(DatabaseError::Other("cannot backfill SVN cursor: completed SVN-to-Git push owner or confirmation conflicts with managed evidence".into()));
+    }
     let applied = MappingOutcome::AppliedAndVerified;
     match (checkpoint, mapping) {
         (None, None) => Ok(None),
@@ -387,7 +399,7 @@ fn finalize_tx(
     op.resume_authorized = false;
     op.updated_at = now;
     if !removed {
-        op.outcome_detail = Some("SVN-to-Git push verified and recorded".into());
+        op.outcome_detail = Some(MANAGED_PUSH_CONFIRMED.into());
     }
     write_op(tx, &op)?;
     clear_active(tx, &op.repo_id, &op.id)?;

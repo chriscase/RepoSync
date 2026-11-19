@@ -857,6 +857,10 @@ struct SingleRepoFixture {
 
 impl SingleRepoFixture {
     fn new() -> Self {
+        Self::with_registration_mode("team")
+    }
+
+    fn with_registration_mode(sync_mode: &str) -> Self {
         let tmp = TempDir::new().unwrap();
         let svn_root = tmp.path().join("svnserve-root");
         std::fs::create_dir_all(&svn_root).unwrap();
@@ -920,7 +924,7 @@ impl SingleRepoFixture {
             git_api_url: String::new(),
             git_repo: bare.to_string_lossy().to_string(),
             git_branch: "main".into(),
-            sync_mode: "team".into(),
+            sync_mode: sync_mode.into(),
             poll_interval_secs: 5,
             lfs_threshold_mb: 0,
             auto_merge: false,
@@ -965,6 +969,10 @@ impl SingleRepoFixture {
     fn make_engine(&self) -> SyncEngine {
         let db = setup_db(&self.db_path);
         let config = make_app_config(&self.repo.svn_url, self.tmp.path());
+        self.make_engine_with_config(db, config)
+    }
+
+    fn make_engine_with_config(&self, db: Database, config: AppConfig) -> SyncEngine {
         let mut engine = SyncEngine::new(
             config,
             db,

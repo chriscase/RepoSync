@@ -1,42 +1,66 @@
 use super::*;
-use crate::db::git_push_operations::{git_push_target_fingerprint, GitPushIntent};
+use crate::db::git_push_operations::{
+    git_push_target_fingerprint, GitPushIntent, GitPushOperation,
+};
 
 const REPO: &str = "finalized";
 const MIRROR: &str = "last_svn_rev_finalized";
 const EMITTED: &str = "dddddddddddddddddddddddddddddddddddddddd";
 const TREE: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
+fn begin_fixture_push(
+    db: &Database,
+    repo_id: &str,
+    remote: &str,
+    worker: &str,
+) -> GitPushOperation {
+    db.begin_svn_to_git_push(GitPushIntent {
+        repo_id,
+        initiator_id: worker,
+        request_id: "svn-r3",
+        target_fingerprint: &git_push_target_fingerprint(repo_id, remote, "main"),
+        source_svn_rev: 3,
+        source_svn_author: "dev",
+        source_svn_message: "emit r3",
+        pre_push_git_remote: remote,
+        pre_push_git_branch: "main",
+        pre_push_git_sha: BASELINE_SHA,
+        pre_push_git_tree: Some(BASELINE_SHA),
+        intended_local_git_sha: EMITTED,
+        intended_local_git_parent: Some(BASELINE_SHA),
+        intended_local_git_tree: TREE,
+    })
+    .unwrap()
+}
+
 fn finalized_then_rewound(remote: &str) -> (tempfile::TempDir, Database) {
-    let (dir, db, _) = open_repo(REPO);
-    let push = db
-        .begin_svn_to_git_push(GitPushIntent {
-            repo_id: REPO,
-            initiator_id: "worker",
-            request_id: "request",
-            target_fingerprint: &git_push_target_fingerprint(REPO, remote, "main"),
-            source_svn_rev: 3,
-            source_svn_author: "dev",
-            source_svn_message: "emit r3",
-            pre_push_git_remote: remote,
-            pre_push_git_branch: "main",
-            pre_push_git_sha: BASELINE_SHA,
-            pre_push_git_tree: Some(BASELINE_SHA),
-            intended_local_git_sha: EMITTED,
-            intended_local_git_parent: Some(BASELINE_SHA),
-            intended_local_git_tree: TREE,
-        })
+    rewound_registration(REPO, remote, "team")
+}
+
+fn rewound_registration(repo_id: &str, remote: &str, mode: &str) -> (tempfile::TempDir, Database) {
+    let (dir, db, _) = open_repo(repo_id);
+    db.conn()
+        .execute(
+            "UPDATE repositories SET sync_mode=?1 WHERE id=?2",
+            params![mode, repo_id],
+        )
         .unwrap();
-    db.confirm_svn_to_git_push(REPO, &push.id, EMITTED, TREE)
+    assert_eq!(db.get_repository(repo_id).unwrap().unwrap().sync_mode, mode);
+    let push = begin_fixture_push(&db, repo_id, remote, "team_worker");
+    db.confirm_svn_to_git_push(repo_id, &push.id, EMITTED, TREE)
         .unwrap();
     db.conn()
         .execute(
             "UPDATE repositories SET last_svn_rev=1,last_git_sha=?1 WHERE id=?2",
-            params![BASELINE_SHA, REPO],
+            params![BASELINE_SHA, repo_id],
         )
         .unwrap();
     assert_eq!(
         db.conn()
-            .execute("DELETE FROM kv_state WHERE key=?1", [MIRROR])
+            .execute(
+                "DELETE FROM kv_state WHERE key=?1",
+                [format!("last_svn_rev_{repo_id}")]
+            )
             .unwrap(),
         1
     );
@@ -44,12 +68,90 @@ fn finalized_then_rewound(remote: &str) -> (tempfile::TempDir, Database) {
         db.conn()
             .execute(
                 "DELETE FROM sync_records WHERE repo_id=?1 AND svn_rev=3",
-                [REPO]
+                [repo_id]
             )
             .unwrap(),
         1
     );
     (dir, db)
+}
+
+#[test]
+fn ordinary_push_veto_covers_direct_and_pr_registrations() {
+    let observations: Vec<_> = ["direct", "pr"]
+        .into_iter()
+        .map(|mode| {
+            let (_dir, db) = rewound_registration(REPO, "origin", mode);
+            let baseline = resolve_repo_import_baseline(&db, REPO).unwrap();
+            (mode, baseline, db.get_state(MIRROR).unwrap())
+        })
+        .collect();
+    assert!(observations.iter().all(|(_,baseline,mirror)| {
+        matches!(baseline, RepoImportBaseline::ReconciliationRequired { reason, .. } if reason == "conflicting_finalized_svn_checkpoint") && mirror.is_none()
+    }), "ordinary managed resolution and physical mirrors: {observations:?}");
+    for mode in ["direct", "pr"] {
+        let (_dir, db) = rewound_registration(REPO, "origin", mode);
+        db.conn()
+            .execute(
+                "UPDATE repositories SET git_branch='other' WHERE id=?1",
+                [REPO],
+            )
+            .unwrap();
+        assert!(resolve_repo_import_baseline(&db, REPO)
+            .unwrap()
+            .is_verified());
+        assert_eq!(db.get_state(MIRROR).unwrap().as_deref(), Some("1"));
+    }
+}
+
+#[test]
+fn personal_publications_stay_separate_from_a_managed_registration_named_personal() {
+    use crate::db::personal_scope::{LEGACY_PERSONAL_REPO_ID, PERSONAL_SCOPE_KEY};
+    let id = LEGACY_PERSONAL_REPO_ID;
+    let mirror = format!("last_svn_rev_{id}");
+    let (_dir, db) = rewound_registration(id, "origin", "direct");
+    let confirm_personal = |db: &Database, repo_id: &str| {
+        let pin = begin_fixture_push(db, repo_id, "origin", "personal_worker");
+        db.confirm_personal_svn_to_git_push(repo_id, &pin.id, EMITTED, TREE, "svn_rev", "Dev")
+            .unwrap();
+        let map: String = db.conn().query_row(
+            "SELECT git_sha FROM commit_map WHERE repo_id=?1 AND svn_rev=3 AND direction='svn_to_git'",
+            [repo_id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(map, EMITTED);
+        assert_eq!(db.get_watermark("svn_rev").unwrap().as_deref(), Some("3"));
+    };
+    confirm_personal(&db, PERSONAL_SCOPE_KEY);
+    let baseline = resolve_repo_import_baseline(&db, id).unwrap();
+    assert!(
+        matches!(baseline, RepoImportBaseline::ReconciliationRequired { reason, .. } if reason == "conflicting_finalized_svn_checkpoint")
+    );
+    assert!(db.get_state(&mirror).unwrap().is_none());
+    // A legacy personal push can point at the same human ID as the older managed publication.
+    confirm_personal(&db, id);
+    let error = resolve_repo_import_baseline(&db, id).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("owner or confirmation conflicts"));
+    assert!(db.get_state(&mirror).unwrap().is_none());
+
+    let (_dir, personal_only, _) = open_repo(id);
+    crate::db::repo_scope_identity::repository_scope_uuid(&personal_only.conn(), id).unwrap();
+    personal_only
+        .conn()
+        .execute(
+            "UPDATE repositories SET sync_mode='direct',last_svn_rev=1,last_git_sha=?1 WHERE id=?2",
+            params![BASELINE_SHA, id],
+        )
+        .unwrap();
+    confirm_personal(&personal_only, id);
+    assert!(resolve_repo_import_baseline(&personal_only, id)
+        .unwrap()
+        .is_verified());
+    assert_eq!(
+        personal_only.get_state(&mirror).unwrap().as_deref(),
+        Some("1")
+    );
 }
 
 #[test]
@@ -169,6 +271,7 @@ fn corrupt_present_evidence_does_not_create_a_mirror() {
         ("DELETE FROM kv_state WHERE key GLOB 'svn_to_git_push_v1:document:*'", "document is missing"),
         ("UPDATE kv_state SET value='broken' WHERE key GLOB 'svn_to_git_push_v1:document:*'", "invalid svn-to-git push"),
         ("UPDATE kv_state SET value=json_set(value,'$.repo_id','other') WHERE key GLOB 'svn_to_git_push_v1:document:*'", "identity differs"),
+        ("UPDATE kv_state SET value=json_set(value,'$.initiator_id','personal_worker') WHERE key GLOB 'svn_to_git_push_v1:document:*'", "owner or confirmation conflicts"),
         ("UPDATE kv_state SET value=json_set(value,'$.pre_push_git_remote','file:///other') WHERE key GLOB 'svn_to_git_push_v1:document:*'", "target fingerprint differs"),
         ("INSERT INTO kv_state(key,value,updated_at) VALUES ('svn_to_git_push_v1:active:finalized','','t')", "still has an active pointer"),
         ("UPDATE kv_state SET value=json_set(value,'$.last_confirmed_git_tree','short') WHERE key GLOB 'svn_to_git_push_v1:document:*'", "inconsistent target or confirmation"),

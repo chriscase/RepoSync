@@ -160,14 +160,20 @@ def post_write_recovery_errors(status: str, detail: object) -> list[str]:
     if not isinstance(recovery, dict) or recovery.get("status") != "PASS":
         errors.append("detail.git_push_checkpoint_recovery.status must be PASS")
     history = detail.get("finalized_history")
-    for name in FINALIZED_HISTORY_CASES:
-        proof = history.get(name) if isinstance(history, dict) else None
+    history = history if isinstance(history, dict) else {}
+    registrations = [(name, history.get(name), "direct") for name in FINALIZED_HISTORY_CASES]
+    contradictory = history.get("contradictory_mirror_hold")
+    if isinstance(contradictory, dict) and contradictory.get("status") == "PASS":
+        registrations.append(("contradictory_mirror_hold.pr_registration", contradictory.get("pr_registration"), "pr"))
+    for name, proof, mode in registrations:
         if not isinstance(proof, dict) or proof.get("status") != "PASS":
             errors.append(f"detail.finalized_history.{name}.status must be PASS")
+        elif proof.get("registration_mode") != mode or proof.get("push_initiator") != "team_worker":
+            errors.append(f"detail.finalized_history.{name} requires registration_mode={mode} and push_initiator=team_worker")
 
     if detail.get("bare_head_stable") is not True or detail.get("duplicate_mapping") is not False:
         errors.append("requires a stable bare head and no duplicate mapping")
-    historical = history.get("historical_hold") if isinstance(history, dict) else None
+    historical = history.get("historical_hold")
     if isinstance(historical, dict):
         # The native case copies these observations from the historical drill into its outer row.
         mirrors = (("final_watermark", "repo_svn_rev"), ("expected_watermark", "canonical_svn_rev"),
@@ -403,15 +409,16 @@ def run_self_test() -> None:
             for case_id in expected_ids
         ]
         post_write = next(row for row in rows if row["id"] == POST_WRITE_RECOVERY)
+        direct = {"status": "PASS", "registration_mode": "direct", "push_initiator": "team_worker"}
         post_write["detail"] = {
             "recovery_ok": True, "expected_watermark": 3, "final_watermark": 3,
             "mapping_count": 1, "mapped_git_sha": "abcd" * 10,
             "bare_head_stable": True, "duplicate_mapping": False,
             "git_push_checkpoint_recovery": {"status": "PASS"},
             "finalized_history": {
-                "historical_hold": {"status": "PASS", "published_git_sha": "abcd" * 10},
-                "mirror_recovery": {"status": "PASS"},
-                "contradictory_mirror_hold": {"status": "PASS"},
+                "historical_hold": {**direct, "published_git_sha": "abcd" * 10},
+                "mirror_recovery": dict(direct),
+                "contradictory_mirror_hold": {**direct, "pr_registration": {**direct, "registration_mode": "pr"}},
             },
         }
         return rows
@@ -522,6 +529,7 @@ def run_self_test() -> None:
             history = detail["finalized_history"]
             proof_fields = [(detail, "git_push_checkpoint_recovery", "detail")]
             proof_fields.extend((history, name, "detail.finalized_history") for name in history)
+            proof_fields.append((history["contradictory_mirror_hold"], "pr_registration", "detail.finalized_history.contradictory_mirror_hold"))
             for parent, key, prefix in proof_fields:
                 diagnostic = [f"{POST_WRITE_RECOVERY}: {prefix}.{key}.status must be PASS"]
                 valid = parent.pop(key)
@@ -530,6 +538,17 @@ def run_self_test() -> None:
                     parent[key] = invalid
                     check_r01_errors(diagnostic)
                 parent[key] = valid
+
+            checks = [(name, history[name], "direct") for name in FINALIZED_HISTORY_CASES]
+            checks.append(("contradictory_mirror_hold.pr_registration", history["contradictory_mirror_hold"]["pr_registration"], "pr"))
+            for name, proof, mode in checks:
+                diagnostic = [f"{POST_WRITE_RECOVERY}: detail.finalized_history.{name} requires registration_mode={mode} and push_initiator=team_worker"]
+                for key, invalid in (("registration_mode", "team"), ("push_initiator", "manual")):
+                    valid = proof.pop(key)
+                    check_r01_errors(diagnostic)
+                    proof[key] = invalid
+                    check_r01_errors(diagnostic)
+                    proof[key] = valid
 
             detail["finalized_history"] = "PASS"
             check_r01_errors([f"{POST_WRITE_RECOVERY}: detail.finalized_history.{name}.status must be PASS"
