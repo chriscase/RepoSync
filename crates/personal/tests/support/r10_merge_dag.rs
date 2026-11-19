@@ -78,7 +78,10 @@ async fn request_path(stream: &mut TcpStream) -> String {
 enum ProviderView {
     Complete,
     IncompleteDag,
+    EarlierOnly,
     PendingBeyondCap,
+    CoveredBeyondCap,
+    ShiftedBoundary,
     PendingMissing,
     EmptyDag,
     ShortDag,
@@ -139,6 +142,12 @@ async fn pr_provider(
             let path = request_path(&mut stream).await;
             let route = path.strip_prefix("/repos/test/test-repo/").unwrap();
             let (route, query) = route.split_once('?').unwrap_or((route, ""));
+            if route == "pulls" {
+                for field in ["state=all", "sort=created", "direction=desc"] {
+                    assert!(query.split('&').any(|pair| pair == field));
+                }
+                assert!(!query.split('&').any(|field| field.starts_with("base=")));
+            }
             let mut body = routes
                 .get(route)
                 .expect("unexpected test-provider route")
@@ -146,6 +155,13 @@ async fn pr_provider(
             let mut continuation = None;
             let current = *view.lock().unwrap();
             match (current, route) {
+                (ProviderView::EarlierOnly, "pulls") => {
+                    body = json!(pulls
+                        .iter()
+                        .filter(|row| row["number"] == 2 || row["number"] == 1)
+                        .collect::<Vec<_>>())
+                    .to_string();
+                }
                 (ProviderView::IncompleteDag, "pulls/3/commits") => {
                     let commits: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
                     body = json!([commits[0]]).to_string();
@@ -163,7 +179,18 @@ async fn pr_provider(
                     commits.swap(0, 1);
                     body = json!(commits).to_string();
                 }
-                (ProviderView::PendingBeyondCap, "pulls") => {
+                (ProviderView::ShiftedBoundary, "pulls") => {
+                    let page_two = query.split('&').any(|field| field == "page=2");
+                    let done = pulls.iter().find(|row| row["number"] == 2).unwrap();
+                    let later = pulls.iter().find(|row| row["number"] == 4).unwrap();
+                    if page_two {
+                        body = json!([done]).to_string();
+                    } else {
+                        body = json!([later, done]).to_string();
+                        continuation = Some(format!("{server_url}/repositories/123/pulls?page=2"));
+                    }
+                }
+                (ProviderView::PendingBeyondCap | ProviderView::CoveredBeyondCap, "pulls") => {
                     let page: usize = query
                         .split('&')
                         .find_map(|pair| pair.strip_prefix("page="))
@@ -184,6 +211,9 @@ async fn pr_provider(
                         }
                         if page == 1 {
                             rows[0] = pulls.iter().find(|row| row["number"] == 4).unwrap().clone();
+                        }
+                        if page == 1 && matches!(current, ProviderView::CoveredBeyondCap) {
+                            rows[1] = pulls.iter().find(|row| row["number"] == 3).unwrap().clone();
                         }
                         body = json!(rows).to_string();
                         continuation = Some(format!(
@@ -284,6 +314,15 @@ fn assert_mappings(db: &Database, direction: &str, expected: &[(i64, &str)]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_personal_merge_dag_replays_across_restart() {
+    qualify_pr_backlog(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_later_pr_preserves_earlier_work() {
+    qualify_pr_backlog(true).await;
+}
+
+async fn qualify_pr_backlog(check_first_cycle_only: bool) {
     assert!(
         svn_available(),
         "this qualification requires local SVN tooling"
@@ -424,8 +463,28 @@ async fn candidate_r10_personal_merge_dag_replays_across_restart() {
         (baseline + 1, earlier.as_str()),
         (baseline + 2, left.as_str()),
     ];
+    if !check_first_cycle_only {
+        let db = Database::new(&path).unwrap();
+        assert_eq!(
+            db.get_watermark("git_sha").unwrap().as_deref(),
+            Some(imported.as_str())
+        );
+        assert_eq!(
+            db.conn()
+                .execute("DELETE FROM watermarks WHERE source='git_sha'", [])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            resolve_personal_checkpoint(&db, &git).unwrap().as_deref(),
+            Some(imported.as_str())
+        );
+    }
     {
         let engine = open();
+        if !check_first_cycle_only {
+            *view.lock().unwrap() = ProviderView::EarlierOnly;
+        }
         let earlier_only = engine.run_cycle().await.unwrap();
         assert_eq!(
             (earlier_only.prs_processed, earlier_only.git_to_svn_count),
@@ -437,6 +496,47 @@ async fn candidate_r10_personal_merge_dag_replays_across_restart() {
         assert_mappings(&db, "git_to_svn", &first[..1]);
         assert!(!db.is_personal_pr_synced(&historical_merge).unwrap());
         assert!(!db.is_personal_pr_synced(&tip).unwrap());
+        if check_first_cycle_only {
+            let prs = db.list_pr_syncs(5).unwrap();
+            assert_eq!(prs.len(), 2);
+            assert_eq!(
+                (
+                    prs[0].pr_number,
+                    prs[0].status.as_str(),
+                    prs[0].commit_count
+                ),
+                (3, "pending", 0)
+            );
+            assert_eq!((prs[1].pr_number, prs[1].status.as_str()), (2, "completed"));
+            assert_eq!(
+                svn_tree(&svn, baseline + 1).await,
+                git_tree(&bare, &earlier)
+            );
+            provider.abort();
+            return;
+        }
+        *view.lock().unwrap() = ProviderView::PendingBeyondCap;
+        let gap = engine.run_cycle().await.unwrap();
+        assert_eq!(
+            (gap.prs_processed, gap.git_to_svn_count),
+            (0, 0),
+            "unstarted earlier merge cannot be skipped on a capped scan"
+        );
+        assert_eq!(svn_youngest(&url), baseline + 1);
+        assert_mappings(&db, "git_to_svn", &first[..1]);
+        *view.lock().unwrap() = ProviderView::ShiftedBoundary;
+        let drift = engine.run_cycle().await.unwrap();
+        assert_eq!(
+            (drift.prs_processed, drift.git_to_svn_count),
+            (0, 0),
+            "unstable two-page discovery cannot omit the unstarted earlier PR"
+        );
+        assert_eq!(svn_youngest(&url), baseline + 1);
+        assert_mappings(&db, "git_to_svn", &first[..1]);
+        assert_eq!(db.list_pr_syncs(5).unwrap().len(), 1);
+        *view.lock().unwrap() = ProviderView::IncompleteDag;
+        let held = engine.run_cycle().await.unwrap();
+        assert_eq!((held.prs_processed, held.git_to_svn_count), (0, 0));
         let pr = db.list_pr_syncs(2).unwrap().remove(0);
         assert_eq!(
             (
@@ -528,7 +628,7 @@ async fn candidate_r10_personal_merge_dag_replays_across_restart() {
         (truncated.git_to_svn_count, truncated.prs_processed),
         (0, 0)
     );
-    assert_eq!(pages.load(Ordering::SeqCst), 10);
+    assert_eq!(pages.load(Ordering::SeqCst), 20);
     assert_eq!(svn_youngest(&url), baseline + 2);
     assert_mappings(&db, "git_to_svn", &first);
     assert!(!db.is_personal_pr_synced(&tip).unwrap());
@@ -550,7 +650,7 @@ async fn candidate_r10_personal_merge_dag_replays_across_restart() {
         assert!(!db.is_personal_pr_synced(&merge).unwrap());
         assert!(!db.is_personal_pr_synced(&tip).unwrap());
     }
-    *view.lock().unwrap() = ProviderView::Complete;
+    *view.lock().unwrap() = ProviderView::CoveredBeyondCap;
     let stats = engine.run_cycle().await.unwrap();
     assert_eq!(
         (
@@ -560,6 +660,8 @@ async fn candidate_r10_personal_merge_dag_replays_across_restart() {
         ),
         (0, 2, 3)
     );
+    assert_eq!(pages.load(Ordering::SeqCst), 30);
+    *view.lock().unwrap() = ProviderView::Complete;
     let expected = [
         first[0],
         first[1],
@@ -634,7 +736,10 @@ async fn candidate_r10_personal_merge_dag_replays_across_restart() {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(errors.len(), 9, "unexpected failed phases: {errors:?}");
+        assert_eq!(errors.len(), 11, "unexpected failed phases: {errors:?}");
+        assert!(errors[0].1.contains("incomplete pull-request discovery"));
+        assert!(errors[1].1.contains("duplicate pull request"));
+        let errors = &errors[2..];
         assert_eq!(errors[0].0, "git_to_svn_incomplete_pr");
         assert!(errors[0].1.contains("incomplete commit list for PR #3"));
         assert!(errors[1].1.contains("pending Personal PR #3 is missing"));
@@ -660,7 +765,7 @@ async fn candidate_r10_personal_merge_dag_replays_across_restart() {
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         json!({"case":"R10_PERSONAL_MERGE_DAG_RESTART","status":"PASS",
-        "mode":"personal","import":imported,"earlier_pr_merge":base,"pr_merge":merge,"tip":tip,"historical_merge":historical_merge,"discovery_pages":pages.load(Ordering::SeqCst),"earlier_before_incomplete":1,"first_unadvertised_prefix_refused":true,"missing_pending_zero_writes":true,"changed_lists_refused":3,"mappings":expected,"restart_after":first,
+        "mode":"personal","import":imported,"earlier_pr_merge":base,"pr_merge":merge,"tip":tip,"historical_merge":historical_merge,"discovery_pages":10,"covered_discovery_pages":10,"shifted_boundary_zero_writes":true,"scoped_import_without_global":true,"uncapped_drift_and_capped_gap_refused":true,"first_unadvertised_prefix_refused":true,"missing_pending_zero_writes":true,"changed_lists_refused":3,"mappings":expected,"restart_after":first,
         "reopened_commits":stats.git_to_svn_count,"svn_trees":checked_trees,
         "pr_range":[baseline+2,baseline+4],"quiet_cycles":2})
     );

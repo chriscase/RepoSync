@@ -196,21 +196,28 @@ impl GitToSvnSync {
 
     /// Default-branch first-parent order is the order in which PRs landed.
     /// Provider update order and merge wall clocks do not establish ancestry.
-    fn ordered_prs(&self, prs: Vec<PullRequest>, remote_tip: &str) -> Result<Vec<PullRequest>> {
-        if prs.is_empty() {
+    fn ordered_prs(
+        &self,
+        prs: Vec<PullRequest>,
+        admitted: &HistoryInspectAdmission,
+        truncated: bool,
+    ) -> Result<Vec<PullRequest>> {
+        if prs.is_empty() && !truncated {
             return Ok(Vec::new());
         }
-        // The legacy Personal import watermark is authoritative only in a
-        // Personal database. Never borrow a global cursor from managed pairs.
-        self.db.require_legacy_import_watermarks_available()?;
         let baseline = self
             .db
-            .get_watermark("git_sha")?
-            .context("Personal PR replay needs the original import Git baseline")?;
+            .personal_pr_history_anchor()?
+            .context("Personal PR replay needs a repository-owned import Git baseline")?;
         let git = GitClient::new(&self.git_repo_path)?;
         let repo = git.repo();
         let anchor = repo.find_commit(baseline.parse()?)?;
-        let mut cursor = repo.find_commit(remote_tip.parse()?)?;
+        let checkpoint = admitted.checkpoint.parse()?;
+        anyhow::ensure!(
+            anchor.id() == checkpoint || repo.graph_descendant_of(checkpoint, anchor.id())?,
+            "Personal import baseline is unrelated to the admitted checkpoint"
+        );
+        let mut cursor = repo.find_commit(admitted.remote_tip.parse()?)?;
         let mut pending = HashMap::new();
         for pr in prs {
             let sha = pr
@@ -229,9 +236,12 @@ impl GitToSvnSync {
             }
         }
         let mut newest_first = Vec::new();
-        while !pending.is_empty() && cursor.id() != anchor.id() {
+        while (truncated || !pending.is_empty()) && cursor.id() != anchor.id() {
             if let Some(pr) = pending.remove(&cursor.id()) {
                 newest_first.push(pr);
+            } else if truncated && !self.db.is_personal_pr_synced(&cursor.id().to_string())? {
+                // A missing first-parent step could be an older unprocessed PR.
+                return Err(GitHubError::IncompletePrDiscovery.into());
             }
             if cursor.parent_count() == 0 {
                 anyhow::bail!(
@@ -290,12 +300,12 @@ impl GitToSvnSync {
 
         // Rescan complete discovery. A local completion timestamp can fall after
         // every provider merge in a backlog.
-        let merged_prs = self
+        let scan = self
             .github
-            .get_merged_pull_requests(&self.github_repo, &self.default_branch, None)
-            .await
-            .context("failed to fetch merged pull requests")?;
+            .scan_merged_pull_requests(&self.github_repo, &self.default_branch, None)
+            .await?;
 
+        let merged_prs = scan.prs;
         info!(count = merged_prs.len(), "found merged pull requests");
 
         for (number, sha) in self.db.unfinished_personal_prs()? {
@@ -303,6 +313,9 @@ impl GitToSvnSync {
                 i64::try_from(pr.number).ok() == Some(number)
                     && pr.merge_commit_sha.as_deref() == Some(&sha)
             }) {
+                if scan.has_more {
+                    return Err(GitHubError::IncompletePrDiscovery.into());
+                }
                 anyhow::bail!("pending Personal PR #{number} is missing from complete discovery");
             }
         }
@@ -318,7 +331,7 @@ impl GitToSvnSync {
                 candidates.push(pr);
             }
         }
-        let ordered = self.ordered_prs(candidates, &admitted.remote_tip)?;
+        let ordered = self.ordered_prs(candidates, &admitted, scan.has_more)?;
         if ordered.is_empty() {
             return Ok(result);
         }

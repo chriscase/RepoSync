@@ -68,6 +68,12 @@ pub struct PullRequestRef {
     pub sha: String,
 }
 
+/// A bounded scan may need local Git coverage to prove that older pages are irrelevant.
+pub struct MergedPrScan {
+    pub prs: Vec<PullRequest>,
+    pub has_more: bool,
+}
+
 /// Detailed commit info from `GET /repos/{owner}/{repo}/commits/{sha}`.
 /// Includes the `parents` array needed for merge strategy detection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,21 +334,37 @@ impl GitHubClient {
         base: &str,
         since: Option<&str>,
     ) -> Result<Vec<PullRequest>, GitHubError> {
+        let scan = self.scan_merged_pull_requests(repo, base, since).await?;
+        if scan.has_more {
+            return Err(GitHubError::IncompletePrDiscovery);
+        }
+        Ok(scan.prs)
+    }
+
+    /// Scan by immutable creation order across all PR states/branches. Moving a
+    /// PR between states or updating it cannot change its position. An insertion
+    /// at the front which shifts a numbered boundary repeats a PR and is refused.
+    pub async fn scan_merged_pull_requests(
+        &self,
+        repo: &str,
+        base: &str,
+        since: Option<&str>,
+    ) -> Result<MergedPrScan, GitHubError> {
         let first_url = format!("{}/repos/{}/pulls", self.api_url, repo);
         let base = base.to_string();
         let since = since.map(|s| s.to_string());
         let mut all_prs = Vec::new();
+        let mut numbers_seen = std::collections::HashSet::new();
         let mut pages = 0usize;
-        loop {
+        let has_more = loop {
             pages += 1;
             let resp = self
                 .retry_request(|| {
                     self.auth(self.http.get(&first_url))
                         .query(&[
-                            ("state", "closed"),
-                            ("base", base.as_str()),
+                            ("state", "all"),
                             ("per_page", "100"),
-                            ("sort", "updated"),
+                            ("sort", "created"),
                             ("direction", "desc"),
                         ])
                         .query(&[("page", pages)])
@@ -350,11 +372,13 @@ impl GitHubClient {
                 .await?;
             let next = Self::next_pr_page(&resp)?;
             let rows: Vec<PullRequest> = resp.json().await?;
-            all_prs.extend(rows);
-            let Some(url) = next else { break };
-            if pages == 10 {
-                return Err(GitHubError::IncompletePrDiscovery);
+            if rows.iter().any(|pr| !numbers_seen.insert(pr.number)) {
+                return Err(GitHubError::ParseError(
+                    "duplicate pull request in paged discovery".into(),
+                ));
             }
+            all_prs.extend(rows);
+            let Some(url) = next else { break false };
             // GitHub may emit a canonical numeric repository URL. Request the
             // next numbered page on the original route with the original filters.
             let numbers: Vec<_> = url
@@ -367,12 +391,16 @@ impl GitHubClient {
                     "unexpected pull-request page sequence".into(),
                 ));
             }
-        }
+            if pages == 10 {
+                break true;
+            }
+        };
         // Filter to only merged PRs, optionally after a timestamp
         let merged: Vec<PullRequest> = all_prs
             .into_iter()
             // GitHub list responses identify merges by merged_at; the detail-only
             // merged flag is optional on compatible providers. Honor an explicit false.
+            .filter(|pr| pr.base.ref_name == base && pr.state == "closed")
             .filter(|pr| {
                 pr.merged.unwrap_or_else(|| {
                     pr.merged_at
@@ -392,7 +420,10 @@ impl GitHubClient {
             })
             .collect();
         debug!(count = merged.len(), base = %base, pages, "fetched merged pull requests");
-        Ok(merged)
+        Ok(MergedPrScan {
+            prs: merged,
+            has_more,
+        })
     }
 
     /// Get commits for a specific pull request.

@@ -256,6 +256,37 @@ impl Database {
         null_commit_map_git_to_svn_has_personal_evidence(&conn, git_sha)
     }
 
+    /// Find the import boundary for Personal PR discovery. Without a legacy
+    /// watermark, match the Personal importer's applied receipt to its actual
+    /// mapping. Later outbound mappings may be on a partially replayed side branch.
+    pub fn personal_pr_history_anchor(&self) -> Result<Option<String>, DatabaseError> {
+        if self.list_repositories()?.is_empty() {
+            if let Some(sha) = self.get_watermark("git_sha")?.filter(|sha| !sha.is_empty()) {
+                return Ok(Some(sha));
+            }
+        }
+        let scopes = personal_repo_ids_for_read(self)?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT m.svn_rev, m.git_sha FROM commit_map m JOIN sync_records r
+             ON r.repo_id=m.repo_id AND r.git_sha=m.git_sha AND r.svn_rev=m.svn_rev
+             WHERE m.repo_id IN (?1,?2) AND m.direction='svn_to_git' AND r.direction='svn_to_git'
+             AND r.status='applied' AND r.message=('personal import checkpoint r' || m.svn_rev)
+             ORDER BY m.svn_rev ASC LIMIT 2",
+        )?;
+        let rows = stmt
+            .query_map(params![scopes[0], scopes.get(1)], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if matches!(rows.as_slice(), [first, second] if first.0 == second.0) {
+            return Err(DatabaseError::Other(
+                "ambiguous Personal import mappings at the same SVN revision".into(),
+            ));
+        }
+        Ok(rows.into_iter().next().map(|(_, sha)| sha))
+    }
+
     /// True when personal mode has completed syncing this PR merge SHA.
     pub fn is_personal_pr_synced(&self, merge_sha: &str) -> Result<bool, DatabaseError> {
         let conn = self.conn();

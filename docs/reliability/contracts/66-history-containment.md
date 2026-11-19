@@ -184,7 +184,17 @@ Still required before claiming #66:
 - equal-looking content with different provenance (already partly R09 amend)
 - SVN mergeinfo-only versus UUID/path incarnation (R15 remains PARTIAL)
 - Personal commit lists that span provider pages. The replay proof uses three
-  commits in the DAG PR. The client requests 100 per page and requires an unpaginated commit-list response. The pending row exists before the first commit-list request. For a two-parent merge, the local Git graph must confirm every introduced commit in parent-before-child order before the first write. The first complete list pins the ordered SHAs, so an empty, shortened or reordered retry stays pending. The queue also holds when the closed-PR listing still has a next page after ten pages or omits an unfinished PR.
+  commits in the DAG PR. The client requests 100 commits per page and records
+  the pending PR before requesting its list. A paginated response keeps it pending.
+  For a two-parent merge, the local Git graph must confirm every introduced commit
+  in parent-before-child order. The first complete list pins the ordered SHAs.
+  Empty, shortened or reordered retries keep the queue at that PR.
+- Discovery reads up to ten pages of PRs in creation order. A repeated PR number
+  across pages or an omitted pending PR holds the queue. At the cap, replay can
+  proceed if every first-parent commit after the import boundary has a listed or
+  previously completed PR. An uncovered step holds publication. A database that
+  lacks the legacy Git watermark can use the Personal importer's matching scoped
+  receipt and mapping. A missing or ambiguous import boundary requires inspection.
   The Team 1,001-commit qualification uses its own continuation mechanism.
 
 Assert zero unwanted remote changes and stable checkpoints on rejection, and
