@@ -1,0 +1,111 @@
+dn: ou=people,dc=lab,dc=invalid
+objectClass: organizationalUnit
+ou: people
+
+dn: ou=services,dc=lab,dc=invalid
+objectClass: organizationalUnit
+ou: services
+
+dn: ou=groups,dc=lab,dc=invalid
+objectClass: organizationalUnit
+ou: groups
+
+dn: ou=contractors,dc=lab,dc=invalid
+objectClass: organizationalUnit
+ou: contractors
+
+dn: uid=svc-bind,ou=services,dc=lab,dc=invalid
+objectClass: inetOrgPerson
+cn: Lab Bind
+sn: Bind
+uid: svc-bind
+mail: svc-bind@lab.invalid
+userPassword: @@LDAP_BIND_PASSWORD@@
+
+dn: uid=svc-sync,ou=people,dc=lab,dc=invalid
+objectClass: inetOrgPerson
+cn: Lab Sync
+sn: Sync
+uid: svc-sync
+mail: svc-sync@lab.invalid
+userPassword: @@SVN_SYNC_PASSWORD@@
+
+dn: uid=alice,ou=people,dc=lab,dc=invalid
+objectClass: inetOrgPerson
+cn: Alice Lab
+sn: Lab
+uid: alice
+mail: alice@lab.invalid
+userPassword: @@ALICE_PASSWORD@@
+
+dn: uid=bob,ou=people,dc=lab,dc=invalid
+objectClass: inetOrgPerson
+cn: Bob Lab
+sn: Lab
+uid: bob
+mail: bob@lab.invalid
+userPassword: @@BOB_PASSWORD@@
+
+dn: uid=observer,ou=people,dc=lab,dc=invalid
+objectClass: inetOrgPerson
+cn: Observer Lab
+sn: Lab
+uid: observer
+mail: observer@lab.invalid
+userPassword: @@OBSERVER_PASSWORD@@
+
+dn: uid=nomail,ou=people,dc=lab,dc=invalid
+objectClass: inetOrgPerson
+cn: No Mail
+sn: Missing
+uid: nomail
+userPassword: @@NOMAIL_PASSWORD@@
+
+dn: uid=dupmail-a,ou=people,dc=lab,dc=invalid
+objectClass: inetOrgPerson
+cn: Dup A
+sn: Dup
+uid: dupmail-a
+mail: ambiguous@lab.invalid
+userPassword: @@DUP_PASSWORD@@
+
+dn: uid=dupmail-b,ou=people,dc=lab,dc=invalid
+objectClass: inetOrgPerson
+cn: Dup B
+sn: Dup
+uid: dupmail-b
+mail: ambiguous@lab.invalid
+userPassword: @@DUP_PASSWORD@@
+
+dn: uid=sam,ou=people,dc=lab,dc=invalid
+objectClass: inetOrgPerson
+cn: Sam People
+sn: Sam
+uid: sam
+mail: sam.people@lab.invalid
+userPassword: @@SAM_PASSWORD@@
+
+dn: uid=sam,ou=contractors,dc=lab,dc=invalid
+objectClass: inetOrgPerson
+cn: Sam Contractor
+sn: Sam
+uid: sam
+mail: sam.contractor@lab.invalid
+userPassword: @@SAM_PASSWORD@@
+
+dn: cn=reposync-admins,ou=groups,dc=lab,dc=invalid
+objectClass: groupOfNames
+cn: reposync-admins
+member: uid=alice,ou=people,dc=lab,dc=invalid
+
+dn: cn=reposync-devs,ou=groups,dc=lab,dc=invalid
+objectClass: groupOfNames
+cn: reposync-devs
+member: uid=alice,ou=people,dc=lab,dc=invalid
+member: uid=bob,ou=people,dc=lab,dc=invalid
+member: uid=svc-sync,ou=people,dc=lab,dc=invalid
+
+dn: cn=reposync-readers,ou=groups,dc=lab,dc=invalid
+objectClass: groupOfNames
+cn: reposync-readers
+member: uid=observer,ou=people,dc=lab,dc=invalid

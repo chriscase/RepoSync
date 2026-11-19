@@ -1,0 +1,10 @@
+ARG GITEA_IMAGE=gitea/gitea:1.22.6
+FROM ${GITEA_IMAGE}
+USER root
+RUN apk add --no-cache curl ca-certificates
+COPY gitea-entrypoint.sh /usr/local/bin/lab-gitea-entrypoint.sh
+RUN chmod 755 /usr/local/bin/lab-gitea-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/lab-gitea-entrypoint.sh"]
+# Same command as gitea/gitea:1.22.6. The wrapper execs the upstream entrypoint,
+# which performs setup and then runs this command. An empty CMD would skip s6.
+CMD ["/bin/s6-svscan", "/etc/s6"]

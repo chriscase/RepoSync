@@ -2348,7 +2348,7 @@ mod shutdown_admission_tests {
         assert!(handles.lock().await.is_empty());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn shutdown_during_reconcile_does_not_admit_and_drains_after_exit() {
         let barrier = Arc::new(ReconcileBarrier {
             entered: Notify::new(),
@@ -2379,6 +2379,8 @@ mod shutdown_admission_tests {
             .await
             .unwrap();
         let mut recorded = Vec::new();
+        let mut deadline_callbacks = 0;
+        let stop_started = tokio::time::Instant::now();
         let outcome = crate::stop_scheduler_and_drain_sync_tasks(
             crate::SchedulerStopContext {
                 notify: &notify,
@@ -2390,6 +2392,7 @@ mod shutdown_admission_tests {
             None,
             &mut |_level, reason| recorded.push(reason.to_string()),
             &mut || {
+                deadline_callbacks += 1;
                 let owned = handles
                     .try_lock()
                     .expect("no child snapshot before scheduler join");
@@ -2402,6 +2405,8 @@ mod shutdown_admission_tests {
             Duration::from_secs(2),
         )
         .await;
+        assert_eq!(deadline_callbacks, 1);
+        assert_eq!(stop_started.elapsed(), Duration::from_millis(50));
         let (_, expected) = reposync_web::scheduler_failure_from_stop_timeout();
         assert_eq!(recorded, vec![expected.clone()]);
         assert_eq!(outcome.failure.as_deref(), Some(expected.as_str()));
