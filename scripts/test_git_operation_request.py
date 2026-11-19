@@ -81,8 +81,8 @@ class RedirectHandler(BaseHTTPRequestHandler):
 
 
 class Stub(ThreadingHTTPServer):
-    def __init__(self, respond):
-        super().__init__(("127.0.0.1", 0), Handler)
+    def __init__(self, respond, handler=Handler):
+        super().__init__(("127.0.0.1", 0), handler)
         self.records = []
         self.respond = respond
 
@@ -146,8 +146,8 @@ class ClientTests(unittest.TestCase):
             server.server_close()
         self._tmp.cleanup()
 
-    def start(self, respond):
-        stub = serve(Stub(respond))
+    def start(self, respond, handler=Handler):
+        stub = serve(Stub(respond, handler))
         self._servers.append(stub)
         return stub
 
@@ -371,6 +371,59 @@ class ClientTests(unittest.TestCase):
                     self.assertFalse(result["execute_requested"])
                     self.assertNotEqual(result["exit_code"], client.EXIT_OK)
                     self.assertEqual(server.records, [])
+
+    def test_truncated_status_body_returns_json_and_keeps_the_operation_id(self):
+        class ShortGetBody(Handler):
+            def send_header(self, name, value):
+                if self.command == "GET" and name == "Content-Length":
+                    # Even a parseable JSON prefix is not a complete HTTP response.
+                    value = str(int(value) + 1)
+                    self.close_connection = True
+                super().send_header(name, value)
+
+        operation_id = "known-operation"
+        status_path = "/api/repos/repo1/import/status"
+
+        def respond(record):
+            if record["method"] == "GET":
+                if http == 200:
+                    return http, {"operation_id": operation_id, "lifecycle": "completed"}
+                return http, {"error": "incomplete error body"}
+            if json.loads(record["body"])["execute"]:
+                return 200, {"operation_id": operation_id, "lifecycle": "queued", "status_path": status_path}
+            return 200, plan(approval={"eligible": True, "binds_to": "plan_digest"}, execute_status="READY")
+
+        server = self.start(respond, ShortGetBody)
+        for action in ("status", "execute"):
+            for http in (200, 409):
+                with self.subTest(action=action, http=http):
+                    server.records.clear()
+                    args = [sys.executable, str(ROOT / "scripts/git_operation_request.py"), action,
+                            "--base-url", server.base_url, "--allow-insecure-http", "--repo-id", "repo1",
+                            "--journal", str(self.journal), "--timeout", "2"]
+                    if action == "status":
+                        args += ["--operation-kind", "import", "--operation-id", operation_id]
+                        expected_calls = [("GET", status_path)]
+                    else:
+                        args += ["--pair-id", "pair1", "--idempotency-key", "test-short-http",
+                                 "--expected-plan-digest", DIGEST, "--poll-attempts", "3"]
+                        expected_calls = [("POST", "/api/repos/pair1/refresh")] * 2 + [("GET", status_path)]
+                    proc = subprocess.run(
+                        args, capture_output=True, text=True, timeout=8, cwd=self._tmp.name,
+                        env={"REPOSYNC_API_TOKEN": TOKEN, "NO_PROXY": "127.0.0.1", "PYTHONDONTWRITEBYTECODE": "1"},
+                    )
+                    self.assertEqual([(r["method"], r["path"]) for r in server.records], expected_calls)
+                    self.assertEqual(proc.returncode, client.EXIT_UNAVAILABLE, proc.stderr)
+                    self.assertEqual(proc.stderr, "")
+                    report = json.loads(proc.stdout)
+                    self.assertFalse(report["ok"])
+                    self.assertEqual(report["outcome"], "service_unavailable")
+                    self.assertEqual(report["exit_code"], proc.returncode)
+                    self.assertEqual(report["operation_id"], operation_id)
+                    self.assertEqual(report["execute_requested"], action == "execute")
+                    self.assertEqual(report["durable_job_started"], action == "execute")
+                    if action == "execute":
+                        self.assertEqual(report["lifecycle"], "queued")
 
     def test_latest_import_progress_is_not_a_named_operation(self):
         server = self.start(lambda _r: (200, payload))

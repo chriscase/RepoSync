@@ -12,6 +12,7 @@ the durable receipt for the supplied child and request ID.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -222,15 +223,16 @@ class ApiClient:
             headers["X-Request-ID"] = idempotency_key
         request = urllib.request.Request(url, data=payload, headers=headers, method=method)
         try:
-            with self.opener.open(request, timeout=self.timeout) as response:
+            try:
+                response = self.opener.open(request, timeout=self.timeout)
+            except urllib.error.HTTPError as exc:
+                response = exc
+            with response:
                 raw = response.read()
                 status = response.status
         except RedirectRefusedError:
             return 302, {"error": "redirect_refused"}
-        except urllib.error.HTTPError as exc:
-            raw = exc.read()
-            status = exc.code
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
             raise ConnectionError("service_unavailable") from exc
         text = raw.decode("utf-8", errors="replace")
         if not text:
