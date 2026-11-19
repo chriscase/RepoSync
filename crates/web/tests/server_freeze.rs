@@ -40,6 +40,14 @@ use reposync_web::AppState;
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
+#[path = "support/import_workers.rs"]
+mod import_workers;
+
+#[cfg(unix)]
+#[path = "support/r04_verified_resume.rs"]
+mod r04_verified_resume;
+
+#[cfg(unix)]
 #[path = "support/r04_import_disable.rs"]
 mod r04_import_disable;
 
@@ -194,30 +202,36 @@ struct TestServerGuard {
 
 impl TestServerGuard {
     fn abort(mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> Result<(), &'static str> {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
-        if let Some(thread) = self.thread.take() {
-            const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-            std::thread::spawn(move || {
-                let _ = thread.join();
-                let _ = done_tx.send(());
-            });
-            if done_rx.recv_timeout(JOIN_TIMEOUT).is_err() {
-                // Join did not finish in time; detach rather than hang Drop/abort.
-            }
-        }
+        let thread = self.thread.take().ok_or("server join handle unavailable")?;
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = done_tx.send(thread.join().map_err(|_| "server thread panicked"));
+            })
+            .map_err(|_| "could not start server join observer")?;
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                    "server thread did not join within five seconds"
+                }
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    "server join observer disconnected"
+                }
+            })?
     }
 }
 
 impl Drop for TestServerGuard {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 
@@ -1705,6 +1719,22 @@ fn seed_import_history(
     (svn_url, bare)
 }
 
+fn import_fixture_engine(root: &Path, config: &AppConfig) -> Arc<SyncEngine> {
+    let engine_db = Database::in_memory().unwrap();
+    engine_db.initialize().unwrap();
+    let dummy_git = root.join("dummy-git");
+    if !dummy_git.exists() {
+        git2::Repository::init(&dummy_git).unwrap();
+    }
+    Arc::new(SyncEngine::new(
+        config.clone(),
+        engine_db,
+        SvnClient::new("file:///nonexistent", "fixture", ""),
+        GitClient::new(&dummy_git).unwrap(),
+        Arc::new(IdentityMapper::new(&IdentityConfig::default()).unwrap()),
+    ))
+}
+
 /// Disposable real SVN history, local bare Git target, v12 file database and
 /// the actual repository routes. No provider or production credentials.
 async fn import_fixture() -> (
@@ -1720,17 +1750,7 @@ async fn import_fixture() -> (
     let config = minimal_config(tmp.path());
     let db = Database::new(tmp.path().join("reposync.db")).unwrap();
     db.initialize().unwrap();
-    let engine_db = Database::in_memory().unwrap();
-    engine_db.initialize().unwrap();
-    let dummy_git = tmp.path().join("dummy-git");
-    git2::Repository::init(&dummy_git).unwrap();
-    let engine = Arc::new(SyncEngine::new(
-        config.clone(),
-        engine_db,
-        SvnClient::new("file:///nonexistent", "fixture", ""),
-        GitClient::new(&dummy_git).unwrap(),
-        Arc::new(IdentityMapper::new(&IdentityConfig::default()).unwrap()),
-    ));
+    let engine = import_fixture_engine(tmp.path(), &config);
     let refresh = reposync_core::pair_refresh::service::RefreshService::new(engine.clone());
     let (sync_tx, _) = tokio::sync::mpsc::channel(1);
     let (ws_tx, _) = tokio::sync::broadcast::channel(32);

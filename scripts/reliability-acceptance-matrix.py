@@ -319,15 +319,15 @@ def self_test() -> None:
     runtime = runpy.run_path(str(ROOT / "scripts/reliability-runtime.py"))
     require_mandatory_cases = runtime["require_mandatory_cases"]
     require_mandatory_cases(manifest)
-    case_id = "R17_MANAGED_FULL_IMPORT_OVERLAP"
-    remaining = [case for case in manifest["candidate"] if case["id"] != case_id]
-    try:
-        require_mandatory_cases({**manifest, "candidate": remaining})
-    except AssertionError as error:
-        if str(error) != f"required candidate case omitted: {[case_id]}":
-            raise
-    else:
-        raise SystemExit(f"SELF-TEST FAIL: sealed runtime accepted omitted {case_id}")
+    for case_id in ("R17_MANAGED_FULL_IMPORT_OVERLAP", "R04_VERIFIED_PARTIAL_RESUME"):
+        remaining = [case for case in manifest["candidate"] if case["id"] != case_id]
+        try:
+            require_mandatory_cases({**manifest, "candidate": remaining})
+        except AssertionError as error:
+            if str(error) != f"required candidate case omitted: {[case_id]}":
+                raise
+        else:
+            raise SystemExit(f"SELF-TEST FAIL: sealed runtime accepted omitted {case_id}")
 
     r70 = next((case for case in manifest.get("browser", [])
                 if case["id"] == "R70_DELETE_NAVIGATION"), None)

@@ -1,3 +1,4 @@
+use super::import_workers::{cleanup_failed_imports, join_last};
 use super::r04_import_disable::{main_ref, ReceiveGate};
 use super::{
     authed_client, import_fixture, inbound_git_sha_kv, register_import_history, rs67_command,
@@ -11,9 +12,9 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::JoinError;
 
 const MAIN: &str = "refs/heads/main";
 const REQUEST: &str = "r17-shared-import-request";
@@ -245,55 +246,6 @@ impl Pair {
         json!({"repo_id":self.id,"operation_id":op.id,"receive_offer":offer.trim_end(),
             "final_ref":tip,"mappings":mapped,"checkpoint":checkpoint,"ref_updates":reflog.len(),
             "confirmed_batches":op.confirmed_batches})
-    }
-}
-
-// A timeout must keep the worker in the fixture registry for failure cleanup.
-async fn join_last(state: &AppState, expected: usize) -> Result<(), JoinError> {
-    let mut workers = state.import_handles.lock().await;
-    assert_eq!(workers.len(), expected);
-    let result = tokio::time::timeout(TIMEOUT, workers.last_mut().unwrap())
-        .await
-        .expect("managed import worker timed out");
-    workers.pop();
-    result
-}
-
-async fn drain(workers: &mut Vec<JoinHandle<()>>, bound: Duration) {
-    let _ = tokio::time::timeout(bound, async {
-        while let Some(worker) = workers.last_mut() {
-            let result = worker.await;
-            workers.pop();
-            if let Err(error) = result {
-                eprintln!("R17 managed import worker ended abnormally: {error}");
-            }
-        }
-    })
-    .await;
-}
-
-async fn cleanup_failed_imports(state: &AppState) {
-    // Ask supervised Git/SVN commands to terminate and reap their process
-    // group before resorting to aborting a Tokio worker.
-    if let Ok(by_repo) = state.repo_import_progress.try_read() {
-        for progress in by_repo.values() {
-            if let Ok(progress) = progress.try_read() {
-                progress.cancel_signal.store(true, Ordering::Release);
-            }
-        }
-    }
-    let mut workers = state.import_handles.lock().await;
-    drain(&mut workers, Duration::from_secs(10)).await;
-    if !workers.is_empty() {
-        let aborted = workers.len();
-        for worker in workers.iter() {
-            worker.abort();
-        }
-        drain(&mut workers, Duration::from_secs(5)).await;
-        eprintln!(
-            "R17 requested abort of {aborted} worker(s); {} join(s) still pending",
-            workers.len()
-        );
     }
 }
 
