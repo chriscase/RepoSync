@@ -1844,11 +1844,15 @@ fn audit(
     Ok(())
 }
 
+fn active_import_id(conn: &Connection, repo_id: &str) -> Result<Option<String>, DatabaseError> {
+    read_value(conn, &format!("import_operation_v1:active:{repo_id}"))
+}
+
 fn import_blocker(
     conn: &Connection,
     repo_id: &str,
 ) -> Result<Option<RemovalBlocker>, DatabaseError> {
-    let Some(op_id) = read_value(conn, &format!("import_operation_v1:active:{repo_id}"))? else {
+    let Some(op_id) = active_import_id(conn, repo_id)? else {
         return Ok(None);
     };
     let Some(raw) = read_value(conn, &format!("import_operation_v1:document:{op_id}"))? else {
@@ -2058,22 +2062,26 @@ impl Database {
     /// Narrow legacy DELETE: clear `enabled` only. Does not create a removal
     /// journal and does not delete mappings, secrets, files, or remotes.
     pub fn legacy_disable_repository(&self, repo_id: &str) -> Result<bool, DatabaseError> {
-        let conn = self.conn();
-        let tx = conn.unchecked_transaction()?;
-        if archived_pair(&tx, repo_id)? {
-            return Err(DatabaseError::Other("archived pair is immutable".into()));
-        }
+        self.immediate_transaction(|tx| {
+            // Import enrollment can commit on another connection. Check its durable
+            // owner after reserving the write and retain held terminal operations.
+            if active_import_id(tx, repo_id)?.is_some() {
+                return Err(DatabaseError::ImportBlocksDisable);
+            }
+            if archived_pair(tx, repo_id)? {
+                return Err(DatabaseError::Other("archived pair is immutable".into()));
+            }
 
-        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
-        super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
-            &tx, repo_id,
-        )?;
-        let changed = tx.execute(
-            "UPDATE repositories SET enabled=0, updated_at=?1 WHERE id=?2",
-            params![Utc::now().to_rfc3339(), repo_id],
-        )?;
-        tx.commit()?;
-        Ok(changed == 1)
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx, repo_id,
+            )?;
+            let changed = tx.execute(
+                "UPDATE repositories SET enabled=0, updated_at=?1 WHERE id=?2",
+                params![Utc::now().to_rfc3339(), repo_id],
+            )?;
+            Ok(changed == 1)
+        })
     }
 
     pub fn prepare_managed_remove(

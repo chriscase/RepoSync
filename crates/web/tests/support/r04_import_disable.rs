@@ -235,7 +235,7 @@ async fn r04_active_import_excludes_even_a_prechecked_legacy_disable() {
     assert!(originally_enabled);
     let initial_ref = main_ref(&bare);
     assert_eq!(initial_ref, None);
-    // First half of disable_repo_inner on an independent SQLite connection.
+    // Reproduce a caller that checked the journal before the import enrolled.
     assert!(prechecked.active_import_operation(&id).unwrap().is_none());
     let initial_svn_kv = prechecked.get_state(&format!("last_svn_rev_{id}")).unwrap();
     let initial_git_kv = inbound_git_sha_kv(&prechecked, &id);
@@ -270,8 +270,7 @@ async fn r04_active_import_excludes_even_a_prechecked_legacy_disable() {
     let (status, body) = disable(&client, &url).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body["error"].as_str().unwrap().contains("import"), "{body}");
-    // Second half of the older request: drop its stale precheck and test the
-    // actual writer while this very same offer and active journal are held.
+    // Resume the prechecked caller's write while the real push is still held.
     let write = prechecked.legacy_disable_repository(&id);
     let still_enabled = state.db.get_repository(&id).unwrap().unwrap().enabled;
     drop(gate);
@@ -344,6 +343,46 @@ async fn r04_idle_disable_allows_explicit_import_on_paused_registration() {
             "can_start_while_disabled":status["can_start"],
             "enabled_after_explicit_import":state.db.get_repository(&id).unwrap().unwrap().enabled
         })
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r04_unresolved_import_pointer_keeps_legacy_disable_blocked() {
+    let (addr, state, server, _tmp, id, bare) = import_fixture().await;
+    let client = authed_client();
+    let url = format!("http://{addr}/api/repos/{id}");
+    let db = &state.db;
+    let op = db
+        .create_import_operation(&id, "fixture", "r04-held", "fixture")
+        .unwrap();
+    db.finish_import_operation(
+        &id,
+        &op.id,
+        ImportOperationState::Cancelled,
+        "fixture cancellation",
+    )
+    .unwrap();
+    let (status, _) = disable(&client, &url).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(db.active_import_operation(&id).unwrap().unwrap().id, op.id);
+
+    // A pointer to a missing document cannot establish that its owner released.
+    let active = format!("import_operation_v1:active:{id}");
+    db.set_state(&active, "fixture-missing-document").unwrap();
+    let (status, _) = disable(&client, &url).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(db.get_repository(&id).unwrap().unwrap().enabled);
+    assert_eq!(
+        db.get_state(&active).unwrap().as_deref(),
+        Some("fixture-missing-document")
+    );
+    assert!(db.managed_removal(&id).unwrap().is_none());
+    assert_eq!(main_ref(&bare), None);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"R04_UNRESOLVED_DISABLE","repo_id":id,"cancelled_operation_id":op.id,
+            "retained_pointer":db.get_state(&active).unwrap(),"enabled":db.get_repository(&id).unwrap().unwrap().enabled})
     );
     server.abort();
 }
