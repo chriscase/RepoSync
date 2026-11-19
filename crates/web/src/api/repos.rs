@@ -537,6 +537,22 @@ async fn get_repo(
     Ok(Json(enrich_repo_detail(db, RepoDetail::from(repo))?))
 }
 
+fn repository_settings_writable(db: &Database, id: &str) -> Result<(), AppError> {
+    db.require_repository_import_released(id)
+        .map_err(|e| save_error(e.into()))?;
+    if db
+        .managed_remove_blocks_new_work(id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        return Err(AppError::BadRequest(
+            "repository removal is in progress or completed; the registration cannot be reactivated"
+                .into(),
+        ));
+    }
+
+    Ok(())
+}
+
 async fn update_repo(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -555,6 +571,9 @@ async fn update_repo(
 
     let payload = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.to_string()))?;
     let db = &state.db;
+    // Read holds first, then check the receipt before returning any refusal.
+    // A concurrent copy of this request may have committed before the hold.
+    let writable = repository_settings_writable(db, &id);
     if let Some(request_id) = &body.save_request_id {
         if let Some(receipt) = db
             .verified_repository_save_receipt(
@@ -575,17 +594,7 @@ async fn update_repo(
             return Ok(Json(result));
         }
     }
-    db.require_repository_import_released(&id)
-        .map_err(|e| save_error(e.into()))?;
-    if db
-        .managed_remove_blocks_new_work(&id)
-        .map_err(|e| AppError::Internal(e.to_string()))?
-    {
-        return Err(AppError::BadRequest(
-            "repository removal is in progress or completed; the registration cannot be reactivated"
-                .into(),
-        ));
-    }
+    writable?;
 
     let (current, receipt) = db
         .save_repository_settings(&id, &user_id, body, &payload)
