@@ -15,6 +15,17 @@ use crate::models::Repository;
 const PREFIX: &str = "import_operation_v1:";
 const SETUP_OWNER_KEY: &str = "import_operation_v1:setup_owner";
 
+enum ImportEnrollment<'a> {
+    Journal,
+    Managed {
+        workdir: &'a Path,
+        svn_username: &'a str,
+    },
+    Setup {
+        data_dir: &'a Path,
+    },
+}
+
 #[derive(Serialize, Deserialize)]
 struct SetupImportIdentity {
     repo_id: String,
@@ -725,7 +736,33 @@ impl Database {
         request_id: &str,
         fingerprint: &str,
     ) -> Result<ImportOperation, DatabaseError> {
-        self.enroll_import(repo_id, initiator_id, request_id, fingerprint, None)
+        self.enroll_import(
+            repo_id,
+            initiator_id,
+            request_id,
+            fingerprint,
+            ImportEnrollment::Journal,
+        )
+    }
+
+    /// Bind a managed import to the registration used to prepare its target.
+    pub fn create_managed_import_operation(
+        &self,
+        repo: &Repository,
+        initiator_id: &str,
+        request_id: &str,
+        workdir: &Path,
+    ) -> Result<ImportOperation, DatabaseError> {
+        self.enroll_import(
+            &repo.id,
+            initiator_id,
+            request_id,
+            &import_target_fingerprint(repo, workdir),
+            ImportEnrollment::Managed {
+                workdir,
+                svn_username: &repo.svn_username,
+            },
+        )
     }
 
     /// Publish the immutable wizard identity in the same transaction as the
@@ -742,7 +779,7 @@ impl Database {
             initiator_id,
             request_id,
             &import_target_fingerprint(repo, &data_dir.join("git-repo")),
-            Some(data_dir),
+            ImportEnrollment::Setup { data_dir },
         )
     }
 
@@ -752,7 +789,7 @@ impl Database {
         initiator_id: &str,
         request_id: &str,
         fingerprint: &str,
-        setup_data_dir: Option<&Path>,
+        target: ImportEnrollment<'_>,
     ) -> Result<ImportOperation, DatabaseError> {
         // Reserve the writer before reading admission state. An idle pause can
         // commit first; a deferred read-to-write upgrade could lose that race
@@ -765,7 +802,7 @@ impl Database {
                     "repository removal blocks a new import".into(),
                 ));
             }
-            if let Some(data_dir) = setup_data_dir {
+            if let ImportEnrollment::Setup { data_dir } = target {
                 match observe_setup_import_owner(tx, data_dir)? {
                     SetupImportOwnership::Unclaimed => {}
                     SetupImportOwnership::Owned(owner) if !owner.blocks_admission() => {}
@@ -783,6 +820,23 @@ impl Database {
                     return Err(DatabaseError::Other(
                         "setup registration changed before admission".into(),
                     ));
+                }
+            }
+            if let ImportEnrollment::Managed {
+                workdir,
+                svn_username,
+            } = target
+            {
+                let current = transaction_target_fingerprint(tx, repo_id, workdir)?;
+                // The durable v1 fingerprint predates this check. Compare the
+                // prepared SVN login here without storing it in the journal.
+                let same_login: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM repositories WHERE id = ?1 AND svn_username = ?2)",
+                    params![repo_id, svn_username],
+                    |row| row.get(0),
+                )?;
+                if !same_login || !current.is_some_and(|(current, _)| current == fingerprint) {
+                    return Err(DatabaseError::ImportTargetChanged);
                 }
             }
             let active = key("active", repo_id);
@@ -826,7 +880,7 @@ impl Database {
             )?;
             write_value(tx, &active, &op.id)?;
             write_value(tx, &key("latest", repo_id), &op.id)?;
-            if setup_data_dir.is_some() {
+            if matches!(target, ImportEnrollment::Setup { .. }) {
                 let identity = SetupImportIdentity {
                     repo_id: repo_id.into(),
                     operation_id: op.id.clone(),
