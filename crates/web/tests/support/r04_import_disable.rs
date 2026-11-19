@@ -349,7 +349,7 @@ async fn r04_idle_disable_allows_explicit_import_on_paused_registration() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r04_unresolved_import_pointer_keeps_legacy_disable_blocked() {
-    let (addr, state, server, _tmp, id, bare) = import_fixture().await;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
     let client = authed_client();
     let url = format!("http://{addr}/api/repos/{id}");
     let db = &state.db;
@@ -367,6 +367,27 @@ async fn r04_unresolved_import_pointer_keeps_legacy_disable_blocked() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(db.active_import_operation(&id).unwrap().unwrap().id, op.id);
 
+    // The committed hold is already visible to readers. Reporting it needs
+    // no writer reservation, even while another connection owns that slot.
+    {
+        let path = tmp.path().join("reposync.db");
+        let reader = Database::new(&path).unwrap();
+        reader.conn().busy_timeout(Duration::ZERO).unwrap();
+        let mut peer = rusqlite::Connection::open(path).unwrap();
+        let writer = peer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let result = reader.legacy_disable_repository(&id);
+        writer.rollback().unwrap();
+        assert!(
+            matches!(
+                &result,
+                Err(reposync_core::errors::DatabaseError::ImportBlocksDisable)
+            ),
+            "a visible import hold must be reported while a writer is reserved: {result:?}"
+        );
+    }
+
     // A pointer to a missing document cannot establish that its owner released.
     let active = format!("import_operation_v1:active:{id}");
     db.set_state(&active, "fixture-missing-document").unwrap();
@@ -383,6 +404,123 @@ async fn r04_unresolved_import_pointer_keeps_legacy_disable_blocked() {
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({"case":"R04_UNRESOLVED_DISABLE","repo_id":id,"cancelled_operation_id":op.id,
             "retained_pointer":db.get_state(&active).unwrap(),"enabled":db.get_repository(&id).unwrap().unwrap().enabled})
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r04_enrollment_waits_for_uncommitted_idle_disable() {
+    use reposync_core::db::import_operations::import_target_fingerprint;
+    use std::cell::Cell;
+    use std::sync::mpsc::{self, Receiver, Sender};
+
+    const WAIT: Duration = Duration::from_secs(10);
+    // SQLite's callback takes a function pointer. Only the enrollment thread
+    // owns these channels. On an early return its sender disconnects on exit.
+    thread_local! {
+        static HANDOFF: Cell<Option<(Sender<()>, Receiver<()>)>> = const { Cell::new(None) };
+    }
+    fn wait_for_commit(_: i32) -> bool {
+        HANDOFF.take().is_some_and(|(waiting, committed)| {
+            waiting.send(()).is_ok() && committed.recv_timeout(WAIT).is_ok()
+        })
+    }
+
+    let (_addr, state, server, tmp, id, bare) = import_fixture().await;
+    let path = tmp.path().join("reposync.db");
+    let enrollment = Database::new(&path).unwrap();
+    let repo = enrollment.get_repository(&id).unwrap().unwrap();
+    assert!(repo.enabled);
+    assert!(enrollment.active_import_operation(&id).unwrap().is_none());
+    let fingerprint =
+        import_target_fingerprint(&repo, &tmp.path().join("repos").join(&id).join("git-repo"));
+    let mut peer = rusqlite::Connection::open(&path).unwrap();
+    let mode: String = peer
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    // Model only the SQL reservation and idle registration update; the two
+    // HTTP/worker cases above exercise the public disable route and real push.
+    let paused = peer
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    assert_eq!(
+        paused
+            .execute(
+                "UPDATE repositories SET enabled=0 WHERE id=?1 AND enabled=1",
+                [&id]
+            )
+            .unwrap(),
+        1
+    );
+    assert!(state.db.get_repository(&id).unwrap().unwrap().enabled);
+    let (waiting_tx, waiting_rx) = mpsc::channel();
+    let (committed_tx, committed_rx) = mpsc::channel();
+    let repo_id = id.as_str();
+    let op = std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            HANDOFF.set(Some((waiting_tx, committed_rx)));
+            enrollment
+                .conn()
+                .busy_handler(Some(wait_for_commit))
+                .unwrap();
+            enrollment.create_import_operation(
+                repo_id,
+                "fixture",
+                "r04-contended-admission",
+                &fingerprint,
+            )
+        });
+        let waited = waiting_rx.recv_timeout(WAIT);
+        paused.commit().unwrap();
+        let _ = committed_tx.send(());
+        // DatabaseError's Debug retains SQLite's typed error and extended code.
+        let op = worker.join().unwrap().unwrap_or_else(|err| {
+            panic!(
+                "import enrollment failed across idle disable: {err:?}; busy callback: {waited:?}"
+            )
+        });
+        waited.expect("enrollment must observe the outstanding SQLite writer");
+        op
+    });
+
+    let reopened = Database::new(&path).unwrap();
+    assert!(!reopened.get_repository(&id).unwrap().unwrap().enabled);
+    assert_eq!(op.state, ImportOperationState::Queued);
+    assert_eq!(op.repo_id, id);
+    assert_eq!(op.request_id, "r04-contended-admission");
+    assert_eq!(
+        reopened.active_import_operation(&id).unwrap().as_ref(),
+        Some(&op)
+    );
+    assert_eq!(
+        reopened.latest_import_operation(&id).unwrap().as_ref(),
+        Some(&op)
+    );
+    let documents: i64 = reopened.conn().query_row(
+        "SELECT count(*) FROM kv_state WHERE key GLOB 'import_operation_v1:document:*' AND json_extract(value,'$.repo_id')=?1",
+        [&id], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(documents, 1);
+    assert_eq!(
+        reopened.get_repo_watermark(&id).unwrap(),
+        (0, String::new())
+    );
+    assert!(reopened.list_commit_map(1).unwrap().is_empty());
+    assert_eq!(main_ref(&bare), None);
+    let svn = tmp.path().join("svn-repo");
+    assert_eq!(
+        rs67_command("svnlook", &["youngest", svn.to_str().unwrap()]),
+        b"3\n"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R04_WAL_ENROLLMENT_AFTER_DISABLE", "repo_id":id, "operation_id":op.id,
+            "lifecycle":op.state, "operation_documents":documents, "journal_mode":mode,
+            "enabled_after_commit":reopened.get_repository(&id).unwrap().unwrap().enabled,
+            "bare_ref_after":main_ref(&bare)
+        })
     );
     server.abort();
 }
