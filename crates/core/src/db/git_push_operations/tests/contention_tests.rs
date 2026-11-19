@@ -31,11 +31,11 @@ fn journal(path: &Path) -> Database {
     db
 }
 
-fn while_writer_is_busy(
+fn while_writer_is_busy<T: Send>(
     path: &Path,
     db: Database,
-    transition: impl FnOnce(&Database) -> Result<GitPushOperation, DatabaseError> + Send,
-) -> (Database, GitPushOperation) {
+    transition: impl FnOnce(&Database) -> Result<T, DatabaseError> + Send,
+) -> (Database, T) {
     let mut peer = Connection::open(path).unwrap();
     let writer = peer
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -48,7 +48,7 @@ fn while_writer_is_busy(
         .unwrap();
     let (waiting_tx, waiting_rx) = mpsc::channel();
     let (committed_tx, committed_rx) = mpsc::channel();
-    let op = std::thread::scope(|scope| {
+    let result = std::thread::scope(|scope| {
         let worker = scope.spawn(move || {
             HANDOFF.set(Some((waiting_tx, committed_rx)));
             db.conn().busy_handler(Some(release_writer)).unwrap();
@@ -59,23 +59,19 @@ fn while_writer_is_busy(
         let waited = waiting_rx.recv_timeout(WAIT);
         writer.commit().unwrap();
         let _ = committed_tx.send(());
-        let op = worker
+        let result = worker
             .join()
             .unwrap()
-            .expect("journal transition must wait for the writer");
+            .expect("repository transition must wait for the writer");
         waited.expect("SQLite must observe the held writer");
-        op
+        result
     });
     let reopened = Database::new(path).unwrap();
     assert_eq!(
         reopened.get_state("peer").unwrap().as_deref(),
         Some("committed")
     );
-    assert_eq!(
-        reopened.get_git_push_operation("pair", &op.id).unwrap(),
-        Some(op.clone())
-    );
-    (reopened, op)
+    (reopened, result)
 }
 
 fn assert_unadvanced(db: &Database) {
@@ -130,6 +126,10 @@ fn confirm_reserves_writer_before_reading_receipts() {
     });
     assert_eq!(op.id, intent.id);
     assert_eq!(op.state, GitPushOperationState::Completed);
+    assert_eq!(
+        db.get_git_push_operation("pair", &intent.id).unwrap(),
+        Some(op.clone())
+    );
     assert_eq!(
         op.last_confirmed_git_sha.as_ref(),
         Some(&intent.intended_local_git_sha)
@@ -193,5 +193,32 @@ fn hold_reserves_writer_before_reading_active_push() {
     assert!(!op.resume_authorized);
     assert!(op.last_confirmed_git_sha.is_none());
     assert_eq!(db.active_git_push_operation("pair").unwrap(), Some(op));
+    assert_unadvanced(&db);
+}
+
+#[test]
+fn reconciliation_status_reserves_writer_before_checking_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("reposync.db");
+    let db = journal(&path);
+    pr245_3_register(&db, "sibling", "file:///sibling");
+    db.update_repo_sync_status("pair", "applying").unwrap();
+    let intent = db.begin_svn_to_git_push(sample_intent()).unwrap();
+    let held = db
+        .hold_svn_to_git_reconciliation("pair", &intent.id, "push was rejected")
+        .unwrap();
+    let (db, ()) = while_writer_is_busy(&path, db, |db| {
+        db.update_repo_sync_status("pair", "reconciliation_required")
+    });
+    assert_eq!(
+        db.get_repository("pair").unwrap().unwrap().sync_status,
+        "reconciliation_required"
+    );
+    assert_eq!(
+        db.get_repository("sibling").unwrap().unwrap().sync_status,
+        "idle"
+    );
+    assert_eq!(held.state, GitPushOperationState::ReconciliationRequired);
+    assert_eq!(db.active_git_push_operation("pair").unwrap(), Some(held));
     assert_unadvanced(&db);
 }
