@@ -154,20 +154,21 @@ pub(super) fn later_finalized_svn_checkpoint(
     if op.state != GitPushOperationState::Completed || op.source_svn_rev <= column_revision {
         return Ok(None);
     }
-    let registration: Option<(Option<String>, bool)> = tx
+    let registration: Option<(Option<String>, String, bool)> = tx
         .query_row(
-            "SELECT scope_uuid, EXISTS (
+            "SELECT scope_uuid, git_branch, EXISTS (
              SELECT 1 FROM repositories other WHERE other.id<>r.id AND
                 (other.scope_uuid=r.scope_uuid OR other.id=r.scope_uuid OR other.scope_uuid=r.id))
-         FROM repositories r WHERE id=?1 AND sync_mode='team' AND git_branch=?2",
-            params![repo_id, op.pre_push_git_branch],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+         FROM repositories r WHERE id=?1 AND sync_mode='team'",
+            [repo_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let Some((scope, conflicting_owner)) = registration else {
+    let Some((scope, branch, conflicting_owner)) = registration else {
         return Ok(None);
     };
     if op.pre_push_git_remote.is_empty()
+        || op.pre_push_git_branch.is_empty()
         || op.target_fingerprint
             != git_push_target_fingerprint(
                 repo_id,
@@ -181,7 +182,7 @@ pub(super) fn later_finalized_svn_checkpoint(
         ));
     }
     // Late-pair publications share the push journal but pin an explicit remote URL.
-    if op.pre_push_git_remote != "origin" {
+    if op.pre_push_git_remote != "origin" || op.pre_push_git_branch != branch {
         return Ok(None);
     }
     if read_value(tx, &key("active", repo_id))?.is_some() {
@@ -202,7 +203,6 @@ pub(super) fn later_finalized_svn_checkpoint(
         s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) && s.bytes().any(|b| b != b'0')
     };
     if op.resume_authorized
-        || op.pre_push_git_branch.is_empty()
         || !full_oid(&op.intended_local_git_sha)
         || !full_oid(&op.intended_local_git_tree)
         || op.last_confirmed_git_sha.as_deref() != Some(&op.intended_local_git_sha)

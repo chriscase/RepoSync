@@ -128,6 +128,38 @@ fn explicit_late_pair_push_target_preserves_legacy_backfill() {
 }
 
 #[test]
+fn edited_push_branch_cannot_bypass_the_fingerprint_check() {
+    for branch in ["other", ""] {
+        let (_dir, db) = finalized_then_rewound("origin");
+        db.conn()
+            .execute(
+                "UPDATE kv_state SET value=json_set(value,'$.pre_push_git_branch',?1)
+             WHERE key GLOB 'svn_to_git_push_v1:document:*'",
+                [branch],
+            )
+            .unwrap();
+        let result = resolve_repo_import_baseline(&db, REPO);
+        let mirror = db.get_state(MIRROR).unwrap();
+        assert!(
+            matches!(&result, Err(error) if error.to_string().contains("target fingerprint")),
+            "edited branch {branch:?}: result={result:?}, mirror={mirror:?}"
+        );
+        assert_eq!(mirror, None);
+    }
+
+    let (_dir, db) = finalized_then_rewound("origin");
+    db.conn().execute(
+        "UPDATE kv_state SET value=json_set(value,'$.pre_push_git_branch','other','$.target_fingerprint',?1)
+         WHERE key GLOB 'svn_to_git_push_v1:document:*'",
+        [git_push_target_fingerprint(REPO, "origin", "other")],
+    ).unwrap();
+    assert!(resolve_repo_import_baseline(&db, REPO)
+        .unwrap()
+        .is_verified());
+    assert_eq!(db.get_state(MIRROR).unwrap().as_deref(), Some("1"));
+}
+
+#[test]
 fn corrupt_present_evidence_does_not_create_a_mirror() {
     for (corruption, error_fragment) in [
         ("DROP TABLE canonical_checkpoints", "schema is incomplete"),
