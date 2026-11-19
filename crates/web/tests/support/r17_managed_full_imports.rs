@@ -6,11 +6,14 @@ use super::{
 use git2::{Oid, Repository};
 use reposync_core::db::import_operations::{ImportOperation, ImportOperationState};
 use reposync_core::db::Database;
+use reposync_web::AppState;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{atomic::Ordering, Arc};
 use std::time::Duration;
+use tokio::task::JoinHandle;
 
 const MAIN: &str = "refs/heads/main";
 const REQUEST: &str = "r17-shared-import-request";
@@ -245,6 +248,48 @@ impl Pair {
     }
 }
 
+// A timeout must keep the worker in the fixture registry for failure cleanup.
+async fn join_last(state: &AppState, expected: usize) {
+    let mut workers = state.import_handles.lock().await;
+    assert_eq!(workers.len(), expected);
+    let result = tokio::time::timeout(TIMEOUT, workers.last_mut().unwrap())
+        .await
+        .expect("managed import worker timed out");
+    workers.pop();
+    result.expect("managed import worker failed");
+}
+
+async fn drain(workers: &mut Vec<JoinHandle<()>>, bound: Duration) -> bool {
+    tokio::time::timeout(bound, async {
+        while let Some(worker) = workers.last_mut() {
+            let _ = worker.await;
+            workers.pop();
+        }
+    })
+    .await
+    .is_ok()
+}
+
+async fn cleanup_failed_imports(state: &AppState) -> bool {
+    // Ask supervised Git/SVN commands to terminate and reap their process
+    // group before resorting to aborting a Tokio worker.
+    if let Ok(by_repo) = state.repo_import_progress.try_read() {
+        for progress in by_repo.values() {
+            if let Ok(progress) = progress.try_read() {
+                progress.cancel_signal.store(true, Ordering::Release);
+            }
+        }
+    }
+    let mut workers = state.import_handles.lock().await;
+    if drain(&mut workers, Duration::from_secs(10)).await {
+        return true;
+    }
+    for worker in workers.iter() {
+        worker.abort();
+    }
+    drain(&mut workers, Duration::from_secs(5)).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_full_imports_publish_independently() {
     let (addr, state, server, tmp, id, bare) = import_fixture().await;
@@ -271,6 +316,24 @@ async fn two_full_imports_publish_independently() {
     );
     assert_ne!(alpha.id, beta.id);
 
+    // Keep the server and its files alive across any assertion failure. The
+    // observer owns the gates, so unwinding releases both before cleanup.
+    let observed = tokio::spawn(observe_imports(state.clone(), data.to_owned(), alpha, beta)).await;
+    if let Err(failure) = observed {
+        let drained = cleanup_failed_imports(&state).await;
+        server.abort();
+        if !drained {
+            panic!(
+                "R17 worker join unconfirmed; retained fixture at {} after {failure}",
+                tmp.keep().display()
+            );
+        }
+        std::panic::resume_unwind(failure.into_panic());
+    }
+    server.abort();
+}
+
+async fn observe_imports(state: Arc<AppState>, data: PathBuf, alpha: Pair, beta: Pair) {
     let client = authed_client();
     let alpha_gate = ReceiveGate::install(&alpha.bare);
     let beta_gate = ReceiveGate::install(&beta.bare);
@@ -304,13 +367,8 @@ async fn two_full_imports_publish_independently() {
         .await;
 
     // Wait for the second admitted worker to finish while the first is still at Git.
-    let mut workers = std::mem::take(&mut *state.import_handles.lock().await);
-    assert_eq!(workers.len(), 2);
     drop(beta_gate);
-    tokio::time::timeout(TIMEOUT, workers.pop().unwrap())
-        .await
-        .unwrap()
-        .unwrap();
+    join_last(&state, 2).await;
     let mid = Database::new(&database).unwrap();
     assert_eq!(mid.list_commit_map(7).unwrap().len(), 3);
     let beta_receipt = beta.completed(&mid, &beta_op, &beta_offer);
@@ -325,10 +383,7 @@ async fn two_full_imports_publish_independently() {
         .await;
 
     drop(alpha_gate);
-    tokio::time::timeout(TIMEOUT, workers.pop().unwrap())
-        .await
-        .unwrap()
-        .unwrap();
+    join_last(&state, 1).await;
     alpha
         .check_status_and_retry(&client, &alpha_id, "completed", alpha_tip)
         .await;
@@ -350,5 +405,4 @@ async fn two_full_imports_publish_independently() {
             "repositories":[alpha_receipt,beta_receipt]
         })
     );
-    server.abort();
 }
