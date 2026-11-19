@@ -259,23 +259,20 @@ async fn join_last(state: &AppState, expected: usize) -> Result<(), JoinError> {
     result
 }
 
-async fn drain(workers: &mut Vec<JoinHandle<()>>, bound: Duration) -> bool {
-    let mut all_normal = true;
-    let finished = tokio::time::timeout(bound, async {
+async fn drain(workers: &mut Vec<JoinHandle<()>>, bound: Duration) {
+    let _ = tokio::time::timeout(bound, async {
         while let Some(worker) = workers.last_mut() {
             let result = worker.await;
             workers.pop();
             if let Err(error) = result {
                 eprintln!("R17 managed import worker ended abnormally: {error}");
-                all_normal = false;
             }
         }
     })
     .await;
-    finished.is_ok() && all_normal
 }
 
-async fn cleanup_failed_imports(state: &AppState) -> bool {
+async fn cleanup_failed_imports(state: &AppState) {
     // Ask supervised Git/SVN commands to terminate and reap their process
     // group before resorting to aborting a Tokio worker.
     if let Ok(by_repo) = state.repo_import_progress.try_read() {
@@ -286,22 +283,18 @@ async fn cleanup_failed_imports(state: &AppState) -> bool {
         }
     }
     let mut workers = state.import_handles.lock().await;
-    if drain(&mut workers, Duration::from_secs(10)).await {
-        return true;
-    }
+    drain(&mut workers, Duration::from_secs(10)).await;
     if !workers.is_empty() {
         let aborted = workers.len();
         for worker in workers.iter() {
             worker.abort();
         }
-        let _ = drain(&mut workers, Duration::from_secs(5)).await;
+        drain(&mut workers, Duration::from_secs(5)).await;
         eprintln!(
             "R17 requested abort of {aborted} worker(s); {} join(s) still pending",
             workers.len()
         );
     }
-    // An abnormal or aborted worker cannot attest that its SCM process group was reaped.
-    false
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -332,24 +325,26 @@ async fn two_full_imports_publish_independently() {
 
     // Keep the server and its files alive across any assertion failure. The
     // observer owns the gates, so unwinding releases both before cleanup.
-    let (worker_failed, failure) =
+    let failure =
         match tokio::spawn(observe_imports(state.clone(), data.to_owned(), alpha, beta)).await {
             Ok(Ok(())) => {
                 server.abort();
                 return;
             }
-            Ok(Err(worker)) => (true, worker),
-            Err(observer) => (false, observer),
+            Ok(Err(failure)) | Err(failure) => failure,
         };
-    let drained_normally = cleanup_failed_imports(&state).await;
+    // A failed HTTP start can precede registration of the worker's handle.
+    let retained = tmp.keep();
+    eprintln!(
+        "R17 process cleanup unconfirmed; retained fixture at {} after {failure}",
+        retained.display()
+    );
+    cleanup_failed_imports(&state).await;
     server.abort();
-    if worker_failed || !drained_normally {
-        panic!(
-            "R17 process cleanup unconfirmed; retained fixture at {} after {failure}",
-            tmp.keep().display()
-        );
+    if failure.is_panic() {
+        std::panic::resume_unwind(failure.into_panic());
     }
-    std::panic::resume_unwind(failure.into_panic());
+    panic!("R17 managed import task failed: {failure}");
 }
 
 async fn observe_imports(
