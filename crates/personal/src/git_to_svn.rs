@@ -410,9 +410,33 @@ impl GitToSvnSync {
         self.sync_pr(pr, merge_sha).await
     }
 
+    fn commit_needs_replay(&self, commit: &GitHubCommit) -> Result<bool> {
+        let echo = TeamEchoContext {
+            db: &self.db,
+            repo_id: PERSONAL_REPO_ID,
+            no_target_projection: PERSONAL_NO_TARGET_PROJECTION,
+        };
+        match classify_incoming_git_commit_personal(&echo, &commit.sha, &commit.commit.message)?? {
+            EchoDisposition::SkipEcho => Ok(false),
+            EchoDisposition::DeferPendingJournal => anyhow::bail!(
+                "pending personal svn-to-git journal for {}; deferring git-to-svn replay",
+                commit.sha
+            ),
+            EchoDisposition::ApplyGenuine | EchoDisposition::ApplyGenuineWithMarkerHint => {
+                Ok(!self.db.is_personal_git_sha_synced(&commit.sha)?)
+            }
+        }
+    }
+
     /// For a two-parent merge, the local Git objects independently identify the
     /// commits introduced by the PR, even on the first provider response.
-    fn verify_merge_membership(&self, merge_sha: &str, shas: &[&str]) -> Result<()> {
+    fn verify_merge_membership(
+        &self,
+        merge_sha: &str,
+        shas: &[&str],
+        commits: &[GitHubCommit],
+        sync_id: i64,
+    ) -> Result<()> {
         let git = GitClient::new(&self.git_repo_path)?;
         let repo = git.repo();
         let merge = repo.find_commit(merge_sha.parse()?)?;
@@ -444,8 +468,17 @@ impl GitToSvnSync {
             count == shas.len(),
             "provider commit list has unrelated or duplicate members"
         );
+        // Include this attempt's confirmed prefix because it is already present
+        // in SVN. An echo or a mapping from another PR won't write again.
+        let prefix = self.db.confirmed_personal_pr_members(sync_id)?;
+        let mut effective = Vec::new();
+        for commit in commits {
+            if prefix.contains(&commit.sha) || self.commit_needs_replay(commit)? {
+                effective.push(commit.sha.as_str());
+            }
+        }
         anyhow::ensure!(
-            git.first_parent_replay_matches_merge(merge_sha, shas)?,
+            git.first_parent_replay_matches_merge(merge_sha, &effective)?,
             "ordered first-parent replay does not reproduce the Git merge tree"
         );
         Ok(())
@@ -479,7 +512,7 @@ impl GitToSvnSync {
         let merge_strategy = self.detect_merge_strategy(pr, &commits).await;
         let shas: Vec<_> = commits.iter().map(|commit| commit.sha.as_str()).collect();
         let membership = self
-            .verify_merge_membership(merge_sha, &shas)
+            .verify_merge_membership(merge_sha, &shas, &commits, sync_id)
             .and_then(|()| {
                 Ok(self
                     .db
@@ -500,52 +533,16 @@ impl GitToSvnSync {
             return Err(error);
         }
 
-        let echo_ctx = TeamEchoContext {
-            db: self.db.as_ref(),
-            repo_id: PERSONAL_REPO_ID,
-            no_target_projection: PERSONAL_NO_TARGET_PROJECTION,
-        };
-
         let mut synced_count: u64 = 0;
         let mut first_svn_rev: Option<i64> = None;
         let mut last_svn_rev: Option<i64> = None;
         let mut replayed_any = false;
 
         for commit in &commits {
-            match classify_incoming_git_commit_personal(
-                &echo_ctx,
-                &commit.sha,
-                &commit.commit.message,
-            )
-            .map_err(|e| anyhow::anyhow!(e))?
-            {
-                Ok(EchoDisposition::SkipEcho) => {
-                    debug!(
-                        git_sha = %commit.sha,
-                        "skipping echo Git commit (repo-scoped receipt)"
-                    );
-                    continue;
-                }
-                Ok(EchoDisposition::DeferPendingJournal) => {
-                    anyhow::bail!(
-                        "pending personal svn-to-git journal for {}; deferring git-to-svn replay",
-                        commit.sha
-                    );
-                }
-                Ok(EchoDisposition::ApplyGenuine | EchoDisposition::ApplyGenuineWithMarkerHint) => {
-                }
-                Err(sync_err) => return Err(sync_err).context("git commit classification failed"),
-            }
-
-            if self
-                .db
-                .is_personal_git_sha_synced(&commit.sha)
-                .context("failed to check personal git-to-svn sync evidence for Git SHA")?
-            {
-                debug!(git_sha = %commit.sha, "skipping already-synced Git commit");
+            if !self.commit_needs_replay(commit)? {
+                debug!(git_sha=%commit.sha, "skipping a commit already handled by Personal sync");
                 continue;
             }
-
             replayed_any = true;
             match self
                 .replay_pr_commit(commit, pr.number, pr_branch, Some(sync_id))

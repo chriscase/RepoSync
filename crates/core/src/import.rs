@@ -3359,6 +3359,7 @@ fn persist_legacy_personal_import_watermarks_tx(
     ] {
         tx.execute("INSERT INTO watermarks(source,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(source) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", rusqlite::params![source,value,now])?;
     }
+    Database::record_personal_pr_import_boundary_tx(tx, git_sha)?;
     Ok(())
 }
 

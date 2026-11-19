@@ -113,7 +113,7 @@ async fn pr_provider(
             .collect::<Vec<_>>());
         pulls.push(json!({
             "number":number, "title":branch, "html_url":format!("http://127.0.0.1/pull/{number}"),
-            "state":"closed", "head":{"ref":branch,"sha":parents[1]}, "base":{"ref":"main","sha":parents[0]},
+            "state":"closed", "head":{"ref":branch,"sha":commits.last().unwrap()}, "base":{"ref":"main","sha":parents[0]},
             "merge_commit_sha":merge,"merged_at":"2025-01-01T00:00:00Z"
         }));
         routes.insert(format!("commits/{merge}"), detail.to_string());
@@ -299,11 +299,17 @@ fn multiple_scoped_imports_need_a_current_import_boundary() {
         .unwrap();
     drop(db);
     let db = Database::new(&path).unwrap();
-    assert!(db
-        .personal_pr_history_anchor()
-        .unwrap_err()
-        .to_string()
-        .contains("multiple Personal import mappings"));
+    assert_eq!(
+        db.personal_pr_history_anchor().unwrap().as_ref(),
+        Some(&second)
+    );
+    db.conn()
+        .execute(
+            "DELETE FROM watermarks WHERE source='personal_pr_import_git_sha'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(db.personal_pr_history_anchor().unwrap(), None);
 }
 
 fn assert_mappings(db: &Database, direction: &str, expected: &[(i64, &str)]) {
@@ -366,6 +372,11 @@ async fn resolution_only_in_outer_merge_holds_before_write() {
     qualify_pr_backlog(BacklogCase::OuterResolution).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prior_squash_mapping_cannot_mask_later_sibling_resolution() {
+    qualify_pr_backlog(BacklogCase::PreviouslyPublishedSibling).await;
+}
+
 #[derive(PartialEq, Eq)]
 enum BacklogCase {
     Restart,
@@ -373,6 +384,7 @@ enum BacklogCase {
     ConflictingSiblings,
     InboundAtCap,
     OuterResolution,
+    PreviouslyPublishedSibling,
 }
 
 async fn qualify_pr_backlog(case: BacklogCase) {
@@ -437,7 +449,12 @@ async fn qualify_pr_backlog(case: BacklogCase) {
     }
     let snapshot = git_sha(&git);
     if case == BacklogCase::InboundAtCap {
-        svn_commit_file(&wc, "inbound.txt", "from SVN\n", "Ordinary SVN change");
+        svn_commit_file(
+            &wc,
+            "inbound.txt",
+            "from SVN\n",
+            "personal import checkpoint r2",
+        );
         let sync = SvnToGitSync::new(
             svn.clone(),
             Arc::new(Mutex::new(GitClient::new(&git).unwrap())),
@@ -451,31 +468,55 @@ async fn qualify_pr_backlog(case: BacklogCase) {
     git_cmd(&git, &["checkout", "-b", "earlier"]);
     let earlier = add_file(&git, "earlier.txt", "earlier\n", "Earlier PR");
     git_cmd(&git, &["checkout", "main"]);
-    git_cmd(
-        &git,
-        &["merge", "--no-ff", "earlier", "-m", "Merge earlier PR"],
-    );
+    if case == BacklogCase::PreviouslyPublishedSibling {
+        git_cmd(&git, &["merge", "--squash", "earlier"]);
+        git_cmd(&git, &["commit", "-m", "Squash earlier PR"]);
+    } else {
+        git_cmd(
+            &git,
+            &["merge", "--no-ff", "earlier", "-m", "Merge earlier PR"],
+        );
+    }
     let base = git_sha(&git);
     git_cmd(&git, &["checkout", "-b", "feature"]);
     if case == BacklogCase::ConflictingSiblings {
         std::fs::write(git.join("shared.txt"), "left value\n").unwrap();
         git_cmd(&git, &["add", "--", "shared.txt"]);
     }
-    let left = add_file(&git, "left.txt", "left\n", "Left change");
-    git_cmd(&git, &["checkout", "-b", "side", &base]);
-    if case == BacklogCase::ConflictingSiblings {
-        std::fs::write(git.join("shared.txt"), "right value\n").unwrap();
-        git_cmd(&git, &["add", "--", "shared.txt"]);
+    if case == BacklogCase::PreviouslyPublishedSibling {
+        std::fs::write(git.join("earlier.txt"), "changed by first sibling\n").unwrap();
+        git_cmd(&git, &["add", "--", "earlier.txt"]);
     }
-    let right = add_file(&git, "right.txt", "right\n", "Right change");
-    git_cmd(&git, &["checkout", "feature"]);
-    git_cmd(&git, &["merge", "--no-ff", "--no-commit", "-Xours", "side"]);
+    let left = add_file(&git, "left.txt", "left\n", "Left change");
+    let right = if case == BacklogCase::PreviouslyPublishedSibling {
+        git_cmd(&git, &["checkout", "earlier"]);
+        git_cmd(
+            &git,
+            &["merge", "--no-ff", "--no-commit", "-Xours", "feature"],
+        );
+        std::fs::write(git.join("earlier.txt"), "earlier\n").unwrap();
+        git_cmd(&git, &["add", "--", "earlier.txt"]);
+        earlier.clone()
+    } else {
+        git_cmd(&git, &["checkout", "-b", "side", &base]);
+        if case == BacklogCase::ConflictingSiblings {
+            std::fs::write(git.join("shared.txt"), "right value\n").unwrap();
+            git_cmd(&git, &["add", "--", "shared.txt"]);
+        }
+        let right = add_file(&git, "right.txt", "right\n", "Right change");
+        git_cmd(&git, &["checkout", "feature"]);
+        git_cmd(&git, &["merge", "--no-ff", "--no-commit", "-Xours", "side"]);
+        right
+    };
     let resolution = add_file(
         &git,
         "resolution.txt",
         "resolved\n",
         "Resolve internal merge",
     );
+    if case == BacklogCase::PreviouslyPublishedSibling {
+        git_cmd(&git, &["branch", "-f", "feature", &resolution]);
+    }
     git_cmd(&git, &["checkout", "main"]);
     if case == BacklogCase::OuterResolution {
         git_cmd(&git, &["merge", "--no-ff", "--no-commit", "feature"]);
@@ -502,10 +543,31 @@ async fn qualify_pr_backlog(case: BacklogCase) {
         (&later, vec![&merge]),
         (&tip, vec![&merge, &later]),
         (&earlier, vec![&imported]),
-        (&base, vec![&imported, &earlier]),
+        (
+            &base,
+            if case == BacklogCase::PreviouslyPublishedSibling {
+                vec![&imported]
+            } else {
+                vec![&imported, &earlier]
+            },
+        ),
         (&left, vec![&base]),
-        (&right, vec![&base]),
-        (&resolution, vec![&left, &right]),
+        (
+            &right,
+            if case == BacklogCase::PreviouslyPublishedSibling {
+                vec![&imported]
+            } else {
+                vec![&base]
+            },
+        ),
+        (
+            &resolution,
+            if case == BacklogCase::PreviouslyPublishedSibling {
+                vec![&right, &left]
+            } else {
+                vec![&left, &right]
+            },
+        ),
         (&merge, vec![&base, &resolution]),
     ] {
         let repo = git2::Repository::open_bare(&bare).unwrap();
@@ -552,6 +614,13 @@ async fn qualify_pr_backlog(case: BacklogCase) {
     if case == BacklogCase::InboundAtCap {
         *view.lock().unwrap() = ProviderView::CoveredBeyondCap;
         let db = Database::new(&path).unwrap();
+        db.conn()
+            .execute("DELETE FROM watermarks WHERE source='git_sha'", [])
+            .unwrap();
+        assert_eq!(
+            db.personal_pr_history_anchor().unwrap().as_ref(),
+            Some(&snapshot)
+        );
         assert_ne!(snapshot, imported);
         let op = db
             .latest_git_push_operation(PERSONAL_SCOPE_KEY)
@@ -594,11 +663,20 @@ async fn qualify_pr_backlog(case: BacklogCase) {
     }
     if matches!(
         case,
-        BacklogCase::ConflictingSiblings | BacklogCase::OuterResolution
+        BacklogCase::ConflictingSiblings
+            | BacklogCase::OuterResolution
+            | BacklogCase::PreviouslyPublishedSibling
     ) {
         if case == BacklogCase::ConflictingSiblings {
             assert_eq!(&git_tree(&bare, &right)["shared.txt"], b"right value\n");
             assert_eq!(&git_tree(&bare, &resolution)["shared.txt"], b"left value\n");
+        } else if case == BacklogCase::PreviouslyPublishedSibling {
+            assert_eq!(right, earlier);
+            assert_eq!(
+                &git_tree(&bare, &left)["earlier.txt"],
+                b"changed by first sibling\n"
+            );
+            assert_eq!(&git_tree(&bare, &merge)["earlier.txt"], b"earlier\n");
         } else {
             assert_eq!(
                 &git_tree(&bare, &merge)["outer-only.txt"],

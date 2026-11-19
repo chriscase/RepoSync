@@ -258,36 +258,72 @@ impl Database {
         null_commit_map_git_to_svn_has_personal_evidence(&conn, git_sha)
     }
 
-    /// Find the import boundary for Personal PR discovery. Without a legacy
-    /// watermark, match the Personal importer's applied receipt to its actual
-    /// mapping. Later outbound mappings may be on a partially replayed side branch.
+    /// Only an import writer establishes a discovery boundary. Ordinary SVN
+    /// log messages can contain any text, including the importer's old labels.
     pub fn personal_pr_history_anchor(&self) -> Result<Option<String>, DatabaseError> {
-        if self.list_repositories()?.is_empty() {
-            if let Some(sha) = self.get_watermark("git_sha")?.filter(|sha| !sha.is_empty()) {
-                return Ok(Some(sha));
+        let legacy = if self.list_repositories()?.is_empty() {
+            self.get_watermark("git_sha")?.filter(|v| !v.is_empty())
+        } else {
+            None
+        };
+        let scoped = self.get_watermark("personal_pr_import_git_sha")?;
+        if let (Some(current), Some(old)) = (&scoped, &legacy) {
+            if current != old {
+                return Err(DatabaseError::Other(
+                    "Personal import boundary and legacy watermark disagree".into(),
+                ));
             }
         }
-        let scopes = personal_repo_ids_for_read(self)?;
+        if let Some(current) = legacy {
+            return Ok(Some(current));
+        }
+        let Some(scoped) = scoped else {
+            return Ok(None);
+        };
+        let proven: bool = self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM commit_map m JOIN sync_records r
+             ON r.repo_id=m.repo_id AND r.svn_rev=m.svn_rev AND r.git_sha=m.git_sha
+             WHERE m.repo_id=?1 AND m.git_sha=?2 AND m.direction='svn_to_git'
+             AND r.direction='svn_to_git' AND r.status='applied')",
+            params![PERSONAL_SCOPE_KEY, scoped],
+            |row| row.get(0),
+        )?;
+        Ok(proven.then_some(scoped))
+    }
+
+    pub(crate) fn record_personal_pr_import_boundary_tx(
+        tx: &Connection,
+        sha: &str,
+    ) -> Result<(), DatabaseError> {
+        tx.execute(
+            "INSERT INTO watermarks(source,value,updated_at) VALUES('personal_pr_import_git_sha',?1,?2)
+             ON CONFLICT(source) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            params![sha,Utc::now().to_rfc3339()])?;
+        Ok(())
+    }
+
+    /// Source members this exact PR already wrote. Earlier PRs may have mapped
+    /// the same Git SHA and must not count as members applied in this PR.
+    pub fn confirmed_personal_pr_members(
+        &self,
+        id: i64,
+    ) -> Result<std::collections::HashSet<String>, DatabaseError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT m.svn_rev, m.git_sha FROM commit_map m JOIN sync_records r
-             ON r.repo_id=m.repo_id AND r.git_sha=m.git_sha AND r.svn_rev=m.svn_rev
-             WHERE m.repo_id IN (?1,?2) AND m.direction='svn_to_git' AND r.direction='svn_to_git'
-             AND r.status='applied' AND r.message=('personal import checkpoint r' || m.svn_rev)
-             ORDER BY m.svn_rev ASC LIMIT 2",
-        )?;
-        let rows = stmt
-            .query_map(params![scopes[0], scopes.get(1)], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        if rows.len() > 1 {
-            return Err(DatabaseError::Other(
-                "multiple Personal import mappings require evidence of the current import boundary"
-                    .into(),
-            ));
-        }
-        Ok(rows.into_iter().next().map(|(_, sha)| sha))
+            "SELECT DISTINCT m.git_sha FROM kv_state d
+             JOIN commit_map m ON m.repo_id=?1 AND m.direction='git_to_svn'
+             JOIN sync_records r ON r.repo_id=m.repo_id AND r.svn_rev=m.svn_rev AND r.git_sha=m.git_sha
+             WHERE r.direction='git_to_svn' AND r.status='applied'
+             AND d.key GLOB 'git_to_svn_commit_v1:document:*'
+             AND d.key=('git_to_svn_commit_v1:document:' || json_extract(d.value,'$.id'))
+             AND json_extract(d.value,'$.version')=1 AND json_extract(d.value,'$.repo_id')=m.repo_id
+             AND json_extract(d.value,'$.operation_type')='git_to_svn_commit'
+             AND json_extract(d.value,'$.state')='completed'
+             AND json_extract(d.value,'$.personal_pr_sync_id')=?2
+             AND json_extract(d.value,'$.source_git_sha')=m.git_sha
+             AND json_extract(d.value,'$.last_confirmed_svn_rev')=m.svn_rev")?;
+        let rows = stmt.query_map(params![PERSONAL_SCOPE_KEY, id], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// True when personal mode has completed syncing this PR merge SHA.
@@ -477,6 +513,7 @@ impl Database {
                  ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 params!["svn_rev", last_svn_rev.to_string(), now],
             )?;
+            Database::record_personal_pr_import_boundary_tx(tx, git_sha)?;
             Database::set_legacy_import_git_sha_watermark_tx(tx, git_sha)?;
             Ok(())
         })
@@ -558,6 +595,7 @@ pub(crate) fn checkpoint_personal_svn_to_git_import_tx(
         )?;
     }
     if update_watermarks {
+        Database::record_personal_pr_import_boundary_tx(tx, git_sha)?;
         let watermark_now = Utc::now().to_rfc3339();
         tx.execute(
             "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)

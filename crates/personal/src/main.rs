@@ -8,8 +8,6 @@ mod commit_format;
 mod daemon;
 mod engine;
 mod git_to_svn;
-#[cfg(test)]
-mod pr_monitor;
 mod scheduler;
 mod signals;
 mod svn_to_git;

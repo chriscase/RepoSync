@@ -188,7 +188,8 @@ Still required before claiming #66:
   the pending PR before requesting its list. A paginated response keeps it pending.
   For a two-parent merge, the local Git graph must confirm every introduced commit
   in parent-before-child order. Their ordered first-parent deltas must reproduce the
-  outer Git merge tree. A sibling conflict whose resolution would be lost holds
+  outer Git merge tree after accounting for previously handled commits. A sibling
+  conflict whose resolution would be lost holds
   before any SVN write for the PR. The first complete list pins the ordered SHAs.
   Empty, shortened or reordered retries keep the queue at that PR.
 - Discovery reads up to ten pages of PRs in creation order. A repeated PR number
@@ -196,9 +197,10 @@ Still required before claiming #66:
   proceed if every first-parent commit after the import boundary has a listed or
   previously completed PR, or an ordinary SVN-origin publication with a matching
   confirmed push, scoped receipt and mapping. An uncovered step holds publication. A database that
-  lacks the legacy Git watermark can use the Personal importer's matching scoped
-  receipt and mapping if they identify a single import boundary. Multiple scoped
-  import mappings without the current boundary require inspection.
+  lacks the legacy Git watermark can use the current scoped Git watermark written
+  by the Personal importer, backed by a matching receipt and mapping. A reimport
+  replaces the scoped watermark. A legacy database with neither import watermark
+  needs inspection. Messages in SVN history cannot establish the import boundary.
   The Team 1,001-commit qualification uses its own continuation mechanism.
 
 Assert zero unwanted remote changes and stable checkpoints on rejection, and
