@@ -148,6 +148,13 @@ state. The client exits nonzero for an identity mismatch, an invalid reply
 or a failed HTTP request. After an accepted submission, a failed poll also
 exits nonzero. Keep the accepted operation ID for a later status check.
 
+If the connection breaks during submission, RepoSync may already have
+received the request. The client reports that it attempted execution and
+leaves the durable-job result unknown. Keep the parent and child IDs, the
+idempotency key and the plan digest. Check the pair's recorded operations in
+RepoSync before considering another submission. Use a named status lookup
+when you have the corresponding server operation or v2 request ID.
+
 ## Responding to reconciliation-required
 
 `reconciliation_required` means an external effect may have happened and

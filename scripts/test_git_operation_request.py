@@ -30,6 +30,7 @@ PAIR_TIP = "a" * 40
 PARENT_TIP = "b" * 40
 TOKEN = "test-token-value"
 REFRESH_OP = "78cb373c-d795-4a4e-9839-296a4878e0e4"
+DROP_REPLY = object()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -52,7 +53,11 @@ class Handler(BaseHTTPRequestHandler):
             "body": raw.decode("utf-8") if raw else "",
         }
         self.server.records.append(record)
-        status, payload = self.server.respond(record)
+        response = self.server.respond(record)
+        if response is DROP_REPLY:
+            self.close_connection = True
+            return
+        status, payload = response
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -150,6 +155,15 @@ class ClientTests(unittest.TestCase):
         stub = serve(Stub(respond, handler))
         self._servers.append(stub)
         return stub
+
+    def run_cli(self, server, action, *args):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "scripts/git_operation_request.py"), action,
+             "--base-url", server.base_url, "--allow-insecure-http", "--repo-id", "repo1",
+             "--journal", str(self.journal), "--timeout", "2", *args],
+            capture_output=True, text=True, timeout=8, cwd=self._tmp.name,
+            env={"REPOSYNC_API_TOKEN": TOKEN, "NO_PROXY": "127.0.0.1", "PYTHONDONTWRITEBYTECODE": "1"},
+        )
 
     def run_client(self, server, action, **overrides):
         config = {
@@ -398,20 +412,14 @@ class ClientTests(unittest.TestCase):
             for http in (200, 409):
                 with self.subTest(action=action, http=http):
                     server.records.clear()
-                    args = [sys.executable, str(ROOT / "scripts/git_operation_request.py"), action,
-                            "--base-url", server.base_url, "--allow-insecure-http", "--repo-id", "repo1",
-                            "--journal", str(self.journal), "--timeout", "2"]
                     if action == "status":
-                        args += ["--operation-kind", "import", "--operation-id", operation_id]
+                        args = ["--operation-kind", "import", "--operation-id", operation_id]
                         expected_calls = [("GET", status_path)]
                     else:
-                        args += ["--pair-id", "pair1", "--idempotency-key", "test-short-http",
-                                 "--expected-plan-digest", DIGEST, "--poll-attempts", "3"]
+                        args = ["--pair-id", "pair1", "--idempotency-key", "test-short-http",
+                                "--expected-plan-digest", DIGEST, "--poll-attempts", "3"]
                         expected_calls = [("POST", "/api/repos/pair1/refresh")] * 2 + [("GET", status_path)]
-                    proc = subprocess.run(
-                        args, capture_output=True, text=True, timeout=8, cwd=self._tmp.name,
-                        env={"REPOSYNC_API_TOKEN": TOKEN, "NO_PROXY": "127.0.0.1", "PYTHONDONTWRITEBYTECODE": "1"},
-                    )
+                    proc = self.run_cli(server, action, *args)
                     self.assertEqual([(r["method"], r["path"]) for r in server.records], expected_calls)
                     self.assertEqual(proc.returncode, client.EXIT_UNAVAILABLE, proc.stderr)
                     self.assertEqual(proc.stderr, "")
@@ -424,6 +432,65 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(report["durable_job_started"], action == "execute")
                     if action == "execute":
                         self.assertEqual(report["lifecycle"], "queued")
+
+    def test_execution_with_an_unconfirmed_submit_reply(self):
+        approved = plan(approval={"eligible": True, "binds_to": "plan_digest"}, execute_status="READY")
+
+        def respond(record):
+            if not json.loads(record["body"])["execute"] and case != "lost-preview":
+                return 200, approved
+            return reply
+
+        server = self.start(respond)
+        for case, reply in (
+            ("lost-preview", DROP_REPLY),
+            ("lost-submit", DROP_REPLY),
+            ("server-error", (503, {"error": "service unavailable"})),
+            ("failed-server-reply", (500, {"error": "refresh_execute_not_implemented"})),
+            ("malformed-success", (200, {})),
+            ("contradictory-success", (200, {"operation_id": "other-operation", "lifecycle": "completed"})),
+            ("explicit-refusal", (400, {"error": "refresh_execute_not_implemented"})),
+        ):
+            with self.subTest(case=case):
+                server.records.clear()
+                key = f"{case}-request"
+                args = ["--pair-id", "pair1", "--idempotency-key", key, "--expected-plan-digest", DIGEST]
+                if case == "contradictory-success":
+                    args += ["--operation-id", "expected-operation"]
+                proc = self.run_cli(server, "execute", *args)
+                sent = case != "lost-preview"
+                self.assertEqual([(r["method"], r["path"]) for r in server.records],
+                                 [("POST", "/api/repos/pair1/refresh")] * (2 if sent else 1))
+                bodies = [json.loads(r["body"]) for r in server.records]
+                self.assertEqual([b["execute"] for b in bodies], [False, True] if sent else [False])
+                self.assertTrue(all(r["idempotency"] == key for r in server.records))
+                if sent:
+                    self.assertEqual(bodies[1]["idempotency_key"], key)
+                    self.assertEqual(bodies[1]["expected_plan_digest"], DIGEST)
+                self.assertEqual(proc.stderr, "")
+                report = json.loads(proc.stdout)
+                self.assertFalse(report["ok"])
+                self.assertNotEqual(proc.returncode, client.EXIT_OK)
+                self.assertEqual(report["exit_code"], proc.returncode)
+                self.assertEqual(report["execute_requested"], sent, report)
+                self.assertEqual((report["repo_id"], report["pair_id"], report["idempotency_key"]),
+                                 ("repo1", "pair1", key))
+                if not sent:
+                    self.assertEqual(report["outcome"], "service_unavailable")
+                    self.assertIs(report["durable_job_started"], False)
+                elif case == "explicit-refusal":
+                    self.assertEqual(report["outcome"], "refresh_execute_not_implemented")
+                    self.assertIs(report["durable_job_started"], False)
+                else:
+                    self.assertEqual(report["outcome"], "submission_unknown", report)
+                    self.assertEqual(proc.returncode, client.EXIT_UNAVAILABLE)
+                    self.assertEqual(report.get("http_status"), None if reply is DROP_REPLY else reply[0])
+                    self.assertIsNone(report["durable_job_started"])
+                    self.assertIsNone(report["operation_id"])
+                    self.assertIsNone(report.get("request_id"))
+                    self.assertEqual(report["plan_digest"], DIGEST)
+                    if case == "contradictory-success":
+                        self.assertEqual(report["expected_operation_id"], "expected-operation")
 
     def test_latest_import_progress_is_not_a_named_operation(self):
         server = self.start(lambda _r: (200, payload))

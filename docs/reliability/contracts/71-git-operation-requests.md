@@ -23,6 +23,8 @@ SVN commit and Git push expose individual journals. For a v2 refresh, use
 the original request ID and child ID. The response contains a separate
 operation UUID. A refresh status request without either ID repeats a preview.
 
+Loss of the submission acknowledgement leaves acceptance unknown. The
+client reports the attempted request and its original pins and key.
 Polling after an accepted submission requires a recognized route in the
 pinned repository or pair and the same operation ID in the reply. A failed
 lookup or polling limit exits nonzero and preserves the accepted ID. A
