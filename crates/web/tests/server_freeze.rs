@@ -39,6 +39,10 @@ use reposync_web::AppState;
 // Test helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
+#[path = "support/r04_import_disable.rs"]
+mod r04_import_disable;
+
 fn inbound_git_sha_kv(db: &Database, repo_id: &str) -> Option<String> {
     reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)
         .expect("read inbound git sha kv")

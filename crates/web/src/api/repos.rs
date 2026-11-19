@@ -721,14 +721,15 @@ async fn disable_repo_inner(
         return Err(AppError::Forbidden("admin access required".into()));
     }
 
-    let db = &state.db;
-    reject_held_import(db, id)?;
-
     // Legacy DELETE stays non-destructive: disable only. Managed removal is
     // POST /api/repos/:id/remove and never runs from this route.
-    let disabled = db
+    let disabled = state
+        .db
         .legacy_disable_repository(id)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
+        .map_err(|e| match e {
+            DatabaseError::ImportBlocksDisable => AppError::BadRequest(e.to_string()),
+            _ => AppError::Internal(format!("database error: {e}")),
+        })?;
     if !disabled {
         return Err(AppError::NotFound("repository not found".into()));
     }

@@ -484,6 +484,10 @@ pub enum DatabaseError {
     #[error("{0}")]
     WriterFenced(String),
 
+    /// The import journal still holds this registration.
+    #[error("repository has active or unresolved import work")]
+    ImportBlocksDisable,
+
     /// A record was not found.
     #[error("{entity} not found: {id}")]
     NotFound { entity: String, id: String },
