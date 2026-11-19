@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{atomic::Ordering, Arc};
 use std::time::Duration;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 
 const MAIN: &str = "refs/heads/main";
 const REQUEST: &str = "r17-shared-import-request";
@@ -249,25 +249,30 @@ impl Pair {
 }
 
 // A timeout must keep the worker in the fixture registry for failure cleanup.
-async fn join_last(state: &AppState, expected: usize) {
+async fn join_last(state: &AppState, expected: usize) -> Result<(), JoinError> {
     let mut workers = state.import_handles.lock().await;
     assert_eq!(workers.len(), expected);
     let result = tokio::time::timeout(TIMEOUT, workers.last_mut().unwrap())
         .await
         .expect("managed import worker timed out");
     workers.pop();
-    result.expect("managed import worker failed");
+    result
 }
 
 async fn drain(workers: &mut Vec<JoinHandle<()>>, bound: Duration) -> bool {
-    tokio::time::timeout(bound, async {
+    let mut all_normal = true;
+    let finished = tokio::time::timeout(bound, async {
         while let Some(worker) = workers.last_mut() {
-            let _ = worker.await;
+            let result = worker.await;
             workers.pop();
+            if let Err(error) = result {
+                eprintln!("R17 managed import worker ended abnormally: {error}");
+                all_normal = false;
+            }
         }
     })
-    .await
-    .is_ok()
+    .await;
+    finished.is_ok() && all_normal
 }
 
 async fn cleanup_failed_imports(state: &AppState) -> bool {
@@ -284,10 +289,19 @@ async fn cleanup_failed_imports(state: &AppState) -> bool {
     if drain(&mut workers, Duration::from_secs(10)).await {
         return true;
     }
-    for worker in workers.iter() {
-        worker.abort();
+    if !workers.is_empty() {
+        let aborted = workers.len();
+        for worker in workers.iter() {
+            worker.abort();
+        }
+        let _ = drain(&mut workers, Duration::from_secs(5)).await;
+        eprintln!(
+            "R17 requested abort of {aborted} worker(s); {} join(s) still pending",
+            workers.len()
+        );
     }
-    drain(&mut workers, Duration::from_secs(5)).await
+    // An abnormal or aborted worker cannot attest that its SCM process group was reaped.
+    false
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -318,22 +332,32 @@ async fn two_full_imports_publish_independently() {
 
     // Keep the server and its files alive across any assertion failure. The
     // observer owns the gates, so unwinding releases both before cleanup.
-    let observed = tokio::spawn(observe_imports(state.clone(), data.to_owned(), alpha, beta)).await;
-    if let Err(failure) = observed {
-        let drained = cleanup_failed_imports(&state).await;
-        server.abort();
-        if !drained {
-            panic!(
-                "R17 worker join unconfirmed; retained fixture at {} after {failure}",
-                tmp.keep().display()
-            );
-        }
-        std::panic::resume_unwind(failure.into_panic());
-    }
+    let (worker_failed, failure) =
+        match tokio::spawn(observe_imports(state.clone(), data.to_owned(), alpha, beta)).await {
+            Ok(Ok(())) => {
+                server.abort();
+                return;
+            }
+            Ok(Err(worker)) => (true, worker),
+            Err(observer) => (false, observer),
+        };
+    let drained_normally = cleanup_failed_imports(&state).await;
     server.abort();
+    if worker_failed || !drained_normally {
+        panic!(
+            "R17 process cleanup unconfirmed; retained fixture at {} after {failure}",
+            tmp.keep().display()
+        );
+    }
+    std::panic::resume_unwind(failure.into_panic());
 }
 
-async fn observe_imports(state: Arc<AppState>, data: PathBuf, alpha: Pair, beta: Pair) {
+async fn observe_imports(
+    state: Arc<AppState>,
+    data: PathBuf,
+    alpha: Pair,
+    beta: Pair,
+) -> Result<(), JoinError> {
     let client = authed_client();
     let alpha_gate = ReceiveGate::install(&alpha.bare);
     let beta_gate = ReceiveGate::install(&beta.bare);
@@ -368,7 +392,7 @@ async fn observe_imports(state: Arc<AppState>, data: PathBuf, alpha: Pair, beta:
 
     // Wait for the second admitted worker to finish while the first is still at Git.
     drop(beta_gate);
-    join_last(&state, 2).await;
+    join_last(&state, 2).await?;
     let mid = Database::new(&database).unwrap();
     assert_eq!(mid.list_commit_map(7).unwrap().len(), 3);
     let beta_receipt = beta.completed(&mid, &beta_op, &beta_offer);
@@ -383,7 +407,7 @@ async fn observe_imports(state: Arc<AppState>, data: PathBuf, alpha: Pair, beta:
         .await;
 
     drop(alpha_gate);
-    join_last(&state, 1).await;
+    join_last(&state, 1).await?;
     alpha
         .check_status_and_retry(&client, &alpha_id, "completed", alpha_tip)
         .await;
@@ -405,4 +429,5 @@ async fn observe_imports(state: Arc<AppState>, data: PathBuf, alpha: Pair, beta:
             "repositories":[alpha_receipt,beta_receipt]
         })
     );
+    Ok(())
 }
