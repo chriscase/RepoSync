@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -23,9 +25,9 @@ PINNED_CI_PARTIAL_ALLOWLIST_IDS = frozenset(
 )
 
 
-def load_expected_real_engine_case_ids() -> list[str]:
+def load_expected_real_engine_tests() -> dict[str, str]:
     payload = json.loads(REQUIRED_CASES_PATH.read_text(encoding="utf-8"))
-    ids: list[str] = []
+    tests = {}
     for tier in ("diagnostics", "candidate"):
         for row in payload.get(tier, []):
             if (
@@ -33,34 +35,18 @@ def load_expected_real_engine_case_ids() -> list[str]:
                 and row.get("binary") == REAL_ENGINE_BINARY
                 and row.get("id")
             ):
-                ids.append(str(row["id"]))
-    if not ids:
+                tests[str(row["id"])] = row.get("test", "")
+    if not tests:
         raise ValueError(f"{REQUIRED_CASES_PATH}: no {REAL_ENGINE_BINARY} case ids")
-    return sorted(set(ids))
+    return tests
 
 
-def evidence_detail(log_text: str, case_id: str | None, want_status: str) -> dict:
-    for line in log_text.splitlines():
-        if "RELIABILITY_EVIDENCE" not in line:
-            continue
-        payload = line.split("RELIABILITY_EVIDENCE", 1)[1].strip()
-        start = payload.find("{")
-        if start < 0:
-            continue
-        try:
-            obj, _end = json.JSONDecoder().raw_decode(payload[start:])
-        except json.JSONDecodeError:
-            continue
-        if obj.get("status") != want_status:
-            continue
-        if case_id is not None and obj.get("case") != case_id:
-            continue
-        detail = obj.get("detail", {})
-        return detail if isinstance(detail, dict) else {}
-    return {}
+def load_expected_real_engine_case_ids() -> list[str]:
+    return sorted(load_expected_real_engine_tests())
 
 
 def evidence_status(log_text: str, case_id: str) -> tuple[str | None, dict]:
+    result = None
     for line in log_text.splitlines():
         if "RELIABILITY_EVIDENCE" not in line:
             continue
@@ -74,28 +60,25 @@ def evidence_status(log_text: str, case_id: str) -> tuple[str | None, dict]:
             continue
         if obj.get("case") != case_id:
             continue
+        if result is not None:
+            return "FAIL", {"reason": "duplicate_evidence", "case": case_id}
         status = obj.get("status")
-        if status in {"PASS", "PARTIAL", "NOT RUN"}:
-            detail = obj.get("detail", {})
-            return status, detail if isinstance(detail, dict) else {}
-    return None, {}
+        if status not in ("PASS", "PARTIAL", "NOT RUN"):
+            return "FAIL", {"reason": "invalid_evidence_status", "case": case_id}
+        detail = obj.get("detail", {})
+        result = status, detail if isinstance(detail, dict) else {}
+    return result if result is not None else (None, {})
 
 
 def classify(log_path: Path, case_id: str, test_exit: int) -> tuple[str, dict]:
     text = log_path.read_text() if log_path.is_file() else ""
-    if '"status":"NOT RUN"' in text or '"status": "NOT RUN"' in text:
-        return "NOT RUN", evidence_detail(text, None, "NOT RUN")
     if test_exit == 0 and "test result: ok" in text:
         status, detail = evidence_status(text, case_id)
         if status is None:
             return "NOT RUN", {"reason": "missing_evidence", "case": case_id}
-        if status == "PARTIAL":
-            return "PARTIAL", detail
-        if status == "NOT RUN":
-            return "NOT RUN", detail
-        if detail:
-            return "PASS", detail
-        return "NOT RUN", {"reason": "missing_evidence_detail", "case": case_id}
+        if status == "PASS" and not detail:
+            return "NOT RUN", {"reason": "missing_evidence_detail", "case": case_id}
+        return status, detail
     tail = next((line for line in reversed(text.splitlines()) if line.strip()), "")
     return "FAIL", {"tail": tail[-500:]}
 
@@ -108,7 +91,10 @@ def append_result(results_path: Path, case_id: str, test_name: str, test_exit: i
     return status
 
 
-def write_summary(results_path: Path, summary_path: Path, toolchain_status: str, missing: str | None) -> dict:
+def write_summary(
+    results_path: Path, summary_path: Path, toolchain_status: str, missing: str | None,
+    timestamp: str | None = None,
+) -> dict:
     results = [
         json.loads(line)
         for line in results_path.read_text().splitlines()
@@ -127,7 +113,7 @@ def write_summary(results_path: Path, summary_path: Path, toolchain_status: str,
         overall = "PASS"
     summary = {
         "suite": "real-engine-scenarios",
-        "timestamp": summary_path.parent.name,
+        "timestamp": timestamp if timestamp is not None else summary_path.parent.name,
         "toolchain": {"status": toolchain_status, "missing": missing},
         "scenarios": results,
         "counts": counts,
@@ -161,6 +147,10 @@ def ci_gate(summary_path: Path, allowlist_path: Path) -> tuple[int, list[str]]:
     if not summary_path.is_file():
         return 1, [f"missing summary: {summary_path}"]
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    return evaluate_ci_summary(summary, allowlist_path)
+
+
+def evaluate_ci_summary(summary: dict, allowlist_path: Path) -> tuple[int, list[str]]:
     try:
         allowed = load_ci_partial_allowlist(allowlist_path)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -259,6 +249,78 @@ def ci_gate(summary_path: Path, allowlist_path: Path) -> tuple[int, list[str]]:
     return 0, []
 
 
+def controlled_status(summary_path: Path, suite_exit: str) -> tuple[str, list[str]]:
+    """Match this invocation's native exit to its complete scenario report."""
+    expected = {"0": "PASS", "2": "NOT RUN", "3": "PARTIAL"}.get(suite_exit)
+    if expected is None:
+        return "FAIL", [f"native suite exited with status {suite_exit}"]
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if not isinstance(summary, dict) or summary.get("suite") != "real-engine-scenarios":
+            return "FAIL", ["expected a real-engine-scenarios summary"]
+        timestamp = summary.get("timestamp")
+        utc_format = "%Y%m%dT%H%M%SZ"
+        if (
+            not isinstance(timestamp, str)
+            or datetime.strptime(timestamp, utc_format).strftime(utc_format) != timestamp
+        ):
+            return "FAIL", ["expected a UTC suite timestamp in YYYYMMDDTHHMMSSZ format"]
+        if summary.get("overall") != expected:
+            return "FAIL", [f"suite exit {suite_exit} requires overall {expected}"]
+        toolchain = summary.get("toolchain")
+        if not isinstance(toolchain, dict) or "missing" not in toolchain:
+            return "FAIL", ["missing native toolchain metadata"]
+        missing = toolchain["missing"]
+        if toolchain.get("status") == "NOT RUN":
+            if expected != "NOT RUN" or not isinstance(missing, str) or not missing.strip():
+                return "FAIL", ["unavailable toolchain requires a named missing tool and overall NOT RUN"]
+        elif toolchain.get("status") != "PASS" or missing is not None:
+            return "FAIL", ["invalid native toolchain status or missing tool"]
+        rows = summary.get("scenarios")
+        if not isinstance(rows, list) or not rows or not all(
+            isinstance(row, dict) and isinstance(row.get("id"), str)
+            and isinstance(row.get("status"), str) for row in rows
+        ):
+            return "FAIL", ["missing or malformed scenario rows"]
+        counts = counts_from_scenarios(rows)
+        reported = summary.get("counts")
+        if not isinstance(reported, dict) or reported != counts or any(
+            type(n) is not int for n in reported.values()
+        ):
+            return "FAIL", ["summary counts must be integers matching the scenario rows"]
+        tests = load_expected_real_engine_tests()
+        if sorted(row["id"] for row in rows) != sorted(tests):
+            return "FAIL", ["expected each cataloged scenario ID exactly once"]
+        for row in rows:
+            case_id = row["id"]
+            if not row.get("test") or row["test"] != tests[case_id]:
+                return "FAIL", [f"{case_id}: expected catalog test {tests[case_id]}"]
+            detail = row.get("detail")
+            if not isinstance(detail, dict) or not detail:
+                return "FAIL", [f"{case_id}: missing scenario evidence detail"]
+            if row["status"] == "NOT RUN":
+                tool = detail.get("tool")
+                if detail.get("reason") != "missing_tool" or not isinstance(tool, str) or not tool.strip():
+                    return "FAIL", [f"{case_id}: NOT RUN requires a named missing tool"]
+                if missing and tool != missing:
+                    return "FAIL", [f"{case_id}: scenario evidence disagrees with the missing tool"]
+        if counts[expected] == 0:
+            return "FAIL", [f"overall {expected} has no corresponding scenario rows"]
+
+        if expected == "NOT RUN":
+            # CI rejects all NOT RUN results. Controlled validation preserves
+            # the distinction only for a complete catalog with no executed row.
+            if counts[expected] != len(rows):
+                return "FAIL", ["NOT RUN requires every scenario row to be NOT RUN"]
+        else:
+            code, errors = evaluate_ci_summary(summary, DEFAULT_CI_PARTIAL_ALLOWLIST)
+            if code:
+                return "FAIL", errors
+        return expected, []
+    except (OSError, ValueError) as exc:
+        return "FAIL", [str(exc)]
+
+
 def run_self_test() -> None:
     allowlist_path = DEFAULT_CI_PARTIAL_ALLOWLIST
     allowed = load_ci_partial_allowlist(allowlist_path)
@@ -273,16 +335,20 @@ def run_self_test() -> None:
         )
     }
     assert json_ids == PINNED_CI_PARTIAL_ALLOWLIST_IDS, (json_ids, PINNED_CI_PARTIAL_ALLOWLIST_IDS)
-    expected_ids = load_expected_real_engine_case_ids()
+    expected_tests = load_expected_real_engine_tests()
+    expected_ids = sorted(expected_tests)
     assert len(expected_ids) >= 8
 
-    def write_summary(tmp: Path, scenarios: list[dict], overall: str) -> Path:
+    def write_summary(tmp: Path, scenarios: list[dict], overall: str, **metadata) -> Path:
         summary_path = tmp / "summary.json"
         payload = {
             "suite": "real-engine-scenarios",
+            "timestamp": "20261119T014057Z",
+            "toolchain": {"status": "PASS", "missing": None},
             "scenarios": scenarios,
             "counts": counts_from_scenarios(scenarios),
             "overall": overall,
+            **metadata,
         }
         summary_path.write_text(json.dumps(payload), encoding="utf-8")
         return summary_path
@@ -290,7 +356,10 @@ def run_self_test() -> None:
     import tempfile
 
     def full_pass_rows() -> list[dict]:
-        rows = [{"id": case_id, "status": "PASS"} for case_id in expected_ids]
+        rows = [
+            {"id": case_id, "test": expected_tests[case_id], "status": "PASS", "detail": {"fixture": True}}
+            for case_id in expected_ids
+        ]
         post_write = next(row for row in rows if row["id"] == POST_WRITE_RECOVERY)
         post_write["detail"] = {"git_push_checkpoint_recovery": {"status": "PASS"}}
         return rows
@@ -300,6 +369,67 @@ def run_self_test() -> None:
         missing_summary = tmp / "no-such-summary.json"
         code, errs = ci_gate(missing_summary, allowlist_path)
         assert code == 1 and errs and "missing summary" in errs[0], (code, errs)
+        assert controlled_status(missing_summary, "0")[0] == "FAIL"
+        missing_summary.write_text('{"suite":', encoding="utf-8")
+        assert controlled_status(missing_summary, "3")[0] == "FAIL"
+
+        def check_controlled(rows: list[dict], overall: str, suite_exit: str, expected: str, **metadata) -> None:
+            status, errors = controlled_status(write_summary(tmp, rows, overall, **metadata), suite_exit)
+            assert status == expected and bool(errors) == (expected == "FAIL"), (status, errors)
+
+        passing = full_pass_rows()
+        check_controlled(passing, "PASS", "0", "PASS")
+        for invalid_stamp in (None, "not-a-time", "20260231T140000Z"):
+            check_controlled(passing, "PASS", "0", "FAIL", timestamp=invalid_stamp)
+        unavailable = {"status": "NOT RUN", "missing": "svnserve"}
+        for invalid_toolchain in (None, {"status": "PASS"}, {"status": "PASS", "missing": "git"}, unavailable):
+            check_controlled(passing, "PASS", "0", "FAIL", toolchain=invalid_toolchain)
+        for changes in ({"test": passing[1]["test"]}, {"test": None}, {"detail": None}, {"detail": {}}):
+            check_controlled([dict(passing[0], **changes), *passing[1:]], "PASS", "0", "FAIL")
+        for wrong_exit in ("1", "2", "3", "127"):
+            check_controlled(passing, "PASS", wrong_exit, "FAIL")
+        check_controlled([], "PASS", "0", "FAIL")
+        not_run_rows = [
+            dict(row, status="NOT RUN", detail={"reason": "missing_tool", "tool": "svnserve"})
+            for row in passing
+        ]
+        check_controlled(not_run_rows, "NOT RUN", "2", "NOT RUN")
+        check_controlled(not_run_rows, "NOT RUN", "2", "NOT RUN", toolchain=unavailable)
+        # A completed Cargo invocation without its case receipt proves no result.
+        log_path = tmp / "test.log"
+        case_id = not_run_rows[0]["id"]
+        receipt = {"case": case_id, "status": "NOT RUN", "detail": not_run_rows[0]["detail"]}
+        cargo_ok = "test result: ok. 1 passed; 0 failed; 0 ignored;\n"
+        for case_receipt in (None, dict(receipt, status="PASS", detail={}), dict(receipt, case="other")):
+            marker = "RELIABILITY_EVIDENCE " + json.dumps(case_receipt) + "\n" if case_receipt else ""
+            log_path.write_text(marker + cargo_ok)
+            status, detail = classify(log_path, case_id, 0)
+            assert detail["reason"] in {"missing_evidence", "missing_evidence_detail"}
+            rows = [dict(row, status=status, detail=detail) for row in not_run_rows]
+            check_controlled(rows, "NOT RUN", "2", "FAIL")
+        log_path.write_text("RELIABILITY_EVIDENCE " + json.dumps(receipt) + "\n" + cargo_ok)
+        assert classify(log_path, case_id, 0) == ("NOT RUN", receipt["detail"])
+        assert classify(log_path, case_id, 1)[0] == "FAIL"
+        passed = dict(receipt, status="PASS", detail={"verified": True})
+        for earlier, expected_status in ((receipt, "FAIL"), (dict(receipt, case="other"), "PASS")):
+            log_path.write_text("".join("RELIABILITY_EVIDENCE " + json.dumps(r) + "\n"
+                                        for r in (earlier, passed)) + cargo_ok)
+            assert classify(log_path, case_id, 0)[0] == expected_status
+        check_controlled([dict(not_run_rows[0], detail={"reason": ""}), *not_run_rows[1:]], "NOT RUN", "2", "FAIL")
+        for wrong_tool in ("", "git"):
+            check_controlled(not_run_rows, "NOT RUN", "2", "FAIL", toolchain={"status": "NOT RUN", "missing": wrong_tool})
+        check_controlled(not_run_rows[:-1], "NOT RUN", "2", "FAIL")
+        check_controlled([not_run_rows[0], *passing[1:]], "PASS", "0", "FAIL")
+        check_controlled([passing[0], *not_run_rows[1:]], "NOT RUN", "2", "FAIL")
+        # The receiving suite reports the legacy R01 and R17 gaps as PARTIAL.
+        receiving_rows = full_pass_rows()
+        for row in receiving_rows:
+            if row["id"] in (POST_WRITE_RECOVERY, "R17_SVNSERVE_NOTIFICATION_ISOLATION"):
+                row["status"] = "PARTIAL"
+        check_controlled(receiving_rows, "PARTIAL", "3", "PARTIAL")
+        check_controlled(receiving_rows, "PARTIAL", "0", "FAIL")
+        next(row for row in receiving_rows if row["id"] == POST_WRITE_RECOVERY).pop("detail")
+        check_controlled(receiving_rows, "PARTIAL", "3", "FAIL")
 
         short = [{"id": expected_ids[0], "status": "PASS"}]
         code, errs = ci_gate(write_summary(tmp, short, "PASS"), allowlist_path)
@@ -362,6 +492,7 @@ def run_self_test() -> None:
                 row["status"] = "PARTIAL"
         code, errs = ci_gate(write_summary(tmp, surprise, "PARTIAL"), allowlist_path)
         assert code != 0 and errs, (code, errs)
+        check_controlled(surprise, "PARTIAL", "3", "FAIL")
 
         failed = full_pass_rows()
         for row in failed:
@@ -422,6 +553,11 @@ def run_self_test() -> None:
             code,
             errs,
         )
+        assert controlled_status(summary_path, "0")[0] == "FAIL"
+        payload["counts"] = counts_from_scenarios(mismatched_counts)
+        payload["counts"]["FAIL"] = False  # compares equal to zero in Python
+        summary_path.write_text(json.dumps(payload), encoding="utf-8")
+        assert controlled_status(summary_path, "0")[0] == "FAIL"
 
     ci_yml = ROOT / ".github/workflows/ci.yml"
     ci_text = ci_yml.read_text(encoding="utf-8")
@@ -433,13 +569,13 @@ def run_self_test() -> None:
     assert "exit 1" in missing_branch, missing_branch
     assert 'exit "${suite_ec' not in missing_branch, missing_branch
 
-    print("SELF-TEST: real-engine ci-gate PASS")
-
 
 def main(argv: list[str]) -> int:
     command = argv[1]
     if command == "self-test":
         run_self_test()
+        subprocess.run([sys.executable, str(ROOT / "scripts/test_controlled_validation.py")], check=True)
+        print("SELF-TEST: real-engine ci-gate PASS")
         return 0
     if command == "ci-gate":
         summary_path = Path(argv[2])
@@ -454,6 +590,15 @@ def main(argv: list[str]) -> int:
             return code
         print("CI-GATE: PASS")
         return 0
+    if command == "controlled-status":
+        if len(argv) == 4:
+            status, errors = controlled_status(Path(argv[2]), argv[3])
+        else:
+            status, errors = "FAIL", ["usage: controlled-status SUMMARY_PATH SUITE_EXIT"]
+        for error in errors:
+            print(error, file=sys.stderr)
+        print(status)
+        return 0
     if command == "append":
         status = append_result(Path(argv[2]), argv[3], argv[4], int(argv[5]), Path(argv[6]))
         if status == "FAIL":
@@ -462,7 +607,13 @@ def main(argv: list[str]) -> int:
             return 3
         return 0
     if command == "summary":
-        summary = write_summary(Path(argv[2]), Path(argv[3]), argv[4], argv[5] if len(argv) > 5 else None)
+        timestamp = None
+        if len(argv) >= 7 and argv[-2] == "--timestamp":
+            timestamp = argv[-1]
+            argv = argv[:-2]
+        summary = write_summary(
+            Path(argv[2]), Path(argv[3]), argv[4], argv[5] if len(argv) > 5 else None, timestamp
+        )
         print(json.dumps(summary, indent=2))
         if summary["overall"] == "FAIL":
             return 1

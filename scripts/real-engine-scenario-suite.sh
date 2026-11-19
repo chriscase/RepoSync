@@ -11,6 +11,7 @@
 #
 # Usage:
 #   scripts/real-engine-scenario-suite.sh
+#   scripts/real-engine-scenario-suite.sh --output-dir NEW_DIRECTORY
 #   REPOSYNC_REAL_ENGINE_USE_COMPOSE=1 scripts/real-engine-scenario-suite.sh
 #
 # Output: artifacts/real-engine-scenarios/<UTC_TIMESTAMP>/summary.json
@@ -30,10 +31,26 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$REPO_ROOT"
-
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-ARTIFACT_DIR="$REPO_ROOT/artifacts/real-engine-scenarios/$TIMESTAMP"
+if [[ $# -eq 0 ]]; then
+  artifact_root="$REPO_ROOT/artifacts/real-engine-scenarios"
+  mkdir -p "$artifact_root"
+  ARTIFACT_DIR="$artifact_root/$TIMESTAMP"
+  if ! mkdir "$ARTIFACT_DIR" 2>/dev/null; then
+    ARTIFACT_DIR=$(mktemp -d "$artifact_root/$TIMESTAMP.XXXXXX")
+  fi
+elif [[ $# -eq 2 && $1 == --output-dir && -n $2 ]]; then
+  ARTIFACT_DIR="$2"
+  if [[ $ARTIFACT_DIR != /* ]]; then
+    ARTIFACT_DIR="$PWD/$ARTIFACT_DIR"
+  fi
+  mkdir -p "$(dirname "$ARTIFACT_DIR")"
+  mkdir "$ARTIFACT_DIR"  # An existing directory belongs to a different run.
+else
+  echo "Usage: $0 [--output-dir NEW_DIRECTORY]" >&2
+  exit 1
+fi
+cd "$REPO_ROOT"
 SUMMARY_FILE="$ARTIFACT_DIR/summary.json"
 RESULTS_FILE="$ARTIFACT_DIR/results.ndjson"
 
@@ -62,7 +79,6 @@ SCENARIOS=(
   "R17_SVNSERVE_NOTIFICATION_ISOLATION:scenario_r17_svnserve_notification_isolation"
 )
 
-mkdir -p "$ARTIFACT_DIR"
 : > "$RESULTS_FILE"
 
 missing_tool=""
@@ -80,7 +96,7 @@ if [[ -n "$missing_tool" ]]; then
     printf '{"id":"%s","status":"NOT RUN","test":"%s","detail":{"reason":"missing_tool","tool":"%s"}}\n' \
       "$id" "$test_name" "$missing_tool" >> "$RESULTS_FILE"
   done
-  python3 scripts/real-engine-scenario-report.py summary "$RESULTS_FILE" "$SUMMARY_FILE" "NOT RUN" "$missing_tool"
+  python3 scripts/real-engine-scenario-report.py summary "$RESULTS_FILE" "$SUMMARY_FILE" "NOT RUN" "$missing_tool" --timestamp "$TIMESTAMP"
   exit 2
 fi
 
@@ -126,7 +142,7 @@ for entry in "${SCENARIOS[@]}"; do
 done
 
 summary_exit=0
-python3 scripts/real-engine-scenario-report.py summary "$RESULTS_FILE" "$SUMMARY_FILE" PASS || summary_exit=$?
+python3 scripts/real-engine-scenario-report.py summary "$RESULTS_FILE" "$SUMMARY_FILE" PASS --timestamp "$TIMESTAMP" || summary_exit=$?
 case "$summary_exit" in
   1) suite_fail=1 ;;
   3) suite_partial=1 ;;
