@@ -754,7 +754,10 @@ impl Database {
         fingerprint: &str,
         setup_data_dir: Option<&Path>,
     ) -> Result<ImportOperation, DatabaseError> {
-        self.transaction(|tx| {
+        // Reserve the writer before reading admission state. An idle pause can
+        // commit first; a deferred read-to-write upgrade could lose that race
+        // with SQLITE_BUSY instead of admitting the explicit import.
+        self.immediate_transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             if super::managed_remove::new_work_blocked(tx, repo_id)? {
