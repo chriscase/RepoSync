@@ -1,6 +1,7 @@
 //! R10. Resume a partially replayed merged PR from its confirmed Personal mappings.
 use super::*;
 use reposync_core::config::GitProvider;
+use reposync_core::db::git_push_operations::GitPushOperationState;
 use reposync_core::git::github::GitHubClient;
 use reposync_core::history_inspect::resolve_personal_checkpoint;
 use reposync_personal::engine::PersonalSyncEngine;
@@ -213,6 +214,7 @@ async fn pr_provider(
                             rows[0] = pulls.iter().find(|row| row["number"] == 4).unwrap().clone();
                         }
                         if page == 1 && matches!(current, ProviderView::CoveredBeyondCap) {
+                            rows[2] = pulls.iter().find(|row| row["number"] == 2).unwrap().clone();
                             rows[1] = pulls.iter().find(|row| row["number"] == 3).unwrap().clone();
                         }
                         body = json!(rows).to_string();
@@ -277,6 +279,33 @@ async fn incomplete_pr_commit_page_is_refused() {
         .contains("incomplete commit list for PR #7"));
 }
 
+#[test]
+fn multiple_scoped_imports_need_a_current_import_boundary() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("personal.db");
+    let db = setup_db(&path);
+    let first = "a".repeat(40);
+    let second = "b".repeat(40);
+    db.checkpoint_personal_snapshot_import(1, &first, "fixture", "Fixture", "svn_rev")
+        .unwrap();
+    db.checkpoint_personal_snapshot_import(2, &second, "fixture", "Fixture", "svn_rev")
+        .unwrap();
+    assert_eq!(
+        db.personal_pr_history_anchor().unwrap().as_ref(),
+        Some(&second)
+    );
+    db.conn()
+        .execute("DELETE FROM watermarks WHERE source='git_sha'", [])
+        .unwrap();
+    drop(db);
+    let db = Database::new(&path).unwrap();
+    assert!(db
+        .personal_pr_history_anchor()
+        .unwrap_err()
+        .to_string()
+        .contains("multiple Personal import mappings"));
+}
+
 fn assert_mappings(db: &Database, direction: &str, expected: &[(i64, &str)]) {
     let conn = db.conn();
     for table in ["commit_map", "sync_records"] {
@@ -314,15 +343,39 @@ fn assert_mappings(db: &Database, direction: &str, expected: &[(i64, &str)]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_personal_merge_dag_replays_across_restart() {
-    qualify_pr_backlog(false).await;
+    qualify_pr_backlog(BacklogCase::Restart).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_later_pr_preserves_earlier_work() {
-    qualify_pr_backlog(true).await;
+    qualify_pr_backlog(BacklogCase::IncompleteLater).await;
 }
 
-async fn qualify_pr_backlog(check_first_cycle_only: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlapping_siblings_with_first_parent_resolution_hold_before_write() {
+    qualify_pr_backlog(BacklogCase::ConflictingSiblings).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capped_discovery_accepts_confirmed_direct_svn_publication() {
+    qualify_pr_backlog(BacklogCase::InboundAtCap).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolution_only_in_outer_merge_holds_before_write() {
+    qualify_pr_backlog(BacklogCase::OuterResolution).await;
+}
+
+#[derive(PartialEq, Eq)]
+enum BacklogCase {
+    Restart,
+    IncompleteLater,
+    ConflictingSiblings,
+    InboundAtCap,
+    OuterResolution,
+}
+
+async fn qualify_pr_backlog(case: BacklogCase) {
     assert!(
         svn_available(),
         "this qualification requires local SVN tooling"
@@ -332,7 +385,10 @@ async fn qualify_pr_backlog(check_first_cycle_only: bool) {
     let svn = SvnClient::new(&url, "", "");
     let wc = root.path().join("svn-wc");
     svn_checkout(&url, &wc);
-    let baseline = svn_commit_file(&wc, "anchor.txt", "base\n", "SVN baseline");
+    assert_eq!(
+        svn_commit_file(&wc, "anchor.txt", "base\n", "SVN baseline"),
+        1
+    );
     let git = root.path().join("git");
     let bare = root.path().join("origin.git");
     let path = root.path().join("personal.db");
@@ -379,6 +435,18 @@ async fn qualify_pr_backlog(check_first_cycle_only: bool) {
         );
         provider.join().unwrap();
     }
+    let snapshot = git_sha(&git);
+    if case == BacklogCase::InboundAtCap {
+        svn_commit_file(&wc, "inbound.txt", "from SVN\n", "Ordinary SVN change");
+        let sync = SvnToGitSync::new(
+            svn.clone(),
+            Arc::new(Mutex::new(GitClient::new(&git).unwrap())),
+            Arc::new(Database::new(&path).unwrap()),
+            config.clone(),
+        );
+        assert_eq!(sync.sync().await.unwrap(), 1);
+    }
+    let baseline = svn_youngest(&url);
     let imported = git_sha(&git);
     git_cmd(&git, &["checkout", "-b", "earlier"]);
     let earlier = add_file(&git, "earlier.txt", "earlier\n", "Earlier PR");
@@ -389,11 +457,19 @@ async fn qualify_pr_backlog(check_first_cycle_only: bool) {
     );
     let base = git_sha(&git);
     git_cmd(&git, &["checkout", "-b", "feature"]);
+    if case == BacklogCase::ConflictingSiblings {
+        std::fs::write(git.join("shared.txt"), "left value\n").unwrap();
+        git_cmd(&git, &["add", "--", "shared.txt"]);
+    }
     let left = add_file(&git, "left.txt", "left\n", "Left change");
     git_cmd(&git, &["checkout", "-b", "side", &base]);
+    if case == BacklogCase::ConflictingSiblings {
+        std::fs::write(git.join("shared.txt"), "right value\n").unwrap();
+        git_cmd(&git, &["add", "--", "shared.txt"]);
+    }
     let right = add_file(&git, "right.txt", "right\n", "Right change");
     git_cmd(&git, &["checkout", "feature"]);
-    git_cmd(&git, &["merge", "--no-ff", "--no-commit", "side"]);
+    git_cmd(&git, &["merge", "--no-ff", "--no-commit", "-Xours", "side"]);
     let resolution = add_file(
         &git,
         "resolution.txt",
@@ -401,7 +477,17 @@ async fn qualify_pr_backlog(check_first_cycle_only: bool) {
         "Resolve internal merge",
     );
     git_cmd(&git, &["checkout", "main"]);
-    git_cmd(&git, &["merge", "--no-ff", "feature", "-m", "Merge PR"]);
+    if case == BacklogCase::OuterResolution {
+        git_cmd(&git, &["merge", "--no-ff", "--no-commit", "feature"]);
+        add_file(
+            &git,
+            "outer-only.txt",
+            "outer resolution\n",
+            "Merge PR with an outer resolution",
+        );
+    } else {
+        git_cmd(&git, &["merge", "--no-ff", "feature", "-m", "Merge PR"]);
+    }
     let merge = git_sha(&git);
     git_cmd(&git, &["checkout", "-b", "later"]);
     std::fs::write(git.join("earlier.txt"), "updated by later PR\n").unwrap();
@@ -412,7 +498,7 @@ async fn qualify_pr_backlog(check_first_cycle_only: bool) {
     let tip = git_sha(&git);
     git_cmd(&git, &["push", "origin", "main"]);
     for (child, parents) in [
-        (&imported, vec![&historical_merge]),
+        (&snapshot, vec![&historical_merge]),
         (&later, vec![&merge]),
         (&tip, vec![&merge, &later]),
         (&earlier, vec![&imported]),
@@ -463,7 +549,91 @@ async fn qualify_pr_backlog(check_first_cycle_only: bool) {
         (baseline + 1, earlier.as_str()),
         (baseline + 2, left.as_str()),
     ];
-    if !check_first_cycle_only {
+    if case == BacklogCase::InboundAtCap {
+        *view.lock().unwrap() = ProviderView::CoveredBeyondCap;
+        let db = Database::new(&path).unwrap();
+        assert_ne!(snapshot, imported);
+        let op = db
+            .latest_git_push_operation(PERSONAL_SCOPE_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(op.state, GitPushOperationState::Completed);
+        assert_eq!(op.last_confirmed_git_sha.as_ref(), Some(&imported));
+        assert_mappings(&db, "svn_to_git", &[(1, &snapshot), (2, &imported)]);
+        let engine = open();
+        let result = engine.run_cycle().await.unwrap();
+        assert_eq!(
+            (result.prs_processed, result.git_to_svn_count),
+            (3, 5),
+            "even a capped scan can cover the verified SVN-origin commit"
+        );
+        assert_mappings(
+            &db,
+            "git_to_svn",
+            &[
+                (3, &earlier),
+                (4, &left),
+                (5, &right),
+                (6, &resolution),
+                (7, &later),
+            ],
+        );
+        assert_eq!(svn_tree(&svn, 7).await, git_tree(&bare, &tip));
+        let quiet = engine.run_cycle().await.unwrap();
+        assert_eq!(
+            (
+                quiet.prs_processed,
+                quiet.git_to_svn_count,
+                quiet.svn_to_git_count
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(svn_youngest(&url), 7);
+        provider.abort();
+        return;
+    }
+    if matches!(
+        case,
+        BacklogCase::ConflictingSiblings | BacklogCase::OuterResolution
+    ) {
+        if case == BacklogCase::ConflictingSiblings {
+            assert_eq!(&git_tree(&bare, &right)["shared.txt"], b"right value\n");
+            assert_eq!(&git_tree(&bare, &resolution)["shared.txt"], b"left value\n");
+        } else {
+            assert_eq!(
+                &git_tree(&bare, &merge)["outer-only.txt"],
+                b"outer resolution\n"
+            );
+            assert!(!git_tree(&bare, &resolution).contains_key("outer-only.txt"));
+        }
+        *view.lock().unwrap() = ProviderView::Complete;
+        for cycle in 0..2 {
+            let engine = open();
+            let stats = engine.run_cycle().await.unwrap();
+            let db = Database::new(&path).unwrap();
+            assert_eq!(
+                svn_youngest(&url),
+                baseline + 1,
+                "incompatible replay wrote an SVN revision"
+            );
+            assert_eq!(stats.prs_processed, u64::from(cycle == 0));
+            assert_eq!(
+                svn_tree(&svn, baseline + 1).await,
+                git_tree(&bare, &earlier)
+            );
+            assert_mappings(&db, "git_to_svn", &first[..1]);
+            assert!(db
+                .unfinished_personal_prs()
+                .unwrap()
+                .contains(&(3, merge.clone())));
+            assert!(!db.is_personal_pr_synced(&tip).unwrap());
+            let reason: String = db.conn().query_row("SELECT details FROM audit_log WHERE action='git_to_svn_pr_membership' ORDER BY id DESC LIMIT 1",[], |row|row.get(0)).unwrap();
+            assert!(reason.contains("does not reproduce the Git merge tree"));
+        }
+        provider.abort();
+        return;
+    }
+    if case == BacklogCase::Restart {
         let db = Database::new(&path).unwrap();
         assert_eq!(
             db.get_watermark("git_sha").unwrap().as_deref(),
@@ -482,7 +652,7 @@ async fn qualify_pr_backlog(check_first_cycle_only: bool) {
     }
     {
         let engine = open();
-        if !check_first_cycle_only {
+        if case == BacklogCase::Restart {
             *view.lock().unwrap() = ProviderView::EarlierOnly;
         }
         let earlier_only = engine.run_cycle().await.unwrap();
@@ -496,7 +666,7 @@ async fn qualify_pr_backlog(check_first_cycle_only: bool) {
         assert_mappings(&db, "git_to_svn", &first[..1]);
         assert!(!db.is_personal_pr_synced(&historical_merge).unwrap());
         assert!(!db.is_personal_pr_synced(&tip).unwrap());
-        if check_first_cycle_only {
+        if case == BacklogCase::IncompleteLater {
             let prs = db.list_pr_syncs(5).unwrap();
             assert_eq!(prs.len(), 2);
             assert_eq!(

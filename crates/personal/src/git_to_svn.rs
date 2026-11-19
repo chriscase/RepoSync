@@ -240,8 +240,18 @@ impl GitToSvnSync {
             if let Some(pr) = pending.remove(&cursor.id()) {
                 newest_first.push(pr);
             } else if truncated && !self.db.is_personal_pr_synced(&cursor.id().to_string())? {
-                // A missing first-parent step could be an older unprocessed PR.
-                return Err(GitHubError::IncompletePrDiscovery.into());
+                // A direct, confirmed SVN-origin push also accounts for one step.
+                // An unknown commit could be an omitted earlier PR.
+                if cursor.parent_count() != 1
+                    || !self.db.is_confirmed_personal_push(
+                        &self.default_branch,
+                        &cursor.id().to_string(),
+                        &cursor.tree_id().to_string(),
+                        &cursor.parent_id(0)?.to_string(),
+                    )?
+                {
+                    return Err(GitHubError::IncompletePrDiscovery.into());
+                }
             }
             if cursor.parent_count() == 0 {
                 anyhow::bail!(
@@ -433,6 +443,10 @@ impl GitToSvnSync {
         anyhow::ensure!(
             count == shas.len(),
             "provider commit list has unrelated or duplicate members"
+        );
+        anyhow::ensure!(
+            git.first_parent_replay_matches_merge(merge_sha, shas)?,
+            "ordered first-parent replay does not reproduce the Git merge tree"
         );
         Ok(())
     }

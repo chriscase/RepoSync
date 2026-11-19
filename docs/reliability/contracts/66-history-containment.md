@@ -187,14 +187,18 @@ Still required before claiming #66:
   commits in the DAG PR. The client requests 100 commits per page and records
   the pending PR before requesting its list. A paginated response keeps it pending.
   For a two-parent merge, the local Git graph must confirm every introduced commit
-  in parent-before-child order. The first complete list pins the ordered SHAs.
+  in parent-before-child order. Their ordered first-parent deltas must reproduce the
+  outer Git merge tree. A sibling conflict whose resolution would be lost holds
+  before any SVN write for the PR. The first complete list pins the ordered SHAs.
   Empty, shortened or reordered retries keep the queue at that PR.
 - Discovery reads up to ten pages of PRs in creation order. A repeated PR number
   across pages or an omitted pending PR holds the queue. At the cap, replay can
   proceed if every first-parent commit after the import boundary has a listed or
-  previously completed PR. An uncovered step holds publication. A database that
+  previously completed PR, or an ordinary SVN-origin publication with a matching
+  confirmed push, scoped receipt and mapping. An uncovered step holds publication. A database that
   lacks the legacy Git watermark can use the Personal importer's matching scoped
-  receipt and mapping. A missing or ambiguous import boundary requires inspection.
+  receipt and mapping if they identify a single import boundary. Multiple scoped
+  import mappings without the current boundary require inspection.
   The Team 1,001-commit qualification uses its own continuation mechanism.
 
 Assert zero unwanted remote changes and stable checkpoints on rejection, and

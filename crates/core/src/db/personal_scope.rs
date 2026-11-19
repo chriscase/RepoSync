@@ -42,7 +42,9 @@ pub fn personal_history_block_keys() -> [String; 2] {
         .unwrap()
 }
 
-fn personal_repo_ids_for_read(db: &Database) -> Result<Vec<&'static str>, DatabaseError> {
+pub(super) fn personal_repo_ids_for_read(
+    db: &Database,
+) -> Result<Vec<&'static str>, DatabaseError> {
     let legacy_blocked = db.get_repository(LEGACY_PERSONAL_REPO_ID)?.is_some();
     if legacy_blocked {
         Ok(vec![PERSONAL_SCOPE_KEY])
@@ -279,9 +281,10 @@ impl Database {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        if matches!(rows.as_slice(), [first, second] if first.0 == second.0) {
+        if rows.len() > 1 {
             return Err(DatabaseError::Other(
-                "ambiguous Personal import mappings at the same SVN revision".into(),
+                "multiple Personal import mappings require evidence of the current import boundary"
+                    .into(),
             ));
         }
         Ok(rows.into_iter().next().map(|(_, sha)| sha))

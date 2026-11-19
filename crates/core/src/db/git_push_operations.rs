@@ -525,6 +525,46 @@ impl Database {
         })
     }
 
+    /// Prove a direct first-parent step for bounded Personal PR discovery.
+    /// Match the original publisher, its confirmed target, mapping and receipt.
+    pub fn is_confirmed_personal_push(
+        &self,
+        branch: &str,
+        sha: &str,
+        tree: &str,
+        parent: &str,
+    ) -> Result<bool, DatabaseError> {
+        let scopes = super::personal_scope::personal_repo_ids_for_read(self)?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT d.key, d.value FROM kv_state d
+             JOIN commit_map m ON m.git_sha=?1 AND m.direction='svn_to_git'
+             JOIN sync_records r ON r.repo_id=m.repo_id AND r.svn_rev=m.svn_rev AND r.git_sha=m.git_sha
+             WHERE m.repo_id IN (?2,?3) AND r.direction='svn_to_git' AND r.status='applied'
+             AND d.key GLOB 'svn_to_git_push_v1:document:*'
+             AND json_extract(d.value,'$.repo_id')=m.repo_id
+             AND json_extract(d.value,'$.source_svn_rev')=m.svn_rev
+             AND json_extract(d.value,'$.last_confirmed_git_sha')=m.git_sha"
+        )?;
+        let mut rows = stmt.query(params![sha, scopes[0], scopes.get(1)])?;
+        let Some(row) = rows.next()? else {
+            return Ok(false);
+        };
+        let op = parse(&row.get::<_, String>(1)?)?;
+        let matching = row.get::<_, String>(0)? == key("document", &op.id)
+            && op.state == GitPushOperationState::Completed
+            && op.initiator_id == "personal_worker"
+            && op.pre_push_git_remote == "origin"
+            && op.pre_push_git_branch == branch
+            && op.target_fingerprint == git_push_target_fingerprint(&op.repo_id, "origin", branch)
+            && op.pre_push_git_sha == parent
+            && op.intended_local_git_parent.as_deref() == Some(parent)
+            && op.intended_local_git_sha == sha
+            && op.intended_local_git_tree == tree
+            && op.last_confirmed_git_tree.as_deref() == Some(tree);
+        Ok(matching && rows.next()?.is_none())
+    }
+
     pub fn latest_git_push_operation(
         &self,
         repo_id: &str,
