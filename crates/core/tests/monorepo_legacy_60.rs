@@ -70,7 +70,10 @@ fn assert_same_tree(svn_repo: &Path, revision: &str, bare: &Path, git_ref: &str)
                 .arg(format!("trunk/{path}")),
         );
         let actual = git(bare, &["show", &format!("{git_ref}:{path}")]);
-        assert_eq!(actual, expected, "SVN r{revision} versus Git {git_ref}:{path}");
+        assert_eq!(
+            actual, expected,
+            "SVN r{revision} versus Git {git_ref}:{path}"
+        );
     }
 }
 
@@ -151,7 +154,10 @@ async fn legacy_single_repo_replays_all_teams_and_remains_quiet_on_reopen() {
     git(&bridge, &["init", "-b", "main"]);
     git(&bridge, &["add", "--", "."]);
     git(&bridge, &["commit", "-m", "Existing SVN r1 baseline"]);
-    git(&bridge, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(
+        &bridge,
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
     git(&bridge, &["push", "origin", "main"]);
     let initial = git_text(&bare, &["rev-parse", "main"]);
     assert_same_tree(&svn_repo, "1", &bare, "main");
@@ -167,8 +173,10 @@ async fn legacy_single_repo_replays_all_teams_and_remains_quiet_on_reopen() {
     assert_same_tree(&svn_repo, "2", &bare, &r2);
     assert_same_tree(&svn_repo, "3", &bare, &r3);
     let youngest = || {
-        String::from_utf8(output(Command::new("svnlook").arg("youngest").arg(&svn_repo)))
-            .unwrap()
+        String::from_utf8(output(
+            Command::new("svnlook").arg("youngest").arg(&svn_repo),
+        ))
+        .unwrap()
     };
     assert_eq!(youngest().trim(), "3");
 
@@ -183,15 +191,29 @@ async fn legacy_single_repo_replays_all_teams_and_remains_quiet_on_reopen() {
             developer.to_str().unwrap(),
         ],
     );
-    std::fs::write(developer.join("docs/index.txt"), b"edited shared docs in Git\n").unwrap();
-    std::fs::write(developer.join("team-c/readme.txt"), b"edited team c in Git\n").unwrap();
-    git(&developer, &["add", "--", "docs/index.txt", "team-c/readme.txt"]);
+    std::fs::write(
+        developer.join("docs/index.txt"),
+        b"edited shared docs in Git\n",
+    )
+    .unwrap();
+    std::fs::write(
+        developer.join("team-c/readme.txt"),
+        b"edited team c in Git\n",
+    )
+    .unwrap();
+    git(
+        &developer,
+        &["add", "--", "docs/index.txt", "team-c/readme.txt"],
+    );
     git(&developer, &["commit", "-m", "Edit docs and team-c on Git"]);
     git(&developer, &["push", "origin", "main"]);
     let git_tip = git_text(&bare, &["rev-parse", "main"]);
 
     let outbound = engine.run_sync_cycle().await.unwrap();
-    assert_eq!((outbound.svn_to_git_count, outbound.git_to_svn_count), (0, 1));
+    assert_eq!(
+        (outbound.svn_to_git_count, outbound.git_to_svn_count),
+        (0, 1)
+    );
     assert_eq!(youngest().trim(), "4");
     assert_same_tree(&svn_repo, "4", &bare, "main");
     let records = vec![
