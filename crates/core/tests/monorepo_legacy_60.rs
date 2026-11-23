@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use reposync_core::config::{AppConfig, IdentityConfig, SvnLayout};
+use reposync_core::config::{AppConfig, SvnLayout};
 use reposync_core::db::Database;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
@@ -88,6 +88,8 @@ password_env = "REPOSYNC_FIXTURE_UNUSED"
 [github]
 repo = "fixture/legacy"
 token_env = "REPOSYNC_FIXTURE_UNUSED"
+[identity]
+email_domain = "example.invalid"
 "#,
     )
     .unwrap();
@@ -99,12 +101,13 @@ token_env = "REPOSYNC_FIXTURE_UNUSED"
 
     let db = Database::new(&root.join("sync.db")).unwrap();
     db.initialize().unwrap();
+    let mapper = Arc::new(IdentityMapper::new(&config.identity).unwrap());
     SyncEngine::new(
         config,
         db,
         SvnClient::new(svn_url, "", ""),
         GitClient::new(bridge).unwrap(),
-        Arc::new(IdentityMapper::new(&IdentityConfig::default()).unwrap()),
+        mapper,
     )
 }
 
