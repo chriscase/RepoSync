@@ -43,10 +43,6 @@ def load_expected_real_engine_tests() -> dict[str, str]:
     return tests
 
 
-def load_expected_real_engine_case_ids() -> list[str]:
-    return sorted(load_expected_real_engine_tests())
-
-
 def evidence_status(log_text: str, case_id: str) -> tuple[str | None, dict]:
     result = None
     for line in log_text.splitlines():
@@ -203,6 +199,17 @@ def post_write_recovery_errors(status: str, detail: object) -> list[str]:
     return [f"{POST_WRITE_RECOVERY}: {error}" for error in errors]
 
 
+def scenario_receipt_errors(row: dict, expected_test: str) -> list[str]:
+    case_id = row["id"]
+    errors = []
+    if not row.get("test") or row["test"] != expected_test:
+        errors.append(f"{case_id}: expected catalog test {expected_test}")
+    detail = row.get("detail")
+    if not isinstance(detail, dict) or not detail:
+        errors.append(f"{case_id}: missing scenario evidence detail")
+    return errors
+
+
 def evaluate_ci_summary(summary: dict, allowlist_path: Path) -> tuple[int, list[str]]:
     try:
         allowed = load_ci_partial_allowlist(allowlist_path)
@@ -215,7 +222,8 @@ def evaluate_ci_summary(summary: dict, allowlist_path: Path) -> tuple[int, list[
         return 1, ["summary.scenarios must be a list"]
 
     try:
-        expected_ids = load_expected_real_engine_case_ids()
+        expected_tests = load_expected_real_engine_tests()
+        expected_ids = sorted(expected_tests)
     except (OSError, ValueError, json.JSONDecodeError, KeyError) as exc:
         return 1, [f"expected case catalog: {exc}"]
 
@@ -258,6 +266,8 @@ def evaluate_ci_summary(summary: dict, allowlist_path: Path) -> tuple[int, list[
         status = row.get("status")
         if isinstance(status, str):
             row_statuses.append(status)
+        if status in ("PASS", "PARTIAL") and isinstance(case_id, str) and case_id in expected_tests:
+            errors.extend(scenario_receipt_errors(row, expected_tests[case_id]))
         if case_id == POST_WRITE_RECOVERY and status in ("PASS", "PARTIAL"):
             errors.extend(post_write_recovery_errors(status, row.get("detail")))
         if status == "FAIL":
@@ -341,12 +351,11 @@ def controlled_status(summary_path: Path, suite_exit: str) -> tuple[str, list[st
             return "FAIL", ["expected each cataloged scenario ID exactly once"]
         for row in rows:
             case_id = row["id"]
-            if not row.get("test") or row["test"] != tests[case_id]:
-                return "FAIL", [f"{case_id}: expected catalog test {tests[case_id]}"]
-            detail = row.get("detail")
-            if not isinstance(detail, dict) or not detail:
-                return "FAIL", [f"{case_id}: missing scenario evidence detail"]
+            errors = scenario_receipt_errors(row, tests[case_id])
+            if errors:
+                return "FAIL", errors
             if row["status"] == "NOT RUN":
+                detail = row["detail"]
                 tool = detail.get("tool")
                 if detail.get("reason") != "missing_tool" or not isinstance(tool, str) or not tool.strip():
                     return "FAIL", [f"{case_id}: NOT RUN requires a named missing tool"]
@@ -440,6 +449,38 @@ def run_self_test() -> None:
         check_controlled(passing, "PASS", "0", "PASS")
         for invalid_stamp in (None, "not-a-time", "20260231T140000Z"):
             check_controlled(passing, "PASS", "0", "FAIL", timestamp=invalid_stamp)
+        # The hosted workflow calls ci-gate directly, not controlled-status.
+        # Both must reject the same incomplete receipts, even for an allowlisted PARTIAL.
+        for scenario_id, overall, suite_exit in (
+            ("R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP", "PASS", "0"),
+            ("R17_SVNSERVE_NOTIFICATION_ISOLATION", "PARTIAL", "3"),
+        ):
+            rows = full_pass_rows()
+            row = next(row for row in rows if row["id"] == scenario_id)
+            row["status"] = overall
+            row["detail"] = {"nested": {"arbitrary": True}, "count": 0}
+            code, errors = ci_gate(write_summary(tmp, rows, overall), allowlist_path)
+            assert (code, errors) == (0, []), (code, errors)
+            check_controlled(rows, overall, suite_exit, overall)
+            def check_invalid_receipt(reason: str) -> None:
+                code, errors = ci_gate(write_summary(tmp, rows, overall), allowlist_path)
+                assert (code, errors) == (1, [f"{scenario_id}: {reason}"]), (code, errors)
+                check_controlled(rows, overall, suite_exit, "FAIL")
+
+            for field, invalid_values, reason in (
+                (
+                    "test", (None, "", "scenario_other_test"),
+                    f"expected catalog test {expected_tests[scenario_id]}",
+                ),
+                ("detail", (None, {}, [], "PASS"), "missing scenario evidence detail"),
+            ):
+                valid = row.pop(field)
+                check_invalid_receipt(reason)
+                for value in invalid_values:
+                    row[field] = value
+                    check_invalid_receipt(reason)
+                row[field] = valid
+
         unavailable = {"status": "NOT RUN", "missing": "svnserve"}
         for invalid_toolchain in (None, {"status": "PASS"}, {"status": "PASS", "missing": "git"}, unavailable):
             check_controlled(passing, "PASS", "0", "FAIL", toolchain=invalid_toolchain)
