@@ -7,32 +7,26 @@ intended default is **update pair from parent**: a coordinated, history-preservi
 operation that accounts for pending work on both sides. It is not a rebase, a
 reset, or a force-push, and nothing in RepoSync turns one of those into a refresh.
 
-**Short version for developers:** you cannot safely do this yourself with
-`git rebase` and `git push --force`. Today you can ask an administrator for a
-**read-only preview or review** of what a refresh would do. **Executing** a
-refresh is in the tree only as an unqualified draft and is not something this
-guide recommends running on a live installation. Automatic refresh does not
-exist, and this guide does not describe one as safe.
+**Short version for developers:** ask a RepoSync administrator for a **read-only
+preview or review**. Do not use `git rebase`, a force-push, or an independent
+`svn merge` to imitate a refresh. The tested local update/re-anchor does not
+make network or deployed refresh safe. There is no automatic refresh.
 
 ## What exists, at a glance
 
-| Capability | Route | Who | Label |
-| --- | --- | --- | --- |
-| v1 preview of "update pair from parent" | `POST /api/repos/{pair_id}/refresh` | admin | **In tree, read-only** |
-| v1 execute (`execute: true` or `dry_run: false`) | same route | admin | **Not implemented**: refused with `refresh_execute_not_implemented` |
-| Re-anchor / recreate the pair | same route, `operation` = `reanchor`, `re-anchor`, `re_anchor`, `recreate`, `re-create` or `recreate_pair` | admin | **Not implemented**: refused with `reanchor_not_implemented` |
-| v2 inspection-only review | `POST /api/v2/repos/{pair_id}/refresh/review` (and `/review/candidate`) | admin | **In tree, draft, read-only** |
-| v2 prepare → approve → execute → receipt | `POST …/refresh/prepare`, `POST …/refresh/action`, `GET …/refresh/requests/{request}` | admin | **In tree, draft**: qualification gates open |
-| Automatic or push-triggered refresh | none | none | **Held / planned**: not provided |
-| A GitHub Action or client that requests refresh | n/a | n/a | **Held**: see [Held and unavailable](held-and-unavailable.md) |
+| Capability | Entry point | Boundary |
+| --- | --- | --- |
+| v1 preview of "update pair from parent" | `POST /api/repos/{pair_id}/refresh` | Admin; read-only. A plan digest is not execution approval. |
+| v1 service-backed update or explicitly approved local re-anchor | Same route | **Local-only, sandbox-evidenced**; separate writer path. |
+| v2 inspection-only review | `POST /api/v2/repos/{pair_id}/refresh/review` (and `/review/candidate`) | Admin, read-only; cannot authorize execution. |
+| v2 prepare → approve → execute → receipt | `POST …/refresh/prepare`, `POST …/refresh/action`, `GET …/refresh/requests/{request}` | Original administrator; bounded service path, not a live or enterprise qualification. |
+| Optional CLI preview and named status | [Manual operator guide](../reliability/git-workflows.md#manual-client-and-workflow) | CLI tested in disposable fixtures. It does not submit an approved refresh against the v1 preview. |
+| Automatic or push-triggered refresh; network re-anchor | None supported by this guide | **Unavailable**. |
 
-`{pair_id}` is the **child** pair's repository ID. The v2 routes are registered
-when the web server starts; the v2 contract itself describes them as a writer
-draft whose full qualification, exact-head CI and independent review are still
-open.
+`{pair_id}` is the **child** pair's repository ID. Do not copy a fixture's
+operation or use a writer route against a deployed pair based on this page.
 
-Sources: [v1 handler][v1], [operation parsing and refusals][core-refresh],
-[v2 routes][v2-routes], [v1/v2 contract][v2-api], [web server wiring][wiring].
+Sources: [v1 handler][v1], [v2 routes and handlers][v2-routes].
 
 ## Step 1: preview (v1, read-only)
 
@@ -58,13 +52,14 @@ It starts no durable job and performs no external write. It does not say work wa
 discarded. If a side's history was rewritten or is unproven, the plan reports it and
 does not treat replacement commits as new work.
 
-The preview also reports `execute_status` and `reanchor_status`; at the pinned
-commit both are `NOT_IMPLEMENTED`, and `approval.eligible` is `false`. **A v1
-`plan_digest` cannot approve a v2 action.**
+The preview reports `execute_status` and `reanchor_status` as
+`refresh_service`, but `approval.eligible` stays `false`. That is a pointer
+to a separate path, not permission to execute. A v1 `plan_digest` cannot
+approve a v2 action or local re-anchor. [Preview fields][core-refresh]
 
 If the pair has no parent, the request is refused as `not_a_branch_pair`.
 
-## Step 2 (draft): v2 review, prepare, approve
+## Step 2: v2 review, prepare, approve
 
 The v2 flow is separate from v1. Every call needs a **current, enabled
 database-administrator session**; the legacy in-memory sessions are refused. A
@@ -92,13 +87,19 @@ request is owned by the actor who started it.
    }
    ```
 
-   `action` is one of `execute`, `reconcile`, `cancel`. Unknown fields are
-   rejected. The approval **expires after five minutes**. RepoSync re-observes the
-   remotes, lineage, credentials and configuration before it writes.
-4. **Read the receipt.** `GET /api/v2/repos/{pair_id}/refresh/requests/{request_id}`.
-   Repeating a completed request returns its original receipt and does not
-   publish again. A lost HTTP response does not abandon an approved publication
-   midway through an external command.
+   The **prepared v2 flow** uses `execute`, `reconcile` or `cancel`. Unknown
+   fields are rejected. The approval **expires after five minutes**. RepoSync
+   re-observes the remotes, lineage, credentials and configuration before it
+   writes. The same action route accepts `reanchor` separately; that action
+   uses the local service and its own approval and journal, not this prepared
+   flow.
+4. **Read the receipt.** `GET /api/v2/repos/{pair_id}/refresh/requests/{request_id}`
+   reads the prepared v2 flow's execution or no-op receipt. Repeating a completed
+   request in that flow returns its original receipt and does not publish again.
+   This GET does not read **v1 local updates or local re-anchors**. A 404 after
+   either local operation is not evidence that nothing was written. A lost
+   HTTP response does not abandon an approved publication midway through an
+   external command.
 
 `reconcile` observes a retained publication intent; it cannot retry the write.
 `cancel` can cancel an unused preparation or an eligible pre-intent job; an
@@ -108,16 +109,34 @@ release it.
 Sources: [web handlers][v2-handlers], [service lifetime and actions][service],
 [v2 contract][v2-api].
 
-### Why this guide does not tell you to run step 3
+## Local-only update and re-anchor
 
-- The v2 contract's own qualification section says full qualification, exact-head
-  CI and independent review are open, and that no merge is authorized by it.
-- Positive restart recovery on Linux is documented there as still needing execution.
-- The held #71 work (a request client, hooks, webhooks) is **explicitly dependent
-  on #69's frozen state**, which this guide cannot establish.
+[#69 closed](https://github.com/chriscase/RepoSync/issues/69#issuecomment-6783961127)
+through [#258](https://github.com/chriscase/RepoSync/pull/258), for local Git
+directories under the daemon data directory and a shared `file://` SVN
+repository. The local service refuses non-local SVN URLs. A v1 update write
+binds the pins read by its own request, not an earlier preview. The local update
+refuses pending child Git or SVN work and leaves it in place. Local re-anchor
+requires its own approval and has two distinct effects:
 
-If your administrator decides to exercise it anyway, that is their decision,
-made against the contract and the then-current CI, not something to infer from this page.
+- **Default new generation (also the only v1 choice):** creates a new SVN path
+  and Git generation ref, retaining the old SVN path and generation evidence
+  without moving the existing local paired branch.
+- **Separately approved same-name re-anchor:** commits replacement contents at
+  the current SVN path and moves the existing local paired Git branch tip. It
+  keeps prior SVN revisions and Git history, but does not leave the current
+  contents or tip unchanged.
+
+Neither mode deletes an SVN path or force-pushes a network Git ref. Local update
+and local re-anchor use a separate journal from the prepared v2 flow. Do not
+substitute the v2 receipt GET for an administrator's inspection of an uncertain
+local result. [Local service][local] · [SVN effects][local-svn] ·
+[Git effects][local-git] · [Bounded execution contract][execution]
+
+The v2 service also restricts what it can safely admit. A stale approval,
+unproven lineage or unsupported content is a reason to stop, not a reason to
+fall back to the v1 writer. Do not interpret the local evidence or a v2 receipt
+as support for a live network installation.
 
 ## Restart recovery (administrators)
 
@@ -135,7 +154,7 @@ not walk through it, because it is an operator procedure on a live data director
 | --- | --- |
 | Get the parent's newer work into your pair | Ask an administrator for a v1 preview or a v2 review, and wait for a decision. Meanwhile, keep committing on top of your own branch. |
 | Check whether you are behind the parent | Ask for the preview. Don't compare tips by eye: SVN revision numbers alone do not tell you what is pending on a branch. |
-| Replace the pair's history with a fresh start | There is no supported operation. Re-anchor is **not implemented**. See [History rewrites and SVN merges](history-rewrites-and-svn-merges.md). |
+| Start a new pair generation | Do not replace history yourself. The default approved local re-anchor creates a new path and keeps the old generation. Same-name re-anchor changes the current contents and local tip. Network re-anchor is not supported. See [History rewrites and SVN merges](history-rewrites-and-svn-merges.md). |
 | Make refresh happen automatically on every parent push | Not provided. Don't script `git rebase`, `git push --force`, or `svn merge` to imitate one. |
 
 ## Safe next steps
@@ -143,15 +162,18 @@ not walk through it, because it is an operator procedure on a live data director
 - If a preview or review shows `both_advanced`-style conflicts, unknowns, or a
   blocked state, treat it as information. Don't try to "clear" it by resetting
   your branch.
-- If you see `refresh_execute_not_implemented` or `reanchor_not_implemented`, the
-  server did what it should. There is no flag that bypasses it.
+- If the server refuses the operation or its approval, stop. Do not change
+  flags, repeat with a new ID or try another route to bypass that refusal.
 - If an executed refresh left a held or uncertain state, go to
   [Status and reconciliation](status-and-reconciliation.md).
 
-[v1]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L3721-L3880
-[core-refresh]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/pair_refresh.rs#L52-L83
-[v2-routes]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/pair_refresh.rs#L20-L36
-[v2-handlers]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/pair_refresh.rs#L56-L172
-[service]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/pair_refresh/service.rs#L25-L25
-[v2-api]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/docs/reliability/contracts/69-pair-refresh-v2-api.md
-[wiring]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/lib.rs#L412-L412
+[v1]: https://github.com/chriscase/RepoSync/blob/0f010a232a29489b31a1c73500040f766c739f81/crates/web/src/api/repos.rs#L3661-L3723
+[core-refresh]: https://github.com/chriscase/RepoSync/blob/0f010a232a29489b31a1c73500040f766c739f81/crates/core/src/pair_refresh.rs#L724-L786
+[v2-routes]: https://github.com/chriscase/RepoSync/blob/0f010a232a29489b31a1c73500040f766c739f81/crates/web/src/api/pair_refresh.rs#L24-L50
+[v2-handlers]: https://github.com/chriscase/RepoSync/blob/0f010a232a29489b31a1c73500040f766c739f81/crates/web/src/api/pair_refresh.rs#L81-L207
+[service]: https://github.com/chriscase/RepoSync/blob/0f010a232a29489b31a1c73500040f766c739f81/crates/core/src/pair_refresh/service.rs#L387-L405
+[v2-api]: ../reliability/contracts/69-pair-refresh-v2-api.md
+[local]: https://github.com/chriscase/RepoSync/blob/0f010a232a29489b31a1c73500040f766c739f81/crates/core/src/pair_refresh/local_operations.rs#L82-L156
+[local-svn]: https://github.com/chriscase/RepoSync/blob/0f010a232a29489b31a1c73500040f766c739f81/crates/core/src/pair_refresh/local_operations.rs#L428-L466
+[local-git]: https://github.com/chriscase/RepoSync/blob/0f010a232a29489b31a1c73500040f766c739f81/crates/core/src/pair_refresh/local_operations.rs#L474-L559
+[execution]: ../reliability/contracts/69-pair-refresh-execution-v2.md
