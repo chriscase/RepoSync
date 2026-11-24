@@ -39,6 +39,24 @@ const FINALIZED_CHANGES: [(&str, &str, &str); 3] = [
     ),
 ];
 
+fn git_push_documents(db: &Database, repo_id: &str) -> Vec<GitPushOperation> {
+    let conn = db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT value FROM kv_state
+         WHERE key GLOB 'svn_to_git_push_v1:document:*' AND json_extract(value, '$.repo_id') = ?1
+         ORDER BY json_extract(value, '$.source_svn_rev'), key",
+    ).unwrap();
+    let documents = stmt
+        .query_map([repo_id], |row| row.get::<_, String>(0))
+        .unwrap();
+    let mut operations = Vec::new();
+    for document in documents {
+        let operation: GitPushOperation = serde_json::from_str(&document.unwrap()).unwrap();
+        operations.push(operation);
+    }
+    operations
+}
+
 fn snapshot(f: &SingleRepoFixture, published: i64, youngest: i64) -> FinalizedHistory {
     let repo = &f.repo;
     let db = Database::new(&f.db_path).unwrap();
@@ -63,23 +81,7 @@ fn snapshot(f: &SingleRepoFixture, published: i64, youngest: i64) -> FinalizedHi
     );
     assert_eq!(ledger.outcomes.len(), (published - 1) as usize);
 
-    let operations = {
-        let conn = db.conn();
-        let mut stmt = conn.prepare(
-            "SELECT value FROM kv_state
-             WHERE key GLOB 'svn_to_git_push_v1:document:*' AND json_extract(value, '$.repo_id') = ?1
-             ORDER BY json_extract(value, '$.source_svn_rev'), key",
-        ).unwrap();
-        let documents = stmt
-            .query_map([&repo.id], |row| row.get::<_, String>(0))
-            .unwrap();
-        let mut operations = Vec::new();
-        for document in documents {
-            let operation: GitPushOperation = serde_json::from_str(&document.unwrap()).unwrap();
-            operations.push(operation);
-        }
-        operations
-    };
+    let operations = git_push_documents(&db, &repo.id);
     assert_eq!(operations.len(), ledger.outcomes.len());
     assert!(db.active_git_push_operation(&repo.id).unwrap().is_none());
     assert_eq!(
@@ -492,4 +494,219 @@ pub(super) async fn evidence() -> Value {
         "mirror_recovery": mirror,
         "contradictory_mirror_hold": contradictory
     })
+}
+
+// Kept out of the qualified catalog until the old-snapshot baseline has been
+// observed. This uses the same Unix/loopback fixture and standard Cargo target
+// as the ordinary native cases. It never copies a live or operator database.
+#[tokio::test]
+#[ignore = "R23 baseline diagnostic: run explicitly, not a qualified scenario"]
+async fn diagnostic_r23_restored_prewrite_database() {
+    assert!(
+        super::toolchain_available().is_none(),
+        "R23 requires the ordinary native Git and Subversion tools"
+    );
+
+    // Two separate fixture lanes prevent an unexpected direct-cycle write from
+    // affecting what the scheduler's baseline resolver observes.
+    let mut reports = Vec::new();
+    let mut safe_disposition = true;
+    for driver in ["scheduler_baseline_resolver", "direct_engine"] {
+        let f = SingleRepoFixture::with_registration_mode("direct");
+        git_cli(&f.repo.bare, &["config", "core.logAllRefUpdates", "true"]);
+        let first = managed_engine(&f).run_sync_cycle().await.unwrap();
+        assert_eq!((first.svn_to_git_count, first.git_to_svn_count), (1, 0));
+        let prewrite = snapshot(&f, 2, 2);
+        verify_finalized_receipts(&prewrite);
+        let prewrite_tip = git_main_commit_and_tree(&f.repo.bare);
+
+        // VACUUM INTO obtains a transactionally consistent database including
+        // committed WAL content. Never copy the live main DB file in isolation.
+        let sealed = f.tmp.path().join("sealed-r2.sqlite");
+        let db = Database::new(&f.db_path).unwrap();
+        db.conn()
+            .execute("VACUUM INTO ?1", [sealed.to_str().unwrap()])
+            .unwrap();
+        drop(db);
+        let seal = std::fs::read(&sealed).unwrap();
+        let restored = f.tmp.path().join("restored");
+        std::fs::create_dir(&restored).unwrap();
+        let restored_db_path = restored.join("sync.db");
+        let restored_bridge = restored.join("bridge");
+        git_cli(
+            f.tmp.path(),
+            &[
+                "clone",
+                "--no-hardlinks",
+                "--branch",
+                "main",
+                f.repo.bare.to_str().unwrap(),
+                restored_bridge.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(git_main_commit_and_tree(&restored_bridge), prewrite_tip);
+
+        queue_finalized_change(&f, 3);
+        let live = managed_engine(&f);
+        let published = live.run_sync_cycle().await.unwrap();
+        assert_eq!(
+            (published.svn_to_git_count, published.git_to_svn_count),
+            (1, 0)
+        );
+        let idle = live.run_sync_cycle().await.unwrap();
+        assert_eq!((idle.svn_to_git_count, idle.git_to_svn_count), (0, 0));
+        drop(live);
+        let genuine = snapshot(&f, 3, 3);
+        verify_finalized_receipts(&genuine);
+        let genuine_receipt = &genuine.operations[1];
+        assert_ne!(&prewrite.operations[0].id, &genuine_receipt.id);
+
+        // This restores the complete pre-write DB into an independent state
+        // directory. The live installation and both remotes remain in place.
+        std::fs::copy(&sealed, &restored_db_path).unwrap();
+        assert_eq!(std::fs::read(&restored_db_path).unwrap(), seal);
+        assert_eq!(std::fs::read(&sealed).unwrap(), seal);
+
+        let repo_id = &f.repo.id;
+        let svn_dir = f.tmp.path().join("svnserve-root").join(repo_id);
+        let reflog = f.repo.bare.join("logs/refs/heads/main");
+        let remote_witness = || {
+            (
+                git_main_commit_and_tree(&f.repo.bare),
+                std::fs::read(&reflog).unwrap(),
+                svnlook_at(&svn_dir, "uuid", &[]),
+                svnlook_at(&svn_dir, "youngest", &[]),
+                svnlook_at(&svn_dir, "tree", &["--show-ids", "--full-paths"]),
+                svnlook_at(&svn_dir, "log", &["-r", "3"]),
+                svnlook_at(&svn_dir, "cat", &["-r", "3", "recovery.txt"]),
+            )
+        };
+        let remote_after_publish = remote_witness();
+        let (published_tip, published_tree) = remote_after_publish.0;
+        assert_eq!(
+            published_tip.to_string(),
+            genuine_receipt.intended_local_git_sha
+        );
+        assert_eq!(
+            published_tree.to_string(),
+            genuine_receipt.intended_local_git_tree
+        );
+
+        let old_db_witness = |db: &Database| {
+            (
+                super::outage_ledger_for_db(db, repo_id),
+                db.get_state(&format!("last_svn_rev_{repo_id}")).unwrap(),
+                db.get_state(&format!("handled_git_baseline_{repo_id}"))
+                    .unwrap(),
+                git_push_documents(db, repo_id),
+                db.active_git_push_operation(repo_id).unwrap(),
+                db.latest_git_push_operation(repo_id).unwrap(),
+            )
+        };
+        let expected_db = (
+            prewrite.ledger,
+            prewrite.mirror,
+            Some(prewrite.handled_git_baseline),
+            prewrite.operations.clone(),
+            None,
+            prewrite.operations.last().cloned(),
+        );
+
+        for attempt in 1..=2 {
+            let db = Database::new(&restored_db_path).unwrap();
+            let before = old_db_witness(&db) == expected_db;
+            let (outcome, expected_decision) = if driver == "scheduler_baseline_resolver" {
+                // This is the production admission resolver the scheduler
+                // calls; it is not a full scheduler tick. A coherent but old
+                // local baseline may verify here, so the engine lane is
+                // independently required to check the real remotes.
+                let result = resolve_repo_import_baseline(&db, repo_id);
+                drop(db);
+                match result {
+                    Ok(RepoImportBaseline::Verified { svn_rev, git_sha }) => {
+                        let consistent = (svn_rev, git_sha.as_str())
+                            == (expected_db.0.watermark.0, expected_db.0.watermark.1.as_str());
+                        (
+                            json!({"decision": "verified_local", "svn_revision": svn_rev}),
+                            consistent,
+                        )
+                    }
+                    Ok(RepoImportBaseline::ReconciliationRequired { reason, .. }) => {
+                        (
+                            json!({"decision": "reconciliation_required", "reason": reason}),
+                            true,
+                        )
+                    }
+                    Ok(RepoImportBaseline::Pending) => (json!({"decision": "pending"}), false),
+                    Err(_) => (json!({"decision": "resolver_error"}), false),
+                }
+            } else {
+                let mut config = make_app_config(&f.repo.svn_url, &restored);
+                config.svn.trunk_path.clear();
+                config.github.default_branch = "main".into();
+                let mut engine = SyncEngine::new(
+                    config,
+                    db,
+                    reposync_core::svn::SvnClient::new(
+                        &f.repo.svn_url,
+                        &f.repo.username,
+                        &f.repo.password,
+                    ),
+                    reposync_core::git::GitClient::new(&restored_bridge).unwrap(),
+                    std::sync::Arc::new(super::make_identity_mapper()),
+                );
+                engine.set_repo_id(repo_id.clone());
+                match engine.run_sync_cycle().await {
+                    Err(SyncError::HistoryBlocked { reason, .. }) => (
+                        json!({"decision": "history_blocked", "reason": reason}),
+                        true,
+                    ),
+                    Err(_) => (json!({"decision": "other_engine_error"}), false),
+                    Ok(stats) => (
+                        json!({
+                            "decision": "cycle_completed",
+                            "svn_to_git_count": stats.svn_to_git_count,
+                            "git_to_svn_count": stats.git_to_svn_count
+                        }),
+                        false,
+                    ),
+                }
+            };
+            // Reopen after each operation; check all scoped receipt rows and
+            // IDs, not just reported counters or the final Git tree.
+            let after = old_db_witness(&Database::new(&restored_db_path).unwrap());
+            let remote_stable = remote_witness() == remote_after_publish;
+            let bridge_stable = git_main_commit_and_tree(&restored_bridge) == prewrite_tip;
+            let ledger_stable = after == expected_db;
+            let accepted =
+                before && remote_stable && bridge_stable && ledger_stable && expected_decision;
+            safe_disposition &= accepted;
+            reports.push(json!({
+                "driver": driver,
+                "cold_attempt": attempt,
+                "outcome": outcome,
+                "prewrite_ledger_at_entry": before,
+                "restored_ledger_unchanged": ledger_stable,
+                "remotes_unchanged": remote_stable,
+                "restored_bridge_unchanged": bridge_stable,
+                "genuine_receipt_id": genuine_receipt.id,
+                "genuine_receipt_svn_revision": genuine_receipt.source_svn_rev,
+                "genuine_git_sha": genuine_receipt.intended_local_git_sha,
+                "restored_receipt_ids": after.3.iter().map(|op| &op.id).collect::<Vec<_>>(),
+                "restored_has_genuine_receipt": after.3.iter().any(|op| op.id == genuine_receipt.id),
+            }));
+        }
+        assert_eq!(std::fs::read(&sealed).unwrap(), seal);
+        let live_db = Database::new(&f.db_path).unwrap();
+        assert_eq!(git_push_documents(&live_db, repo_id), genuine.operations);
+        assert_eq!(super::outage_ledger_for_db(&live_db, repo_id), genuine.ledger);
+    }
+    eprintln!(
+        "R23_BASELINE_OBSERVATION {}",
+        json!({"expected_safe_disposition": safe_disposition, "cases": reports})
+    );
+    assert!(
+        safe_disposition,
+        "R23 baseline did not demonstrate an explicit cold-engine hold without replay; retain the diagnostic receipt"
+    );
 }
