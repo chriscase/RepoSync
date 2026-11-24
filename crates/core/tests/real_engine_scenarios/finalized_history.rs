@@ -612,9 +612,42 @@ async fn diagnostic_r23_restored_prewrite_database() {
             prewrite.operations.last().cloned(),
         );
 
+        // Observation only: capture each attempt's entry and exit independently.
+        // The second attempt intentionally reuses the restored DB and checkout.
+        let bridge_probe = || {
+            let git = git2::Repository::open(&restored_bridge).unwrap();
+            let head = git.head().unwrap();
+            let commit = head.peel_to_commit().unwrap();
+            let main_log_entries = match git.reflog("refs/heads/main") {
+                Ok(log) => Some(log.len()),
+                Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+                Err(e) => panic!("cannot inspect synthetic main reflog: {:?}", e.code()),
+            };
+            json!({
+                "head_on_main": head.name() == Some("refs/heads/main"),
+                "head_sha": commit.id().to_string(),
+                "head_tree": commit.tree_id().to_string(),
+                "head_is_published": (commit.id(), commit.tree_id()) == (published_tip, published_tree),
+                "head_is_prewrite": (commit.id(), commit.tree_id()) == prewrite_tip,
+                "main_reflog_entries": main_log_entries,
+            })
+        };
+        let conflict_probe = |db: &Database| {
+            let blocking_rows = db.count_conflicts_blocking_apply_for_repo(repo_id).unwrap();
+            let first = db.first_conflict_blocking_apply_for_repo(repo_id).unwrap();
+            json!({
+                "blocking_rows": blocking_rows,
+                "first_blocking_row_id": first.as_ref().map(|(id, _)| id),
+                "first_blocking_row_is_fixture_path": first
+                    .as_ref()
+                    .is_some_and(|(_, path)| path == "recovery.txt"),
+            })
+        };
         for attempt in 1..=2 {
             let db = Database::new(&restored_db_path).unwrap();
             let before = old_db_witness(&db) == expected_db;
+            let bridge_before = bridge_probe();
+            let conflicts_before = conflict_probe(&db);
             let (outcome, expected_decision) = if driver == "scheduler_baseline_resolver" {
                 // This is the production admission resolver the scheduler
                 // calls; it is not a full scheduler tick. A coherent but old
@@ -661,7 +694,34 @@ async fn diagnostic_r23_restored_prewrite_database() {
                         json!({"decision": "history_blocked", "reason": reason}),
                         true,
                     ),
-                    Err(_) => (json!({"decision": "other_engine_error"}), false),
+                    Err(error) => {
+                        // Never print arbitrary remote messages, paths or credentials.
+                        // Match exhaustively so new variants require an explicit safe label.
+                        let kind = match &error {
+                            SyncError::AlreadyRunning { .. } => "already_running",
+                            SyncError::HistoryBlocked { .. } => "history_blocked",
+                            SyncError::SvnCommitHeld { .. } => "svn_commit_held",
+                            SyncError::GitPushHeld { .. } => "git_push_held",
+                            SyncError::CycleMappingHeld { .. } => "cycle_mapping_held",
+                            SyncError::UnresolvableConflict { .. } => "unresolvable_conflict",
+                            SyncError::EchoDetectionFailed { .. } => "echo_detection_failed",
+                            SyncError::InvalidStateTransition { .. } => "invalid_state_transition",
+                            SyncError::SvnError(_) => "svn_error",
+                            SyncError::GitError(_) => "git_error",
+                            SyncError::GitHubError(_) => "github_error",
+                            SyncError::DatabaseError(_) => "database_error",
+                            SyncError::IdentityError(_) => "identity_error",
+                        };
+                        let on_recovery_path = matches!(
+                            &error,
+                            SyncError::UnresolvableConflict { file_path, .. } if file_path == "recovery.txt"
+                        );
+                        (json!({
+                            "decision": "other_engine_error",
+                            "error_kind": kind,
+                            "fixture_path_is_recovery_txt": on_recovery_path,
+                        }), false)
+                    }
                     Ok(stats) => (
                         json!({
                             "decision": "cycle_completed",
@@ -674,7 +734,11 @@ async fn diagnostic_r23_restored_prewrite_database() {
             };
             // Reopen after each operation; check all scoped receipt rows and
             // IDs, not just reported counters or the final Git tree.
-            let after = old_db_witness(&Database::new(&restored_db_path).unwrap());
+            let reopened = Database::new(&restored_db_path).unwrap();
+            let after = old_db_witness(&reopened);
+            let conflicts_after = conflict_probe(&reopened);
+            let bridge_after = bridge_probe();
+            drop(reopened);
             let remote_stable = remote_witness() == remote_after_publish;
             let bridge_stable = git_main_commit_and_tree(&restored_bridge) == prewrite_tip;
             let ledger_stable = after == expected_db;
@@ -685,6 +749,10 @@ async fn diagnostic_r23_restored_prewrite_database() {
                 "driver": driver,
                 "cold_attempt": attempt,
                 "outcome": outcome,
+                "bridge_at_entry": bridge_before,
+                "bridge_at_exit": bridge_after,
+                "scoped_conflicts_at_entry": conflicts_before,
+                "scoped_conflicts_at_exit": conflicts_after,
                 "prewrite_ledger_at_entry": before,
                 "restored_ledger_unchanged": ledger_stable,
                 "remotes_unchanged": remote_stable,

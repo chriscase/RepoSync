@@ -1,7 +1,7 @@
-name: R23 isolated baseline
+name: R23 typed observation
 on:
   push:
-    branches: [codex/r23-isolated-baseline]
+    branches: [codex/r23-typed-observation]
 permissions:
   contents: read
 jobs:
@@ -23,15 +23,14 @@ jobs:
           git --version
           for tool in svn svnadmin svnserve svnlook; do "$tool" --version; done
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          source_commit=7e5dd966321649de86d7e0c2f56029ee7a3f2ff0
-          git merge-base --is-ancestor "$source_commit" HEAD
-          test "$(git rev-list --parents -n 1 "$source_commit")" = "$source_commit 707e8c910629cbd62e3027a6522fea663962012d"
-          test "$(git rev-parse "$source_commit^{tree}")" = 75e6ad7d59371bb5bc7926f7f04cc498de2b2ebd
+          baseline=587053084f7ac97f60c0b93350970ad330aeb5e7
+          test "$(git rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $baseline"
+          test "$(git rev-parse "$baseline^{tree}")" = 2f2c4b901c478a395e46ceece70de9bd4e838f1d
           history_path=crates/core/tests/real_engine_scenarios/finalized_history.rs
-          test "$(git diff-tree --no-commit-id --name-only -r "$source_commit" HEAD)" = "$(printf '%s\n' .github/workflows/r23-isolated-baseline.yml "$history_path")"
-          test "$(git rev-parse "HEAD:$history_path")" = 3816162b04b5af1728df9191dd9cc2953bfe86c7
+          test "$(git diff-tree --no-commit-id --name-only -r "$baseline" HEAD)" = "$(printf '%s\n' .github/workflows/r23-isolated-baseline.yml "$history_path")"
+          test "$(git rev-parse "HEAD:$history_path")" = 661061b8f9d2fa330f7f838af64589dd4af53ad1
           test "$(git rev-parse HEAD:crates/core/tests/real_engine_scenarios.rs)" = c45c0578fa1bef19d506d268f0d5fbf6ed4366ae
-          git show -s --format='%H %T %s' HEAD "$source_commit"
+          git show -s --format='%H %T %s' HEAD "$baseline"
       - name: Compile the exact integration test binary
         run: |
           set -euo pipefail
@@ -106,6 +105,9 @@ jobs:
           expected = {(driver, n) for driver in ('scheduler_baseline_resolver', 'direct_engine') for n in (1, 2)}
           if len(receipt['cases']) != 4 or cases != expected:
               raise SystemExit(f'Unexpected R23 lane/attempt identities: {cases!r}')
+          fields = {'bridge_at_entry', 'bridge_at_exit', 'scoped_conflicts_at_entry', 'scoped_conflicts_at_exit'}
+          if any(not fields.issubset(row) for row in receipt['cases']):
+              raise SystemExit('R23 observation lacks before/after witnesses')
           if receipt.get('expected_safe_disposition') is not True or not re.search(
               r'^test result: ok\. 1 passed; 0 failed; 0 ignored;', data, flags=re.M):
               raise SystemExit('R23 ran but did not establish the required safe disposition')
