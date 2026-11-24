@@ -27,7 +27,10 @@ jobs:
           git merge-base --is-ancestor "$source_commit" HEAD
           test "$(git rev-list --parents -n 1 "$source_commit")" = "$source_commit 707e8c910629cbd62e3027a6522fea663962012d"
           test "$(git rev-parse "$source_commit^{tree}")" = 75e6ad7d59371bb5bc7926f7f04cc498de2b2ebd
-          test "$(git diff-tree --no-commit-id --name-only -r "$source_commit" HEAD)" = .github/workflows/r23-isolated-baseline.yml
+          history_path=crates/core/tests/real_engine_scenarios/finalized_history.rs
+          test "$(git diff-tree --no-commit-id --name-only -r "$source_commit" HEAD)" = "$(printf '%s\n' .github/workflows/r23-isolated-baseline.yml "$history_path")"
+          test "$(git rev-parse "HEAD:$history_path")" = 3816162b04b5af1728df9191dd9cc2953bfe86c7
+          test "$(git rev-parse HEAD:crates/core/tests/real_engine_scenarios.rs)" = c45c0578fa1bef19d506d268f0d5fbf6ed4366ae
           git show -s --format='%H %T %s' HEAD "$source_commit"
       - name: Compile the exact integration test binary
         run: |

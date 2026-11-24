@@ -499,7 +499,7 @@ pub(super) async fn evidence() -> Value {
 // Kept out of the qualified catalog until the old-snapshot baseline has been
 // observed. This uses the same Unix/loopback fixture and standard Cargo target
 // as the ordinary native cases. It never copies a live or operator database.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "R23 baseline diagnostic: run explicitly, not a qualified scenario"]
 async fn diagnostic_r23_restored_prewrite_database() {
     assert!(
