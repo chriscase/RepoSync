@@ -1,0 +1,394 @@
+name: R23 sealed scheduler receipt (#307)
+
+on:
+  push:
+    branches: [codex/r23-scheduler-sealed-307]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r23-sealed-307
+  cancel-in-progress: false
+
+jobs:
+  sealed-scheduler:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SOURCE_HEAD: be6574c4c672b373fd7576c8dafb001f2392c8a8
+      SOURCE_TREE: 93e5754123554a44c2d0acfc290053b5fc48c7b8
+      CASE_ID: R23_SCHEDULER_RESTORED_DATABASE
+      CASE_NAME: scheduler::r23_restored_database::restored_prewrite_database_holds_on_actual_interval_tick
+      WORKFLOW_PATH: .github/workflows/r23-scheduler-sealed-307.yml
+      TOOLCHAIN: 1.100.0
+    steps:
+      - name: Require the exact first branch creation event
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          env = os.environ
+          ref = "refs/heads/codex/r23-scheduler-sealed-307"
+          sha = env["GITHUB_SHA"]
+          event = json.loads(Path(env["GITHUB_EVENT_PATH"]).read_text())
+          valid = (
+              env["GITHUB_EVENT_NAME"] == "push" and env["GITHUB_REF"] == ref
+              and env["GITHUB_REF_TYPE"] == "branch" and env["GITHUB_RUN_ATTEMPT"] == "1"
+              and env["GITHUB_REPOSITORY"] == "chriscase/RepoSync"
+              and re.fullmatch(r"[a-f0-9]{40}", sha) is not None
+              and event.get("ref") == ref and event.get("after") == sha
+              and event.get("before") == "0" * 40
+              and event.get("created") is True and event.get("deleted") is False
+              and event.get("forced") is False
+              and event.get("repository", {}).get("full_name") == "chriscase/RepoSync"
+          )
+          if not valid:
+              raise SystemExit("R23 event gate refused; no checkout, preparation, or test")
+          print("R23 event gate: first exact branch creation, run attempt 1")
+          PY
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Bind the reviewed carrier and parent archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF" = refs/heads/codex/r23-scheduler-sealed-307
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-list --parents -n1 HEAD)" = "$GITHUB_SHA $SOURCE_HEAD"
+          test "$(git rev-parse "$SOURCE_HEAD^{tree}")" = "$SOURCE_TREE"
+          test "$(git diff-tree --no-commit-id --name-status -r "$SOURCE_HEAD" HEAD)" = "$(printf 'A\t%s' "$WORKFLOW_PATH")"
+          sandbox_path="$RUNNER_TEMP/r23-307"
+          mkdir -m 0700 "$sandbox_path"
+          mkdir -m 0700 "$sandbox_path/source" "$sandbox_path/build-home" "$sandbox_path/build-tmp" "$sandbox_path/evidence"
+          git archive --format=tar "$SOURCE_HEAD" | tar -x -C "$sandbox_path/source"
+          pin() {
+            local p="$1" id="$2"
+            test "$(git rev-parse "$SOURCE_HEAD:$p")" = "$id"
+            test "$(git hash-object "$sandbox_path/source/$p")" = "$id"
+          }
+          pin crates/daemon/src/scheduler.rs d4aba64fc0736b9e305445de336a7d60952c0f93
+          pin crates/daemon/src/scheduler/r23_restored_database.rs ca753578cbc8ea198b063b5edfc8e6d46eb8f6fd
+          pin docs/reliability/required-cases.json 9d9a1f5c36e1728f5308cc237441556884dfc780
+          pin docs/reliability/fixtures/Cargo.lock 265e8f191e3427f00a134015bcf4ad9173072242
+          pin scripts/reliability_scan.py bd90c420bc962b01df1b9a185a91365b49291457
+          python3 - "$sandbox_path/source/docs/reliability/required-cases.json" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          cases = json.loads(Path(sys.argv[1]).read_text())["candidate"]
+          found = [c for c in cases if c["id"] == os.environ["CASE_ID"]]
+          assert found == [dict(id=os.environ["CASE_ID"], binary="reposync-daemon",
+                                test=os.environ["CASE_NAME"], tier="candidate_regression")]
+          PY
+          test ! -e "$sandbox_path/source/Cargo.lock"
+          install -m 0400 "$sandbox_path/source/docs/reliability/fixtures/Cargo.lock" "$sandbox_path/source/Cargo.lock"
+          git rev-parse HEAD^{tree} > "$sandbox_path/carrier-tree"
+          git rev-parse "HEAD:$WORKFLOW_PATH" > "$sandbox_path/workflow-blob"
+
+      - name: Prepare only the selected daemon test binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          d="$RUNNER_TEMP/r23-307"
+          sudo -n timeout --kill-after=5s 120s apt-get update -qq
+          sudo -n timeout --kill-after=5s 120s apt-get install -y --no-install-recommends subversion iproute2 util-linux pkg-config libssl-dev
+          for bin in git svn svnadmin svnlook python3; do test -x "/usr/bin/$bin"; done
+          for bin in mount umount unshare ip setpriv chroot timeout; do command -v "$bin" >/dev/null; done
+          rustup_bin="$(command -v rustup)"
+          test -x "$rustup_bin"
+          rustup_home="$d/rustup"
+          cargo_home="$d/cargo"
+          mkdir -m 0700 "$rustup_home" "$cargo_home" "$d/target"
+          tool_env=(/usr/bin/env -i PATH=/usr/bin:/bin HOME="$d/build-home" TMPDIR="$d/build-tmp"
+                    CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home" CARGO_TARGET_DIR="$d/target"
+                    LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+                    CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0)
+          timeout --kill-after=5s 120s "${tool_env[@]}" "$rustup_bin" toolchain install "$TOOLCHAIN" --profile minimal
+          cd "$d/source"
+          {
+            "${tool_env[@]}" "$rustup_bin" run "$TOOLCHAIN" rustc --version --verbose
+            "${tool_env[@]}" "$rustup_bin" run "$TOOLCHAIN" cargo --version
+            /usr/bin/git --version
+            /usr/bin/svn --version --quiet
+          } > "$d/versions.txt"
+          grep -Fxq 'rustc 1.100.0 (0ef1bc386 2026-11-09)' "$d/versions.txt"
+          grep -Fxq 'cargo 1.100.0 (3acc79c0c 2026-11-05)' "$d/versions.txt"
+          before="$(sha256sum Cargo.lock | cut -d ' ' -f 1)"
+          timeout --kill-after=10s 900s "${tool_env[@]}" "$rustup_bin" run "$TOOLCHAIN" cargo test \
+            --locked -p reposync-daemon --bin reposync-daemon --no-run --message-format=json \
+            > "$d/cargo-artifacts.jsonl"
+          test "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" = "$before"
+          printf '%s\n' "$before" > "$d/lock-sha256"
+          python3 - "$d" <<'PY'
+          import hashlib, json, stat, sys
+          from pathlib import Path
+          root = Path(sys.argv[1]).resolve(strict=True)
+          target_dir = root.joinpath("target").resolve(strict=True)
+          src = root / "source/crates/daemon/src/main.rs"
+          selected = []
+          for line in root.joinpath("cargo-artifacts.jsonl").read_text().splitlines():
+              item = json.loads(line)
+              if item.get("reason") != "compiler-artifact" or not item.get("executable"):
+                  continue
+              target = item["target"]
+              if item["profile"]["test"] and target["name"] == "reposync-daemon":
+                  assert target["kind"] == ["bin"] and Path(target["src_path"]) == src
+                  assert item["package_id"].startswith(f"path+file://{src.parents[1]}#")
+                  selected.append(Path(item["executable"]))
+          assert len(selected) == 1, "expected one compiler-produced daemon unit binary"
+          executable = selected[0]
+          pem = executable.lstat()
+          assert executable == executable.resolve(strict=True) and executable.is_relative_to(target_dir)
+          assert stat.S_ISREG(pem.st_mode) and pem.st_mode & 0o111 and 0 < pem.st_size <= 128 * 1024 * 1024
+          root.joinpath("binary-path").write_text(str(executable) + "\n")
+          with executable.open("rb") as source:
+              digest = hashlib.file_digest(source, "sha256").hexdigest()
+          root.joinpath("binary-sha256").write_text(digest + "\n")
+          PY
+
+      - name: Run one exact case without egress and scan its receipt
+        id: sealed
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          d="$RUNNER_TEMP/r23-307"
+          binary="$(cat "$d/binary-path")"
+          digest="$(cat "$d/binary-sha256")"
+
+          cat > "$d/guard.sh" <<'GUARD'
+          set -euo pipefail
+          umask 077
+          ulimit -c 0
+          ulimit -n 256
+          ulimit -u 256
+          ulimit -f 16384
+          test "$(id -u)" = 65534
+          test "$(id -g)" = 65534
+          test "$(id -G)" = 65534
+          test "$(sha256sum /guard/daemon-exact | cut -d ' ' -f 1)" = "$1"
+          test "$(stat -c '%u:%g:%a' /guard/daemon-exact)" = 0:0:555
+          test "$(pwd)" = /fixture
+          test -w "$HOME" && test -w "$TMPDIR"
+          test ! -e /home/runner && test ! -e /var/run/docker.sock
+          python3 - "$2" <<'PY'
+          import errno, json, os, socket, sys
+          from pathlib import Path
+          caps = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
+          assert all(int(caps[key].strip(), 16) == 0 for key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"))
+          assert caps["NoNewPrivs"].strip() == "1"
+          assert os.readlink("/proc/self/ns/net") != sys.argv[1]
+          denied = {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EACCES}
+          for family, loopback, documentation in [(socket.AF_INET, "127.0.0.1", "192.0.2.1"),
+                                                    (socket.AF_INET6, "::1", "2001:db8::1")]:
+              with socket.socket(family, socket.SOCK_STREAM) as listener:
+                  listener.bind((loopback, 0))
+                  listener.listen(1)
+                  with socket.socket(family, socket.SOCK_STREAM) as peer:
+                      peer.settimeout(1)
+                      peer.connect(listener.getsockname())
+                      accepted, addr = listener.accept()
+                      accepted.close()
+                      assert addr[0] == loopback
+              with socket.socket(family, socket.SOCK_STREAM) as peer:
+                  peer.settimeout(1)
+                  try:
+                      peer.connect((documentation, 9))
+                  except OSError as error:
+                      assert error.errno in denied, error
+                  else:
+                      raise AssertionError("isolated route unexpectedly reachable")
+          print("R23_GUARD " + json.dumps(dict(uid=65534, gid=65534, caps=0,
+                no_new_privs=True, private_net=True, ipv4_loopback=True, ipv6_loopback=True,
+                ipv4_denied=True, ipv6_denied=True, host_path_absent=True), sort_keys=True))
+          PY
+          name='scheduler::r23_restored_database::restored_prewrite_database_holds_on_actual_interval_tick'
+          inventory="$(/guard/daemon-exact "$name" --exact --list --format pretty)"
+          test "$(printf '%s\n' "$inventory" | grep -Fxc "$name: test")" -eq 1
+          printf '%s\n' 'R23_CASE_LISTING 1'
+          exec /guard/daemon-exact "$name" --exact --nocapture --test-threads=1 --format pretty
+          GUARD
+
+          cat > "$d/namespace.sh" <<'NAMESPACE'
+          set -euo pipefail
+          umask 077
+          stage="$1"
+          binary="$2"
+          digest="$3"
+          outer_net="$4"
+          jail="$stage/jail"
+          mount --make-rprivate /
+          mkdir -m 0755 "$jail"
+          mount -t tmpfs -o size=160m,nr_inodes=4096,nosuid,nodev,mode=0755 tmpfs "$jail"
+          mkdir -m 0755 "$jail"/{usr,etc,dev,proc,guard,fixture}
+          ln -s usr/bin "$jail/bin"
+          ln -s usr/sbin "$jail/sbin"
+          ln -s usr/lib "$jail/lib"
+          ln -s usr/lib64 "$jail/lib64"
+          ln -s fixture/tmp "$jail/tmp"
+          mount --bind /usr "$jail/usr"
+          mount -o remount,bind,ro,nosuid,nodev "$jail/usr"
+          for name in null zero random urandom; do
+            touch "$jail/dev/$name"
+            mount --bind "/dev/$name" "$jail/dev/$name"
+          done
+          mount -t proc -o nosuid,nodev,noexec,hidepid=2 proc "$jail/proc"
+          printf 'fixture:x:65534:65534:Fixture:/fixture/home:/usr/sbin/nologin\n' > "$jail/etc/passwd"
+          printf 'fixture:x:65534:\n' > "$jail/etc/group"
+          printf '127.0.0.1 localhost\n::1 localhost\n' > "$jail/etc/hosts"
+          printf 'passwd: files\ngroup: files\nhosts: files\n' > "$jail/etc/nsswitch.conf"
+          chmod 0444 "$jail"/etc/*
+          install -m 0555 -o 0 -g 0 "$binary" "$jail/guard/daemon-exact"
+          install -m 0444 -o 0 -g 0 "$stage/guard.sh" "$jail/guard/guard.sh"
+          test "$(sha256sum "$jail/guard/daemon-exact" | cut -d ' ' -f 1)" = "$digest"
+          mount -t tmpfs -o size=128m,nr_inodes=4096,nosuid,nodev,noexec,uid=65534,gid=65534,mode=0700 tmpfs "$jail/fixture"
+          install -d -m 0700 -o 65534 -g 65534 "$jail/fixture/home" "$jail/fixture/tmp" "$jail/fixture/config"
+          ip link set lo up
+          test "$(ip -o link show | awk -F ': ' '{print $2}')" = lo
+          test -z "$(ip -4 route show default)$(ip -6 route show default)"
+          printf '%s\n' 'R23_NET_LINKS only-lo; no IPv4/IPv6 default'
+          mount -o remount,ro,nosuid,nodev "$jail"
+          exec chroot "$jail" /usr/bin/setpriv --reuid=65534 --regid=65534 \
+            --clear-groups --inh-caps=-all --bounding-set=-all --ambient-caps=-all --no-new-privs \
+            /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C HOME=/fixture/home TMPDIR=/fixture/tmp \
+            XDG_CONFIG_HOME=/fixture/config GIT_ALLOW_PROTOCOL=file GIT_CONFIG_NOSYSTEM=1 \
+            GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+            /bin/bash -euo pipefail -c 'cd /fixture; exec /bin/bash /guard/guard.sh "$1" "$2"' bash "$digest" "$outer_net"
+          NAMESPACE
+
+          # No token/credential vars, checkout mount, or writable code is carried
+          # into the jail. Namespace setup is the only privileged portion.
+          chmod 0444 "$d/guard.sh" "$d/namespace.sh"
+          host_net="$(readlink /proc/self/ns/net)"
+          set +e
+          sudo -n timeout --kill-after=5s 240s /usr/bin/unshare --mount --pid --net --fork --kill-child \
+            /bin/bash "$d/namespace.sh" "$d" "$binary" "$digest" "$host_net" \
+            </dev/null 2>&1 | head -c 262145 > "$d/runtime.raw"
+          rc=("${PIPESTATUS[@]}")
+          set -e
+          test "${rc[1]}" -eq 0
+          test "$(wc -c < "$d/runtime.raw")" -le 262144
+          # Never print the raw capture. A failed guard or test earns no success
+          # artifact; preserve only the step's bounded status and source identity.
+          if [[ "${rc[0]}" -ne 0 ]]; then
+            printf '::error::Sealed R23 namespace or test failed (exit %s); no success receipt.\n' "${rc[0]}"
+            exit 1
+          fi
+          python3 - "$d" <<'PY'
+          import hashlib, json, os, re, sys
+          from pathlib import Path
+          base = Path(sys.argv[1])
+          raw = (base / "runtime.raw").read_bytes()
+          text = raw.decode("utf-8", errors="strict")
+          env = os.environ
+          case = env["CASE_NAME"]
+          lines = text.splitlines()
+          assert lines.count("R23_NET_LINKS only-lo; no IPv4/IPv6 default") == 1
+          assert lines.count("R23_CASE_LISTING 1") == 1
+          # With --nocapture the harness can append stderr's marker to
+          # the name's partial stdout line before its terminal "ok".
+          result_lines = re.sub(r"RELIABILITY_EVIDENCE [^\r\n]+\r?\n", "", text)
+          name_result = r"^test " + re.escape(case) + r" \.\.\.[ \t\r\n]*ok$"
+          assert len(re.findall(name_result, result_lines, re.M)) == 1
+          counts = re.findall(r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", text, re.M)
+          assert counts == [("1", "0", "0")]
+          guards = [json.loads(line.split(" ", 1)[1]) for line in lines if line.startswith("R23_GUARD ")]
+          assert guards == [dict(uid=65534, gid=65534, caps=0, no_new_privs=True, private_net=True,
+                                 ipv4_loopback=True, ipv6_loopback=True, ipv4_denied=True, ipv6_denied=True,
+                                 host_path_absent=True)]
+          proofs = [json.loads(line.split("RELIABILITY_EVIDENCE ", 1)[1]) for line in lines
+                    if "RELIABILITY_EVIDENCE " in line]
+          assert len(proofs) == 1
+          p = proofs[0]
+          expected = dict(case=env["CASE_ID"], status="PASS", scheduler_entry="handle_interval_tick",
+              qualified_transport="local filesystem Git and SVN", restored_svn_revision=2,
+              published_svn_revision=3, qualified_cold_attempts=2, registered_worker_each_attempt=True,
+              reason="unreceipted_svn_publication", checked_out_branch="refs/heads/main",
+              restored_checkout_and_ledger_unchanged=True, remote_refs_tree_reflog_and_source_unchanged=True,
+              live_receipted_repeat_noop=True, exact_local_fetch_and_push_url_checked_each_tick=True,
+              source_author="fixture-author")
+          assert set(p) == set(expected) | {"prior_git", "published_git"}
+          assert all(type(p[key]) is type(value) and p[key] == value for key, value in expected.items())
+          assert all(re.fullmatch(r"[a-f0-9]{40}", p[key]) for key in ("prior_git", "published_git"))
+          assert p["prior_git"] != p["published_git"]
+          def read(name):
+              return (base / name).read_text().strip()
+          receipt = dict(source_head=env["SOURCE_HEAD"], source_tree=env["SOURCE_TREE"],
+              carrier_sha=env["GITHUB_SHA"], carrier_tree=read("carrier-tree"),
+              carrier_workflow_blob=read("workflow-blob"), actions_run_id=env["GITHUB_RUN_ID"],
+              actions_run_attempt=env["GITHUB_RUN_ATTEMPT"], test=case, matched_inventory=1,
+              test_result=dict(passed=1, failed=0, ignored=0), runtime_exit=0, guard=guards[0], proof=p,
+              lock_sha256=read("lock-sha256"), daemon_binary_sha256=read("binary-sha256"),
+              runtime_log_sha256=hashlib.sha256(raw).hexdigest(), tool_versions=read("versions.txt").splitlines(),
+              guard_script_sha256=hashlib.sha256((base / "guard.sh").read_bytes()).hexdigest(),
+              namespace_script_sha256=hashlib.sha256((base / "namespace.sh").read_bytes()).hexdigest())
+          dest = base / "evidence"
+          assert not any(dest.iterdir())
+          (dest / "receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+          PY
+          python3 "$d/source/scripts/reliability_scan.py" --scan "$d/evidence" \
+            --status-file "$d/evidence/scan-status.json"
+
+      - name: Preserve only sealed R23 receipt and scan status
+        if: steps.sealed.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: r23-scheduler-sealed-307
+          path: |
+            ${{ runner.temp }}/r23-307/evidence/receipt.json
+            ${{ runner.temp }}/r23-307/evidence/scan-status.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Purge bounded raw capture and local proof copies
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/timeout --kill-after=2s 10s /usr/bin/python3 -I - "$RUNNER_TEMP" <<'PY'
+          import os, stat, sys
+          from contextlib import ExitStack
+
+          root = sys.argv[1]
+          if not os.path.isabs(root) or root == "/":
+              raise SystemExit("R23 purge refused unsafe runner temporary root")
+          flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+          def open_dir(name, stack, parent=None):
+              try:
+                  fd = os.open(name, flags, dir_fd=parent)
+              except FileNotFoundError:
+                  return None
+              stack.callback(os.close, fd)
+              return fd
+
+          def remove_known(parent, name):
+              try:
+                  info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+              except FileNotFoundError:
+                  return
+              if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                  raise SystemExit("R23 purge refused unexpected local entry")
+              os.unlink(name, dir_fd=parent)
+
+          with ExitStack() as stack:
+              parent = open_dir(root, stack)
+              if parent is None:
+                  raise SystemExit("R23 purge could not verify runner temporary root")
+              stage = open_dir("r23-307", stack, parent)
+              if stage is not None:
+                  remove_known(stage, "runtime.raw")
+                  proof = open_dir("evidence", stack, stage)
+                  if proof is not None:
+                      remove_known(proof, "receipt.json")
+                      remove_known(proof, "scan-status.json")
+          print("R23 local capture/proof purge complete")
+          PY
