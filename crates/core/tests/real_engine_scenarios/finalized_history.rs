@@ -654,18 +654,19 @@ async fn scenario_r23_restored_database_admission() {
                 match result {
                     Ok(RepoImportBaseline::Verified { svn_rev, git_sha }) => {
                         let consistent = (svn_rev, git_sha.as_str())
-                            == (expected_db.0.watermark.0, expected_db.0.watermark.1.as_str());
+                            == (
+                                expected_db.0.watermark.0,
+                                expected_db.0.watermark.1.as_str(),
+                            );
                         (
                             json!({"decision": "verified_local", "svn_revision": svn_rev}),
                             consistent,
                         )
                     }
-                    Ok(RepoImportBaseline::ReconciliationRequired { reason, .. }) => {
-                        (
-                            json!({"decision": "reconciliation_required", "reason": reason}),
-                            false,
-                        )
-                    }
+                    Ok(RepoImportBaseline::ReconciliationRequired { reason, .. }) => (
+                        json!({"decision": "reconciliation_required", "reason": reason}),
+                        false,
+                    ),
                     Ok(RepoImportBaseline::Pending) => (json!({"decision": "pending"}), false),
                     Err(_) => (json!({"decision": "resolver_error"}), false),
                 }
@@ -712,11 +713,14 @@ async fn scenario_r23_restored_database_admission() {
                             &error,
                             SyncError::UnresolvableConflict { file_path, .. } if file_path == "recovery.txt"
                         );
-                        (json!({
-                            "decision": "other_engine_error",
-                            "error_kind": kind,
-                            "fixture_path_is_recovery_txt": on_recovery_path,
-                        }), false)
+                        (
+                            json!({
+                                "decision": "other_engine_error",
+                                "error_kind": kind,
+                                "fixture_path_is_recovery_txt": on_recovery_path,
+                            }),
+                            false,
+                        )
                     }
                     Ok(stats) => (
                         json!({
@@ -744,8 +748,8 @@ async fn scenario_r23_restored_database_admission() {
                 && bridge_before["main_reflog_entries"].as_u64().is_some()
                 && std::fs::read(restored_bridge.join(".git/index")).unwrap() == index_before
                 && !restored_bridge.join("recovery.txt").exists();
-            let no_conflicts = conflicts_before == conflicts_after
-                && conflicts_after["blocking_rows"] == 0;
+            let no_conflicts =
+                conflicts_before == conflicts_after && conflicts_after["blocking_rows"] == 0;
             let accepted = before
                 && remote_stable
                 && bridge_stable
@@ -776,7 +780,10 @@ async fn scenario_r23_restored_database_admission() {
         assert_eq!(std::fs::read(&sealed).unwrap(), seal);
         let live_db = Database::new(&f.db_path).unwrap();
         assert_eq!(git_push_documents(&live_db, repo_id), genuine.operations);
-        assert_eq!(super::outage_ledger_for_db(&live_db, repo_id), genuine.ledger);
+        assert_eq!(
+            super::outage_ledger_for_db(&live_db, repo_id),
+            genuine.ledger
+        );
     }
     super::emit_evidence(
         "R23_RESTORED_DATABASE_ADMISSION",
@@ -855,13 +862,20 @@ async fn scenario_r23_ordinary_admission_controls() {
         let db = Database::new(&fixture.db_path).unwrap();
         let svn_dir = fixture.tmp.path().join("svnserve-root").join(&repo.id);
         if expect_conflict {
-            assert!(matches!(
-                result, Err(SyncError::UnresolvableConflict { file_path, .. }) if file_path == path
-            ), "{control} must be an ordinary conflict");
+            assert!(
+                matches!(
+                    result, Err(SyncError::UnresolvableConflict { file_path, .. }) if file_path == path
+                ),
+                "{control} must be an ordinary conflict"
+            );
             assert_eq!(git_main_commit_and_tree(&repo.bridge), before_bridge);
             assert!(!repo.bridge.join(path).exists());
             assert_eq!(super::outage_ledger_for_db(&db, &repo.id), before.ledger);
-            assert_eq!(db.count_conflicts_blocking_apply_for_repo(&repo.id).unwrap(), 1);
+            assert_eq!(
+                db.count_conflicts_blocking_apply_for_repo(&repo.id)
+                    .unwrap(),
+                1
+            );
             assert_eq!(
                 svnlook_at(&svn_dir, "cat", &["-r", "3", path]),
                 FINALIZED_CHANGES[1].1
@@ -879,11 +893,22 @@ async fn scenario_r23_ordinary_admission_controls() {
             );
             assert_eq!(svnlook_at(&svn_dir, "cat", &["-r", "4", path]), payload);
             assert_eq!(svnlook_at(&svn_dir, "youngest", &[]).trim(), "4");
-            assert_eq!(db.count_conflicts_blocking_apply_for_repo(&repo.id).unwrap(), 0);
+            assert_eq!(
+                db.count_conflicts_blocking_apply_for_repo(&repo.id)
+                    .unwrap(),
+                0
+            );
             let after = std::fs::read(reflog_path).unwrap();
             let appended = after.strip_prefix(reflog_before.as_slice()).unwrap();
-            assert_eq!(appended.split(|b| *b == b'\n').filter(|s| !s.is_empty()).count(), 1);
-            assert!(String::from_utf8_lossy(appended).starts_with(&format!("{commit} {} ", published.0)));
+            assert_eq!(
+                appended
+                    .split(|b| *b == b'\n')
+                    .filter(|s| !s.is_empty())
+                    .count(),
+                1
+            );
+            assert!(String::from_utf8_lossy(appended)
+                .starts_with(&format!("{commit} {} ", published.0)));
             let noop = engine.run_sync_cycle().await.unwrap();
             assert_eq!((noop.svn_to_git_count, noop.git_to_svn_count), (0, 0));
             continue;
@@ -892,7 +917,11 @@ async fn scenario_r23_ordinary_admission_controls() {
             assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (0, 1));
             assert_eq!(git_main_commit_and_tree(&repo.bridge).0, commit);
             assert_eq!(svnlook_at(&svn_dir, "cat", &["-r", "3", path]), payload);
-            assert_eq!(db.count_conflicts_blocking_apply_for_repo(&repo.id).unwrap(), 0);
+            assert_eq!(
+                db.count_conflicts_blocking_apply_for_repo(&repo.id)
+                    .unwrap(),
+                0
+            );
             let noop = engine.run_sync_cycle().await.unwrap();
             assert_eq!((noop.svn_to_git_count, noop.git_to_svn_count), (0, 0));
         }
@@ -900,9 +929,5 @@ async fn scenario_r23_ordinary_admission_controls() {
         assert_eq!(git_main_commit_and_tree(&repo.bare).0, commit);
         assert_eq!(std::fs::read(reflog_path).unwrap(), reflog_before);
     }
-    super::emit_evidence(
-        CASE,
-        "PASS",
-        json!({"controls": controls}),
-    );
+    super::emit_evidence(CASE, "PASS", json!({"controls": controls}));
 }

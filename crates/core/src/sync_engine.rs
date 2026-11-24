@@ -5379,8 +5379,10 @@ impl SyncEngine {
         else {
             return Ok(());
         };
-        let (prior, checkpoint_sha) =
-            self.db.get_repo_watermark(repo_id).map_err(SyncError::DatabaseError)?;
+        let (prior, checkpoint_sha) = self
+            .db
+            .get_repo_watermark(repo_id)
+            .map_err(SyncError::DatabaseError)?;
         if prior <= 0
             || prior.checked_add(1) != Some(svn_change.revision)
             || checkpoint_sha != admission.checkpoint
@@ -5397,7 +5399,9 @@ impl SyncEngine {
         {
             return Ok(());
         }
-        let Some(retained) = self.db.latest_git_push_operation(repo_id)
+        let Some(retained) = self
+            .db
+            .latest_git_push_operation(repo_id)
             .map_err(SyncError::DatabaseError)?
         else {
             return Ok(());
@@ -5442,10 +5446,16 @@ impl SyncEngine {
             {
                 return Ok(());
             }
-            let oid = git2::Oid::from_str(&git_change.sha).map_err(crate::errors::GitError::from)?;
-            let commit = repo.find_commit(oid).map_err(crate::errors::GitError::from)?;
+            let oid =
+                git2::Oid::from_str(&git_change.sha).map_err(crate::errors::GitError::from)?;
+            let commit = repo
+                .find_commit(oid)
+                .map_err(crate::errors::GitError::from)?;
             if commit.parent_count() != 1
-                || commit.parent_id(0).map_err(crate::errors::GitError::from)?.to_string()
+                || commit
+                    .parent_id(0)
+                    .map_err(crate::errors::GitError::from)?
+                    .to_string()
                     != admission.checkpoint
                 || commit.committer().name() != Some("reposync")
                 || commit.committer().email() != Some("sync@reposync.local")
@@ -5461,7 +5471,11 @@ impl SyncEngine {
 
         // Re-observe the pinned SVN UUID/path at the exact revision, rather
         // than interpreting the remote Git object's public text as authority.
-        let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let svn = self
+            .svn_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         for revision in [prior, svn_change.revision] {
             let source = svn.info_at_rev(revision).await?;
             let Some(identity) = checked_svn_path_identity(&source.root_url, &source.url) else {
@@ -5485,7 +5499,9 @@ impl SyncEngine {
         {
             return Ok(());
         }
-        let props = svn.file_properties_at_rev(path, svn_change.revision).await?;
+        let props = svn
+            .file_properties_at_rev(path, svn_change.revision)
+            .await?;
         if props.contains("<property ") || props.contains("<property>") {
             return Ok(());
         }
@@ -5577,12 +5593,13 @@ impl SyncEngine {
                 "ignored bridge paths could not be inspected",
             )
         })?;
-        let target = run(&["ls-tree", "-r", "--name-only", "-z", reset_target]).ok_or_else(|| {
-            reject(
-                "inspection_command_failed",
-                "incoming batch tree could not be inspected",
-            )
-        })?;
+        let target =
+            run(&["ls-tree", "-r", "--name-only", "-z", reset_target]).ok_or_else(|| {
+                reject(
+                    "inspection_command_failed",
+                    "incoming batch tree could not be inspected",
+                )
+            })?;
         if crate::history_inspect::ignored_checkout_path_collision(&ignored, &target) {
             return Err(reject(
                 "ignored_path_collision",
@@ -5599,7 +5616,7 @@ impl SyncEngine {
             .current_dir(git.repo_path())
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
-        .map_err(crate::errors::GitError::IoError)?;
+            .map_err(crate::errors::GitError::IoError)?;
         if !reset.status.success() {
             return Err(SyncError::GitError(crate::errors::GitError::Git2Error(
                 git2::Error::from_str("git reset to replay target failed"),
@@ -8025,7 +8042,10 @@ repo = "test/test-repo"
     fn team_checkout_refuses_same_sha_branch_switch_or_detach() {
         let (engine, git_dir) = team_echo_engine_with_git_dir("pair");
         let branch = format!("refs/heads/{}", engine.config.github.default_branch);
-        engine.git_client.lock().unwrap()
+        engine
+            .git_client
+            .lock()
+            .unwrap()
             .ensure_head_on_branch(&engine.config.github.default_branch)
             .unwrap();
         let parent = git_fixture_commit(git_dir.path(), "base.txt", "base\n", "base");
@@ -8040,7 +8060,8 @@ repo = "test/test-repo"
         )
         .unwrap();
         let unrelated_branch = "refs/heads/other";
-        repo.reference(unrelated_branch, parent_oid, false, "fixture").unwrap();
+        repo.reference(unrelated_branch, parent_oid, false, "fixture")
+            .unwrap();
         let admission = TeamHistoryAdmission {
             checkpoint: parent.clone(),
             remote_tip: child.clone(),
@@ -8070,7 +8091,9 @@ repo = "test/test-repo"
         }
 
         repo.set_head(&branch).unwrap();
-        engine.checkout_admitted_git_batch(&admission, &child).unwrap();
+        engine
+            .checkout_admitted_git_batch(&admission, &child)
+            .unwrap();
         assert_eq!(repo.refname_to_id(&branch).unwrap(), child_oid);
         assert_eq!(repo.refname_to_id(unrelated_branch).unwrap(), parent_oid);
         assert_eq!(
