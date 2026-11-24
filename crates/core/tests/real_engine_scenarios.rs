@@ -1877,10 +1877,13 @@ struct OutageLedger {
 
 fn outage_ledger(fixture: &SingleRepoFixture) -> OutageLedger {
     let db = Database::new(&fixture.db_path).unwrap();
-    let repo_id = &fixture.repo.id;
+    outage_ledger_for_db(&db, &fixture.repo.id)
+}
+
+fn outage_ledger_for_db(db: &Database, repo_id: &str) -> OutageLedger {
     let watermark = db.get_repo_watermark(repo_id).unwrap();
-    let inbound_git = scoped_inbound_git_checkpoint(&db, repo_id);
-    let lineage = load_canonical_lineage(&db, repo_id).unwrap().unwrap();
+    let inbound_git = scoped_inbound_git_checkpoint(db, repo_id);
+    let lineage = load_canonical_lineage(db, repo_id).unwrap().unwrap();
     let conn = db.conn();
     let checkpoint = |direction| {
         load_directional_checkpoint(&conn, &lineage.scope_uuid, lineage.generation, direction)
@@ -1900,12 +1903,12 @@ fn outage_ledger(fixture: &SingleRepoFixture) -> OutageLedger {
         "SELECT json_object('revision', svn_rev, 'sha', git_sha, 'direction', direction, 'id', id,
                             'synced_at', synced_at, 'svn_author', svn_author, 'git_author', git_author)
          FROM commit_map WHERE repo_id=?1 ORDER BY svn_rev,id",
-        &[repo_id],
+        &[&repo_id],
     );
     let sync_records = rows(
         "SELECT json_object('revision', svn_rev, 'sha', git_sha, 'direction', direction, 'status', status,
                             'id', id, 'author', author, 'message', message, 'timestamp', timestamp, 'synced_at', synced_at)
-         FROM sync_records WHERE repo_id=?1 ORDER BY svn_rev,id", &[repo_id]);
+         FROM sync_records WHERE repo_id=?1 ORDER BY svn_rev,id", &[&repo_id]);
     let outcomes = rows(
         "SELECT json_object('key', source_key, 'sha', target_git_sha, 'direction', direction, 'outcome', outcome,
                             'id', id, 'target_svn_rev', target_svn_rev, 'reason', reason,

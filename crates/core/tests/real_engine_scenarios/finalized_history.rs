@@ -39,6 +39,26 @@ const FINALIZED_CHANGES: [(&str, &str, &str); 3] = [
     ),
 ];
 
+fn git_push_documents(db: &Database, repo_id: &str) -> Vec<GitPushOperation> {
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare(
+            "SELECT value FROM kv_state
+         WHERE key GLOB 'svn_to_git_push_v1:document:*' AND json_extract(value, '$.repo_id') = ?1
+         ORDER BY json_extract(value, '$.source_svn_rev'), key",
+        )
+        .unwrap();
+    let documents = stmt
+        .query_map([repo_id], |row| row.get::<_, String>(0))
+        .unwrap();
+    let mut operations = Vec::new();
+    for document in documents {
+        let operation: GitPushOperation = serde_json::from_str(&document.unwrap()).unwrap();
+        operations.push(operation);
+    }
+    operations
+}
+
 fn snapshot(f: &SingleRepoFixture, published: i64, youngest: i64) -> FinalizedHistory {
     let repo = &f.repo;
     let db = Database::new(&f.db_path).unwrap();
@@ -63,23 +83,7 @@ fn snapshot(f: &SingleRepoFixture, published: i64, youngest: i64) -> FinalizedHi
     );
     assert_eq!(ledger.outcomes.len(), (published - 1) as usize);
 
-    let operations = {
-        let conn = db.conn();
-        let mut stmt = conn.prepare(
-            "SELECT value FROM kv_state
-             WHERE key GLOB 'svn_to_git_push_v1:document:*' AND json_extract(value, '$.repo_id') = ?1
-             ORDER BY json_extract(value, '$.source_svn_rev'), key",
-        ).unwrap();
-        let documents = stmt
-            .query_map([&repo.id], |row| row.get::<_, String>(0))
-            .unwrap();
-        let mut operations = Vec::new();
-        for document in documents {
-            let operation: GitPushOperation = serde_json::from_str(&document.unwrap()).unwrap();
-            operations.push(operation);
-        }
-        operations
-    };
+    let operations = git_push_documents(&db, &repo.id);
     assert_eq!(operations.len(), ledger.outcomes.len());
     assert!(db.active_git_push_operation(&repo.id).unwrap().is_none());
     assert_eq!(
@@ -492,4 +496,442 @@ pub(super) async fn evidence() -> Value {
         "mirror_recovery": mirror,
         "contradictory_mirror_hold": contradictory
     })
+}
+
+// Candidate acceptance for the preserved R23 failing baseline. The fixture
+// restores only its own synthetic pre-write database into a separate directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r23_restored_database_admission() {
+    if !super::require_toolchain("R23_RESTORED_DATABASE_ADMISSION") {
+        return;
+    }
+
+    // Two separate fixture lanes prevent an unexpected direct-cycle write from
+    // affecting what the scheduler's baseline resolver observes.
+    let mut reports = Vec::new();
+    let mut safe_disposition = true;
+    for driver in ["scheduler_baseline_resolver", "direct_engine"] {
+        let f = SingleRepoFixture::with_registration_mode("direct");
+        git_cli(&f.repo.bare, &["config", "core.logAllRefUpdates", "true"]);
+        let first = managed_engine(&f).run_sync_cycle().await.unwrap();
+        assert_eq!((first.svn_to_git_count, first.git_to_svn_count), (1, 0));
+        let prewrite = snapshot(&f, 2, 2);
+        verify_finalized_receipts(&prewrite);
+        let prewrite_tip = git_main_commit_and_tree(&f.repo.bare);
+
+        // VACUUM INTO obtains a transactionally consistent database including
+        // committed WAL content. Never copy the live main DB file in isolation.
+        let sealed = f.tmp.path().join("sealed-r2.sqlite");
+        let db = Database::new(&f.db_path).unwrap();
+        db.conn()
+            .execute("VACUUM INTO ?1", [sealed.to_str().unwrap()])
+            .unwrap();
+        drop(db);
+        let seal = std::fs::read(&sealed).unwrap();
+        let restored = f.tmp.path().join("restored");
+        std::fs::create_dir(&restored).unwrap();
+        let restored_db_path = restored.join("sync.db");
+        let restored_bridge = restored.join("bridge");
+        git_cli(
+            f.tmp.path(),
+            &[
+                "clone",
+                "--no-hardlinks",
+                "--branch",
+                "main",
+                f.repo.bare.to_str().unwrap(),
+                restored_bridge.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(git_main_commit_and_tree(&restored_bridge), prewrite_tip);
+
+        queue_finalized_change(&f, 3);
+        let live = managed_engine(&f);
+        let published = live.run_sync_cycle().await.unwrap();
+        assert_eq!(
+            (published.svn_to_git_count, published.git_to_svn_count),
+            (1, 0)
+        );
+        let idle = live.run_sync_cycle().await.unwrap();
+        assert_eq!((idle.svn_to_git_count, idle.git_to_svn_count), (0, 0));
+        drop(live);
+        let genuine = snapshot(&f, 3, 3);
+        verify_finalized_receipts(&genuine);
+        let genuine_receipt = &genuine.operations[1];
+        assert_ne!(&prewrite.operations[0].id, &genuine_receipt.id);
+
+        // This restores the complete pre-write DB into an independent state
+        // directory. The live installation and both remotes remain in place.
+        std::fs::copy(&sealed, &restored_db_path).unwrap();
+        assert_eq!(std::fs::read(&restored_db_path).unwrap(), seal);
+        assert_eq!(std::fs::read(&sealed).unwrap(), seal);
+
+        let repo_id = &f.repo.id;
+        let svn_dir = f.tmp.path().join("svnserve-root").join(repo_id);
+        let reflog = f.repo.bare.join("logs/refs/heads/main");
+        let remote_witness = || {
+            (
+                git_main_commit_and_tree(&f.repo.bare),
+                std::fs::read(&reflog).unwrap(),
+                svnlook_at(&svn_dir, "uuid", &[]),
+                svnlook_at(&svn_dir, "youngest", &[]),
+                svnlook_at(&svn_dir, "tree", &["--show-ids", "--full-paths"]),
+                svnlook_at(&svn_dir, "log", &["-r", "3"]),
+                svnlook_at(&svn_dir, "cat", &["-r", "3", "recovery.txt"]),
+            )
+        };
+        let remote_after_publish = remote_witness();
+        let (published_tip, published_tree) = remote_after_publish.0;
+        assert_eq!(
+            published_tip.to_string(),
+            genuine_receipt.intended_local_git_sha
+        );
+        assert_eq!(
+            published_tree.to_string(),
+            genuine_receipt.intended_local_git_tree
+        );
+
+        let old_db_witness = |db: &Database| {
+            (
+                super::outage_ledger_for_db(db, repo_id),
+                db.get_state(&format!("last_svn_rev_{repo_id}")).unwrap(),
+                db.get_state(&format!("handled_git_baseline_{repo_id}"))
+                    .unwrap(),
+                git_push_documents(db, repo_id),
+                db.active_git_push_operation(repo_id).unwrap(),
+                db.latest_git_push_operation(repo_id).unwrap(),
+            )
+        };
+        let expected_db = (
+            prewrite.ledger,
+            prewrite.mirror,
+            Some(prewrite.handled_git_baseline),
+            prewrite.operations.clone(),
+            None,
+            prewrite.operations.last().cloned(),
+        );
+
+        // Capture entry and exit independently. The second attempt reopens the
+        // same restored database and checkout, not the original live bridge.
+        let bridge_probe = || {
+            let git = git2::Repository::open(&restored_bridge).unwrap();
+            let head = git.head().unwrap();
+            let commit = head.peel_to_commit().unwrap();
+            let main_log_entries = match git.reflog("refs/heads/main") {
+                Ok(log) => Some(log.len()),
+                Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+                Err(e) => panic!("cannot inspect synthetic main reflog: {:?}", e.code()),
+            };
+            json!({
+                "head_on_main": head.name() == Some("refs/heads/main"),
+                "head_sha": commit.id().to_string(),
+                "head_tree": commit.tree_id().to_string(),
+                "head_is_published": (commit.id(), commit.tree_id()) == (published_tip, published_tree),
+                "head_is_prewrite": (commit.id(), commit.tree_id()) == prewrite_tip,
+                "main_reflog_entries": main_log_entries,
+            })
+        };
+        let conflict_probe = |db: &Database| {
+            let blocking_rows = db.count_conflicts_blocking_apply_for_repo(repo_id).unwrap();
+            let first = db.first_conflict_blocking_apply_for_repo(repo_id).unwrap();
+            json!({
+                "blocking_rows": blocking_rows,
+                "first_blocking_row_id": first.as_ref().map(|(id, _)| id),
+                "first_blocking_row_is_fixture_path": first
+                    .as_ref()
+                    .is_some_and(|(_, path)| path == "recovery.txt"),
+            })
+        };
+        for attempt in 1..=2 {
+            let db = Database::new(&restored_db_path).unwrap();
+            let before = old_db_witness(&db) == expected_db;
+            let bridge_before = bridge_probe();
+            let index_before = std::fs::read(restored_bridge.join(".git/index")).unwrap();
+            let conflicts_before = conflict_probe(&db);
+            let (outcome, expected_decision) = if driver == "scheduler_baseline_resolver" {
+                // This is the production admission resolver the scheduler
+                // calls; it is not a full scheduler tick. A coherent but old
+                // local baseline may verify here, so the engine lane is
+                // independently required to check the real remotes.
+                let result = resolve_repo_import_baseline(&db, repo_id);
+                drop(db);
+                match result {
+                    Ok(RepoImportBaseline::Verified { svn_rev, git_sha }) => {
+                        let consistent = (svn_rev, git_sha.as_str())
+                            == (
+                                expected_db.0.watermark.0,
+                                expected_db.0.watermark.1.as_str(),
+                            );
+                        (
+                            json!({"decision": "verified_local", "svn_revision": svn_rev}),
+                            consistent,
+                        )
+                    }
+                    Ok(RepoImportBaseline::ReconciliationRequired { reason, .. }) => (
+                        json!({"decision": "reconciliation_required", "reason": reason}),
+                        false,
+                    ),
+                    Ok(RepoImportBaseline::Pending) => (json!({"decision": "pending"}), false),
+                    Err(_) => (json!({"decision": "resolver_error"}), false),
+                }
+            } else {
+                let mut config = make_app_config(&f.repo.svn_url, &restored);
+                config.svn.trunk_path.clear();
+                config.github.default_branch = "main".into();
+                let mut engine = SyncEngine::new(
+                    config,
+                    db,
+                    reposync_core::svn::SvnClient::new(
+                        &f.repo.svn_url,
+                        &f.repo.username,
+                        &f.repo.password,
+                    ),
+                    reposync_core::git::GitClient::new(&restored_bridge).unwrap(),
+                    std::sync::Arc::new(super::make_identity_mapper()),
+                );
+                engine.set_repo_id(repo_id.clone());
+                match engine.run_sync_cycle().await {
+                    Err(SyncError::HistoryBlocked { reason, .. }) => (
+                        json!({"decision": "history_blocked", "reason": reason}),
+                        reason == "unreceipted_svn_publication",
+                    ),
+                    Err(error) => {
+                        // Never print arbitrary remote messages, paths or credentials.
+                        // Match exhaustively so new variants require an explicit safe label.
+                        let kind = match &error {
+                            SyncError::AlreadyRunning { .. } => "already_running",
+                            SyncError::HistoryBlocked { .. } => "history_blocked",
+                            SyncError::SvnCommitHeld { .. } => "svn_commit_held",
+                            SyncError::GitPushHeld { .. } => "git_push_held",
+                            SyncError::CycleMappingHeld { .. } => "cycle_mapping_held",
+                            SyncError::UnresolvableConflict { .. } => "unresolvable_conflict",
+                            SyncError::EchoDetectionFailed { .. } => "echo_detection_failed",
+                            SyncError::InvalidStateTransition { .. } => "invalid_state_transition",
+                            SyncError::SvnError(_) => "svn_error",
+                            SyncError::GitError(_) => "git_error",
+                            SyncError::GitHubError(_) => "github_error",
+                            SyncError::DatabaseError(_) => "database_error",
+                            SyncError::IdentityError(_) => "identity_error",
+                        };
+                        let on_recovery_path = matches!(
+                            &error,
+                            SyncError::UnresolvableConflict { file_path, .. } if file_path == "recovery.txt"
+                        );
+                        (
+                            json!({
+                                "decision": "other_engine_error",
+                                "error_kind": kind,
+                                "fixture_path_is_recovery_txt": on_recovery_path,
+                            }),
+                            false,
+                        )
+                    }
+                    Ok(stats) => (
+                        json!({
+                            "decision": "cycle_completed",
+                            "svn_to_git_count": stats.svn_to_git_count,
+                            "git_to_svn_count": stats.git_to_svn_count
+                        }),
+                        false,
+                    ),
+                }
+            };
+            // Reopen after each operation; check all scoped receipt rows and
+            // IDs, not just reported counters or the final Git tree.
+            let reopened = Database::new(&restored_db_path).unwrap();
+            let after = old_db_witness(&reopened);
+            let conflicts_after = conflict_probe(&reopened);
+            let bridge_after = bridge_probe();
+            drop(reopened);
+            let remote_stable = remote_witness() == remote_after_publish;
+            let bridge_stable = git_main_commit_and_tree(&restored_bridge) == prewrite_tip;
+            let ledger_stable = after == expected_db;
+            let checkout_unchanged = bridge_before == bridge_after
+                && bridge_before["head_on_main"] == true
+                && bridge_before["head_is_prewrite"] == true
+                && bridge_before["main_reflog_entries"].as_u64().is_some()
+                && std::fs::read(restored_bridge.join(".git/index")).unwrap() == index_before
+                && !restored_bridge.join("recovery.txt").exists();
+            let no_conflicts =
+                conflicts_before == conflicts_after && conflicts_after["blocking_rows"] == 0;
+            let accepted = before
+                && remote_stable
+                && bridge_stable
+                && ledger_stable
+                && checkout_unchanged
+                && no_conflicts
+                && expected_decision;
+            safe_disposition &= accepted;
+            reports.push(json!({
+                "driver": driver,
+                "cold_attempt": attempt,
+                "outcome": outcome,
+                "bridge_at_entry": bridge_before,
+                "bridge_at_exit": bridge_after,
+                "scoped_conflicts_at_entry": conflicts_before,
+                "scoped_conflicts_at_exit": conflicts_after,
+                "prewrite_ledger_at_entry": before,
+                "restored_ledger_unchanged": ledger_stable,
+                "remotes_unchanged": remote_stable,
+                "restored_bridge_unchanged": bridge_stable && checkout_unchanged,
+                "genuine_receipt_id": genuine_receipt.id,
+                "genuine_receipt_svn_revision": genuine_receipt.source_svn_rev,
+                "genuine_git_sha": genuine_receipt.intended_local_git_sha,
+                "restored_receipt_ids": after.3.iter().map(|op| &op.id).collect::<Vec<_>>(),
+                "restored_has_genuine_receipt": after.3.iter().any(|op| op.id == genuine_receipt.id),
+            }));
+        }
+        assert_eq!(std::fs::read(&sealed).unwrap(), seal);
+        let live_db = Database::new(&f.db_path).unwrap();
+        assert_eq!(git_push_documents(&live_db, repo_id), genuine.operations);
+        assert_eq!(
+            super::outage_ledger_for_db(&live_db, repo_id),
+            genuine.ledger
+        );
+    }
+    super::emit_evidence(
+        "R23_RESTORED_DATABASE_ADMISSION",
+        if safe_disposition { "PASS" } else { "FAIL" },
+        json!({"expected_safe_disposition": safe_disposition, "cases": reports}),
+    );
+    assert!(
+        safe_disposition,
+        "R23 must hold before replay, without advancing either remote or the restored checkout"
+    );
+}
+
+/// Independent Git/SVN edits must not be mistaken for a restored receipt.
+/// Give the strongest negative the same emitter fields with different bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r23_ordinary_admission_controls() {
+    const CASE: &str = "R23_ORDINARY_ADMISSION_CONTROLS";
+    if !super::require_toolchain(CASE) {
+        return;
+    }
+
+    let controls = [
+        "plain_fast_forward",
+        "marker_only",
+        "ordinary_conflict",
+        "exact_hint_wrong_bytes",
+        "mixed_disjoint",
+    ];
+    for control in controls {
+        let fixture = SingleRepoFixture::with_registration_mode("direct");
+        let repo = &fixture.repo;
+        git_cli(&repo.bare, &["config", "core.logAllRefUpdates", "true"]);
+        let engine = managed_engine(&fixture);
+        let initial = engine.run_sync_cycle().await.unwrap();
+        assert_eq!((initial.svn_to_git_count, initial.git_to_svn_count), (1, 0));
+        let before = snapshot(&fixture, 2, 2);
+        verify_finalized_receipts(&before);
+        let before_bridge = git_main_commit_and_tree(&repo.bridge);
+        let expect_conflict = matches!(control, "ordinary_conflict" | "exact_hint_wrong_bytes");
+        let disjoint = control == "mixed_disjoint";
+        if expect_conflict || disjoint {
+            queue_finalized_change(&fixture, 3);
+        }
+
+        git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
+        let path = if expect_conflict {
+            "recovery.txt"
+        } else {
+            "ordinary.txt"
+        };
+        let payload = "independent Git content\n";
+        let message = match control {
+            "marker_only" => "User work\n\n[reposync] synced from SVN r3".into(),
+            "exact_hint_wrong_bytes" => format!(
+                "{}\n\n[reposync] synced from SVN r3",
+                FINALIZED_CHANGES[1].2
+            ),
+            _ => "Independent Git work".into(),
+        };
+        std::fs::write(fixture.developer.join(path), payload).unwrap();
+        let developer = reposync_core::git::GitClient::new(&fixture.developer).unwrap();
+        let commit = developer
+            .commit_via_cli(
+                &message,
+                "Test User",
+                "test@example.com",
+                "reposync",
+                "sync@reposync.local",
+            )
+            .unwrap();
+        git_cli(&fixture.developer, &["push", "origin", "main"]);
+        assert_eq!(git_main_commit_and_tree(&repo.bare).0, commit);
+        let reflog_path = repo.bare.join("logs/refs/heads/main");
+        let reflog_before = std::fs::read(&reflog_path).unwrap();
+        let result = engine.run_sync_cycle().await;
+        let db = Database::new(&fixture.db_path).unwrap();
+        let svn_dir = fixture.tmp.path().join("svnserve-root").join(&repo.id);
+        if expect_conflict {
+            assert!(
+                matches!(
+                    result, Err(SyncError::UnresolvableConflict { file_path, .. }) if file_path == path
+                ),
+                "{control} must be an ordinary conflict"
+            );
+            assert_eq!(git_main_commit_and_tree(&repo.bridge), before_bridge);
+            assert!(!repo.bridge.join(path).exists());
+            assert_eq!(super::outage_ledger_for_db(&db, &repo.id), before.ledger);
+            assert_eq!(
+                db.count_conflicts_blocking_apply_for_repo(&repo.id)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                svnlook_at(&svn_dir, "cat", &["-r", "3", path]),
+                FINALIZED_CHANGES[1].1
+            );
+        } else if disjoint {
+            let stats = result.unwrap();
+            assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (1, 1));
+            let published = git_main_commit_and_tree(&repo.bare);
+            assert_ne!(published.0, commit);
+            assert_eq!(git_main_commit_and_tree(&repo.bridge), published);
+            assert_eq!(git_show_blob(&repo.bare, "main", path), payload);
+            assert_eq!(
+                git_show_blob(&repo.bare, "main", "recovery.txt"),
+                FINALIZED_CHANGES[1].1,
+            );
+            assert_eq!(svnlook_at(&svn_dir, "cat", &["-r", "4", path]), payload);
+            assert_eq!(svnlook_at(&svn_dir, "youngest", &[]).trim(), "4");
+            assert_eq!(
+                db.count_conflicts_blocking_apply_for_repo(&repo.id)
+                    .unwrap(),
+                0
+            );
+            let after = std::fs::read(reflog_path).unwrap();
+            let appended = after.strip_prefix(reflog_before.as_slice()).unwrap();
+            assert_eq!(
+                appended
+                    .split(|b| *b == b'\n')
+                    .filter(|s| !s.is_empty())
+                    .count(),
+                1
+            );
+            assert!(String::from_utf8_lossy(appended)
+                .starts_with(&format!("{commit} {} ", published.0)));
+            let noop = engine.run_sync_cycle().await.unwrap();
+            assert_eq!((noop.svn_to_git_count, noop.git_to_svn_count), (0, 0));
+            continue;
+        } else {
+            let stats = result.unwrap();
+            assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (0, 1));
+            assert_eq!(git_main_commit_and_tree(&repo.bridge).0, commit);
+            assert_eq!(svnlook_at(&svn_dir, "cat", &["-r", "3", path]), payload);
+            assert_eq!(
+                db.count_conflicts_blocking_apply_for_repo(&repo.id)
+                    .unwrap(),
+                0
+            );
+            let noop = engine.run_sync_cycle().await.unwrap();
+            assert_eq!((noop.svn_to_git_count, noop.git_to_svn_count), (0, 0));
+        }
+        assert_eq!(svnlook_at(&svn_dir, "youngest", &[]).trim(), "3");
+        assert_eq!(git_main_commit_and_tree(&repo.bare).0, commit);
+        assert_eq!(std::fs::read(reflog_path).unwrap(), reflog_before);
+    }
+    super::emit_evidence(CASE, "PASS", json!({"controls": controls}));
 }
