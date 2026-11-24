@@ -39,6 +39,24 @@ const FINALIZED_CHANGES: [(&str, &str, &str); 3] = [
     ),
 ];
 
+fn git_push_documents(db: &Database, repo_id: &str) -> Vec<GitPushOperation> {
+    let conn = db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT value FROM kv_state
+         WHERE key GLOB 'svn_to_git_push_v1:document:*' AND json_extract(value, '$.repo_id') = ?1
+         ORDER BY json_extract(value, '$.source_svn_rev'), key",
+    ).unwrap();
+    let documents = stmt
+        .query_map([repo_id], |row| row.get::<_, String>(0))
+        .unwrap();
+    let mut operations = Vec::new();
+    for document in documents {
+        let operation: GitPushOperation = serde_json::from_str(&document.unwrap()).unwrap();
+        operations.push(operation);
+    }
+    operations
+}
+
 fn snapshot(f: &SingleRepoFixture, published: i64, youngest: i64) -> FinalizedHistory {
     let repo = &f.repo;
     let db = Database::new(&f.db_path).unwrap();
@@ -63,23 +81,7 @@ fn snapshot(f: &SingleRepoFixture, published: i64, youngest: i64) -> FinalizedHi
     );
     assert_eq!(ledger.outcomes.len(), (published - 1) as usize);
 
-    let operations = {
-        let conn = db.conn();
-        let mut stmt = conn.prepare(
-            "SELECT value FROM kv_state
-             WHERE key GLOB 'svn_to_git_push_v1:document:*' AND json_extract(value, '$.repo_id') = ?1
-             ORDER BY json_extract(value, '$.source_svn_rev'), key",
-        ).unwrap();
-        let documents = stmt
-            .query_map([&repo.id], |row| row.get::<_, String>(0))
-            .unwrap();
-        let mut operations = Vec::new();
-        for document in documents {
-            let operation: GitPushOperation = serde_json::from_str(&document.unwrap()).unwrap();
-            operations.push(operation);
-        }
-        operations
-    };
+    let operations = git_push_documents(&db, &repo.id);
     assert_eq!(operations.len(), ledger.outcomes.len());
     assert!(db.active_git_push_operation(&repo.id).unwrap().is_none());
     assert_eq!(
