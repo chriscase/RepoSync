@@ -54,10 +54,20 @@ differs by route** (verified in the handlers, not in older docs):
 | SVN → Git push | Read status | `GET /api/repos/{id}/git-push/{op}` | **admin** |
 | SVN → Git push | Re-inspect (reconcile) | `POST /api/repos/{id}/git-push/{op}/reconcile` | admin |
 | Late pair | Status, resume, cancel | `POST /api/repos/{parent}/branches` with `"action"` and `"reconciliation": true` | the same admin who started it |
-| Pair refresh (v2, draft) | Read receipt | `GET /api/v2/repos/{pair}/refresh/requests/{request}` | the original actor |
-| Pair refresh (v2, draft) | Reconcile or cancel | `POST /api/v2/repos/{pair}/refresh/action` with `"action"` | the original actor |
+| Pair refresh (v2) | Read receipt | `GET /api/v2/repos/{pair}/refresh/requests/{request}` | the original actor |
+| Pair refresh (v2) | Reconcile or cancel | `POST /api/v2/repos/{pair}/refresh/action` with `"action"` | the original actor |
 
-A reconcile call takes the repository's busy slot, waits briefly for it (about ten
+For v2 refresh status, keep the child ID and the original **request ID**. The
+operation UUID is a separate field. The receipt GET reads the prepared v2
+flow's execution or no-op receipt. It does not read the local journal for a
+**v1 local update or a local re-anchor**, even when re-anchor was requested at
+the v2 action route. A 404 for either is not proof that nothing was written.
+If an execution attempt or response is uncertain, keep the IDs and available
+pins, preserve the hold and ask an administrator to verify before considering
+another request. See [manual status and uncertain
+outcomes](../reliability/git-workflows.md#checking-status).
+
+For import, SVN commit and Git push, a reconcile call takes the repository's busy slot, waits briefly for it (about ten
 seconds), and otherwise answers "repository is busy; retry remote verification
 later". It is **observe-first**: it looks at the remote and records what it can
 prove, and it finalizes only on a unique verified match. It does not blindly retry

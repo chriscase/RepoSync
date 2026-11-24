@@ -25,7 +25,7 @@ installation, and it does not close #71 (see [Held and unavailable](held-and-una
   means RepoSync could not prove what happened to an external write and is
   refusing to guess. See [Status and reconciliation](status-and-reconciliation.md).
 - **Nothing here is a release or a live qualification.** The statements below are
-  checked against source at one pinned commit. See [Evidence and its limits](#evidence-and-its-limits).
+  checked against pinned source. See [Evidence and its limits](#evidence-and-its-limits).
 
 ## Reading order
 
@@ -48,7 +48,7 @@ the source tree, not a deployment.
 | Label | Meaning |
 | --- | --- |
 | **In tree** | Code exists at the pinned commit. It is *not* a release, and it is not evidence that a live installation has it or that it was qualified live. |
-| **In tree, draft** | In the tree, but its own contract describes it as a draft with qualification gates still open. |
+| **Local-only, sandbox-evidenced** | Tested within the cited disposable fixture's scope. Does not establish network, release or live support. |
 | **Read-only** | Inspects and reports. It never writes to Git or SVN. |
 | **Not implemented** | The server refuses the request with an explicit code. |
 | **Held** | Deliberately not delivered by this documentation lane. Dependent on other work. |
@@ -85,8 +85,11 @@ any other host, and never put it in a URL.
 
 - **Pinned source.** Behavior statements were checked against commit
   [`ade6f9c`](https://github.com/chriscase/RepoSync/commit/ade6f9cb383f76d65c6610ef21eec2199f6c23b5)
-  (the tip of `epic/reposync-reliability-61` when this guide was written). Source
-  links in this guide set are permalinks to that commit. Code on a later commit may differ.
+  (the tip of `epic/reposync-reliability-61` when this guide was written).
+  The refresh, operation-status and safeguards availability summary was checked
+  against [`0f010a2`](https://github.com/chriscase/RepoSync/commit/0f010a232a29489b31a1c73500040f766c739f81).
+  Source links and prior evidence retain their own pins; the latter are not
+  fresh runtime runs at this commit.
 - **Read from source, not run.** Route lists, authorization rules, request
   fields and refusal codes were read from the handlers. The Git commands in these pages
   (ancestry exit codes, hook arguments, `--no-verify`) were run once in a throwaway repository.
@@ -101,9 +104,9 @@ any other host, and never put it in a URL.
 
 ## Related existing documents
 
-These predate this guide set and are not edited by it. Where they disagree with
-the pinned source, this guide set follows the source; the disagreements are
-listed in the [FAQ](faq.md#where-older-documents-disagree-with-the-source).
+The [operator guide](../reliability/git-workflows.md) has been updated for named
+status and local hooks. Where older guidance disagrees with the pinned source,
+use the source; see the [FAQ](faq.md#where-older-documents-disagree-with-the-source).
 
 - [`docs/reliability/coworker-FAQ.md`](../reliability/coworker-FAQ.md) and
   [`docs/reliability/git-workflows.md`](../reliability/git-workflows.md): the first #71 slice
