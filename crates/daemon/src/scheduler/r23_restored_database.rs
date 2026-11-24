@@ -77,9 +77,21 @@ fn verify_fixture_targets(scheduler: &Scheduler, svn: &Path, bare: &Path, bridge
     assert_eq!(repo.git_repo, git_path);
     assert_eq!(repo.git_branch, "main");
     assert!(repo.teams_webhook_url.is_none());
-    assert!(scheduler.db.resolve_credential_chain(REPO, "secret_git_token").is_none());
-    assert!(scheduler.db.resolve_credential_chain(REPO, "secret_svn_password").is_none());
-    let expected_bridge = scheduler.app_config.daemon.data_dir.join("repos").join(REPO).join("git-repo");
+    assert!(scheduler
+        .db
+        .resolve_credential_chain(REPO, "secret_git_token")
+        .is_none());
+    assert!(scheduler
+        .db
+        .resolve_credential_chain(REPO, "secret_svn_password")
+        .is_none());
+    let expected_bridge = scheduler
+        .app_config
+        .daemon
+        .data_dir
+        .join("repos")
+        .join(REPO)
+        .join("git-repo");
     assert_eq!(bridge, expected_bridge.as_path());
     assert_eq!(bridge.canonicalize().unwrap().as_path(), bridge);
 
@@ -93,24 +105,38 @@ fn verify_fixture_targets(scheduler: &Scheduler, svn: &Path, bare: &Path, bridge
     ] {
         let effective = String::from_utf8(command(bridge, "git", args)).unwrap();
         let urls: Vec<_> = effective.lines().collect();
-        assert_eq!(urls.as_slice(), &[git_path], "expected one literal local URL");
+        assert_eq!(
+            urls.as_slice(),
+            &[git_path],
+            "expected one literal local URL"
+        );
     }
 }
 
 /// Enter the same interval path as Scheduler::run and wait for exactly its
 /// worker. An unchanged database alone could also mean we never scheduled it.
 async fn tick_and_join(
-    scheduler: &Scheduler, due_at: &mut time::Instant, svn: &Path, bare: &Path, bridge: &Path,
+    scheduler: &Scheduler,
+    due_at: &mut time::Instant,
+    svn: &Path,
+    bare: &Path,
+    bridge: &Path,
 ) -> Value {
     verify_fixture_targets(scheduler, svn, bare, bridge);
     let tick = scheduler.stats.poll_ticks.load(Ordering::SeqCst);
     let spawns = scheduler.sync_task_spawns.load(Ordering::SeqCst);
     let mut events = scheduler.ws_broadcast.subscribe();
-    time::timeout(Duration::from_secs(30), scheduler.handle_interval_tick(due_at))
-        .await
-        .expect("interval tick timed out");
+    time::timeout(
+        Duration::from_secs(30),
+        scheduler.handle_interval_tick(due_at),
+    )
+    .await
+    .expect("interval tick timed out");
     assert_eq!(scheduler.stats.poll_ticks.load(Ordering::SeqCst), tick + 1);
-    assert_eq!(scheduler.sync_task_spawns.load(Ordering::SeqCst), spawns + 1);
+    assert_eq!(
+        scheduler.sync_task_spawns.load(Ordering::SeqCst),
+        spawns + 1
+    );
     let mut handle = {
         let mut handles = scheduler.sync_handles.lock().await;
         assert_eq!(handles.len(), 1, "expected one admitted scheduler worker");
@@ -123,8 +149,8 @@ async fn tick_and_join(
             panic!("scheduler worker timed out");
         }
     };
-    let event: Value = serde_json::from_str(&events.try_recv().expect("worker emitted no result"))
-        .unwrap();
+    let event: Value =
+        serde_json::from_str(&events.try_recv().expect("worker emitted no result")).unwrap();
     assert_eq!(event["repo_id"], REPO);
     assert!(matches!(
         events.try_recv(),
@@ -169,8 +195,8 @@ fn ledger(db: &Database) -> Value {
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
     };
-    let checkpoints = [CheckpointDirection::SvnToGit, CheckpointDirection::GitToSvn]
-        .map(|direction| {
+    let checkpoints =
+        [CheckpointDirection::SvnToGit, CheckpointDirection::GitToSvn].map(|direction| {
             load_directional_checkpoint(&conn, &lineage.scope_uuid, lineage.generation, direction)
                 .unwrap()
         });
@@ -238,7 +264,14 @@ fn bridge_witness(path: &Path) -> Vec<Vec<u8>> {
     assert_eq!(git(path, &["symbolic-ref", "HEAD"]), MAIN);
     assert!(!path.join("recovery.txt").exists());
     let status = command(
-        path, "git", &["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"],
+        path,
+        "git",
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ],
     );
     assert!(status.is_empty());
     vec![
@@ -307,15 +340,21 @@ async fn restored_prewrite_database_holds_on_actual_interval_tick() {
         for (key, expected) in &environment {
             assert_eq!(std::env::var_os(*key).as_ref(), Some(expected), "{key}");
         }
-        assert!(std::env::vars_os().all(|(key, _)|
-            key.as_os_str() == std::ffi::OsStr::new("PATH")
-                || environment.iter().any(|(name, _)| key.as_os_str() == std::ffi::OsStr::new(*name))
-        ));
+        assert!(std::env::vars_os().all(|(key, _)| key.as_os_str()
+            == std::ffi::OsStr::new("PATH")
+            || environment
+                .iter()
+                .any(|(name, _)| key.as_os_str() == std::ffi::OsStr::new(*name))));
         let path = std::env::var_os("PATH").expect("fixture requires installed SVN and Git");
         assert!(std::env::split_paths(&path).all(|dir| dir.is_absolute()));
-        assert!(std::fs::read(root.join("empty.gitconfig")).unwrap().is_empty());
+        assert!(std::fs::read(root.join("empty.gitconfig"))
+            .unwrap()
+            .is_empty());
         for empty in ["hooks", "template", "home", "config", "cache", "tmp"] {
-            assert!(std::fs::read_dir(root.join(empty)).unwrap().next().is_none());
+            assert!(std::fs::read_dir(root.join(empty))
+                .unwrap()
+                .next()
+                .is_none());
         }
         actual_interval_fixture().await;
         return;
@@ -335,19 +374,29 @@ async fn restored_prewrite_database_holds_on_actual_interval_tick() {
         "fixture tools must not resolve through cwd-relative PATH entries"
     );
     let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
-    child.args([TEST_NAME, "--exact", "--nocapture", "--test-threads=1"])
+    child
+        .args([TEST_NAME, "--exact", "--nocapture", "--test-threads=1"])
         .current_dir(&root)
         .env_clear()
         .env("PATH", path)
         .envs(fixture_environment(&root))
         .kill_on_drop(true);
     let out = time::timeout(Duration::from_secs(180), child.output())
-        .await.expect("clean scheduler fixture timed out").unwrap();
+        .await
+        .expect("clean scheduler fixture timed out")
+        .unwrap();
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(out.status.success(), "clean scheduler fixture failed:\n{stdout}\n{stderr}");
-    assert!(stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")));
-    let proofs: Vec<_> = stdout.lines().chain(stderr.lines())
+    assert!(
+        out.status.success(),
+        "clean scheduler fixture failed:\n{stdout}\n{stderr}"
+    );
+    assert!(stdout
+        .lines()
+        .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")));
+    let proofs: Vec<_> = stdout
+        .lines()
+        .chain(stderr.lines())
         .filter_map(|line| line.split_once(EVIDENCE_PREFIX).map(|(_, proof)| proof))
         .collect();
     assert_eq!(proofs.len(), 1, "expected one executed child receipt");
@@ -376,24 +425,46 @@ async fn actual_interval_fixture() {
     let confined = reposync_core::svn::working_copy::ConfinedWorkingCopy::open(&external).unwrap();
     for (name, content, message, rev) in [
         (".gitkeep", b"".as_slice(), "Initial anchor", 1),
-        ("origin.txt", b"Original SVN work\n".as_slice(), "Baseline SVN work", 2),
+        (
+            "origin.txt",
+            b"Original SVN work\n".as_slice(),
+            "Baseline SVN work",
+            2,
+        ),
     ] {
         confined.write_file(name, content).unwrap();
         svn.add_with_retry(&external, &[name]).await.unwrap();
-        assert_eq!(svn.commit(&external, message, SVN_AUTHOR).await.unwrap(), rev);
+        assert_eq!(
+            svn.commit(&external, message, SVN_AUTHOR).await.unwrap(),
+            rev
+        );
     }
 
     let bare = root.join("publish.git");
-    git(root, &["init", "--bare", "--initial-branch=main", bare.to_str().unwrap()]);
+    git(
+        root,
+        &[
+            "init",
+            "--bare",
+            "--initial-branch=main",
+            bare.to_str().unwrap(),
+        ],
+    );
     git(&bare, &["config", "core.logAllRefUpdates", "true"]);
     std::fs::create_dir_all(&bridge).unwrap();
     git(&bridge, &["init", "--initial-branch=main"]);
     git(&bridge, &["config", "user.name", "Fixture"]);
-    git(&bridge, &["config", "user.email", "fixture@example.invalid"]);
+    git(
+        &bridge,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
     std::fs::write(bridge.join(".gitkeep"), []).unwrap();
     git(&bridge, &["add", ".gitkeep"]);
     git(&bridge, &["commit", "-m", "Initial anchor"]);
-    git(&bridge, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(
+        &bridge,
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
     git(&bridge, &["push", "origin", "main"]);
 
     let mut repo = live.db.get_repository(REPO).unwrap().unwrap();
@@ -407,59 +478,115 @@ async fn actual_interval_fixture() {
     repo.last_svn_rev = 1;
     repo.last_git_sha = git(&bridge, &["rev-parse", "HEAD"]);
     live.db.update_repository(&repo).unwrap();
-    live.db.set_state(&format!("last_svn_rev_{REPO}"), "1").unwrap();
+    live.db
+        .set_state(&format!("last_svn_rev_{REPO}"), "1")
+        .unwrap();
     let uuid = text_out(svnlook(&svn_repo, "uuid", &[]));
     assert!(!uuid.is_empty());
     reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
         &live.db, REPO, &uuid,
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut maintenance = time::Instant::now();
-    assert_completion(tick_and_join(&live, &mut maintenance, &svn_repo, &bare, &bridge).await, 1);
+    assert_completion(
+        tick_and_join(&live, &mut maintenance, &svn_repo, &bare, &bridge).await,
+        1,
+    );
     let prior = publication(&live.db, 2, &bare);
     make_due(&live.db);
     let prior_ledger = ledger(&live.db);
     let sealed_db = root.join("sealed-r2.sqlite");
-    live.db.conn().execute("VACUUM INTO ?1", [sealed_db.to_str().unwrap()]).unwrap();
+    live.db
+        .conn()
+        .execute("VACUUM INTO ?1", [sealed_db.to_str().unwrap()])
+        .unwrap();
     let seal = std::fs::read(&sealed_db).unwrap();
 
     let restored_root = root.join("restored");
     let restored_bridge = restored_root.join("repos").join(REPO).join("git-repo");
     std::fs::create_dir_all(restored_bridge.parent().unwrap()).unwrap();
-    git(root, &[
-        "clone", "--no-hardlinks", "--branch", "main", bare.to_str().unwrap(),
-        restored_bridge.to_str().unwrap(),
-    ]);
-    assert_eq!(git(&restored_bridge, &["rev-parse", MAIN]), prior.intended_local_git_sha);
+    git(
+        root,
+        &[
+            "clone",
+            "--no-hardlinks",
+            "--branch",
+            "main",
+            bare.to_str().unwrap(),
+            restored_bridge.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        git(&restored_bridge, &["rev-parse", MAIN]),
+        prior.intended_local_git_sha
+    );
     let restored_checkout = bridge_witness(&restored_bridge);
     let previous_reflog = std::fs::read(bare.join("logs/refs/heads/main")).unwrap();
 
     confined.write_file("recovery.txt", SOURCE_BYTES).unwrap();
-    svn.add_with_retry(&external, &["recovery.txt"]).await.unwrap();
-    assert_eq!(svn.commit(&external, SOURCE_MESSAGE, SVN_AUTHOR).await.unwrap(), 3);
-    assert_eq!(svnlook(&svn_repo, "cat", &["-r", "3", "recovery.txt"]), SOURCE_BYTES);
-    assert_eq!(text_out(svnlook(&svn_repo, "log", &["-r", "3"])), SOURCE_MESSAGE);
-    assert_eq!(text_out(svnlook(&svn_repo, "author", &["-r", "3"])), SVN_AUTHOR);
-    assert_eq!(text_out(svnlook(&svn_repo, "changed", &["-r", "3"])), "A   recovery.txt");
+    svn.add_with_retry(&external, &["recovery.txt"])
+        .await
+        .unwrap();
+    assert_eq!(
+        svn.commit(&external, SOURCE_MESSAGE, SVN_AUTHOR)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        svnlook(&svn_repo, "cat", &["-r", "3", "recovery.txt"]),
+        SOURCE_BYTES
+    );
+    assert_eq!(
+        text_out(svnlook(&svn_repo, "log", &["-r", "3"])),
+        SOURCE_MESSAGE
+    );
+    assert_eq!(
+        text_out(svnlook(&svn_repo, "author", &["-r", "3"])),
+        SVN_AUTHOR
+    );
+    assert_eq!(
+        text_out(svnlook(&svn_repo, "changed", &["-r", "3"])),
+        "A   recovery.txt"
+    );
     assert!(!bridge.join("recovery.txt").exists());
 
-    assert_completion(tick_and_join(&live, &mut maintenance, &svn_repo, &bare, &bridge).await, 1);
+    assert_completion(
+        tick_and_join(&live, &mut maintenance, &svn_repo, &bare, &bridge).await,
+        1,
+    );
     let genuine = publication(&live.db, 3, &bare);
     assert_ne!(genuine.id, prior.id);
     assert_eq!(genuine.pre_push_git_sha, prior.intended_local_git_sha);
     assert_eq!(genuine.source_svn_message, SOURCE_MESSAGE);
     assert_eq!(genuine.source_svn_author, SVN_AUTHOR);
-    assert_eq!(command(&bare, "git", &["show", "refs/heads/main:recovery.txt"]), SOURCE_BYTES);
+    assert_eq!(
+        command(&bare, "git", &["show", "refs/heads/main:recovery.txt"]),
+        SOURCE_BYTES
+    );
     let after_publish = remote_witness(&svn_repo, &bare);
-    let appended = after_publish[2].strip_prefix(previous_reflog.as_slice()).unwrap();
-    assert_eq!(appended.split(|b| *b == b'\n').filter(|s| !s.is_empty()).count(), 1);
+    let appended = after_publish[2]
+        .strip_prefix(previous_reflog.as_slice())
+        .unwrap();
+    assert_eq!(
+        appended
+            .split(|b| *b == b'\n')
+            .filter(|s| !s.is_empty())
+            .count(),
+        1
+    );
     assert!(String::from_utf8_lossy(appended).starts_with(&format!(
-        "{} {} ", prior.intended_local_git_sha, genuine.intended_local_git_sha,
+        "{} {} ",
+        prior.intended_local_git_sha, genuine.intended_local_git_sha,
     )));
 
     make_due(&live.db);
     let genuine_ledger = ledger(&live.db);
-    assert_completion(tick_and_join(&live, &mut maintenance, &svn_repo, &bare, &bridge).await, 0);
+    assert_completion(
+        tick_and_join(&live, &mut maintenance, &svn_repo, &bare, &bridge).await,
+        0,
+    );
     assert_eq!(ledger(&live.db), genuine_ledger);
     assert_eq!(remote_witness(&svn_repo, &bare), after_publish);
     let mut restored_config = live.app_config.clone();
@@ -476,23 +603,50 @@ async fn actual_interval_fixture() {
         assert_eq!(ledger(&scheduler.db), prior_ledger);
         assert_eq!(bridge_witness(&restored_bridge), restored_checkout);
         let mut maintenance = time::Instant::now();
-        let event = tick_and_join(&scheduler, &mut maintenance, &svn_repo, &bare, &restored_bridge).await;
+        let event = tick_and_join(
+            &scheduler,
+            &mut maintenance,
+            &svn_repo,
+            &bare,
+            &restored_bridge,
+        )
+        .await;
         assert_eq!(event["type"], "repo_sync_failed", "{event}");
-        assert!(event["error"].as_str().unwrap().contains("unreceipted_svn_publication"));
-        let block = reposync_core::history_inspect::load_history_block_for_repo(&scheduler.db, REPO)
-            .unwrap().expect("worker must persist the scoped reconciliation reason");
+        assert!(event["error"]
+            .as_str()
+            .unwrap()
+            .contains("unreceipted_svn_publication"));
+        let block =
+            reposync_core::history_inspect::load_history_block_for_repo(&scheduler.db, REPO)
+                .unwrap()
+                .expect("worker must persist the scoped reconciliation reason");
         assert_eq!(block["reason"], "unreceipted_svn_publication");
         assert_eq!(block["p_handled"], prior.intended_local_git_sha);
         assert_eq!(block["r_fresh_remote"], genuine.intended_local_git_sha);
         assert_eq!(block["l_bridge"], prior.intended_local_git_sha);
-        assert_eq!(scheduler.db.get_repository(REPO).unwrap().unwrap().sync_status, "reconciliation_required");
-        assert!(scheduler.db.get_git_push_operation(REPO, &genuine.id).unwrap().is_none());
+        assert_eq!(
+            scheduler
+                .db
+                .get_repository(REPO)
+                .unwrap()
+                .unwrap()
+                .sync_status,
+            "reconciliation_required"
+        );
+        assert!(scheduler
+            .db
+            .get_git_push_operation(REPO, &genuine.id)
+            .unwrap()
+            .is_none());
         assert_eq!(ledger(&scheduler.db), prior_ledger);
         assert_eq!(bridge_witness(&restored_bridge), restored_checkout);
         assert_eq!(remote_witness(&svn_repo, &bare), after_publish);
     }
     assert_eq!(std::fs::read(sealed_db).unwrap(), seal);
-    assert_eq!(ledger(&Database::new(&root.join("reposync.db")).unwrap()), genuine_ledger);
+    assert_eq!(
+        ledger(&Database::new(&root.join("reposync.db")).unwrap()),
+        genuine_ledger
+    );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         json!({
