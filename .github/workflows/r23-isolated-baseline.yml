@@ -1,0 +1,105 @@
+name: R23 isolated baseline
+on:
+  push:
+    branches: [codex/r23-isolated-baseline]
+permissions:
+  contents: read
+jobs:
+  r23:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - name: Install and verify native tools
+        run: |
+          set -euo pipefail
+          sudo -n apt-get update
+          sudo -n apt-get install -y subversion git-lfs
+          rustc --version --verbose
+          cargo --version
+          git --version
+          for tool in svn svnadmin svnserve svnlook; do "$tool" --version; done
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^^)" = 707e8c910629cbd62e3027a6522fea663962012d
+          test "$(git rev-parse 'HEAD~1^{tree}')" = 75e6ad7d59371bb5bc7926f7f04cc498de2b2ebd
+          test "$(git diff-tree --no-commit-id --name-only -r HEAD^ HEAD)" = .github/workflows/r23-isolated-baseline.yml
+          git log -2 --format='%H %T %s'
+      - name: Compile the exact integration test binary
+        run: |
+          set -euo pipefail
+          cargo test --locked -p reposync-core --test real_engine_scenarios --no-run --message-format=json > "$RUNNER_TEMP/r23-cargo.jsonl"
+          python3 - "$RUNNER_TEMP/r23-cargo.jsonl" > "$RUNNER_TEMP/r23-bin" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding='utf-8') as source:
+              records = (json.loads(line) for line in source)
+              result = [row['executable'] for row in records
+                        if row.get('reason') == 'compiler-artifact' and row.get('executable')
+                        and row['target']['name'] == 'real_engine_scenarios'
+                        and 'test' in row['target']['kind'] and row['profile']['test']]
+          if len(result) != 1:
+              raise SystemExit(f'Expected one test executable, got {len(result)}')
+          print(result[0])
+          PY
+      - name: Execute only R23, offline except loopback
+        run: |
+          set -euo pipefail
+          box=$(mktemp -d /tmp/reposync-r23.XXXXXXXX)
+          trap 'sudo -n rm -rf -- "$box"' EXIT
+          chmod 0755 "$box"
+          install -m 0555 "$(cat "$RUNNER_TEMP/r23-bin")" "$box/scenarios"
+          sudo -n install -d -m 0700 -o nobody -g nogroup "$box/home" "$box/tmp"
+          cat > "$box/run-r23.sh" <<'R23_SH'
+          set -euo pipefail
+          test "$(id -u)" = 65534
+          test -w "$HOME" && test -w "$TMPDIR"
+          test "$(id -G)" = "$(id -g)"
+          awk '/^(CapInh|CapPrm|CapEff|CapBnd|CapAmb):/ { if ($2 !~ /^0+$/) bad=1 } /^NoNewPrivs:/ { locked=$2 } END { exit (bad || locked != 1) }' /proc/self/status
+          git --version
+          for tool in svn svnadmin svnserve svnlook; do "$tool" --version; done
+          exec timeout --kill-after=5s 180s "$1" --ignored --exact "$2" --nocapture --test-threads=1
+          R23_SH
+          chmod 0444 "$box/run-r23.sh"
+          cd "$box"
+          case_id=finalized_history::diagnostic_r23_restored_prewrite_database
+          set +e
+          sudo -n unshare --net --fork --kill-child /bin/bash -euc '
+            ip link set lo up
+            links=$(ip -o link show)
+            test "$(printf "%s\n" "$links" | cut -d : -f2)" = " lo"
+            v4=$(ip -4 route show default)
+            v6=$(ip -6 route show default)
+            test -z "$v4$v6"
+            ip -o addr show dev lo
+            # Drop the runner identity, all groups/capabilities, and ambient environment.
+            exec /usr/bin/setpriv --reuid=nobody --regid=nogroup --clear-groups \
+              --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs \
+              /usr/bin/env -i \
+              PATH=/usr/bin:/bin HOME="$1/home" TMPDIR="$1/tmp" LC_ALL=C \
+              GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+              GIT_AUTHOR_NAME="Fixture User" GIT_AUTHOR_EMAIL=fixture@example.invalid \
+              GIT_COMMITTER_NAME="Fixture User" GIT_COMMITTER_EMAIL=fixture@example.invalid \
+              REPOSYNC_TEST_SVN_PW=fixture-only-svn-secret REPOSYNC_TEST_GH_TOKEN=fixture-only-git-secret \
+              /bin/bash "$1/run-r23.sh" "$1/scenarios" "$2"
+          ' bash "$box" "$case_id" </dev/null 2>&1 | tee "$RUNNER_TEMP/r23-run.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          test "${statuses[1]}" -eq 0
+          python3 - "$RUNNER_TEMP/r23-run.log" <<'PY'
+          import json, pathlib, re, sys
+          data = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
+          markers = re.findall(r'R23_BASELINE_OBSERVATION (\{[^\n]+\})', data)
+          if len(markers) != 1:
+              raise SystemExit('Expected exactly one R23 baseline observation')
+          receipt = json.loads(markers[0])
+          cases = {(row['driver'], row['cold_attempt']) for row in receipt['cases']}
+          expected = {(driver, n) for driver in ('scheduler_baseline_resolver', 'direct_engine') for n in (1, 2)}
+          if len(receipt['cases']) != 4 or cases != expected:
+              raise SystemExit(f'Unexpected R23 lane/attempt identities: {cases!r}')
+          if receipt.get('expected_safe_disposition') is not True or not re.search(
+              r'^test result: ok\. 1 passed; 0 failed; 0 ignored;', data, flags=re.M):
+              raise SystemExit('R23 ran but did not establish the required safe disposition')
+          PY
+          test "${statuses[0]}" -eq 0
