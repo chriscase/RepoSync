@@ -41,11 +41,13 @@ const FINALIZED_CHANGES: [(&str, &str, &str); 3] = [
 
 fn git_push_documents(db: &Database, repo_id: &str) -> Vec<GitPushOperation> {
     let conn = db.conn();
-    let mut stmt = conn.prepare(
-        "SELECT value FROM kv_state
+    let mut stmt = conn
+        .prepare(
+            "SELECT value FROM kv_state
          WHERE key GLOB 'svn_to_git_push_v1:document:*' AND json_extract(value, '$.repo_id') = ?1
          ORDER BY json_extract(value, '$.source_svn_rev'), key",
-    ).unwrap();
+        )
+        .unwrap();
     let documents = stmt
         .query_map([repo_id], |row| row.get::<_, String>(0))
         .unwrap();
