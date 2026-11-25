@@ -94,6 +94,7 @@ async fn fixture(
     });
 
     let app = Router::new()
+        .merge(api::auth::routes())
         .merge(api::setup::routes())
         .merge(api::config::routes())
         .with_state(state.clone());
@@ -415,4 +416,40 @@ async fn admin_and_bootstrap_matrix_preserves_existing_admission() {
         assert!(state.import_handles.lock().await.is_empty());
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn page_identity_observes_the_current_session_mode() {
+    let (addr, state, server, _tmp) = fixture(true).await;
+    let me = "/api/auth/me";
+    assert_eq!(
+        call(addr, Some(TEST_TOKEN), "GET", me, Value::Null)
+            .await
+            .status(),
+        200
+    );
+    add_user(&state, "named", "admin", true, false);
+    add_user(&state, "disabled", "admin", false, false);
+    for (token, expected) in [("named", 200), ("disabled", 401), (TEST_TOKEN, 401)] {
+        assert_eq!(
+            call(addr, Some(token), "GET", me, Value::Null)
+                .await
+                .status(),
+            expected
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn unavailable_user_count_cannot_enable_setup_bootstrap() {
+    let (addr, state, server, _tmp) = fixture(false).await;
+    state
+        .db
+        .conn()
+        .execute("ALTER TABLE users RENAME TO unavailable_users", [])
+        .unwrap();
+    let response = call(addr, None, "GET", "/api/setup/import/status", Value::Null).await;
+    assert_eq!(response.status(), 500);
+    server.abort();
 }

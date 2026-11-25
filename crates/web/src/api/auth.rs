@@ -482,10 +482,13 @@ async fn me(
         .ok_or_else(|| AppError::Unauthorized("missing or invalid Authorization header".into()))?;
 
     // Check DB session
+    let db = &state.db;
     let db_result = {
-        let db = &state.db;
         if let Ok(Some(session)) = db.get_session(token) {
             if let Ok(Some(user)) = db.get_user(&session.user_id) {
+                if !user.enabled {
+                    return Err(AppError::Unauthorized("user disabled".into()));
+                }
                 Some(serde_json::json!({
                     "id": user.id,
                     "username": user.username,
@@ -505,7 +508,15 @@ async fn me(
         return Ok(Json(user_json));
     }
 
-    // Fallback: if in-memory session exists (legacy mode), return minimal info
+    // Only an installation using the legacy password can have a legacy identity.
+    if state.config.web.admin_password.is_none()
+        || db
+            .count_users()
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            > 0
+    {
+        return Err(AppError::Unauthorized("session expired or invalid".into()));
+    }
     let sessions = state.sessions.read().await;
     if let Some(expires_at) = sessions.get(token) {
         if *expires_at > Utc::now() {
@@ -629,4 +640,22 @@ pub async fn validate_session_with_role(
     }
 
     Err(AppError::Unauthorized("session expired or invalid".into()))
+}
+
+/// Require a valid administrator session and return its identity for audited actions.
+pub(super) async fn require_admin(
+    state: &Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+) -> Result<String, AppError> {
+    let (user_id, role) = validate_session_with_role(
+        state,
+        headers
+            .get("authorization")
+            .and_then(|header| header.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Forbidden("admin access required".into()));
+    }
+    Ok(user_id)
 }

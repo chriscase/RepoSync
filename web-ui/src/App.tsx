@@ -1,6 +1,7 @@
 import { clientSession } from './session';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import Layout from './components/Layout';
+import AdministratorRoute from './components/AdministratorRoute';
 import Dashboard from './pages/Dashboard';
 import Conflicts from './pages/Conflicts';
 import ConflictDetail from './pages/ConflictDetail';
@@ -40,12 +41,12 @@ export default function App() {
         <Route path="repos/:id" element={<RepoDetail />} />
         <Route path="conflicts" element={<Conflicts />} />
         <Route path="conflicts/:id" element={<ConflictDetail />} />
-        <Route path="config" element={<Config />} />
+        <Route path="config" element={<AdministratorRoute><Config /></AdministratorRoute>} />
         <Route path="audit" element={<AuditLog />} />
         <Route path="settings" element={<UserSettings />} />
         <Route path="users" element={<AdminUsers />} />
         <Route path="ldap" element={<AdminLdap />} />
-        <Route path="setup" element={<SetupWizard />} />
+        <Route path="setup" element={<AdministratorRoute><SetupWizard /></AdministratorRoute>} />
         <Route path="docs" element={<Documentation />} />
       </Route>
     </Routes>
