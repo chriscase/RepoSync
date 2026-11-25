@@ -296,6 +296,16 @@ fn old_import_progress_counts_log_entries_on_a_sparse_svn_branch() {
         read_planned_cutover_pins(&conn, ID).unwrap().mappings.len(),
         2
     );
+    conn.execute(
+        "UPDATE audit_log SET svn_rev=15 WHERE action='import_full'",
+        [],
+    )
+    .unwrap();
+    let pins = read_planned_cutover_pins(&conn, ID).unwrap();
+    assert_eq!(
+        (pins.import_completion_svn_rev, pins.import_log_entry_count),
+        (Some(15), Some(2))
+    );
     conn.execute_batch("UPDATE import_progress SET current_rev=12,total_revs=99; UPDATE audit_log SET details='Full history import: 2 commits from 99 revisions'").unwrap();
     assert!(read_planned_cutover_pins(&conn, ID).is_err());
 }

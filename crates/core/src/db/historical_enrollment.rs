@@ -16,6 +16,8 @@ pub struct LegacyPairPins {
     pub git_repo: String,
     pub git_branch: String,
     pub last_svn_rev: i64,
+    pub import_completion_svn_rev: Option<i64>,
+    pub import_log_entry_count: Option<i64>,
     pub last_git_sha: String,
     pub mappings: Vec<(i64, String)>,
     pub storage_sha256: String,
@@ -101,7 +103,7 @@ fn stored_pair(
         [id], |r| Ok(LegacyPairPins {
             repo_id:r.get(0)?, svn_url:r.get(1)?, svn_branch:r.get(2)?, svn_username:r.get(3)?,
             git_provider:r.get(4)?, git_api_url:r.get(5)?, git_repo:r.get(6)?, git_branch:r.get(7)?,
-            last_svn_rev:r.get(8)?, last_git_sha:r.get(9)?, scope_uuid:String::new(),
+            last_svn_rev:r.get(8)?, import_completion_svn_rev:None, import_log_entry_count:None, last_git_sha:r.get(9)?, scope_uuid:String::new(),
             generation:0, mappings:vec![], storage_sha256:String::new(),
         })
     ).optional()?.ok_or_else(|| refused("the requested paused full-import root was not found"))?;
@@ -165,6 +167,7 @@ fn stored_pair(
         "SELECT json_array(id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,enabled,sync_status,created_at,updated_at,last_svn_rev,last_git_sha,parent_id,allowed_paths,blocked_patterns) FROM repositories WHERE id=?1",
         "SELECT json_array(id,svn_rev,git_sha,direction,synced_at,svn_author,git_author) FROM commit_map WHERE repo_id=?1 ORDER BY svn_rev,id",
         "SELECT json_array(id,svn_rev,git_sha,direction,status,author,message,timestamp,synced_at) FROM sync_records WHERE repo_id=?1 ORDER BY svn_rev,id",
+        "SELECT json_array(id,repo_id,direction,svn_rev,git_sha,details,created_at,success) FROM audit_log WHERE action='import_full' AND (repo_id=?1 OR repo_id IS NULL) ORDER BY id",
         "SELECT json_array(id,repo_id,phase,current_rev,total_revs,commits_created,batches_pushed,updated_at) FROM import_progress WHERE repo_id=?1 OR repo_id IS NULL ORDER BY id",
     ] {hash_rows(conn,id,sql,&mut hash)?;}
     // Scope migration moves the legacy Git key. Bind its logical presence/value in either spelling.
@@ -195,10 +198,28 @@ fn stored_pair(
         }
         hash.update([u8::from(present)]);
     }
-    if !conn.query_row("SELECT EXISTS(SELECT 1 FROM commit_map WHERE repo_id<>?1) OR EXISTS(SELECT 1 FROM repositories WHERE id<>?1 AND (last_svn_rev>0 OR last_git_sha!=''))",[id],|r|r.get::<_,bool>(0))? {
-        for (source,expected) in [("git_sha",&pair.last_git_sha),("svn_rev",&pair.last_svn_rev.to_string())] {
-            let value:Option<String>=conn.query_row("SELECT value FROM watermarks WHERE source=?1",[source],|r|r.get(0)).optional()?;
-            if value.as_ref().is_some_and(|v|v!=expected) { return Err(refused("a legacy import watermark contradicts its only published pair")); }
+    let sole_publisher = !conn.query_row("SELECT EXISTS(SELECT 1 FROM commit_map WHERE repo_id<>?1)
+        OR EXISTS(SELECT 1 FROM sync_records WHERE repo_id<>?1) OR EXISTS(SELECT 1 FROM repositories WHERE id<>?1 AND (last_svn_rev>0 OR last_git_sha!=''))",
+        [id],|r|r.get::<_,bool>(0))?;
+    (pair.import_completion_svn_rev, pair.import_log_entry_count) =
+        import_completion(conn, &pair, sole_publisher)?;
+    if sole_publisher {
+        for (source, expected) in [
+            ("git_sha", &pair.last_git_sha),
+            ("svn_rev", &pair.last_svn_rev.to_string()),
+        ] {
+            let value: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM watermarks WHERE source=?1",
+                    [source],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if value.as_ref().is_some_and(|v| v != expected) {
+                return Err(refused(
+                    "a legacy import watermark contradicts its only published pair",
+                ));
+            }
             hash.update([u8::from(value.is_some())]);
         }
     }
@@ -262,6 +283,7 @@ fn require_single_published_pair(
            UNION ALL SELECT repo_id FROM import_progress WHERE repo_id IS NOT NULL AND (phase<>'idle' OR current_rev<>0 OR commits_created<>0 OR batches_pushed<>0)
          ) h WHERE NOT EXISTS(SELECT 1 FROM repositories r WHERE r.id=h.repo_id))
         OR EXISTS(SELECT 1 FROM sync_state) OR EXISTS(SELECT 1 FROM pr_sync_log)
+        OR EXISTS(SELECT 1 FROM audit_log WHERE repo_id IS NULL AND action<>'import_full' AND (svn_rev IS NOT NULL OR COALESCE(git_sha,'')<>''))
         OR EXISTS(SELECT 1 FROM kv_state WHERE key GLOB 'independently_established_svn_uuid:*' OR key GLOB 'import_operation_*'
             OR (key GLOB 'last_git_sha_*' AND value<>'' AND key<>'last_git_sha_'||?1)
             OR (key GLOB 'last_svn_rev_*' AND value NOT IN ('','0') AND key<>'last_svn_rev_'||?1)
@@ -274,28 +296,40 @@ fn require_single_published_pair(
             "unattributed history needs review before migrating this database",
         ));
     }
+    Ok(())
+}
+
+fn import_completion(
+    conn: &Connection,
+    pair: &LegacyPairPins,
+    include_singleton: bool,
+) -> Result<(Option<i64>, Option<i64>), DatabaseError> {
     // Both original daemons emitted these two singleton records without repo_id.
     // Corroborate the one documented full import against this pair's real keyed rows.
     let ambiguous:bool=conn.query_row(
         "WITH progress AS (
-           SELECT * FROM import_progress WHERE repo_id IS NULL AND (phase<>'idle' OR current_rev<>0 OR commits_created<>0 OR batches_pushed<>0)
-         ), audit AS (SELECT * FROM audit_log WHERE repo_id IS NULL AND (svn_rev IS NOT NULL OR COALESCE(git_sha,'')<>''))
+           SELECT * FROM import_progress WHERE (repo_id=?1 OR (?4 AND repo_id IS NULL)) AND (phase<>'idle' OR current_rev<>0 OR commits_created<>0 OR batches_pushed<>0)
+         ), audit AS (SELECT * FROM audit_log WHERE action='import_full' AND (repo_id=?1 OR (?4 AND repo_id IS NULL)))
          SELECT (SELECT COUNT(*) FROM progress)>1 OR (SELECT COUNT(*) FROM audit)>1
          OR EXISTS(SELECT 1 FROM progress p WHERE p.phase<>'completed' OR p.current_rev<>p.total_revs OR p.total_revs<p.commits_created OR p.commits_created<>?3
             OR julianday(p.started_at) IS NULL OR julianday(p.completed_at) IS NULL OR julianday(p.started_at)>julianday(p.completed_at)
             OR EXISTS(SELECT 1 FROM (SELECT synced_at FROM commit_map WHERE repo_id=?1 UNION ALL SELECT synced_at FROM sync_records WHERE repo_id=?1) m
                  WHERE julianday(m.synced_at) IS NULL OR julianday(m.synced_at) NOT BETWEEN julianday(p.started_at) AND julianday(p.completed_at)))
          OR EXISTS(SELECT 1 FROM audit a WHERE a.action<>'import_full' OR a.success<>1 OR a.direction IS NOT 'svn_to_git'
-            OR a.svn_rev IS NOT ?2 OR COALESCE(a.git_sha,'')<>'' OR NOT EXISTS(SELECT 1 FROM progress p
+            OR a.svn_rev IS NULL OR a.svn_rev<?2 OR COALESCE(a.git_sha,'')<>'' OR NOT EXISTS(SELECT 1 FROM progress p
                 WHERE julianday(a.created_at) BETWEEN julianday(p.started_at) AND julianday(p.completed_at)
                 AND a.details='Full history import: '||p.commits_created||' commits from '||p.total_revs||' revisions'))",
-        params![pair.repo_id,pair.last_svn_rev,pair.mappings.len() as i64],|r|r.get(0))?;
+        params![pair.repo_id,pair.last_svn_rev,pair.mappings.len() as i64,include_singleton],|r|r.get(0))?;
     if ambiguous {
         return Err(refused(
             "unassigned older import evidence cannot be correlated to the selected mapped history",
         ));
     }
-    Ok(())
+    let head=conn.query_row("SELECT svn_rev FROM audit_log WHERE action='import_full' AND (repo_id=?1 OR (?2 AND repo_id IS NULL))",
+        params![pair.repo_id,include_singleton],|r|r.get(0)).optional()?;
+    let count=conn.query_row("SELECT total_revs FROM import_progress WHERE phase='completed' AND (repo_id=?1 OR (?2 AND repo_id IS NULL))",
+        params![pair.repo_id,include_singleton],|r|r.get(0)).optional()?;
+    Ok((head, count))
 }
 
 fn planned_view(mut pins: LegacyPairPins) -> LegacyPairPins {
@@ -369,6 +403,14 @@ where
     }
     let transport = read_registered_transport(conn, &pins)?;
     let proof = verify(&pins, &transport)?;
+    if pins
+        .import_log_entry_count
+        .is_some_and(|n| usize::try_from(n).ok() != Some(proof.verified_branch_revisions()))
+    {
+        return Err(refused(
+            "verified branch revision count differs from the completed historical import",
+        ));
+    }
     let canonical = proof.lineage();
     if proof.pair() != &pins
         || proof.review_sha256() != review
