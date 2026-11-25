@@ -395,14 +395,14 @@ async function runScenarios(uiOrigin, session, mode) {
     }
     throw new Error(`Timed out: ${label}; path=${await pathOf().catch(() => '?')}; body=${(await body().catch(() => last)).slice(0, 500)}`);
   };
-  const click = async (testId) => {
+  const click = async (testId, descendant = '') => {
     const clicked = await evaluate(`(() => {
-      const el = document.querySelector('[data-testid="${testId}"]');
+      const el = document.querySelector(${JSON.stringify(`[data-testid="${testId}"]${descendant}`)});
       if (!el) return false;
       el.click();
       return true;
     })()`);
-    if (!clicked) throw new Error(`Missing [data-testid=${testId}]\n${await body()}`);
+    if (!clicked) throw new Error(`Missing [data-testid=${testId}]${descendant}\n${await body()}`);
   };
   const goto = async (pathname, ready) => {
     await send('Page.navigate', { url: `${uiOrigin}${pathname}` });
@@ -486,7 +486,7 @@ async function runScenarios(uiOrigin, session, mode) {
     if ((await heading()) === '') throw new Error('Parent heading disappeared');
     results.push('real-delete-child-stays-on-parent');
 
-    await click(`branch-pair-row-${viewedId}`);
+    await click(`branch-pair-row-${viewedId}`, ` a[href="/repos/${viewedId}"]`);
     await until(async () => (await pathOf()) === `/repos/${viewedId}` && (await heading()).includes('Viewed pair'), 'open viewed pair');
     await click('delete-viewed-branch-pair');
     const during = Date.now();
