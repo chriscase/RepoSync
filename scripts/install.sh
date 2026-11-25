@@ -166,6 +166,26 @@ install_from_verified_archive() {
             use_sudo=0
         fi
     fi
+    # Darwin runs the foreground daemon as the person who installed it. A
+    # privileged mkdir would leave a fresh default database unwritable.
+    # Preserve ownership and contents of every existing data directory.
+    if [[ "$INSTALL_OS" == Darwin && -z "$prefix" && ! -e "$data_dir" && ! -L "$data_dir" ]]; then
+        local runtime_user parent_dir
+        parent_dir="$(dirname -- "$data_dir")"
+        runtime_user="$(id -un)"
+        if [[ "$(id -u)" == 0 && -n "${SUDO_USER:-}" ]]; then runtime_user="$SUDO_USER"; fi
+        if [[ "$use_sudo" -eq 1 ]]; then
+            sudo mkdir -p "$parent_dir"
+            sudo install -d -m 700 -o "$runtime_user" "$data_dir"
+        else
+            mkdir -p "$parent_dir"
+            if [[ "$(id -u)" == 0 ]]; then
+                install -d -m 700 -o "$runtime_user" "$data_dir"
+            else
+                mkdir -m 700 "$data_dir"
+            fi
+        fi
+    fi
     # Parents must exist before copying. The systemd unit directory is a
     # default-install destination, including a direct root install that does
     # not escalate. A prefix install never uses it.
@@ -353,6 +373,10 @@ echo "       REPOSYNC_SESSION_SECRET=$(openssl rand -hex 32)"
 if [[ "$INSTALL_OS" == Linux ]]; then
     echo "  4. Start the daemon: sudo systemctl enable --now reposync"
 else
-    echo "  4. Export the variables above and run ${INSTALL_DIR}/reposync-daemon --config ${CONFIG_DIR}/config.toml"
+    echo "  4. Run the foreground daemon as the non-root account that owns the configured data directory."
+    if [[ "$(id -u)" == 0 && -z "${SUDO_USER:-}" ]]; then
+        echo "     Set data_dir in ${CONFIG_DIR}/config.toml to a private directory owned by that account before starting."
+    fi
+    echo "     Export the variables above and run ${INSTALL_DIR}/reposync-daemon --config ${CONFIG_DIR}/config.toml"
 fi
 echo "  5. Open http://your-server:8080 for the dashboard"

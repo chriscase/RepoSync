@@ -292,7 +292,10 @@ set -e
 printf 'INNER_EXIT direct_root %s\n' "$root_code" | tee -a /tmp/rs118-inner-exits.txt
 [[ "$root_code" -eq 0 ]] || fail "direct-root temp install failed"
 check_service_destination "$root_root"
-sudo rm -rf "$root_root"
+if [[ "$(uname -s)" == Darwin ]]; then
+    [[ "$(id -u)" -ne 0 ]] || fail "macOS qualification needs a non-root foreground account"
+    [[ -O "${root_root}/var/lib/reposync" && -w "${root_root}/var/lib/reposync" ]] || fail "foreground account cannot write installed data directory"
+fi
 
 prefix="$(mktemp -d)"
 unit_trap="$(mktemp -d)"
@@ -317,6 +320,7 @@ echo "building native release binaries"
 (cd "$ROOT" && rustup run stable cargo build --release --bin reposync --bin reposync-daemon)
 bash "${ROOT}/scripts/assemble_release_archive.sh" --bin-dir "$BIN_DIR" --out "$OUT"
 product_sha="$(verified_digest "$OUT" sha256sum_c_product)"
+echo "PRODUCT_ARCHIVE ${target} SHA256 ${product_sha}"
 bash "${ROOT}/scripts/install.sh" --from-archive --archive "$OUT" --sha256 "$product_sha" --prefix "$prefix"
 [[ "$(cat "${prefix}/etc/reposync/config.toml")" == "kept-config" ]] || fail "config changed during binary replacement"
 [[ -f "${prefix}/etc/reposync/reposync.service" ]] || fail "prefix unit missing after binary replacement"
@@ -362,11 +366,17 @@ with socket.socket() as sock:
 PYPORT
 )"
 runtime="${prefix}/etc/reposync/runtime.toml"
+runtime_data="${prefix}/var/lib/reposync"
+if [[ "$(uname -s)" == Darwin ]]; then
+    # Exercise the data directory the privileged default-path install created,
+    # using the ordinary account that launches the foreground daemon.
+    runtime_data="${root_root}/var/lib/reposync"
+fi
 cat > "$runtime" <<EOF
 [daemon]
 poll_interval_secs = 3600
 log_level = "error"
-data_dir = "${prefix}/var/lib/reposync-runtime"
+data_dir = "${runtime_data}"
 
 [svn]
 url = "file:///tmp/reposync-118-no-such-repo"
@@ -420,6 +430,7 @@ with open("/tmp/rs118-health.out") as reply:
 if health.get("ok") is not True or not health.get("version"):
     raise SystemExit("installed daemon returned an invalid health response")
 PYHEALTH
+[[ -s "${runtime_data}/reposync.db" && -O "${runtime_data}/reposync.db" ]] || fail "daemon did not create an owned database in the install directory"
 curl -fsS "http://127.0.0.1:${port}/" -o /tmp/rs118-index.html
 grep -q "RepoSync Dashboard" /tmp/rs118-index.html || fail "product index missing"
 cmp /tmp/rs118-index.html "${ROOT}/web-ui/dist/index.html" || fail "served index differs from the web-ui build"
@@ -455,4 +466,5 @@ kill "$daemon_pid"
 wait "$daemon_pid" || true
 trap - EXIT
 rm -rf "$prefix" "$previous_prefix" "$unit_trap" "$stub_dir"
+sudo rm -rf "$root_root"
 echo "QUALIFY_EXIT 0"
