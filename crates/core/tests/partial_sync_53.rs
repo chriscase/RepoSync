@@ -1,0 +1,2581 @@
+//! #53 SVN→Git filtering with early #60 assertions, on real private SVN and
+//! Git repositories driven through the actual `SyncEngine` cycle.
+//!
+//! Each case starts from a fresh `svnadmin` repository (fresh UUID), commits
+//! an SVN-origin baseline, imports it through the pinned snapshot importer and
+//! completes that import, then runs ordinary engine cycles with path rules.
+//! "Reopen" drops the engine, database and writer fence and opens them again.
+//! These cases require `svn`, `svnadmin` and `git`; they fail, never skip,
+//! when the toolchain is missing.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+
+use tokio::sync::RwLock;
+
+use reposync_core::config::{AppConfig, IdentityConfig, SvnLayout};
+use reposync_core::db::import_operations::import_target_fingerprint;
+use reposync_core::db::lineage_checkpoints::{
+    load_mapping_outcome, svn_source_key, CheckpointDirection, MappingOutcome,
+};
+use reposync_core::db::nullable_commit_map::CommitMapTarget;
+use reposync_core::db::team_cycle_mapping_operations::{
+    TeamCycleMappingOutcome, TeamCycleMappingState,
+};
+use reposync_core::db::Database;
+use reposync_core::errors::SyncError;
+use reposync_core::file_policy::FilePolicy;
+use reposync_core::git::GitClient;
+use reposync_core::identity::mapper::IdentityMapper;
+use reposync_core::import::{ImportConfig, ImportOutcome, ImportProgress, ImportRunState};
+use reposync_core::models::Repository;
+use reposync_core::snapshot::{resolve_snapshot_pin, SnapshotRevision};
+use reposync_core::svn::SvnClient;
+use reposync_core::sync_engine::SyncEngine;
+use reposync_core::writer_fence;
+use tempfile::TempDir;
+
+const REPO: &str = "partial-53";
+
+/// This target serializes its own real-fence cases; nothing else shares it.
+fn serial() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &LOCK
+}
+
+fn require_toolchain() {
+    for tool in ["svn", "svnadmin", "git"] {
+        let found = Command::new(tool)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(found, "#53 native case requires `{tool}` on PATH");
+    }
+}
+
+fn run(dir: &Path, program: &str, args: &[&str]) -> String {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .env("LC_ALL", "C.UTF-8")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Partial fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Partial fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{program} {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// SVN CLI operand for a literal working-copy path (peg-escape any `@`).
+fn op(path: &str) -> String {
+    format!("{path}@")
+}
+
+/// An engine and the real writer-fence guard held for it. Fields drop in
+/// order: the engine and its database first, then the guard, which releases
+/// the lease. Dropping this is a true close; the next open reclaims.
+struct OwnedEngine {
+    engine: SyncEngine,
+    _fence: writer_fence::WriterFenceGuard,
+}
+
+impl std::ops::Deref for OwnedEngine {
+    type Target = SyncEngine;
+    fn deref(&self) -> &SyncEngine {
+        &self.engine
+    }
+}
+
+/// The durable writer-fence lease, read through the product's read-only
+/// inspection entrance `Database::open_existing_read_only`, not `Database::new`
+/// (which creates, sets WAL, checkpoints with TRUNCATE and integrity-checks).
+/// That entrance never creates storage, disables checkpoint-on-close before any
+/// read and refuses empty or pending-rollback storage. The handle is closed
+/// explicitly by dropping it. SQLite may still create or touch the `-wal`/`-shm`
+/// sidecars.
+///
+/// `None` means the database was read and holds no lease row. A refused open or a
+/// failed read panics with its own message, so it is never reported as an absent
+/// lease.
+fn fence_lease(db_path: &Path) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    let db = match Database::open_existing_read_only(db_path) {
+        Ok(db) => db,
+        Err(e) => panic!("writer-fence lease read failed (not an absent lease): open: {e}"),
+    };
+    let lease = db
+        .conn()
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = 'writer_fence_v1:lease'",
+            [],
+            |row| row.get(0),
+        )
+        .optional();
+    drop(db);
+    match lease {
+        Ok(lease) => lease,
+        Err(e) => panic!("writer-fence lease read failed (not an absent lease): query: {e}"),
+    }
+}
+
+struct Fixture {
+    tmp: TempDir,
+    svn_url: String,
+    wc: PathBuf,
+    bare: PathBuf,
+    git_work: PathBuf,
+    data_dir: PathBuf,
+    db_path: PathBuf,
+    developer: Option<PathBuf>,
+}
+
+impl Fixture {
+    /// Fresh SVN repository and baseline r1, imported and completed before
+    /// any mapping or watermark exists.
+    async fn new(baseline: &[(&str, &str)]) -> Self {
+        require_toolchain();
+        let tmp = TempDir::new().unwrap();
+        let repo_dir = tmp.path().join("svn_repo");
+        run(
+            tmp.path(),
+            "svnadmin",
+            &["create", repo_dir.to_str().unwrap()],
+        );
+        let hook = repo_dir.join("hooks/pre-revprop-change");
+        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let svn_url = format!("file://{}", repo_dir.display());
+        let wc = tmp.path().join("svn_wc");
+        run(
+            tmp.path(),
+            "svn",
+            &[
+                "checkout",
+                &svn_url,
+                wc.to_str().unwrap(),
+                "--non-interactive",
+            ],
+        );
+        let fixture_paths = Fixture {
+            svn_url: svn_url.clone(),
+            wc: wc.clone(),
+            bare: tmp.path().join("origin.git"),
+            git_work: tmp.path().join("git_work"),
+            data_dir: tmp.path().join("data"),
+            // The canonical name: WriterFenceGuard::drop releases its lease in
+            // `<data_dir>/reposync.db`. Any other name leaves the lease behind.
+            db_path: tmp.path().join("data").join("reposync.db"),
+            developer: None,
+            tmp,
+        };
+        for (path, bytes) in baseline {
+            fixture_paths.write(path, bytes);
+        }
+        // Observation-only: the projection producer records what it actually read
+        // and planned here (debug builds); dumped only if this case panics.
+        std::env::set_var(
+            "REPOSYNC_RS53_OBSERVE_DIR",
+            fixture_paths.tmp.path().join("observe"),
+        );
+        let baseline_rev = fixture_paths.commit("baseline r1");
+        fixture_paths.import(baseline_rev).await;
+        fixture_paths
+    }
+
+    fn write(&self, path: &str, bytes: &str) {
+        let file = self.wc.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let existed = file.exists();
+        std::fs::write(&file, bytes).unwrap();
+        if !existed {
+            run(&self.wc, "svn", &["add", "--parents", "--force", &op(path)]);
+        }
+    }
+
+    fn svn(&self, args: &[&str]) {
+        run(&self.wc, "svn", args);
+    }
+
+    fn commit(&self, message: &str) -> i64 {
+        let out = run(
+            &self.wc,
+            "svn",
+            &["commit", "-m", message, ".", "--non-interactive"],
+        );
+        run(&self.wc, "svn", &["update", "--non-interactive"]);
+        out.lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("Committed revision ")
+                    .map(|rev| rev.trim_end_matches('.').parse::<i64>().unwrap())
+            })
+            .expect("committed revision")
+    }
+
+    async fn import(&self, selected: i64) {
+        git2::Repository::init_bare(&self.bare).unwrap();
+        let git_client = Arc::new(std::sync::Mutex::new(
+            GitClient::init(&self.git_work).unwrap(),
+        ));
+        run(&self.git_work, "git", &["checkout", "-B", "main"]);
+        run(
+            &self.git_work,
+            "git",
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("file://{}", self.bare.display()),
+            ],
+        );
+        std::fs::create_dir_all(&self.data_dir).unwrap();
+        let db = Database::new(&self.db_path).unwrap();
+        db.initialize().unwrap();
+        let fence = writer_fence::claim(&db, &self.data_dir).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let repo = Repository {
+            id: REPO.into(),
+            name: "Partial".into(),
+            svn_url: self.svn_url.clone(),
+            svn_branch: String::new(),
+            svn_username: String::new(),
+            git_provider: "local".into(),
+            git_api_url: format!("file://{}", self.tmp.path().display()),
+            git_repo: "origin".into(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 0,
+            last_git_sha: String::new(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        };
+        db.insert_repository(&repo).unwrap();
+        let op = db
+            .create_import_operation(
+                REPO,
+                "fixture",
+                "partial-53",
+                &import_target_fingerprint(&repo, &self.git_work),
+            )
+            .unwrap();
+        let svn = SvnClient::new(&self.svn_url, "", "");
+        let pin = resolve_snapshot_pin(&svn, SnapshotRevision::Number(selected))
+            .await
+            .unwrap();
+        db.pin_snapshot_import(REPO, &op.id, pin.clone()).unwrap();
+        db.start_import_operation(REPO, &op.id).unwrap();
+        let outcome = reposync_core::import::run_snapshot_import(
+            &svn,
+            &git_client,
+            &db,
+            &FilePolicy::new(0, Vec::new()),
+            &ImportConfig {
+                committer_name: "Test User".into(),
+                committer_email: "test@example.com".into(),
+                remote_name: "origin".into(),
+                branch: "main".into(),
+                push_token: None,
+                message_prefix: None,
+                trunk_path: String::new(),
+            },
+            &pin,
+            ImportRunState {
+                progress: Arc::new(RwLock::new(ImportProgress::default())),
+                ws_broadcast: None,
+                repo_id: Some(REPO.into()),
+                operation_id: Some(op.id.clone()),
+                cancel_signal: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ImportOutcome::Completed {
+            svn_rev, git_sha, ..
+        } = outcome
+        else {
+            panic!("baseline import must complete: {outcome:?}");
+        };
+        assert_eq!(svn_rev, selected);
+        db.complete_import_operation(REPO, &op.id, svn_rev, &git_sha)
+            .unwrap();
+        drop(db);
+        drop(fence);
+        assert_eq!(
+            fence_lease(&self.db_path),
+            None,
+            "the import's writer fence is really released"
+        );
+    }
+
+    /// A real reopen: a new database handle, startup holds, a new engine.
+    /// Admit `allowed`/`blocked` on the repository row (JSON arrays, NULL
+    /// when empty) and build the engine's rules from that row exactly as the
+    /// daemon scheduler does. This is the production authority for policy.
+    fn engine(&self, allowed: &[&str], blocked: &[&str]) -> OwnedEngine {
+        self.admit_policy(allowed, blocked);
+        self.engine_with_rules_from_row()
+    }
+
+    fn admit_policy(&self, allowed: &[&str], blocked: &[&str]) {
+        let encode = |rules: &[&str]| -> Option<String> {
+            (!rules.is_empty()).then(|| serde_json::to_string(rules).unwrap())
+        };
+        let db = Database::new(&self.db_path).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE repositories SET allowed_paths = ?1, blocked_patterns = ?2 WHERE id = ?3",
+                rusqlite::params![encode(allowed), encode(blocked), REPO],
+            )
+            .unwrap();
+    }
+
+    fn engine_with_rules_from_row(&self) -> OwnedEngine {
+        let mut owned = self.engine_without_rules();
+        let engine = &mut owned.engine;
+        let row = engine.db().get_repository(REPO).unwrap().unwrap();
+        let parse = |raw: Option<&str>| -> Vec<String> {
+            raw.map(|raw| serde_json::from_str::<Vec<String>>(raw).unwrap())
+                .unwrap_or_default()
+        };
+        let allowed = parse(row.allowed_paths.as_deref());
+        let blocked = parse(row.blocked_patterns.as_deref());
+        if !allowed.is_empty() || !blocked.is_empty() {
+            engine.set_path_rules(allowed, blocked);
+        }
+        owned
+    }
+
+    /// An engine whose in-memory rules are NOT the admitted row policy.
+    fn engine_with_stale_rules(&self, allowed: &[&str]) -> OwnedEngine {
+        let mut owned = self.engine_without_rules();
+        owned
+            .engine
+            .set_path_rules(allowed.iter().map(|s| s.to_string()).collect(), Vec::new());
+        owned
+    }
+
+    /// A real open: a new database handle, a real writer-fence claim held for
+    /// this engine's whole life, startup holds, a new engine.
+    fn engine_without_rules(&self) -> OwnedEngine {
+        let mut config: AppConfig = toml::from_str(&format!(
+            "[daemon]\ndata_dir = \"{}\"\n[svn]\nurl = \"{}\"\nusername = \"\"\npassword_env = \"RS53_UNUSED\"\n[github]\nrepo = \"fixture/partial\"\ntoken_env = \"RS53_UNUSED\"\n",
+            self.data_dir.display(),
+            self.svn_url
+        ))
+        .unwrap();
+        config.svn.layout = SvnLayout::Custom;
+        config.svn.password = Some(String::new());
+        config.github.token = Some(String::new());
+        let db = Database::new(&self.db_path).unwrap();
+        db.initialize().unwrap();
+        let fence = writer_fence::claim(&db, &self.data_dir).unwrap();
+        db.hold_interrupted_svn_commits().unwrap();
+        db.hold_interrupted_git_pushes().unwrap();
+        db.hold_interrupted_team_cycle_mappings().unwrap();
+        let mut engine = SyncEngine::new(
+            config,
+            db,
+            SvnClient::new(&self.svn_url, "", ""),
+            GitClient::new(&self.git_work).unwrap(),
+            Arc::new(
+                IdentityMapper::new(&IdentityConfig {
+                    email_domain: Some("example.invalid".into()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+        );
+        engine.set_repo_id(REPO.into());
+        OwnedEngine {
+            engine,
+            _fence: fence,
+        }
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let mut full = vec!["--git-dir", self.bare.to_str().unwrap()];
+        full.extend_from_slice(args);
+        run(self.tmp.path(), "git", &full)
+    }
+
+    fn git_tip(&self) -> String {
+        self.git(&["rev-parse", "main"]).trim().to_owned()
+    }
+
+    fn git_commits(&self) -> usize {
+        self.git(&["rev-list", "--count", "main"])
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn git_file(&self, path: &str) -> Option<String> {
+        let listed = self.git(&["ls-tree", "-r", "--name-only", "-z", "main"]);
+        listed
+            .split('\0')
+            .any(|name| name == path)
+            .then(|| self.git(&["show", &format!("main:{path}")]))
+    }
+
+    fn git_paths(&self) -> Vec<String> {
+        let listed = self.git(&["ls-tree", "-r", "--name-only", "-z", "main"]);
+        listed
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn svn_head(&self) -> i64 {
+        let out = run(
+            &self.wc,
+            "svn",
+            &["info", "--show-item", "revision", &self.svn_url],
+        );
+        out.trim().parse().unwrap()
+    }
+
+    fn svn_file(&self, path: &str) -> Option<String> {
+        let output = Command::new("svn")
+            .args(["cat", &format!("{}/{}@HEAD", self.svn_url, path)])
+            .output()
+            .unwrap();
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8(output.stdout).unwrap())
+    }
+
+    /// A Git developer clone that pushes to the bare origin.
+    fn developer(&mut self) -> PathBuf {
+        if self.developer.is_none() {
+            let dir = self.tmp.path().join("developer");
+            run(
+                self.tmp.path(),
+                "git",
+                &[
+                    "clone",
+                    "-b",
+                    "main",
+                    self.bare.to_str().unwrap(),
+                    dir.to_str().unwrap(),
+                ],
+            );
+            self.developer = Some(dir);
+        }
+        self.developer.clone().unwrap()
+    }
+
+    fn git_push(&mut self, files: &[(&str, &str)], message: &str) -> String {
+        let dev = self.developer();
+        run(&dev, "git", &["pull", "--ff-only", "origin", "main"]);
+        for (path, bytes) in files {
+            let file = dev.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, bytes).unwrap();
+            run(&dev, "git", &["add", "--", path]);
+        }
+        run(&dev, "git", &["commit", "-m", message]);
+        run(&dev, "git", &["push", "origin", "main"]);
+        run(&dev, "git", &["rev-parse", "HEAD"]).trim().to_owned()
+    }
+}
+
+/// Observation-only dump, written only when a case is already failing.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Never `eprintln!`, which panics if the write fails. A panic here,
+            // during unwinding, could abort the process. The report goes straight
+            // to the process stderr, after the failing assertion the panic hook
+            // already printed, and a failed write is ignored.
+            let report = self.observations();
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), report.as_bytes());
+        }
+        std::env::remove_var("REPOSYNC_RS53_OBSERVE_DIR");
+    }
+}
+
+/// The diagnostic report. Its whole allowance is allocated once, and every
+/// append is checked against what is left before it is made. Once one does not
+/// fit, the report is closed: that append and every later step are recorded as
+/// not run.
+struct ObservationReport {
+    text: String,
+    cap: usize,
+    closed: bool,
+    not_run: usize,
+}
+
+impl ObservationReport {
+    /// Space past `cap` for the closing labels only.
+    const LABEL_RESERVE: usize = 512;
+
+    fn new(cap: usize) -> Self {
+        Self {
+            text: String::with_capacity(cap + Self::LABEL_RESERVE),
+            cap,
+            closed: false,
+            not_run: 0,
+        }
+    }
+
+    fn room(&self) -> usize {
+        self.cap.saturating_sub(self.text.len())
+    }
+
+    /// Whether a further step may run; if not, it is counted as not run.
+    fn admit(&mut self, deadline: std::time::Instant) -> bool {
+        if self.closed || std::time::Instant::now() >= deadline {
+            self.not_run += 1;
+            return false;
+        }
+        true
+    }
+
+    /// Appends `part` whole if it fits; otherwise closes the report.
+    fn put(&mut self, part: &str) {
+        if self.closed {
+            return;
+        }
+        if part.len() > self.room() {
+            self.closed = true;
+            self.not_run += 1;
+            return;
+        }
+        self.text.push_str(part);
+    }
+
+    /// Formats `value` straight into the report: each fragment is checked
+    /// before it is appended, so nothing is serialized outside the allowance.
+    fn put_display(&mut self, value: &dyn std::fmt::Display) {
+        let _ = std::fmt::Write::write_fmt(self, format_args!("{value}"));
+    }
+
+    /// Appends retained bytes shown as UTF-8, invalid sequences as U+FFFD, one
+    /// piece at a time, each checked first. A piece that does not fit is cut at
+    /// the allowance and the report is closed.
+    fn put_lossy(&mut self, bytes: &[u8]) {
+        for chunk in bytes.utf8_chunks() {
+            if self.closed {
+                return;
+            }
+            let valid = chunk.valid();
+            let room = self.room();
+            if valid.len() > room {
+                let mut end = room;
+                while !valid.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.text.push_str(valid.get(..end).unwrap_or(""));
+                self.closed = true;
+                self.not_run += 1;
+                return;
+            }
+            self.text.push_str(valid);
+            if !chunk.invalid().is_empty() {
+                self.put("\u{FFFD}");
+            }
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if self.closed {
+            self.text.push_str(
+                "\n<report allowance spent: the last item was cut or not appended; later steps not run>\n",
+            );
+        }
+        if self.not_run > 0 {
+            self.text.push_str("<steps or appends not run: ");
+            let _ = std::fmt::Write::write_fmt(&mut self.text, format_args!("{}", self.not_run));
+            self.text.push_str(">\n");
+        }
+        self.text
+    }
+}
+
+impl std::fmt::Write for ObservationReport {
+    fn write_str(&mut self, part: &str) -> std::fmt::Result {
+        if self.closed || part.len() > self.room() {
+            self.put(part);
+            return Err(std::fmt::Error);
+        }
+        self.text.push_str(part);
+        Ok(())
+    }
+}
+
+/// Present or absent, and the size per metadata, of the database and its SQLite
+/// sidecars.
+fn put_sqlite_files(report: &mut ObservationReport, db_path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut name = db_path.as_os_str().to_owned();
+        name.push(suffix);
+        report.put("  reposync.db");
+        report.put(suffix);
+        match std::fs::symlink_metadata(&name) {
+            Ok(meta) => {
+                report.put(": present, metadata size ");
+                report.put_display(&meta.len());
+                report.put(" bytes\n");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => report.put(": absent\n"),
+            Err(_) => report.put(": <metadata read failed>\n"),
+        }
+    }
+}
+
+/// Bounded rows from the fixture database through the product's read-only
+/// inspection entrance `Database::open_existing_read_only`, not `Database::new`
+/// (which creates, sets WAL, checkpoints with TRUNCATE and integrity-checks).
+/// That entrance never creates storage, disables checkpoint-on-close before any
+/// read and refuses empty or pending-rollback storage. The handle is closed
+/// explicitly by dropping it.
+///
+/// SQLite may still create the `-wal` and `-shm` sidecars and write the
+/// wal-index in `-shm`; the sizes before and after are reported. No claim is
+/// made that the file is physically unchanged.
+///
+/// Rows and cells are limited in SQL. SQLite may read whole stored cells and use
+/// its own page cache internally. A failed open or query is reported as a read
+/// failure; "(no rows)" means the query ran and returned none. If the deadline
+/// watchdog cannot start, no query runs and SQL diagnostics are reported
+/// unavailable.
+fn put_database_rows(
+    report: &mut ObservationReport,
+    db_path: &Path,
+    row_cap: usize,
+    cell_cap: usize,
+    deadline: std::time::Instant,
+) {
+    use std::time::{Duration, Instant};
+    report.put("sidecars before:\n");
+    put_sqlite_files(report, db_path);
+    let db = match Database::open_existing_read_only(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            report.put("<read failure: read-only inspection open refused or failed: ");
+            report.put_display(&e);
+            report.put(">\n");
+            return;
+        }
+    };
+    let conn = db.conn();
+    // The deadline also interrupts a running statement; joined before return.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = {
+        let done = done.clone();
+        let handle = conn.get_interrupt_handle();
+        std::thread::Builder::new()
+            .name("rs53-observe-db-deadline".into())
+            .spawn(move || {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if Instant::now() >= deadline {
+                        handle.interrupt();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+    };
+    // Without the watchdog nothing bounds SQL scanning (busy_timeout bounds
+    // only lock waits), so no query runs.
+    let watchdog = match watchdog {
+        Ok(watchdog) => watchdog,
+        Err(_) => {
+            report.put(
+                "<SQL diagnostics unavailable: deadline watchdog not started; no query run>\n",
+            );
+            drop(conn);
+            drop(db);
+            report.put("closed explicitly (handle dropped)\n");
+            report.put("sidecars after:\n");
+            put_sqlite_files(report, db_path);
+            return;
+        }
+    };
+    let cell = |column: &str| {
+        format!(
+            "CASE typeof(\"{column}\") WHEN 'null' THEN 'NULL' \
+             WHEN 'blob' THEN 'blob(' || length(\"{column}\") || '):' \
+             || hex(substr(\"{column}\", 1, {half})) \
+             ELSE substr(\"{column}\", 1, {cell_cap}) || CASE WHEN length(\"{column}\") > {cell_cap} \
+             THEN '<cell cut: ' || length(\"{column}\") || ' chars stored>' ELSE '' END END",
+            half = cell_cap / 2
+        )
+    };
+    // Fixed column lists: no runtime-derived identifiers.
+    let specs: [(&str, &[&str], &str); 6] = [
+        (
+            "repositories",
+            &["id", "last_svn_rev", "last_git_sha", "scope_uuid", "allowed_paths", "blocked_patterns"],
+            "",
+        ),
+        (
+            "sync_records",
+            &["id", "svn_rev", "git_sha", "direction", "status"],
+            "ORDER BY rowid",
+        ),
+        ("commit_map", &["svn_rev", "git_sha", "direction", "repo_id"], "ORDER BY id"),
+        (
+            "canonical_checkpoints",
+            &[
+                "scope_uuid", "generation", "direction", "handled_source_key", "outcome",
+                "target_git_sha", "target_svn_rev", "reason", "policy_snapshot", "updated_at",
+            ],
+            "",
+        ),
+        (
+            "canonical_mapping_outcomes",
+            &[
+                "id", "scope_uuid", "generation", "direction", "source_key", "outcome",
+                "target_git_sha", "target_svn_rev", "reason", "policy_snapshot", "created_at",
+            ],
+            "ORDER BY id",
+        ),
+        (
+            "kv_state",
+            &["key", "value"],
+            "WHERE key LIKE '%git%' OR key LIKE '%svn_rev%' OR key LIKE 'team_cycle_mapping%' ORDER BY key",
+        ),
+    ];
+    for (table, columns, tail) in specs {
+        if !report.admit(deadline) {
+            break;
+        }
+        let sql = format!(
+            "SELECT {} FROM \"{table}\" {tail} LIMIT {}",
+            columns
+                .iter()
+                .map(|c| cell(c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            row_cap + 1
+        );
+        report.put("--- ");
+        report.put(table);
+        report.put(" (");
+        for (i, column) in columns.iter().enumerate() {
+            if i > 0 {
+                report.put(", ");
+            }
+            report.put(column);
+        }
+        report.put(") ");
+        report.put(tail);
+        report.put(" ---\n");
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                report.put("<read failure: prepare: ");
+                report.put_display(&e);
+                report.put(">\n");
+                continue;
+            }
+        };
+        let mut rows = match stmt.query([]) {
+            Ok(rows) => rows,
+            Err(e) => {
+                report.put("<read failure: query: ");
+                report.put_display(&e);
+                report.put(">\n");
+                continue;
+            }
+        };
+        let mut read = 0usize;
+        loop {
+            if read == row_cap {
+                match rows.next() {
+                    Ok(Some(_)) => report.put("<row cap: more rows exist; not read>\n"),
+                    Ok(None) => {}
+                    Err(_) => report.put("<read failure while probing for more rows>\n"),
+                }
+                break;
+            }
+            match rows.next() {
+                Ok(Some(row)) => {
+                    for i in 0..columns.len() {
+                        if i > 0 {
+                            report.put(" | ");
+                        }
+                        match row.get_ref(i) {
+                            Ok(rusqlite::types::ValueRef::Text(t)) => report.put_lossy(t),
+                            Ok(_) => report.put("<non-text cell>"),
+                            Err(_) => report.put("<cell read failure>"),
+                        }
+                    }
+                    report.put("\n");
+                    read += 1;
+                }
+                Ok(None) => {
+                    if read == 0 {
+                        report.put("(no rows)\n");
+                    }
+                    break;
+                }
+                Err(e) => {
+                    report.put("<read failure: row: ");
+                    report.put_display(&e);
+                    report.put(">\n");
+                    break;
+                }
+            }
+        }
+    }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = watchdog.join();
+    drop(conn);
+    drop(db);
+    report.put("closed explicitly (handle dropped)\n");
+    report.put("sidecars after:\n");
+    put_sqlite_files(report, db_path);
+}
+
+impl Fixture {
+    /// Secondary evidence, written only after the failing assertion's panic
+    /// message (the panic hook prints first). It starts no subprocess. Bounded
+    /// before allocation and before each append:
+    /// - producer files: the directory is iterated to `ENTRY_CAP` entries, no
+    ///   more enumerated; regular files only; each is read into one fixed buffer,
+    ///   at most the bytes still allowed;
+    /// - database rows and cells are limited in SQL (`put_database_rows`);
+    /// - the report has a fixed allowance; a step is not run once it or
+    ///   `DEADLINE` is spent.
+    ///
+    /// Git bare and bridge state would need a secondary subprocess, so it is
+    /// labelled unavailable. Nothing here panics: no unwrap or unchecked index.
+    fn observations(&self) -> String {
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+        const FILE_CAP: usize = 64 * 1024;
+        const ENTRY_CAP: usize = 64;
+        const ROW_CAP: usize = 200;
+        const CELL_CAP: usize = 2048;
+        const TOTAL_CAP: usize = 512 * 1024;
+        const DEADLINE: Duration = Duration::from_secs(30);
+        let deadline = Instant::now() + DEADLINE;
+        let mut report = ObservationReport::new(TOTAL_CAP);
+        let mut buf = vec![0u8; FILE_CAP];
+        report.put("=== RS53 OBSERVATION (secondary; labels state what is retained) ===\n");
+        report.put("thread: ");
+        report.put(std::thread::current().name().unwrap_or("<unnamed>"));
+        report.put("\nsource of this case: ");
+        report.put(&self.svn_url);
+        report.put("\n");
+        let observe = self.tmp.path().join("observe");
+        report.put("--- producer files (directory order; header names the writing source) ---\n");
+        match std::fs::read_dir(&observe) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                report.put("<observation directory absent: no producer capture reached it>\n")
+            }
+            Err(_) => report.put("<read failure: observation directory not listed>\n"),
+            Ok(mut entries) => {
+                let mut seen = 0usize;
+                loop {
+                    if seen == ENTRY_CAP {
+                        if entries.next().is_some() {
+                            report.put("<entry cap: more entries exist; not enumerated>\n");
+                        }
+                        break;
+                    }
+                    let Some(entry) = entries.next() else {
+                        break;
+                    };
+                    seen += 1;
+                    if !report.admit(deadline) {
+                        break;
+                    }
+                    let Ok(entry) = entry else {
+                        report.put("<read failure: directory entry>\n");
+                        continue;
+                    };
+                    report.put("--- ");
+                    report.put_lossy(entry.file_name().as_encoded_bytes());
+                    report.put(": ");
+                    let meta = match std::fs::symlink_metadata(entry.path()) {
+                        Ok(meta) if meta.file_type().is_file() => meta,
+                        Ok(_) => {
+                            report.put("not a regular file; not read\n");
+                            continue;
+                        }
+                        Err(_) => {
+                            report.put("<read failure: metadata>\n");
+                            continue;
+                        }
+                    };
+                    // Room is kept for this file's label (its name is at most a few
+                    // hundred bytes), so the retained bytes can be shown.
+                    let allowance = FILE_CAP.min(report.room().saturating_sub(1024));
+                    let mut file = match std::fs::File::open(entry.path()) {
+                        Ok(file) => file,
+                        Err(_) => {
+                            report.put("<read failure: open>\n");
+                            continue;
+                        }
+                    };
+                    let mut kept = 0usize;
+                    let mut failed = false;
+                    while kept < allowance {
+                        let Some(window) = buf.get_mut(kept..allowance) else {
+                            break;
+                        };
+                        match file.read(window) {
+                            Ok(0) => break,
+                            Ok(n) => kept += n,
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(_) => {
+                                failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    drop(file);
+                    let retained = buf.get(..kept).unwrap_or(&[]);
+                    report.put("metadata size ");
+                    report.put_display(&meta.len());
+                    report.put(" bytes; retained ");
+                    report.put_display(&kept);
+                    report.put(" bytes");
+                    if failed {
+                        report.put(" before a read failure");
+                    }
+                    if (kept as u64) < meta.len() {
+                        report.put(" (prefix only: not complete content, no hash)");
+                    }
+                    report.put("; ");
+                    let header = retained
+                        .split(|b| *b == b'\n')
+                        .next()
+                        .and_then(|line| line.strip_prefix(b"# rs53-observe source="));
+                    match header {
+                        Some(rest) => {
+                            let source = rest.split(|b| *b == b' ').next().unwrap_or(&[]);
+                            if source == self.svn_url.as_bytes() {
+                                report.put("written for this case's source");
+                            } else {
+                                report.put(
+                                    "header source differs from this case's source: not attributed",
+                                );
+                            }
+                        }
+                        None => report.put("no producer header retained: not attributed"),
+                    }
+                    report.put(" ---\n");
+                    report.put_lossy(retained);
+                    report.put("\n");
+                }
+            }
+        }
+        report.put("--- Git bare and bridge state ---\n");
+        report.put(
+            "<unavailable: would need a secondary subprocess; no admitted finite capture facility>\n",
+        );
+        if report.admit(deadline) {
+            report
+                .put("--- database (read-only, no create, no checkpoint; not Database::new) ---\n");
+            put_database_rows(&mut report, &self.db_path, ROW_CAP, CELL_CAP, deadline);
+        }
+        report.finish()
+    }
+}
+
+/// Current repository scope and generation, read without side effects: the scope
+/// from the registration row, the generation from that scope's single canonical
+/// SVN→Git checkpoint row.
+fn scope_and_generation(engine: &SyncEngine) -> (String, i64) {
+    let conn = engine.db().conn();
+    let scope: String = conn
+        .query_row(
+            "SELECT scope_uuid FROM repositories WHERE id = ?1",
+            [REPO],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut stmt = conn
+        .prepare("SELECT generation FROM canonical_checkpoints WHERE scope_uuid = ?1 AND direction = 'svn_to_git'")
+        .unwrap();
+    let generations: Vec<i64> = stmt
+        .query_map([&scope], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        generations.len(),
+        1,
+        "one current SVN→Git checkpoint for scope {scope}"
+    );
+    (scope, generations[0])
+}
+
+/// The team publication record of `rev`, equal to `sha` everywhere: exactly one
+/// applied svn_to_git `sync_records` row; the canonical AppliedAndVerified outcome
+/// in the current scope/generation; the push journal's observed SHA and tree.
+/// The team publication finalizer (`git_push_operations::finalize_tx`) inserts no
+/// applied `commit_map` row; imports and other legacy paths do populate that table.
+/// An applied revision has no NULL row either.
+fn assert_team_applied(engine: &SyncEngine, fx: &Fixture, rev: i64, sha: &str) {
+    let applied: Vec<String> = {
+        let conn = engine.db().conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND svn_rev = ?2 \
+                 AND direction = 'svn_to_git' AND status = 'applied'",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![REPO, rev], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(
+        applied,
+        vec![sha.to_owned()],
+        "one applied sync record for r{rev}"
+    );
+    let (scope, generation) = scope_and_generation(engine);
+    let outcome = load_mapping_outcome(
+        &engine.db().conn(),
+        &scope,
+        generation,
+        CheckpointDirection::SvnToGit,
+        &svn_source_key(rev),
+    )
+    .unwrap()
+    .expect("canonical SVN→Git outcome");
+    assert_eq!(outcome.outcome, MappingOutcome::AppliedAndVerified);
+    assert_eq!(outcome.target_git_sha.as_deref(), Some(sha));
+    let op = engine
+        .db()
+        .latest_git_push_operation(REPO)
+        .unwrap()
+        .expect("push journal");
+    assert_eq!(op.source_svn_rev, rev);
+    assert_eq!(op.last_confirmed_git_sha.as_deref(), Some(sha));
+    let tree = fx.git(&["rev-parse", &format!("{sha}^{{tree}}")]);
+    assert_eq!(op.last_confirmed_git_tree.as_deref(), Some(tree.trim()));
+    assert_eq!(
+        filtered_row_count(engine, rev),
+        0,
+        "no NULL row for an applied revision"
+    );
+}
+
+/// The current SVN→Git checkpoint is `rev`, filtered with no target.
+fn assert_svn_checkpoint_filtered(engine: &SyncEngine, rev: i64) {
+    let (scope, generation) = scope_and_generation(engine);
+    let (key, outcome, target): (String, String, Option<String>) = engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT handled_source_key, outcome, target_git_sha FROM canonical_checkpoints \
+             WHERE scope_uuid = ?1 AND generation = ?2 AND direction = 'svn_to_git'",
+            rusqlite::params![scope, generation],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(key, svn_source_key(rev));
+    assert_eq!(
+        outcome,
+        MappingOutcome::IntentionallyFilteredNoTarget.as_str()
+    );
+    assert_eq!(target, None);
+}
+
+fn rows(engine: &SyncEngine) -> Vec<(i64, Option<String>, CommitMapTarget)> {
+    let mut listed: Vec<_> = engine
+        .db()
+        .list_commit_map_rows(Some(REPO), 1000)
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.svn_rev, row.git_sha, row.target))
+        .collect();
+    listed.sort_by_key(|row| row.0);
+    listed
+}
+
+fn filtered_row_count(engine: &SyncEngine, rev: i64) -> usize {
+    rows(engine)
+        .into_iter()
+        .filter(|(r, sha, target)| {
+            *r == rev && sha.is_none() && *target == CommitMapTarget::FilteredNoTarget
+        })
+        .count()
+}
+
+fn latest_cycle_mapping(
+    engine: &SyncEngine,
+) -> Option<reposync_core::db::team_cycle_mapping_operations::TeamCycleMappingOperation> {
+    let id = engine
+        .db()
+        .get_state(&format!("team_cycle_mapping_v1:latest:{REPO}"))
+        .unwrap()?;
+    engine
+        .db()
+        .get_team_cycle_mapping_operation(REPO, &id)
+        .unwrap()
+}
+
+fn audit_count(engine: &SyncEngine, action: &str) -> i64 {
+    engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE action = ?1 AND repo_id = ?2",
+            [action, REPO],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn svn_watermark(engine: &SyncEngine) -> i64 {
+    engine.db().get_repo_watermark(REPO).unwrap().0
+}
+
+fn inbound_git_cursor(engine: &SyncEngine) -> Option<String> {
+    reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(engine.db(), REPO).unwrap()
+}
+
+/// Assert that `rev` was finalized as filtered exactly once, atomically.
+fn assert_filtered_once(engine: &SyncEngine, rev: i64) {
+    assert_eq!(
+        filtered_row_count(engine, rev),
+        1,
+        "one proven NULL row for r{rev}"
+    );
+    let op = latest_cycle_mapping(engine).expect("filtered journal operation");
+    assert_eq!(op.outcome, TeamCycleMappingOutcome::SvnFiltered);
+    assert_eq!(op.state, TeamCycleMappingState::Completed);
+    assert_eq!(op.source_svn_rev, Some(rev));
+    assert!(op.source_git_sha.is_none());
+    assert!(engine
+        .db()
+        .active_team_cycle_mapping_operation(REPO)
+        .unwrap()
+        .is_none());
+    assert!(
+        reposync_core::echo_receipt_scope::read_svn_no_target_receipt(engine.db(), REPO, rev)
+            .unwrap()
+            .is_some(),
+        "scoped SVN no-target receipt for r{rev}"
+    );
+}
+
+const BASELINE: &[(&str, &str)] = &[
+    ("team-a/a.txt", "team-a baseline\n"),
+    ("team-a/old.txt", "team-a old\n"),
+    ("team-b/b.txt", "team-b baseline\n"),
+    ("team-b/c.txt", "team-b c\n"),
+    ("docs/readme.txt", "docs baseline\n"),
+];
+
+// ---------------------------------------------------------------------------
+// SC01-SC06
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc01_only_admitted_paths_and_bytes_enter_git_and_excluded_work_is_accounted() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let commits_before = fx.git_commits();
+    fx.write("team-a/a.txt", "team-a changed\n");
+    fx.write("team-a/new.txt", "team-a new\n");
+    let r2 = fx.commit("r2 admitted");
+    fx.write("team-b/b.txt", "team-b changed\n");
+    fx.write("docs/readme.txt", "docs changed\n");
+    let r3 = fx.commit("r3 excluded only");
+    let engine = fx.engine(&["team-a/"], &[]);
+    let stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        stats.svn_to_git_count, 1,
+        "only the admitted revision commits"
+    );
+    assert_eq!(fx.git_commits(), commits_before + 1);
+    assert_eq!(
+        fx.git_file("team-a/a.txt").as_deref(),
+        Some("team-a changed\n")
+    );
+    assert_eq!(
+        fx.git_file("team-a/new.txt").as_deref(),
+        Some("team-a new\n")
+    );
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("team-b baseline\n")
+    );
+    assert_eq!(
+        fx.git_file("docs/readme.txt").as_deref(),
+        Some("docs baseline\n")
+    );
+    assert!(fx
+        .git(&["log", "-1", "--format=%B", "main"])
+        .contains(&format!("synced from SVN r{r2}")));
+    assert_eq!(
+        svn_watermark(&engine),
+        r3,
+        "the scoped frontier accounts for r3"
+    );
+    assert_filtered_once(&engine, r3);
+    // The current remote tip at this point is r2's publication.
+    let tip = fx.git_tip();
+    assert_team_applied(&engine, &fx, r2, &tip);
+    // The later r3 is the current checkpoint: filtered, no target.
+    assert_svn_checkpoint_filtered(&engine, r3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc02_fully_excluded_revision_has_no_git_effect_and_reopen_repeat_is_quiet() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let tip = fx.git_tip();
+    let refs = fx.git(&["for-each-ref"]);
+    fx.write("team-b/b.txt", "team-b only\n");
+    let r2 = fx.commit("r2 excluded");
+    let engine = fx.engine(&["team-a/"], &[]);
+    let cursor = inbound_git_cursor(&engine);
+    let stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 0);
+    assert_eq!(fx.git_tip(), tip, "no Git commit");
+    assert_eq!(fx.git(&["for-each-ref"]), refs, "no ref effect");
+    assert_eq!(svn_watermark(&engine), r2);
+    assert_eq!(
+        inbound_git_cursor(&engine),
+        cursor,
+        "inbound Git cursor unchanged"
+    );
+    assert_filtered_once(&engine, r2);
+    assert_eq!(audit_count(&engine, "svn_to_git_filtered"), 1);
+    let rows_before = rows(&engine);
+    assert!(
+        fence_lease(&fx.db_path).is_some(),
+        "the running engine holds the fence"
+    );
+    drop(engine);
+    assert_eq!(
+        fence_lease(&fx.db_path),
+        None,
+        "closing the engine releases its fence before any reopen"
+    );
+    let reopened = fx.engine(&["team-a/"], &[]);
+    assert!(
+        fence_lease(&fx.db_path).is_some(),
+        "the reopened engine reclaims the fence"
+    );
+    for _ in 0..2 {
+        let quiet = reopened.run_sync_cycle().await.unwrap();
+        assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
+    }
+    assert_eq!(
+        rows(&reopened),
+        rows_before,
+        "no extra rows after reopen/repeat"
+    );
+    assert_eq!(audit_count(&reopened, "svn_to_git_filtered"), 1);
+    assert_eq!(fx.git_tip(), tip);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc03_straddling_revision_applies_selected_bytes_and_deletes_only() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    fx.write("team-a/a.txt", "team-a straddle\n");
+    fx.svn(&["rm", &op("team-a/old.txt")]);
+    fx.write("team-b/b.txt", "team-b straddle\n");
+    fx.svn(&["rm", &op("team-b/c.txt")]);
+    let r2 = fx.commit("r2 straddles");
+    let engine = fx.engine(&["team-a/"], &[]);
+    let stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-a/a.txt").as_deref(),
+        Some("team-a straddle\n")
+    );
+    assert_eq!(
+        fx.git_file("team-a/old.txt"),
+        None,
+        "selected delete applied"
+    );
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("team-b baseline\n")
+    );
+    assert_eq!(
+        fx.git_file("team-b/c.txt").as_deref(),
+        Some("team-b c\n"),
+        "unrelated tree kept"
+    );
+    assert_eq!(
+        fx.git_file("docs/readme.txt").as_deref(),
+        Some("docs baseline\n")
+    );
+    let message = fx.git(&["log", "-1", "--format=%B", "main"]);
+    assert!(message.starts_with("r2 straddles"));
+    assert!(message.contains(&format!("synced from SVN r{r2}")));
+    assert_eq!(
+        filtered_row_count(&engine, r2),
+        0,
+        "a straddling revision is applied, not filtered"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc04_git_mixed_commit_reaches_svn_with_outside_paths_untouched() {
+    let _serial = serial().lock().await;
+    let mut fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    engine.run_sync_cycle().await.unwrap();
+    let head = fx.svn_head();
+    fx.git_push(
+        &[
+            ("team-a/from-git.txt", "from git admitted\n"),
+            ("team-b/from-git.txt", "from git outside\n"),
+        ],
+        "Git mixed commit",
+    );
+    let stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.git_to_svn_count, 1);
+    assert_eq!(fx.svn_head(), head + 1);
+    assert_eq!(
+        fx.svn_file("team-a/from-git.txt").as_deref(),
+        Some("from git admitted\n")
+    );
+    assert_eq!(
+        fx.svn_file("team-b/from-git.txt"),
+        None,
+        "outside path untouched in SVN"
+    );
+    assert_eq!(
+        fx.svn_file("team-b/b.txt").as_deref(),
+        Some("team-b baseline\n")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc05_git_excluded_only_commit_produces_no_svn_revision_and_repeats_quietly() {
+    let _serial = serial().lock().await;
+    let mut fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    engine.run_sync_cycle().await.unwrap();
+    let head = fx.svn_head();
+    let sha = fx.git_push(
+        &[("team-b/only.txt", "outside only\n")],
+        "Git excluded-only commit",
+    );
+    let stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.git_to_svn_count, 0);
+    assert_eq!(fx.svn_head(), head, "no SVN revision");
+    assert!(
+        reposync_core::echo_receipt_scope::read_git_no_target_receipt(engine.db(), REPO, &sha)
+            .unwrap()
+            .is_some(),
+        "existing Git no-target receipt"
+    );
+    let quiet = engine.run_sync_cycle().await.unwrap();
+    assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
+    assert_eq!(fx.svn_head(), head);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc06_svn_git_edit_svn_round_trip_keeps_exact_bytes_without_duplication() {
+    let _serial = serial().lock().await;
+    let mut fx = Fixture::new(BASELINE).await;
+    fx.write("team-a/round.txt", "from svn\n");
+    fx.write("team-b/noise.txt", "excluded noise\n");
+    let r2 = fx.commit("r2 svn origin");
+    let engine = fx.engine(&["team-a/"], &[]);
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-a/round.txt").as_deref(),
+        Some("from svn\n")
+    );
+    assert_eq!(fx.git_file("team-b/noise.txt"), None);
+    let r2_publication = fx.git_tip();
+    assert_team_applied(&engine, &fx, r2, &r2_publication);
+    fx.git_push(&[("team-a/round.txt", "edited in git\n")], "Git edit");
+    assert_eq!(engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    let head = fx.svn_head();
+    assert_eq!(
+        fx.svn_file("team-a/round.txt").as_deref(),
+        Some("edited in git\n")
+    );
+    let tip = fx.git_tip();
+    let commits = fx.git_commits();
+    let mapped = rows(&engine);
+    assert_team_applied(&engine, &fx, r2, &r2_publication);
+    drop(engine);
+    let reopened = fx.engine(&["team-a/"], &[]);
+    for _ in 0..2 {
+        let quiet = reopened.run_sync_cycle().await.unwrap();
+        assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
+    }
+    assert_eq!(
+        (fx.svn_head(), fx.git_tip(), fx.git_commits()),
+        (head, tip, commits)
+    );
+    assert_eq!(
+        rows(&reopened),
+        mapped,
+        "no duplicated mapping after reopen"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mandatory controls
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_policy_keeps_the_legacy_full_apply() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    fx.write("team-b/b.txt", "legacy full apply\n");
+    let r2 = fx.commit("r2 unfiltered");
+    let engine = fx.engine(&[], &[]);
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("legacy full apply\n")
+    );
+    assert_eq!(filtered_row_count(&engine, r2), 0);
+    assert_eq!(audit_count(&engine, "svn_to_git_filtered"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn component_matching_and_literal_names_are_mapped_exactly_once() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(&[
+        ("team/seed.txt", "seed\n"),
+        ("team-other/seed.txt", "seed\n"),
+    ])
+    .await;
+    fx.write("team/plain.txt", "plain\n");
+    fx.write("team/sp ace @-dash.txt", "literal\n");
+    fx.write("team/ünïcödé.txt", "unicode\n");
+    fx.write("team/%41.txt", "percent stays literal\n");
+    fx.write("team-other/y.txt", "sibling prefix\n");
+    fx.commit("r2 names");
+    let engine = fx.engine(&["team"], &[]);
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let paths = fx.git_paths();
+    for admitted in [
+        "team/plain.txt",
+        "team/sp ace @-dash.txt",
+        "team/ünïcödé.txt",
+        "team/%41.txt",
+    ] {
+        assert!(
+            paths.iter().any(|p| p == admitted),
+            "{admitted} in {paths:?}"
+        );
+    }
+    assert_eq!(
+        fx.git_file("team/%41.txt").as_deref(),
+        Some("percent stays literal\n")
+    );
+    assert!(!paths.iter().any(|p| p == "team/A.txt"), "no URL decoding");
+    assert!(
+        !paths.iter().any(|p| p == "team-other/y.txt"),
+        "component-aware match"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_rules_alone_project_with_the_same_namespace() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    fx.write("team-a/keep.txt", "kept\n");
+    fx.write("team-a/drop.log", "blocked\n");
+    fx.commit("r2 blocked pattern");
+    let engine = fx.engine(&[], &["*.log"]);
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(fx.git_file("team-a/keep.txt").as_deref(), Some("kept\n"));
+    assert_eq!(fx.git_file("team-a/drop.log"), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ancestor_directory_delete_removes_admitted_descendants_only() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(&[
+        ("team-a/sub/s.txt", "admitted descendant\n"),
+        ("team-a/keep.txt", "outside the admitted subtree\n"),
+        ("team-b/b.txt", "team-b baseline\n"),
+    ])
+    .await;
+    fx.svn(&["rm", &op("team-a")]);
+    fx.commit("r2 deletes the ancestor directory");
+    let engine = fx.engine(&["team-a/sub/"], &[]);
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-a/sub/s.txt"),
+        None,
+        "admitted descendant deleted"
+    );
+    assert_eq!(
+        fx.git_file("team-a/keep.txt").as_deref(),
+        Some("outside the admitted subtree\n"),
+        "excluded sibling under the same ancestor is never pruned"
+    );
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("team-b baseline\n")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copies_never_delete_sources_and_moves_across_the_boundary_are_endpoint_scoped() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    fx.svn(&["copy", &op("team-a/a.txt"), "team-b/copied.txt"]);
+    let r2 = fx.commit("r2 copy out of scope");
+    // Committed SVN at HEAD: the literal destination holds the source bytes,
+    // no `@`-suffixed destination exists, and the copy source is kept.
+    assert_eq!(
+        fx.svn_file("team-b/copied.txt").as_deref(),
+        Some("team-a baseline\n"),
+        "committed copy destination spelled exactly"
+    );
+    assert_eq!(
+        fx.svn_file("team-b/copied.txt@"),
+        None,
+        "no @-suffixed copy destination"
+    );
+    assert_eq!(
+        fx.svn_file("team-a/a.txt").as_deref(),
+        Some("team-a baseline\n"),
+        "committed copy source preserved"
+    );
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 0);
+    assert_eq!(
+        fx.git_file("team-a/a.txt").as_deref(),
+        Some("team-a baseline\n"),
+        "copy source kept"
+    );
+    assert_eq!(fx.git_file("team-b/copied.txt"), None);
+    assert_filtered_once(&engine, r2);
+    fx.svn(&["move", &op("team-b/b.txt"), "team-a/moved-in.txt"]);
+    fx.commit("r3 move into scope");
+    // Committed SVN at HEAD: exact destination, no `@` suffix, source deleted.
+    assert_eq!(
+        fx.svn_file("team-a/moved-in.txt").as_deref(),
+        Some("team-b baseline\n"),
+        "committed move destination spelled exactly"
+    );
+    assert_eq!(
+        fx.svn_file("team-a/moved-in.txt@"),
+        None,
+        "no @-suffixed move destination"
+    );
+    assert_eq!(
+        fx.svn_file("team-b/b.txt"),
+        None,
+        "committed move source deleted"
+    );
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-a/moved-in.txt").as_deref(),
+        Some("team-b baseline\n")
+    );
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("team-b baseline\n"),
+        "excluded delete not applied"
+    );
+    fx.svn(&["move", &op("team-a/old.txt"), "team-b/moved-out.txt"]);
+    fx.commit("r4 move out of scope");
+    // Committed SVN at HEAD: exact destination, no `@` suffix, source deleted.
+    assert_eq!(
+        fx.svn_file("team-b/moved-out.txt").as_deref(),
+        Some("team-a old\n"),
+        "committed move destination spelled exactly"
+    );
+    assert_eq!(
+        fx.svn_file("team-b/moved-out.txt@"),
+        None,
+        "no @-suffixed move destination"
+    );
+    assert_eq!(
+        fx.svn_file("team-a/old.txt"),
+        None,
+        "committed move source deleted"
+    );
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-a/old.txt"),
+        None,
+        "admitted source endpoint deleted"
+    );
+    assert_eq!(
+        fx.git_file("team-b/moved-out.txt"),
+        None,
+        "blocked endpoint not added"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_directory_and_plain_property_are_filtered_but_git_meaning_property_holds() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    fx.svn(&["mkdir", &op("team-a/empty-dir")]);
+    let r2 = fx.commit("r2 empty directory");
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 0);
+    assert_filtered_once(&engine, r2);
+    fx.svn(&["propset", "custom:note", "value", &op("team-a/a.txt")]);
+    let r3 = fx.commit("r3 plain property");
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 0);
+    assert_filtered_once(&engine, r3);
+    let tip = fx.git_tip();
+    fx.svn(&["propset", "svn:executable", "*", &op("team-a/a.txt")]);
+    let r4 = fx.commit("r4 executable bit");
+    fx.write("team-a/after.txt", "later dependent work\n");
+    fx.commit("r5 later work");
+    let held = engine.run_sync_cycle().await.unwrap_err();
+    assert!(
+        matches!(&held, SyncError::HistoryBlocked { reason, .. } if reason == "svn_projection_held"),
+        "{held:?}"
+    );
+    assert_eq!(svn_watermark(&engine), r3, "r{r4} and later stay pending");
+    assert_eq!(
+        filtered_row_count(&engine, r4),
+        0,
+        "a hold never counts as filtering"
+    );
+    assert_eq!(fx.git_tip(), tip);
+    assert_eq!(fx.git_file("team-a/after.txt"), None);
+    assert_eq!(audit_count(&engine, "svn_to_git_projection_held"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_selected_patch_stops_at_the_frontier_and_never_counts_as_filtered() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    fx.write("team-a/a.txt", "selected bytes\n");
+    let r2 = fx.commit("r2 selected");
+    fx.write("team-b/b.txt", "excluded later\n");
+    let r3 = fx.commit("r3 excluded later");
+    let engine = fx.engine(&["team-a/"], &[]);
+    let tip = fx.git_tip();
+    // Debug fixture hook of the unchanged apply path: it replaces r2's patch
+    // bytes on this engine, so the real `git apply` subprocess fails.
+    engine.set_svn_apply_test_fault(r2, &fx.git_work);
+    let failed = engine.run_sync_cycle().await;
+    engine.clear_svn_apply_test_fault();
+    assert!(failed.is_err(), "{failed:?}");
+    assert_eq!(fx.git_tip(), tip);
+    assert!(svn_watermark(&engine) < r2, "r{r2} stays pending");
+    assert_eq!(filtered_row_count(&engine, r2), 0);
+    assert_eq!(
+        filtered_row_count(&engine, r3),
+        0,
+        "later revision stays pending"
+    );
+    let recovered = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(recovered.svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-a/a.txt").as_deref(),
+        Some("selected bytes\n")
+    );
+    assert_filtered_once(&engine, r3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filtered_finalizer_write_fault_rolls_back_atomically_then_fresh_cycle_finalizes_once() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    fx.write("team-b/b.txt", "excluded\n");
+    let r2 = fx.commit("r2 excluded");
+    let engine = fx.engine(&["team-a/"], &[]);
+    let receipts_before: i64 = engine
+        .db()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM kv_state", [], |row| row.get(0))
+        .unwrap();
+    engine
+        .db()
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER rs53_filtered_write_fault BEFORE INSERT ON commit_map \
+             WHEN NEW.git_sha IS NULL BEGIN SELECT RAISE(ABORT,'rs53 filtered write fault'); END;",
+        )
+        .unwrap();
+    let failed = engine.run_sync_cycle().await.unwrap_err();
+    assert!(
+        failed.to_string().contains("rs53 filtered write fault"),
+        "{failed}"
+    );
+    assert_eq!(svn_watermark(&engine), 1, "watermark rolled back");
+    assert!(
+        rows(&engine).iter().all(|(rev, _, _)| *rev != r2),
+        "no NULL row"
+    );
+    assert!(
+        latest_cycle_mapping(&engine).is_none(),
+        "no journal operation survives"
+    );
+    assert!(
+        reposync_core::echo_receipt_scope::read_svn_no_target_receipt(engine.db(), REPO, r2)
+            .unwrap()
+            .is_none()
+    );
+    let receipts_after: i64 = engine
+        .db()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM kv_state", [], |row| row.get(0))
+        .unwrap();
+    assert!(receipts_after >= receipts_before);
+    drop(engine);
+    {
+        let reopened = Database::new(&fx.db_path).unwrap();
+        reopened.initialize().unwrap();
+        let recovery_fence = writer_fence::claim(&reopened, &fx.data_dir).unwrap();
+        reopened.hold_interrupted_team_cycle_mappings().unwrap();
+        assert!(reopened
+            .active_team_cycle_mapping_operation(REPO)
+            .unwrap()
+            .is_none());
+        reopened
+            .conn()
+            .execute_batch("DROP TRIGGER rs53_filtered_write_fault")
+            .unwrap();
+        // Close the database first, then release the guard.
+        drop(reopened);
+        drop(recovery_fence);
+    }
+    assert_eq!(
+        fence_lease(&fx.db_path),
+        None,
+        "the recovery reopen releases its fence before the next engine claims"
+    );
+    let engine = fx.engine(&["team-a/"], &[]);
+    let fresh = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(fresh.svn_to_git_count, 0);
+    assert_filtered_once(&engine, r2);
+    let quiet = engine.run_sync_cycle().await.unwrap();
+    assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
+    assert_eq!(filtered_row_count(&engine, r2), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_scope_conflict_with_pending_git_work_stays_held() {
+    let _serial = serial().lock().await;
+    let mut fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    engine.run_sync_cycle().await.unwrap();
+    fx.git_push(
+        &[("team-a/a.txt", "git side\n")],
+        "Git edits the admitted file",
+    );
+    fx.write("team-a/a.txt", "svn side\n");
+    fx.commit("r2 svn edits the same admitted file");
+    let watermark = svn_watermark(&engine);
+    let held = engine.run_sync_cycle().await.unwrap_err();
+    assert!(
+        matches!(held, SyncError::UnresolvableConflict { .. }),
+        "{held:?}"
+    );
+    assert_eq!(svn_watermark(&engine), watermark);
+    assert_eq!(fx.svn_file("team-a/a.txt").as_deref(), Some("svn side\n"));
+    assert_eq!(fx.git_file("team-a/a.txt").as_deref(), Some("git side\n"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replaced_svn_repository_identity_cannot_mint_filtered_completion() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let repo_dir = fx.tmp.path().join("svn_repo");
+    std::fs::remove_dir_all(&repo_dir).unwrap();
+    run(
+        fx.tmp.path(),
+        "svnadmin",
+        &["create", repo_dir.to_str().unwrap()],
+    );
+    let other = fx.tmp.path().join("other_wc");
+    run(
+        fx.tmp.path(),
+        "svn",
+        &[
+            "checkout",
+            &fx.svn_url,
+            other.to_str().unwrap(),
+            "--non-interactive",
+        ],
+    );
+    std::fs::create_dir_all(other.join("team-b")).unwrap();
+    std::fs::write(other.join("team-b/b.txt"), "foreign\n").unwrap();
+    run(
+        &other,
+        "svn",
+        &["add", "--parents", "--force", "team-b/b.txt@"],
+    );
+    run(
+        &other,
+        "svn",
+        &["commit", "-m", "foreign r1", ".", "--non-interactive"],
+    );
+    std::fs::write(other.join("team-b/b.txt"), "foreign r2\n").unwrap();
+    run(
+        &other,
+        "svn",
+        &["commit", "-m", "foreign r2", ".", "--non-interactive"],
+    );
+    let engine = fx.engine(&["team-a/"], &[]);
+    let refused = format!("{:?}", engine.run_sync_cycle().await.unwrap_err());
+    assert!(
+        refused.contains("svn_identity_changed") || refused.contains("does not match pinned uuid"),
+        "changed SVN UUID is refused as an identity change: {refused}"
+    );
+    assert!(!refused.contains("WriterFenced"), "{refused}");
+    assert_eq!(filtered_row_count(&engine, 2), 0);
+    assert!(latest_cycle_mapping(&engine).is_none());
+    assert_eq!(svn_watermark(&engine), 1);
+}
+
+// ---------------------------------------------------------------------------
+// RS53-R1 / RS53-R2 regressions
+// ---------------------------------------------------------------------------
+
+/// The revision stays at the durable frontier: no Git effect, no watermark
+/// movement, no filtered row, later revisions pending, one held audit row.
+fn assert_held_at_frontier(
+    engine: &SyncEngine,
+    fx: &Fixture,
+    tip: &str,
+    held_rev: i64,
+    later_rev: i64,
+) {
+    assert_eq!(fx.git_tip(), tip, "no Git commit for the held revision");
+    assert_eq!(
+        fx.git_file("team-a/a.txt").as_deref(),
+        Some("team-a baseline\n"),
+        "selected content not applied"
+    );
+    assert_eq!(
+        fx.git_file("team-a/later.txt"),
+        None,
+        "later revision pending"
+    );
+    assert_eq!(svn_watermark(engine), held_rev - 1);
+    assert_eq!(filtered_row_count(engine, held_rev), 0);
+    assert_eq!(filtered_row_count(engine, later_rev), 0);
+    assert!(latest_cycle_mapping(engine).is_none());
+    assert_eq!(audit_count(engine, "svn_to_git_projection_held"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r1_selected_content_with_a_selected_executable_change_on_another_file_holds() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    let tip = fx.git_tip();
+    fx.write("team-a/a.txt", "selected content\n");
+    fx.svn(&["propset", "svn:executable", "*", &op("team-a/old.txt")]);
+    let held = fx.commit("r2 content plus a mode-only change");
+    fx.write("team-a/later.txt", "later dependent work\n");
+    let later = fx.commit("r3 later work");
+    let error = engine.run_sync_cycle().await.unwrap_err();
+    assert!(
+        matches!(&error, SyncError::HistoryBlocked { reason, detail }
+            if reason == "svn_projection_held" && detail.contains("svn:executable")),
+        "{error:?}"
+    );
+    assert_held_at_frontier(&engine, &fx, &tip, held, later);
+    let again = engine.run_sync_cycle().await.unwrap_err();
+    assert!(
+        matches!(again, SyncError::HistoryBlocked { .. }),
+        "the hold persists: {again:?}"
+    );
+    assert_eq!(fx.git_tip(), tip);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r1_selected_content_with_a_selected_symlink_holds() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    let tip = fx.git_tip();
+    fx.write("team-a/a.txt", "selected content\n");
+    std::os::unix::fs::symlink("a.txt", fx.wc.join("team-a/link")).unwrap();
+    fx.svn(&["add", &op("team-a/link")]);
+    let held = fx.commit("r2 content plus a symlink");
+    fx.write("team-a/later.txt", "later dependent work\n");
+    let later = fx.commit("r3 later work");
+    let error = engine.run_sync_cycle().await.unwrap_err();
+    assert!(
+        matches!(&error, SyncError::HistoryBlocked { reason, detail }
+            if reason == "svn_projection_held" && detail.contains("svn:special")),
+        "{error:?}"
+    );
+    assert_held_at_frontier(&engine, &fx, &tip, held, later);
+    assert_eq!(fx.git_file("team-a/link"), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_engine_policy_that_is_not_the_admitted_policy_is_refused_before_any_effect() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    fx.admit_policy(&["team-a/"], &[]);
+    let engine = fx.engine_with_stale_rules(&["team-b/"]);
+    let tip = fx.git_tip();
+    fx.write("team-a/a.txt", "would be excluded under the stale rules\n");
+    let r2 = fx.commit("r2");
+    let error = engine.run_sync_cycle().await.unwrap_err();
+    assert!(error.to_string().contains("admitted policy"), "{error}");
+    assert_eq!(fx.git_tip(), tip);
+    assert_eq!(svn_watermark(&engine), 1);
+    assert_eq!(filtered_row_count(&engine, r2), 0);
+    assert!(latest_cycle_mapping(&engine).is_none());
+    assert_eq!(audit_count(&engine, "svn_to_git_filtered"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_admitted_policy_change_refuses_the_stale_engine_and_a_fresh_engine_follows_it() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let stale = fx.engine(&["team-a/"], &[]);
+    fx.write("team-b/b.txt", "excluded under team-a\n");
+    let r2 = fx.commit("r2 team-b");
+    assert_eq!(stale.run_sync_cycle().await.unwrap().svn_to_git_count, 0);
+    assert_filtered_once(&stale, r2);
+    let tip = fx.git_tip();
+    // The operator admits a different policy; this engine still holds the old one.
+    fx.admit_policy(&["team-b/"], &[]);
+    fx.write("team-b/b.txt", "admitted under team-b\n");
+    let r3 = fx.commit("r3 team-b");
+    let error = stale.run_sync_cycle().await.unwrap_err();
+    assert!(error.to_string().contains("admitted policy"), "{error}");
+    assert_eq!(fx.git_tip(), tip);
+    assert_eq!(svn_watermark(&stale), r2);
+    assert_eq!(filtered_row_count(&stale, r3), 0);
+    drop(stale);
+    // r3 depends on r2's bytes, which the old policy filtered forever (forward-only,
+    // no reimport). The fresh engine must fail closed at the durable frontier:
+    // no reset, no repair, no automatic catch-up.
+    let fresh = fx.engine_with_rules_from_row();
+    let failed = fresh.run_sync_cycle().await.unwrap_err();
+    assert!(
+        format!("{failed:?}").contains("ApplyFailed"),
+        "dependent history fails to apply: {failed:?}"
+    );
+    assert_eq!(fx.git_tip(), tip, "no Git effect");
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("team-b baseline\n"),
+        "the diverged file is neither repaired nor reset"
+    );
+    assert_eq!(
+        svn_watermark(&fresh),
+        r2,
+        "r3 stays pending at the frontier"
+    );
+    assert_eq!(
+        filtered_row_count(&fresh, r3),
+        0,
+        "a failed apply is never filtering"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_fresh_engine_follows_a_widened_admitted_policy_for_a_new_selected_path() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let stale = fx.engine(&["team-a/"], &[]);
+    fx.write("team-b/b.txt", "excluded under team-a\n");
+    let r2 = fx.commit("r2 team-b");
+    assert_eq!(stale.run_sync_cycle().await.unwrap().svn_to_git_count, 0);
+    assert_filtered_once(&stale, r2);
+    fx.admit_policy(&["team-b/"], &[]);
+    fx.write("team-b/new-admitted.txt", "new under team-b\n");
+    let r3 = fx.commit("r3 new team-b path");
+    let refused = stale.run_sync_cycle().await.unwrap_err();
+    assert!(refused.to_string().contains("admitted policy"), "{refused}");
+    drop(stale);
+    let fresh = fx.engine_with_rules_from_row();
+    assert_eq!(fresh.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fx.git_file("team-b/new-admitted.txt").as_deref(),
+        Some("new under team-b\n")
+    );
+    assert_eq!(
+        fx.git_file("team-b/b.txt").as_deref(),
+        Some("team-b baseline\n"),
+        "no automatic catch-up of filtered history"
+    );
+    assert_eq!(svn_watermark(&fresh), r3);
+    let tip = fx.git_tip();
+    assert_team_applied(&fresh, &fx, r3, &tip);
+}
+
+// ---------------------------------------------------------------------------
+// RS53-IMPORTED-ORIGIN-HISTORICAL-INCARNATION-1: branch-path fixture and the
+// imported-origin incarnation cases. The default root fixture is unchanged.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// A pair whose SVN URL is the branch path `<repo>/<branch>`, so the
+    /// imported path has its own line of history (the repository root cannot
+    /// be deleted and recreated).
+    /// - Uncopied: `svn mkdir` creates the branch at r1.
+    /// - Copied (`copied_from_trunk`): trunk is created at r1 and given content
+    ///   at r2, and the branch is copied from `trunk@2` at r3.
+    ///
+    /// The baseline is then committed on the branch and imported at that
+    /// revision, exactly as `Fixture::new` does for the root.
+    async fn new_branch(branch: &str, copied_from_trunk: bool, baseline: &[(&str, &str)]) -> Self {
+        require_toolchain();
+        let tmp = TempDir::new().unwrap();
+        let repo_dir = tmp.path().join("svn_repo");
+        run(
+            tmp.path(),
+            "svnadmin",
+            &["create", repo_dir.to_str().unwrap()],
+        );
+        let hook = repo_dir.join("hooks/pre-revprop-change");
+        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let root = format!("file://{}", repo_dir.display());
+        if copied_from_trunk {
+            run(
+                tmp.path(),
+                "svn",
+                &[
+                    "mkdir",
+                    "--parents",
+                    "-m",
+                    "create trunk",
+                    &format!("{root}/trunk"),
+                ],
+            );
+            let trunk_wc = tmp.path().join("trunk_wc");
+            run(
+                tmp.path(),
+                "svn",
+                &[
+                    "checkout",
+                    &format!("{root}/trunk"),
+                    trunk_wc.to_str().unwrap(),
+                    "--non-interactive",
+                ],
+            );
+            std::fs::write(trunk_wc.join("seed.txt"), "trunk seed\n").unwrap();
+            run(&trunk_wc, "svn", &["add", &op("seed.txt")]);
+            run(
+                &trunk_wc,
+                "svn",
+                &["commit", "-m", "trunk content", ".", "--non-interactive"],
+            );
+            run(
+                tmp.path(),
+                "svn",
+                &[
+                    "copy",
+                    "--parents",
+                    "-m",
+                    "branch from trunk@2",
+                    &format!("{root}/trunk@2"),
+                    &format!("{root}/{branch}"),
+                ],
+            );
+        } else {
+            run(
+                tmp.path(),
+                "svn",
+                &[
+                    "mkdir",
+                    "--parents",
+                    "-m",
+                    "create branch",
+                    &format!("{root}/{branch}"),
+                ],
+            );
+        }
+        let svn_url = format!("{root}/{branch}");
+        let wc = tmp.path().join("svn_wc");
+        run(
+            tmp.path(),
+            "svn",
+            &[
+                "checkout",
+                &svn_url,
+                wc.to_str().unwrap(),
+                "--non-interactive",
+            ],
+        );
+        let fixture_paths = Fixture {
+            svn_url,
+            wc,
+            bare: tmp.path().join("origin.git"),
+            git_work: tmp.path().join("git_work"),
+            data_dir: tmp.path().join("data"),
+            db_path: tmp.path().join("data").join("reposync.db"),
+            developer: None,
+            tmp,
+        };
+        for (path, bytes) in baseline {
+            fixture_paths.write(path, bytes);
+        }
+        std::env::set_var(
+            "REPOSYNC_RS53_OBSERVE_DIR",
+            fixture_paths.tmp.path().join("observe"),
+        );
+        let baseline_rev = fixture_paths.commit("baseline on the branch");
+        fixture_paths.import(baseline_rev).await;
+        fixture_paths
+    }
+
+    /// The SVN repository root URL (the pair's URL is a branch below it).
+    fn svn_root(&self) -> String {
+        format!("file://{}", self.tmp.path().join("svn_repo").display())
+    }
+
+    /// An SVN operation on repository URLs, not the working copy.
+    fn svn_remote(&self, args: &[&str]) -> String {
+        run(self.tmp.path(), "svn", args)
+    }
+}
+
+/// One canonical lineage row of the pair, read directly with no side effects.
+#[derive(Debug, PartialEq, Eq)]
+struct LineageRow {
+    created_rev: i64,
+    copy_from_path: Option<String>,
+    copy_from_rev: Option<i64>,
+    git_baseline_sha: Option<String>,
+    svn_url: String,
+}
+
+fn lineage_rows(engine: &SyncEngine) -> Vec<LineageRow> {
+    let conn = engine.db().conn();
+    let mut stmt = conn
+        .prepare(
+            "SELECT incarnation_created_rev, copy_from_path, copy_from_rev, git_baseline_sha, svn_url \
+             FROM canonical_lineage WHERE repo_id = ?1 ORDER BY generation",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([REPO], |r| {
+            Ok(LineageRow {
+                created_rev: r.get(0)?,
+                copy_from_path: r.get(1)?,
+                copy_from_rev: r.get(2)?,
+                git_baseline_sha: r.get(3)?,
+                svn_url: r.get(4)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows
+}
+
+fn sync_record_ids(engine: &SyncEngine) -> Vec<String> {
+    let conn = engine.db().conn();
+    let mut stmt = conn
+        .prepare("SELECT id FROM sync_records WHERE repo_id = ?1 ORDER BY id")
+        .unwrap();
+    let rows = stmt
+        .query_map([REPO], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows
+}
+
+/// After an import, the first lineage pin is refused (held) with `needle` in
+/// the identity-change detail. Nothing is pinned, published, mapped or moved.
+async fn assert_first_pin_held(fx: &Fixture, imported: &str, imported_rev: i64, needle: &str) {
+    let commits = fx.git_commits();
+    let engine = fx.engine(&["team-a/"], &[]);
+    let origin_only = sync_record_ids(&engine);
+    let mapped = rows(&engine);
+    let refused = format!("{:?}", engine.run_sync_cycle().await.unwrap_err());
+    assert!(
+        refused.contains("svn_identity_changed"),
+        "a different incarnation is an identity change: {refused}"
+    );
+    assert!(refused.contains(needle), "{needle:?} in {refused}");
+    assert!(
+        lineage_rows(&engine).is_empty(),
+        "no canonical lineage row is pinned for the replacement incarnation"
+    );
+    assert_eq!(svn_watermark(&engine), imported_rev, "SVN cursor unchanged");
+    assert_eq!(
+        inbound_git_cursor(&engine).as_deref(),
+        Some(imported),
+        "inbound Git cursor unchanged"
+    );
+    assert_eq!(sync_record_ids(&engine), origin_only, "no new sync record");
+    assert_eq!(rows(&engine), mapped, "no new mapping");
+    assert!(latest_cycle_mapping(&engine).is_none());
+    assert_eq!(
+        (fx.git_tip(), fx.git_commits()),
+        (imported.to_owned(), commits),
+        "no remote Git effect"
+    );
+    // The hold is durable: a second cycle is refused the same way and pins nothing.
+    let again = format!("{:?}", engine.run_sync_cycle().await.unwrap_err());
+    assert!(!again.contains("WriterFenced"), "{again}");
+    assert!(lineage_rows(&engine).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_branch_first_pins_its_incarnation_and_round_trips_with_pending_git() {
+    let _serial = serial().lock().await;
+    // trunk created uncopied at r1, baseline r2 imported at R = 2 (C = 1 < R).
+    let mut fx = Fixture::new_branch("trunk", false, BASELINE).await;
+    let imported = fx.git_tip();
+    fx.write("team-a/round.txt", "from svn\n");
+    fx.write("team-b/noise.txt", "excluded noise\n");
+    let r3 = fx.commit("r3 svn origin");
+    let engine = fx.engine(&["team-a/"], &[]);
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let lineage = lineage_rows(&engine);
+    assert_eq!(lineage.len(), 1, "one first pin");
+    let pinned = &lineage[0];
+    assert_eq!(
+        (
+            pinned.created_rev,
+            pinned.copy_from_path.as_deref(),
+            pinned.copy_from_rev
+        ),
+        (1, None, None),
+        "the pinned incarnation is the one the snapshot read at R"
+    );
+    assert_eq!(
+        pinned.git_baseline_sha.as_deref(),
+        Some(imported.as_str()),
+        "baseline B"
+    );
+    assert!(pinned.svn_url.ends_with("/trunk"), "{}", pinned.svn_url);
+    let r3_publication = fx.git_tip();
+    assert_team_applied(&engine, &fx, r3, &r3_publication);
+    assert_eq!(fx.git_file("team-b/noise.txt"), None);
+    assert_eq!(
+        inbound_git_cursor(&engine).as_deref(),
+        Some(imported.as_str()),
+        "the inbound Git cursor stays at B; Git after B stays pending"
+    );
+    // Git work after B is replayed under the current policy (the witness path).
+    fx.git_push(&[("team-a/round.txt", "edited in git\n")], "Git edit");
+    assert_eq!(engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    assert_eq!(
+        fx.svn_file("team-a/round.txt").as_deref(),
+        Some("edited in git\n")
+    );
+    assert_eq!(
+        fx.svn_file("team-b/noise.txt").as_deref(),
+        Some("excluded noise\n"),
+        "outside work in SVN is untouched"
+    );
+    let head = fx.svn_head();
+    let tip = fx.git_tip();
+    let commits = fx.git_commits();
+    let mapped = rows(&engine);
+    assert_team_applied(&engine, &fx, r3, &r3_publication);
+    drop(engine);
+    let reopened = fx.engine(&["team-a/"], &[]);
+    for _ in 0..2 {
+        let quiet = reopened.run_sync_cycle().await.unwrap();
+        assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
+    }
+    assert_eq!(
+        (fx.svn_head(), fx.git_tip(), fx.git_commits()),
+        (head, tip, commits)
+    );
+    assert_eq!(
+        rows(&reopened),
+        mapped,
+        "no duplicated mapping after reopen"
+    );
+    assert_eq!(
+        lineage_rows(&reopened).len(),
+        1,
+        "the lineage row is never rewritten"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_and_recreating_the_imported_uncopied_branch_holds_the_first_pin() {
+    let _serial = serial().lock().await;
+    // N1: trunk created uncopied at r1, baseline r2 imported at R = 2.
+    let fx = Fixture::new_branch("trunk", false, BASELINE).await;
+    let imported = fx.git_tip();
+    let root = fx.svn_root();
+    // Same UUID, same URL, no copy origin on either incarnation.
+    fx.svn_remote(&["rm", "-m", "delete trunk", &format!("{root}/trunk")]);
+    fx.svn_remote(&["mkdir", "-m", "recreate trunk", &format!("{root}/trunk")]);
+    assert_eq!(fx.svn_head(), 4);
+    assert_first_pin_held(&fx, &imported, 2, "incarnation_created_rev: 1 != 4").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recopying_the_imported_branch_from_the_same_source_holds_the_first_pin() {
+    let _serial = serial().lock().await;
+    // N2: branches/b copied from trunk@2 at r3, baseline r4 imported at R = 4.
+    let fx = Fixture::new_branch("branches/b", true, BASELINE).await;
+    let imported = fx.git_tip();
+    let root = fx.svn_root();
+    fx.svn_remote(&["rm", "-m", "delete branch", &format!("{root}/branches/b")]);
+    fx.svn_remote(&[
+        "copy",
+        "-m",
+        "recopy branch from trunk@2",
+        &format!("{root}/trunk@2"),
+        &format!("{root}/branches/b"),
+    ]);
+    // Same UUID, URL and copy source /trunk@2; only the creation differs.
+    assert_eq!(fx.svn_head(), 6);
+    assert_first_pin_held(&fx, &imported, 4, "incarnation_created_rev: 3 != 6").await;
+}
+
+// ---------------------------------------------------------------------------
+// RS53-IMPORTED-ORIGIN-COVERAGE-EXTENSION-1: first-pin historical-unavailable
+// control. This is an INJECTED native subprocess-refusal control with a real
+// healthy SVN HEAD and the real first-pin entrypoint. It is not a real server
+// outage or authorization test, and it does not show that the refused
+// historical command reached the official binary (it never does). It uses the
+// existing `reliability-fixture` interposer of `SvnClient::svn_command`
+// unchanged.
+// ---------------------------------------------------------------------------
+
+/// Restores the previous values of the interposer variables when dropped.
+#[cfg(all(feature = "reliability-fixture", unix))]
+struct InterposerEnv {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+impl InterposerEnv {
+    fn install(root: &Path, script: &Path) -> Self {
+        let names = ["REPOSYNC_FIXTURE_ROOT", "REPOSYNC_IMPORT_SVN_BINARY"];
+        let saved = names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        std::env::set_var("REPOSYNC_FIXTURE_ROOT", root);
+        std::env::set_var("REPOSYNC_IMPORT_SVN_BINARY", script);
+        Self { saved }
+    }
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+impl Drop for InterposerEnv {
+    fn drop(&mut self) {
+        for (name, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+/// At most 64 KiB of the interposer's dispatch log.
+#[cfg(all(feature = "reliability-fixture", unix))]
+fn bounded_dispatch_log(path: &Path) -> String {
+    use std::io::Read;
+    let mut text = String::new();
+    if let Ok(file) = std::fs::File::open(path) {
+        let _ = file.take(64 * 1024).read_to_string(&mut text);
+    }
+    text
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn injected_refusal_of_the_historical_log_at_r_holds_the_real_first_pin_with_healthy_head() {
+    use reposync_core::db::lineage_checkpoints::verify_or_pin_live_svn_identity;
+    const SENTINEL: &str = "RS53-INJECTED-HISTORICAL-REFUSAL";
+    const REFUSED_STATUS: i32 = 97;
+    let _serial = serial().lock().await;
+    // 1. A genuine branch-path snapshot import at R = 2 (trunk created r1),
+    //    then a later revision H = 3 in the same incarnation.
+    let fx = Fixture::new_branch("trunk", false, BASELINE).await;
+    let snapshot_rev = 2;
+    let imported = fx.git_tip();
+    fx.write("team-a/later.txt", "same incarnation\n");
+    let head_rev = fx.commit("r3 in the same incarnation");
+    assert!(head_rev > snapshot_rev);
+    // The actual engine, database and writer fence stay alive; no cycle runs.
+    let engine = fx.engine(&["team-a/"], &[]);
+    assert!(lineage_rows(&engine).is_empty(), "no canonical lineage yet");
+    assert_eq!(svn_watermark(&engine), snapshot_rev);
+    let cursor = inbound_git_cursor(&engine);
+    assert_eq!(cursor.as_deref(), Some(imported.as_str()));
+    let records = sync_record_ids(&engine);
+    let mapped = rows(&engine);
+    let git = (fx.git_tip(), fx.git_commits());
+    // The configured fixture client with a genuine, false cancellation token
+    // (the interposer applies only to clients carrying one).
+    let svn = SvnClient::new(&fx.svn_url, "", "")
+        .with_cancel_signal(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    // 2. Before the fault: the official binary serves old-peg and HEAD reads.
+    svn.info_at_rev(snapshot_rev).await.unwrap();
+    assert!(!svn
+        .copy_history_at_rev(snapshot_rev)
+        .await
+        .unwrap()
+        .is_empty());
+    let before = svn.info().await.unwrap();
+    assert_eq!(before.latest_rev, head_rev);
+    assert!(!svn.copy_history_at_rev(head_rev).await.unwrap().is_empty());
+    // 3. A small script below a private canonical root refuses only the exact
+    //    dispatched argv of the historical log at R; every other argv execs
+    //    the absolute official SVN binary unchanged.
+    let official = run(fx.tmp.path(), "sh", &["-c", "command -v svn"]);
+    let official = std::fs::canonicalize(official.trim()).unwrap();
+    let root = fx.tmp.path().join("interposer-root");
+    std::fs::create_dir(&root).unwrap();
+    let root = std::fs::canonicalize(&root).unwrap();
+    let script = root.join("svn-refuse-historical.sh");
+    let dispatch_log = root.join("dispatch.log");
+    let target = reposync_core::svn::operand::literal_url(&fx.svn_url, Some(snapshot_rev)).unwrap();
+    let range = format!("{snapshot_rev}:1");
+    for value in [
+        &official.display().to_string(),
+        &dispatch_log.display().to_string(),
+        &target,
+    ] {
+        assert!(!value.contains('\''), "fixture paths are single-quote free");
+    }
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$#\" -eq 14 ] && [ \"$1\" = log ] && [ \"$2\" = --non-interactive ] \
+             && [ \"$3\" = --no-auth-cache ] && [ \"$4\" = --username ] && [ \"$5\" = '' ] \
+             && [ \"$6\" = --password ] && [ \"$7\" = '' ] && [ \"$8\" = --xml ] \
+             && [ \"$9\" = --verbose ] && [ \"${{10}}\" = --stop-on-copy ] && [ \"${{11}}\" = -r ] \
+             && [ \"${{12}}\" = '{range}' ] && [ \"${{13}}\" = -- ] && [ \"${{14}}\" = '{target}' ]; then\n\
+             printf 'REFUSED status={REFUSED_STATUS} argv=%s\\n' \"$*\" >> '{log}'\n\
+             printf '%s\\n' '{SENTINEL}' >&2\n\
+             exit {REFUSED_STATUS}\n\
+             fi\n\
+             printf 'DELEGATED argv=%s\\n' \"$*\" >> '{log}'\n\
+             exec '{official}' \"$@\"\n",
+            log = dispatch_log.display(),
+            official = official.display(),
+        ),
+    )
+    .unwrap();
+    let prior = (
+        std::env::var_os("REPOSYNC_FIXTURE_ROOT"),
+        std::env::var_os("REPOSYNC_IMPORT_SVN_BINARY"),
+    );
+    {
+        let _interposer = InterposerEnv::install(&root, &script);
+        // After installation, live HEAD info/history still delegate and succeed.
+        let live_info = svn.info().await.unwrap();
+        assert_eq!(live_info.latest_rev, head_rev);
+        assert!(!svn.copy_history_at_rev(head_rev).await.unwrap().is_empty());
+        let delegated = bounded_dispatch_log(&dispatch_log);
+        assert!(
+            delegated.lines().count() >= 2
+                && delegated.lines().all(|l| l.starts_with("DELEGATED ")),
+            "HEAD reads delegated to the official binary: {delegated}"
+        );
+        // 4. The real first-pin entrypoint, on the fixture's real database
+        //    under its retained fence, with genuine live info.
+        let held = verify_or_pin_live_svn_identity(engine.db(), REPO, &svn, &live_info)
+            .await
+            .unwrap_err();
+        let receipt = bounded_dispatch_log(&dispatch_log);
+        println!("RS53_INJECTED_REFUSAL_RECEIPT\n{receipt}");
+        // 5. The exact refused subprocess, the expected hold, and no effect.
+        match &held {
+            SyncError::HistoryBlocked { reason, detail } => {
+                assert_eq!(reason, "svn_incarnation_unproved", "{detail}");
+                assert!(detail.contains(SENTINEL), "{detail}");
+                assert!(
+                    detail.contains(&format!("exit {REFUSED_STATUS}")),
+                    "{detail}"
+                );
+                assert!(detail.contains(&format!("r{snapshot_rev}")), "{detail}");
+            }
+            other => panic!("expected the first-pin hold, got {other:?}"),
+        }
+        let refused: Vec<&str> = receipt
+            .lines()
+            .filter(|l| l.starts_with("REFUSED "))
+            .collect();
+        assert_eq!(
+            refused.len(),
+            1,
+            "exactly one subprocess refused: {receipt}"
+        );
+        assert!(
+            refused[0].contains(&format!("--stop-on-copy -r {range} -- {target}")),
+            "{receipt}"
+        );
+        assert!(
+            receipt
+                .lines()
+                .filter(|l| l.starts_with("DELEGATED "))
+                .any(|l| l.contains("info ") && l.contains(&target)),
+            "the historical info at R was delegated before the refused log: {receipt}"
+        );
+        assert!(
+            lineage_rows(&engine).is_empty(),
+            "no canonical lineage inserted"
+        );
+        assert_eq!(svn_watermark(&engine), snapshot_rev);
+        assert_eq!(inbound_git_cursor(&engine), cursor);
+        assert_eq!(sync_record_ids(&engine), records);
+        assert_eq!(rows(&engine), mapped);
+        assert_eq!((fx.git_tip(), fx.git_commits()), git);
+        assert_eq!(fx.svn_head(), head_rev);
+        // 6. `_interposer` restores the previous values here, before the
+        //    target-local serial guard is released at the end of the case.
+    }
+    assert_eq!(
+        (
+            std::env::var_os("REPOSYNC_FIXTURE_ROOT"),
+            std::env::var_os("REPOSYNC_IMPORT_SVN_BINARY"),
+        ),
+        prior,
+        "the interposer variables are restored"
+    );
+    // 7. Read-only old-peg reads succeed again once the fault is removed. The
+    //    durable hold is not cleared and the first pin is not retried.
+    svn.info_at_rev(snapshot_rev).await.unwrap();
+    assert!(!svn
+        .copy_history_at_rev(snapshot_rev)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(lineage_rows(&engine).is_empty());
+}

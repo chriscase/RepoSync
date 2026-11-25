@@ -93,8 +93,8 @@ admin_password_env = "REPOSYNC_ADMIN_PASSWORD"
 
 [sync]
 # Set team path rules in the registered repository's Path policy editor or API.
-# The scheduler applies them to Git-to-SVN writes. The `reposync sync now`
-# command builds its engine from service TOML and does not load those rules.
+# The Team scheduler applies them to Git-to-SVN and incremental SVN-to-Git sync.
+# Initial imports and the standalone `reposync sync now` command do not load these rules.
 # See docs/monorepo-subset-sync.md for a worked example and verification.
 
 # Sync mode: "direct" = auto-sync immediately, "pr" = create GitHub PR for review

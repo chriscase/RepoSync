@@ -212,7 +212,7 @@ async fn rs56_get_reports_unset_lists_empty_and_malformed_without_raw_columns() 
     assert_eq!(
         unset["path_policy"],
         json!({"version":1,"allowed_paths":{"state":"unset"},"blocked_patterns":{"state":"unset"},
-            "enforced_direction":"git_to_svn","svn_to_git_filtering":"not_applied","path_rewriting":"none_read_only"})
+            "enforced_direction":"bidirectional","svn_to_git_filtering":"managed_incremental","path_rewriting":"none_read_only"})
     );
     let lists = get_repo(&client, addr, "lists").await;
     assert_eq!(

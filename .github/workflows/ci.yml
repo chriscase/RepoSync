@@ -93,6 +93,14 @@ jobs:
           GIT_COMMITTER_NAME: "Test User"
           GIT_COMMITTER_EMAIL: "test@example.com"
 
+      - name: Partial sync incarnation feature qualification (#53)
+        timeout-minutes: 10
+        env:
+          CARGO_BUILD_JOBS: 1
+        run: |
+          cargo clippy --locked -p reposync-core --features reliability-fixture --test partial_sync_53 -- -D warnings
+          cargo test --locked -p reposync-core --features reliability-fixture --test partial_sync_53 -- --list --format pretty --color never
+          cargo test --locked -p reposync-core --features reliability-fixture --test partial_sync_53 -- --format pretty --color never
       - name: Snapshot and full-import feature qualification (#68)
         timeout-minutes: 10
         run: |

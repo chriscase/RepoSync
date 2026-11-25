@@ -1,6 +1,6 @@
 import { useId, useRef, useState } from 'react';
 import {
-  POLICY_FIELDS, PATH_POLICY_LIMITATIONS, type PathPolicyDraft, type PolicyFieldKey,
+  POLICY_FIELDS, inboundFilteringNote, type PathPolicyDraft, type PolicyFieldKey,
   addPolicyEntry, beginPolicyEdit, clearPolicyField, effectivePathPolicy, hasSurroundingWhitespace, parsePreviewPaths,
   policyEntryNoun, policyFieldIssues, policyFieldLabel, policyFieldSummary, policyFieldWarnings,
   previewPath, previewReasonText, removePolicyEntry, undoPolicyField, updatePolicyEntry,
@@ -44,7 +44,8 @@ export default function PathPolicyEditor56({ draft, onChange, initialPreview = '
       <div role="note" aria-labelledby={`${base}-limits`} className="rs-bn rs-bn--warn rounded-md border border-amber-700/60 bg-amber-900/20 px-3 py-2 text-xs text-amber-100">
         <p id={`${base}-limits`} className="font-medium">Limitations in this build</p>
         <ul className="list-disc pl-4">
-          {PATH_POLICY_LIMITATIONS.map(text => <li key={text}>{text}</li>)}
+          <li>{inboundFilteringNote[draft.inboundFiltering]}</li>
+          <li>Paths keep their branch-relative names. Rewriting is read-only and cannot be configured here.</li>
         </ul>
       </div>
       {draft.notices.map(notice => <p key={notice} className="text-xs text-amber-200">{notice}</p>)}
@@ -179,7 +180,7 @@ export default function PathPolicyEditor56({ draft, onChange, initialPreview = '
         )}
         <p role="status" className="text-xs text-gray-300">
           {effective.ok && outcomes.length
-            ? `${included} of ${outcomes.length} sample ${outcomes.length === 1 ? 'path' : 'paths'} included in Git→SVN. SVN→Git is not filtered in this build.`
+            ? `${included} of ${outcomes.length} sample ${outcomes.length === 1 ? 'path' : 'paths'} included in Git→SVN.`
             : ''}
         </p>
       </div>
