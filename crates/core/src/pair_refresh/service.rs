@@ -68,6 +68,23 @@ impl RefreshReceiptView {
     }
 }
 
+/// Git inputs bound by the v2 approval digest. Recovery retains the original
+/// operation inputs even when a publication has already moved one remote.
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshApprovalGitTips {
+    pub child: String,
+    pub parent: String,
+}
+
+impl RefreshApprovalGitTips {
+    fn new(child: &str, parent: &str) -> Self {
+        Self {
+            child: child.to_owned(),
+            parent: parent.to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RefreshApprovalView {
     pub version: u8,
@@ -76,6 +93,7 @@ pub struct RefreshApprovalView {
     pub request_id: String,
     pub child_id: String,
     pub parent_id: String,
+    pub git_tips: RefreshApprovalGitTips,
     pub approval_digest: String,
     pub kind: String,
     pub expires_at: String,
@@ -857,6 +875,16 @@ async fn own_request(
             return;
         }
     };
+    let git_tips = match &preparation {
+        Preparation::Integration(value) => {
+            let git = &value.pins().git.pins;
+            RefreshApprovalGitTips::new(&git.child_tip, &git.parent_tip)
+        }
+        Preparation::Noop(value) => {
+            let pins = value.pins();
+            RefreshApprovalGitTips::new(&pins.child.last_git_sha, &pins.parent.last_git_sha)
+        }
+    };
     let expiry = Instant::now() + PREPARATION_LIFETIME;
     let approval = RefreshApprovalView {
         version: 2,
@@ -865,6 +893,7 @@ async fn own_request(
         request_id: request.clone(),
         child_id: child.clone(),
         parent_id: parent.clone(),
+        git_tips,
         approval_digest: digest.clone(),
         kind: kind.into(),
         expires_at: (chrono::Utc::now()

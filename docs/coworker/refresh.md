@@ -75,7 +75,12 @@ request is owned by the actor who started it.
    `{"request_id":"<id you choose>"}`. Keep and reuse that ID across retries and
    disconnects. A successful reply may contain an `approval` (preparation ID,
    operation ID, approval digest, expiry, `kind` = `integration` or `no_op`) or an
-   existing durable `receipt`.
+   existing durable `receipt`. An approval also reports the full Git object IDs in
+   `details.git_tips.child` and `details.git_tips.parent`. Compare both with the
+   tips you intend to approve. Submit the digest from this same preparation only
+   if both match. Older servers omit these fields. A client that requires pinned
+   tips must stop when either field is absent. A recovery approval reports the
+   original operation's input tips, including after a partial publication.
 3. **Approve and execute.** `POST /api/v2/repos/{pair_id}/refresh/action`:
 
    ```json
