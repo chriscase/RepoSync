@@ -1325,6 +1325,9 @@ static PARSED_BLOCKED_PATTERNS: std::sync::OnceLock<std::sync::Mutex<Vec<(String
 static PARSED_ALLOWED_PATHS: std::sync::OnceLock<std::sync::Mutex<Vec<(String, Vec<String>)>>> =
     std::sync::OnceLock::new();
 
+#[cfg(all(test, unix))]
+mod r23_restored_database;
+
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
