@@ -160,14 +160,19 @@ fn tracked_tree_at(repo: &Path, revision: &str) -> BTreeMap<String, Vec<u8>> {
     files
 }
 
-fn create_svn_repo(dir: &Path) -> String {
+fn create_svn_repo(dir: &Path) -> (String, String) {
     assert_fixture_owned(dir);
     let repo_dir = dir.join("svn_repo");
     run_ok(
         Command::new("svnadmin").args(["create", repo_dir.to_str().unwrap()]),
         "svnadmin create",
     );
-    format!("file://{}", repo_dir.display())
+    let uuid = run_ok(
+        Command::new("svnlook").arg("uuid").arg(&repo_dir),
+        "read new repository UUID",
+    );
+    assert!(!uuid.is_empty());
+    (format!("file://{}", repo_dir.display()), uuid)
 }
 
 fn svn_youngest(root_url: &str) -> i64 {
@@ -402,7 +407,7 @@ impl Fixture {
             );
         }
         let tmp = TempDir::new().unwrap();
-        let svn_root = create_svn_repo(tmp.path());
+        let (svn_root, created_uuid) = create_svn_repo(tmp.path());
         let trunk_url = reposync_core::svn::operand::configured_branch_url(&svn_root, "trunk")
             .expect("trunk URL");
 
@@ -483,6 +488,16 @@ impl Fixture {
             teams_webhook_url: None,
         })
         .expect("insert repository");
+
+        let info = SvnClient::new(&trunk_url, "", "").info().await.unwrap();
+        assert_eq!(info.uuid, created_uuid);
+        assert_eq!(info.url, trunk_url);
+        reposync_core::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            &db,
+            REPO_ID,
+            &created_uuid,
+        )
+        .expect("bind the repository row to the UUID witnessed at creation");
 
         let engine = open_engine(db, git, &svn_root, &trunk_url, tmp.path());
 
