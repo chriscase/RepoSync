@@ -29,6 +29,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::historical_review_key::ReviewSessionKey;
 use super::historical_transport::{read_registered_transport, RegisteredTransport};
 use super::lineage_checkpoints::{self, CanonicalLineage};
 use super::{schema, Database};
@@ -390,6 +391,7 @@ fn verify_review<F>(
     pins: LegacyPairPins,
     review: &str,
     planned: bool,
+    review_key: Option<&ReviewSessionKey>,
     verify: F,
 ) -> Result<Reviewed, DatabaseError>
 where
@@ -401,7 +403,7 @@ where
     if !lower_hex(review, 64) {
         return Err(refused("expected the complete reviewed evidence digest"));
     }
-    let transport = read_registered_transport(conn, &pins)?;
+    let transport = read_registered_transport(conn, &pins, review_key)?;
     let proof = verify(&pins, &transport)?;
     if pins
         .import_log_entry_count
@@ -518,6 +520,7 @@ pub fn enroll_verified_lineage<F>(
     data_dir: &Path,
     id: &str,
     review_sha256: &str,
+    review_key: Option<&ReviewSessionKey>,
     verify: F,
 ) -> Result<EnrollmentOutcome, DatabaseError>
 where
@@ -530,7 +533,7 @@ where
         data_dir,
         |tx| {
             let pins = read_legacy_pair_pins(tx, id)?;
-            verify_review(tx, pins, review_sha256, false, verify)
+            verify_review(tx, pins, review_sha256, false, review_key, verify)
         },
         |tx, checked| persist(tx, checked, false),
     )?;
@@ -543,6 +546,7 @@ pub fn prepare_historical_cutover<F>(
     data_dir: &Path,
     id: &str,
     review_sha256: &str,
+    review_key: Option<&ReviewSessionKey>,
     verify: F,
 ) -> Result<EnrollmentOutcome, DatabaseError>
 where
@@ -558,7 +562,7 @@ where
             let pins = read_planned_cutover_pins(tx, id)?;
             Ok((
                 original,
-                verify_review(tx, pins, review_sha256, true, verify)?,
+                verify_review(tx, pins, review_sha256, true, review_key, verify)?,
             ))
         },
         |tx, (original, verified)| persist(tx, verified, original),

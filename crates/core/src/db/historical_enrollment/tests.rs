@@ -69,7 +69,7 @@ fn prospective_refuses_another_imported_pair_before_migrating() {
     let conn = fixture(&path);
     assert!(read_planned_cutover_pins(&conn, ID).is_ok());
     history(&conn, OTHER);
-    let error = prepare_historical_cutover(dir.path(), ID, &"1".repeat(64), |_, _| {
+    let error = prepare_historical_cutover(dir.path(), ID, &"1".repeat(64), None, |_, _| {
         panic!("verified a stranded database")
     })
     .unwrap_err();
@@ -257,7 +257,7 @@ fn refused_retrospective_proof_does_not_retire_a_previous_writer_lease() {
         params![key, previous],
     )
     .unwrap();
-    let error = enroll_verified_lineage(dir.path(), ID, &"1".repeat(64), |_, _| {
+    let error = enroll_verified_lineage(dir.path(), ID, &"1".repeat(64), None, |_, _| {
         Err(refused("synthetic changed witness"))
     })
     .unwrap_err();
