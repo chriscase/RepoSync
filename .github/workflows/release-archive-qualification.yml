@@ -1,0 +1,34 @@
+name: Release archive qualification
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release-archive-qualification.yml
+      - .github/workflows/release.yml
+      - scripts/assemble_release_archive.sh
+      - scripts/install.sh
+      - scripts/qualify_release_artifact.sh
+      - scripts/reposync.service
+      - config.example.toml
+      - authors.example.toml
+      - web-ui/**
+
+permissions:
+  contents: read
+
+jobs:
+  qualify-linux-archive:
+    name: Install and run the native Linux archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+      - run: bash scripts/qualify_release_artifact.sh

@@ -26,8 +26,6 @@ REQUIRED_ARCHIVE_MEMBERS=(
     reposync.service
     static/index.html
     static/favicon.svg
-    static/assets/index-CMTDqfvH.js
-    static/assets/index-De9InfNN.css
 )
 
 archive_sha256() {
@@ -45,78 +43,107 @@ verify_archive_digest() {
     fi
 }
 
-require_archive_members() {
-    local archive="$1"
-    python3 - "$archive" "${REQUIRED_ARCHIVE_MEMBERS[@]}" <<'PY'
+# Keep the release contract in the standalone installer. The assembler uses
+# the same entry point to check Vite's complete non-sourcemap output.
+release_members() {
+    python3 - "$1" "$2" "${REQUIRED_ARCHIVE_MEMBERS[@]}" <<'PYTHON'
+from html.parser import HTMLParser
+from pathlib import Path
+import re
 import sys
 import tarfile
 
-archive = sys.argv[1]
-allowed = sys.argv[2:]
-try:
-    handle = tarfile.open(archive, "r:gz")
-except (tarfile.TarError, OSError):
-    print("Error: corrupt or unreadable archive", file=sys.stderr)
-    sys.exit(1)
+mode, source, *required = sys.argv[1:]
 
-def normalized(name):
-    if name.startswith("./"):
-        name = name[2:]
-    return name.rstrip("/")
 
-seen = []
-with handle:
-    for member in handle.getmembers():
-        name = normalized(member.name)
-        if (
-            name.startswith("/")
-            or ".." in name.split("/")
-            or "\\" in name
-            or name == ""
-        ):
-            print(f"Error: archive member is not allowed: {member.name}", file=sys.stderr)
-            sys.exit(1)
-        if member.issym():
-            kind = "symlink"
-        elif member.islnk():
-            kind = "hardlink"
-        elif member.isreg():
-            kind = "file"
+def fail(message):
+    sys.exit(f"Error: {message}")
+
+
+class Entrypoint(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.assets = set()
+        self.has_module = False
+        self.has_style = False
+
+    def handle_starttag(self, tag, attributes):
+        attrs = dict(attributes)
+        rel = (attrs.get("rel") or "").lower().split()
+        if tag == "script" and attrs.get("type") == "module":
+            url, suffix = attrs.get("src"), "js"
+            self.has_module = True
+        elif tag == "link" and "stylesheet" in rel:
+            url, suffix = attrs.get("href"), "css"
+            self.has_style = True
+        elif tag == "link" and "modulepreload" in rel:
+            url, suffix = attrs.get("href"), "js"
         else:
-            kind = "other"
-        seen.append((name, kind))
+            return
+        if not re.fullmatch(r"/assets/[A-Za-z0-9_][A-Za-z0-9_-]*-[A-Za-z0-9_-]{8}\." + suffix, url or ""):
+            fail(f"unsupported release UI asset reference: {url!r}")
+        self.assets.add("static" + url)
 
-names = [name for name, _kind in seen]
-if len(names) != len(set(names)):
-    for name in names:
-        if names.count(name) > 1:
-            print(f"Error: duplicate archive member: {name}", file=sys.stderr)
-            sys.exit(1)
-for name, kind in seen:
-    if kind == "symlink":
-        print(f"Error: archive member is a symlink: {name}", file=sys.stderr)
-        sys.exit(1)
-    if kind == "hardlink":
-        print(f"Error: archive member is a hard link: {name}", file=sys.stderr)
-        sys.exit(1)
-    if kind != "file":
-        print(f"Error: archive member is not a regular file: {name}", file=sys.stderr)
-        sys.exit(1)
-present = set(names)
-for required in allowed:
-    if required not in present:
-        print(f"Error: archive is missing required member: {required}", file=sys.stderr)
-        sys.exit(1)
-for name in names:
-    if name not in allowed:
-        print(f"Error: archive has an extra member: {name}", file=sys.stderr)
-        sys.exit(1)
-PY
+
+if mode == "build":
+    dist = Path(source)
+    present = {name for name in required if not name.startswith("static/")}
+    for path in dist.rglob("*"):
+        if path.is_symlink():
+            fail(f"build output is a symlink: {path}")
+        if path.is_file() and path.suffix != ".map":
+            present.add("static/" + path.relative_to(dist).as_posix())
+else:
+    present = set()
+    try:
+        with tarfile.open(source, "r:gz") as handle:
+            for member in handle:
+                name = member.name[2:] if member.name.startswith("./") else member.name
+                if (not name or name.startswith("/") or ".." in name.split("/")
+                        or "\\" in name):
+                    fail(f"archive member is not allowed: {member.name}")
+                if name in present:
+                    fail(f"duplicate archive member: {name}")
+                if member.issym():
+                    fail(f"archive member is a symlink: {name}")
+                if member.islnk():
+                    fail(f"archive member is a hard link: {name}")
+                if not member.isfile():
+                    fail(f"archive member is not a regular file: {name}")
+                present.add(name)
+                if name == "static/index.html":
+                    index = handle.extractfile(member).read()
+    except (tarfile.TarError, OSError):
+        fail("corrupt or unreadable archive")
+
+for name in required:
+    if name not in present:
+        fail(f"archive is missing required member: {name}")
+if mode == "build":
+    index = (dist / "index.html").read_bytes()
+entry = Entrypoint()
+entry.feed(index.decode("utf-8"))
+entry.close()
+if not entry.has_module or not entry.has_style:
+    fail("release UI index requires a module script and stylesheet")
+expected = set(required) | entry.assets
+for name in sorted(expected - present):
+    fail(f"archive is missing required member: {name}")
+for name in sorted(present - expected):
+    fail(f"archive has an extra member: {name}")
+print("\n".join(sorted(expected)))
+PYTHON
 }
+
+if [[ "${1:-}" == "--list-build-members" ]]; then
+    release_members build "$2"
+    exit 0
+fi
 
 install_from_verified_archive() {
     local archive="$1"
-    local prefix="${2:-}"
+    local prefix="$2"
+    local members="$3"
     local use_sudo=1
     local install_dir config_dir data_dir stage
     if [[ -n "$prefix" ]]; then
@@ -178,13 +205,13 @@ install_from_verified_archive() {
     copy_file "${stage}/reposync-daemon" "${install_dir}/reposync-daemon" 755
     copy_file "${stage}/reposync" "${install_dir}/reposync" 755
     local member
-    for member in "${REQUIRED_ARCHIVE_MEMBERS[@]}"; do
+    while IFS= read -r member; do
         case "$member" in
             static/*)
                 copy_tree_file "${stage}/${member}" "${install_dir}/${member}"
                 ;;
         esac
-    done
+    done <<< "$members"
 
     # Existing configuration, keys, and data are preserved. Examples are
     # copied only when the destination file is absent.
@@ -240,8 +267,8 @@ if [[ "${1:-}" == "--from-archive" ]]; then
     fi
     # Digest and member checks happen before any prefix mutation.
     verify_archive_digest "$ARCHIVE" "$ARCHIVE_SHA"
-    require_archive_members "$ARCHIVE"
-    install_from_verified_archive "$ARCHIVE" "$PREFIX"
+    members="$(release_members archive "$ARCHIVE")"
+    install_from_verified_archive "$ARCHIVE" "$PREFIX" "$members"
     if [[ -n "$PREFIX" ]]; then
         echo "==> RepoSync installed under ${PREFIX}"
     else
@@ -294,8 +321,8 @@ curl -fsSL "$DOWNLOAD_URL" -o "${TMP_DIR}/reposync.tar.gz"
 curl -fsSL "${DOWNLOAD_URL}.sha256" -o "${TMP_DIR}/reposync.tar.gz.sha256"
 EXPECTED_SHA="$(awk 'NR==1 {print $1}' "${TMP_DIR}/reposync.tar.gz.sha256")"
 verify_archive_digest "${TMP_DIR}/reposync.tar.gz" "$EXPECTED_SHA"
-require_archive_members "${TMP_DIR}/reposync.tar.gz"
-install_from_verified_archive "${TMP_DIR}/reposync.tar.gz"
+members="$(release_members archive "${TMP_DIR}/reposync.tar.gz")"
+install_from_verified_archive "${TMP_DIR}/reposync.tar.gz" "" "$members"
 
 # Create system user if running as root
 if [ "$(id -u)" = "0" ] || [ -n "${SUDO_USER:-}" ]; then
