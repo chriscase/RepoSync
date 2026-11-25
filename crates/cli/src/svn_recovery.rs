@@ -127,7 +127,9 @@ fn database_failure(error: DatabaseError, fallback: &'static str) -> anyhow::Err
 pub(crate) async fn run(action: RecoveryAction) -> Result<()> {
     let (inputs, reviewed) = match action {
         RecoveryAction::CreateReviewKey { output } => {
-            historical_review_key::create(&output).map_err(|_| anyhow!("Could not create a new review key in the private operator directory. Check its permissions and choose an unused file name."))?;
+            // This narrow key API reports only fixed diagnostics, including the
+            // distinction between an unpublished file and a completed rename.
+            historical_review_key::create(&output)?;
             println!("Private review key created. Use the same file for preview and apply.");
             return Ok(());
         }
