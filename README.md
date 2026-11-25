@@ -235,7 +235,43 @@ reposync upgrade-preflight --database /backups/team/reposync.db
 
 The report identifies the installed v13 or v14 catalog and lists each registration by ID. It checks for retained Git/SVN checkpoints, mappings, sync records, revision-bearing audit entries and import progress. An exit status of zero means these checks found no retained or unattributed history. The command returns a failure status for missing historical identity, evidence of unknown origin or an unreadable, changed or unsupported snapshot. A poll timestamp alone is inconclusive. Both old daemons recorded one after empty and failed polls. Check the old deployment’s records for published work in this case. The command reads the supplied snapshot offline, without loading configuration or connecting to either remote.
 
-For a pair with retained history, keep it paused and locate an independently attributable pre-upgrade SVN backup, its original service URL and branch creation or copy history, and the corresponding Git ref and full imported commits. A saved SVN working copy can corroborate the original URL and UUID. Assessing the live repository and authorizing recovery require a separate review. [Historical Team upgrade follow-up](https://github.com/chriscase/RepoSync/issues/316)
+For a pair with retained history, keep it paused. If the known-good installation is still available, rehearse the planned cutover below. If it has already been replaced, recovery needs an independently attributable pre-upgrade SVN backup, its original service URL and the matching team Git history. A saved SVN working copy can corroborate the original URL and UUID. [Historical Team upgrade follow-up](https://github.com/chriscase/RepoSync/issues/316)
+
+### Rehearse SVN continuity for a Team upgrade
+
+Use `recover-svn-lineage` to rehearse an upgrade for a pair that brings changes from company SVN into the team’s Git repository. The candidate targets disposable installations with local `file://` SVN registrations. Qualification uses synthetic repositories. Recovery against a real company SVN service, including its network transport and authentication, still needs qualification.
+
+For a **planned cutover**, begin while you can identify the working old installation, its company SVN repository and the team’s Git repository. This live pair is the starting point for continuity going forward. You can use it without a historical SVN backup. Arrange a maintenance window. Pause the pair, stop the supervised RepoSync service and hold separate CLI jobs, automation or users that could write the database or either repository. Keep SVN and Git reachable for reads. Confirm in-flight work has finished. A disabled pair can still have work in progress.
+
+Keep a checkpointed copy of the old database before applying changes. Set `DATABASE` to the stopped installation’s `reposync.db`, `PAIR` to its registration UUID from `upgrade-preflight`, and `GIT_MIRROR` to a local repository containing the configured team Git ref and its full imported commits. These paths depend on the installation. The tool reads the registered company SVN location and branch from that database.
+
+```bash
+reposync recover-svn-lineage preview \
+  --database "$DATABASE" --pair "$PAIR" --git-mirror "$GIT_MIRROR"
+```
+
+Preview is read-only. It checks the database, SVN and Git evidence and prints findings and a SHA-256 digest. Review those findings against the installation you intend to replace. If its provenance is uncertain, keep the pair paused. For an isolated apply rehearsal, set `REVIEWED_DIGEST` to the digest you reviewed. Keep writers stopped throughout.
+
+```bash
+reposync recover-svn-lineage apply \
+  --database "$DATABASE" --pair "$PAIR" --git-mirror "$GIT_MIRROR" \
+  --reviewed-digest "$REVIEWED_DIGEST" --confirm-stopped-writers --attest-known-good-install
+```
+
+For **recovery after migration**, supply the migrated `reposync.db` and a separate SVN repository restored from an independently trusted pre-upgrade backup. Obtain `HISTORICAL_ROOT_URL` from records that tie the backup to the old service. Use its original repository root URL without credentials. A new copy of today’s repository cannot supply that provenance. Use the same backup and original URL for both commands.
+
+```bash
+reposync recover-svn-lineage preview \
+  --database "$DATABASE" --pair "$PAIR" --git-mirror "$GIT_MIRROR" \
+  --svn-backup "$RESTORED_SVN" --historical-root-url "$HISTORICAL_ROOT_URL"
+
+reposync recover-svn-lineage apply \
+  --database "$DATABASE" --pair "$PAIR" --git-mirror "$GIT_MIRROR" \
+  --svn-backup "$RESTORED_SVN" --historical-root-url "$HISTORICAL_ROOT_URL" \
+  --reviewed-digest "$REVIEWED_DIGEST" --confirm-stopped-writers --attest-trusted-backup
+```
+
+Apply checks the evidence again before recording continuity for the selected pair in its database. A changed digest or incomplete evidence requires a new review. The pair stays paused after apply. Review the result and check the expected SVN revision and team Git commit before using the normal pair controls to re-enable sync. Keep the database backup and reviewed evidence for the cutover record.
 
 ### Personal Mode Commands
 

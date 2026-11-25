@@ -8,6 +8,8 @@
 
 mod personal;
 mod status;
+mod svn_recovery;
+mod svn_recovery_args;
 mod upgrade_preflight;
 
 use std::path::PathBuf;
@@ -15,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use reposync_core::config::AppConfig;
@@ -47,6 +49,21 @@ struct Cli {
     command: Commands,
 }
 
+impl Cli {
+    fn from_checked_matches(mut matches: clap::ArgMatches) -> Result<Self, clap::Error> {
+        // A global option can occur before the nested subcommand as well as after it.
+        if matches.subcommand_name() == Some("recover-svn-lineage")
+            && matches.value_source("config") == Some(clap::parser::ValueSource::CommandLine)
+        {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "recover-svn-lineage uses the supplied database and does not accept --config",
+            ));
+        }
+        Self::from_arg_matches_mut(&mut matches)
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Show current synchronization status.
@@ -57,6 +74,12 @@ enum Commands {
         /// Checkpointed standalone snapshot of the legacy reposync.db.
         #[arg(long)]
         database: PathBuf,
+    },
+
+    /// Rehearse or record SVN continuity for a stopped legacy Team installation.
+    RecoverSvnLineage {
+        #[command(subcommand)]
+        action: svn_recovery_args::RecoveryAction,
     },
 
     /// Manage sync conflicts.
@@ -161,7 +184,7 @@ async fn main() -> ExitCode {
         .without_time()
         .init();
 
-    let cli = Cli::parse();
+    let cli = Cli::from_checked_matches(Cli::command().get_matches()).unwrap_or_else(|e| e.exit());
 
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -176,6 +199,7 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init { output } => cmd_init(&output),
         Commands::UpgradePreflight { database } => upgrade_preflight::run(&database),
+        Commands::RecoverSvnLineage { action } => svn_recovery::run(action).await,
         Commands::Validate => cmd_validate(&cli.config),
         Commands::Personal {
             personal_config,
