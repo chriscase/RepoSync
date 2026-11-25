@@ -46,7 +46,35 @@ pub(crate) struct HistoricalSvnWitness {
     pub configured_git_url: String,
 }
 
+/// Bounded operator diagnostics. VCS errors may contain private locations,
+/// paths or output. Never cross the proof boundary with their raw text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum HistoricalVerifyError {
+    #[error("The registered endpoint or credential context could not be verified.")]
+    Registration,
+    #[error("The registered or mirror Git branch could not be read at the retained tip.")]
+    GitRef,
+    #[error("The retained mapping and Git commit ancestry do not form a complete linear history.")]
+    GitAncestry,
+    #[error("The registered SVN branch, incarnation or history through the watermark could not be verified.")]
+    SvnHistory,
+    #[error("A historical SVN checkout, its visible properties or its complete Git projection could not be verified.")]
+    SvnTree,
+    #[error("The trusted SVN restore or its association with the registered history could not be verified.")]
+    Archive,
+}
+
+impl HistoricalVerifyError {
+    pub fn classify(error: &anyhow::Error) -> Self {
+        Self::specific_or(error, Self::Registration)
+    }
+    fn specific_or(error: &anyhow::Error, fallback: Self) -> Self {
+        error.downcast_ref::<Self>().copied().unwrap_or(fallback)
+    }
+}
+
 pub struct VerifiedHistoricalLineage {
+    trees: Vec<Oid>,
     pair: LegacyPairPins,
     lineage: CanonicalLineage,
     history: String,
@@ -61,6 +89,10 @@ impl VerifiedHistoricalLineage {
     }
     pub fn lineage(&self) -> &CanonicalLineage {
         &self.lineage
+    }
+    /// Verified trees in exactly the same order as the retained SVN/Git pairs.
+    pub fn projected_tree_ids(&self) -> &[Oid] {
+        &self.trees
     }
     pub fn history_sha256(&self) -> &str {
         &self.history
@@ -384,14 +416,20 @@ async fn observe_svn(
     let started = std::time::Instant::now();
     let mut snapshots = Vec::with_capacity(trees.len());
     for (i, ((rev, _), tree)) in pair.mappings.iter().zip(trees).enumerate() {
-        let checkout = observe_subtree(client, *rev).await?;
+        let checkout = observe_subtree(client, *rev)
+            .await
+            .context(HistoricalVerifyError::SvnTree)?;
         let pinned = checkout.info();
         ensure!(
             pinned.uuid == info.uuid && pinned.url == info.url && pinned.root_url == info.root_url,
             "pegged SVN snapshot identity differs"
         );
-        require_empty_visible_ancestors(client, pinned).await?;
-        let properties = visible_checkout_properties(client, checkout.path(), pinned).await?;
+        require_empty_visible_ancestors(client, pinned)
+            .await
+            .context(HistoricalVerifyError::SvnTree)?;
+        let properties = visible_checkout_properties(client, checkout.path(), pinned)
+            .await
+            .context(HistoricalVerifyError::SvnTree)?;
         verify_refresh_svn_tree(
             mirror,
             &tree.to_string(),
@@ -400,7 +438,7 @@ async fn observe_svn(
             None,
             &branch,
         )
-        .with_context(|| format!("SVN snapshot r{rev} differs from its retained Git tree"))?;
+        .context(HistoricalVerifyError::SvnTree)?;
         snapshots.push((
             *rev,
             tree.to_string(),
@@ -463,6 +501,51 @@ async fn require_stable_source(
     Ok(())
 }
 
+async fn verify_archive(
+    repository: &Path,
+    original_root_url: &str,
+    pair: &LegacyPairPins,
+    mirror: &Path,
+    trees: &[Oid],
+    active: &SvnEvidence,
+) -> Result<Value> {
+    ensure!(
+        original_root_url == pair.svn_url,
+        "trusted backup original location differs from registration"
+    );
+    let repository = repository.canonicalize()?;
+    let original = Url::parse(original_root_url)?;
+    if original.scheme() == "file" {
+        let live_path = original
+            .to_file_path()
+            .map_err(|_| anyhow!("invalid original local SVN root"))?
+            .canonicalize()?;
+        use std::os::unix::fs::MetadataExt;
+        let a = std::fs::metadata(live_path)?;
+        let b = std::fs::metadata(&repository)?;
+        ensure!(
+            (a.dev(), a.ino()) != (b.dev(), b.ino()),
+            "trusted restore must be separate from the active repository"
+        );
+    }
+    let root = Url::from_file_path(&repository)
+        .map_err(|_| anyhow!("unusable restored repository path"))?
+        .to_string();
+    let archived =
+        SvnClient::new_isolated_refresh(&format!("{root}/{}", pair.svn_branch), "", None)?;
+    let old = observe_svn(&archived, &root, pair, mirror, trees).await?;
+    ensure!(
+        old.identity.uuid == active.identity.uuid
+            && old.identity.branch_path == active.identity.branch_path
+            && old.identity.incarnation_created_rev == active.identity.incarnation_created_rev
+            && old.log == active.log
+            && old.snapshots == active.snapshots,
+        "trusted backup and current SVN history differ"
+    );
+    require_stable_source(&archived, &old, pair, true).await?;
+    Ok(json!({"restore_location_sha256": digest(&repository)?, "restored_head": old.head}))
+}
+
 pub(crate) async fn verify_registered(
     pair: &LegacyPairPins,
     witness: &HistoricalSvnWitness,
@@ -470,8 +553,12 @@ pub(crate) async fn verify_registered(
     svn_password: Option<&str>,
     git_token: Option<&str>,
 ) -> Result<VerifiedHistoricalLineage> {
-    let live = SvnClient::new_isolated_refresh(&branch_url(pair)?, svn_username, svn_password)?;
-    verify_isolated(pair, witness, &live, git_token).await
+    let url = branch_url(pair).map_err(|_| HistoricalVerifyError::Registration)?;
+    let live = SvnClient::new_isolated_refresh(&url, svn_username, svn_password)
+        .map_err(|_| HistoricalVerifyError::Registration)?;
+    verify_isolated(pair, witness, &live, git_token)
+        .await
+        .map_err(|error| HistoricalVerifyError::classify(&error).into())
 }
 
 async fn verify_isolated(
@@ -521,64 +608,41 @@ async fn verify_isolated(
         !pair.git_branch.starts_with("refs/") && git2::Reference::is_valid_name(&reference),
         "unsupported registered Git branch"
     );
-    let tip = oid(&pair.last_git_sha)?;
-    let mirror = witness.git_mirror.canonicalize()?;
-    require_local_ref(&mirror, &reference, tip)?;
-    registered_ref(&git_url, &reference, tip, token)?;
-    let trees = mapped_trees(pair, &mirror)?;
-    let active = observe_svn(live, &pair.svn_url, pair, &mirror, &trees).await?;
+    let tip = oid(&pair.last_git_sha).context(HistoricalVerifyError::GitAncestry)?;
+    let mirror = witness
+        .git_mirror
+        .canonicalize()
+        .context(HistoricalVerifyError::GitRef)?;
+    require_local_ref(&mirror, &reference, tip).context(HistoricalVerifyError::GitRef)?;
+    registered_ref(&git_url, &reference, tip, token).context(HistoricalVerifyError::GitRef)?;
+    let trees = mapped_trees(pair, &mirror).context(HistoricalVerifyError::GitAncestry)?;
+    let active = observe_svn(live, &pair.svn_url, pair, &mirror, &trees)
+        .await
+        .map_err(|e| HistoricalVerifyError::specific_or(&e, HistoricalVerifyError::SvnHistory))?;
     let (planned, archive) = match &witness.source {
         HistoricalSvnSource::Restored {
             repository,
             original_root_url,
         } => {
-            ensure!(
-                *original_root_url == pair.svn_url,
-                "trusted backup original location differs from registration"
-            );
-            let repository = repository.canonicalize()?;
-            let original = Url::parse(original_root_url)?;
-            if original.scheme() == "file" {
-                let live_path = original
-                    .to_file_path()
-                    .map_err(|_| anyhow!("invalid original local SVN root"))?
-                    .canonicalize()?;
-                use std::os::unix::fs::MetadataExt;
-                let a = std::fs::metadata(live_path)?;
-                let b = std::fs::metadata(&repository)?;
-                ensure!(
-                    (a.dev(), a.ino()) != (b.dev(), b.ino()),
-                    "trusted restore must be separate from the active repository"
-                );
-            }
-            let root = Url::from_file_path(&repository)
-                .map_err(|_| anyhow!("unusable restored repository path"))?
-                .to_string();
-            let archived =
-                SvnClient::new_isolated_refresh(&format!("{root}/{}", pair.svn_branch), "", None)?;
-            let old = observe_svn(&archived, &root, pair, &mirror, &trees).await?;
-            ensure!(
-                old.identity.uuid == active.identity.uuid
-                    && old.identity.branch_path == active.identity.branch_path
-                    && old.identity.incarnation_created_rev
-                        == active.identity.incarnation_created_rev
-                    && old.log == active.log
-                    && old.snapshots == active.snapshots,
-                "trusted backup and current SVN history differ"
-            );
-            require_stable_source(&archived, &old, pair, true).await?;
-            (
-                false,
-                Some(
-                    json!({"restore_location_sha256":digest(&repository)?, "restored_head": old.head}),
-                ),
+            let archive = verify_archive(
+                repository,
+                original_root_url,
+                pair,
+                &mirror,
+                &trees,
+                &active,
             )
+            .await
+            .map_err(|e| HistoricalVerifyError::specific_or(&e, HistoricalVerifyError::Archive))?;
+            (false, Some(archive))
         }
         HistoricalSvnSource::PlannedCutover => (true, None),
     };
-    require_stable_source(live, &active, pair, false).await?;
-    require_local_ref(&mirror, &reference, tip)?;
-    registered_ref(&git_url, &reference, tip, token)?;
+    require_stable_source(live, &active, pair, false)
+        .await
+        .context(HistoricalVerifyError::SvnHistory)?;
+    require_local_ref(&mirror, &reference, tip).context(HistoricalVerifyError::GitRef)?;
+    registered_ref(&git_url, &reference, tip, token).context(HistoricalVerifyError::GitRef)?;
     let id = active.identity;
     let history = digest(&json!({
         "profile": "legacy_import_history_v1",
@@ -636,6 +700,7 @@ async fn verify_isolated(
         policy_hash: String::new(),
     };
     Ok(VerifiedHistoricalLineage {
+        trees,
         pair: pair.clone(),
         lineage,
         history,

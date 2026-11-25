@@ -133,6 +133,14 @@ impl Fixture {
 async fn both_sources_bind_the_same_history_with_separate_review_authority() {
     let mut f = Fixture::new();
     let old = f.verify().await.unwrap();
+    let mirror = Repository::open_bare(&f.witness.git_mirror).unwrap();
+    let trees = f
+        .pair
+        .mappings
+        .iter()
+        .map(|(_, sha)| mirror.find_commit(oid(sha).unwrap()).unwrap().tree_id())
+        .collect::<Vec<_>>();
+    assert_eq!(old.projected_tree_ids(), trees);
     assert_eq!(old.lineage().incarnation_created_rev, 1);
     assert_eq!(old.lineage().svn_root_url, f.pair.svn_url);
     assert!(!old.is_planned_cutover());
@@ -179,11 +187,7 @@ async fn refuses_changed_uuid_and_same_uuid_replacement_even_with_matching_bytes
     let f = Fixture::new();
     let old_uuid = command("svnlook", &["uuid", f.backup.to_str().unwrap()]);
     command("svnadmin", &["setuuid", f.backup.to_str().unwrap()]);
-    assert!(f
-        .verify()
-        .await
-        .unwrap_err_text()
-        .contains("backup and current SVN history differ"));
+    assert_eq!(refusal(f.verify().await), HistoricalVerifyError::Archive);
     command(
         "svnadmin",
         &["setuuid", f.backup.to_str().unwrap(), old_uuid.trim()],
@@ -221,11 +225,7 @@ async fn refuses_changed_log_metadata_and_substituted_archive() {
             message.to_str().unwrap(),
         ],
     );
-    assert!(f
-        .verify()
-        .await
-        .unwrap_err_text()
-        .contains("backup and current SVN history differ"));
+    assert_eq!(refusal(f.verify().await), HistoricalVerifyError::Archive);
     command(
         "svnadmin",
         &[
@@ -247,44 +247,39 @@ async fn refuses_changed_log_metadata_and_substituted_archive() {
             message.to_str().unwrap(),
         ],
     );
-    assert!(f
-        .verify()
-        .await
-        .unwrap_err_text()
-        .contains("backup and current SVN history differ"));
+    assert_eq!(refusal(f.verify().await), HistoricalVerifyError::Archive);
     f.witness.source = HistoricalSvnSource::Restored {
         repository: f.active.clone(),
         original_root_url: f.pair.svn_url.clone(),
     };
-    assert!(f.verify().await.unwrap_err_text().contains("separate"));
+    assert_eq!(refusal(f.verify().await), HistoricalVerifyError::Archive);
 }
 
 #[tokio::test]
 async fn refuses_incomplete_mapping_and_false_intermediate_tree_and_git_ref() {
     let mut f = Fixture::new();
     f.pair.mappings.remove(0);
-    assert!(f.verify().await.unwrap_err_text().contains("ancestry"));
+    assert_eq!(
+        refusal(f.verify().await),
+        HistoricalVerifyError::GitAncestry
+    );
     let mirror = Repository::open_bare(&f.witness.git_mirror).unwrap();
     let wrong = git_commit(&mirror, "refs/heads/other", b"wrong\n", None);
     let tip = git_commit(&mirror, "refs/heads/other", b"two\n", Some(wrong));
     f.pair.last_git_sha = tip.to_string();
     f.pair.mappings = vec![(1, wrong.to_string()), (2, tip.to_string())];
-    assert!(f
-        .verify()
-        .await
-        .unwrap_err_text()
-        .contains("named Git branch differs"));
+    assert_eq!(refusal(f.verify().await), HistoricalVerifyError::GitRef);
     f.pair.git_branch = "other".into();
-    assert!(f.verify().await.unwrap_err_text().contains("r1 differs"));
+    assert_eq!(refusal(f.verify().await), HistoricalVerifyError::SvnTree);
 }
 
-trait Failure {
-    fn unwrap_err_text(self) -> String;
-}
-impl Failure for Result<VerifiedHistoricalLineage> {
-    fn unwrap_err_text(self) -> String {
-        format!("{:#}", self.err().expect("expected refusal"))
-    }
+fn refusal(result: Result<VerifiedHistoricalLineage>) -> HistoricalVerifyError {
+    let error = result.err().expect("expected refusal");
+    let category = HistoricalVerifyError::classify(&error);
+    // Even an operator printing the full chain cannot accidentally emit a
+    // repository-controlled path, revision property, URL or secret.
+    assert_eq!(format!("{error:#}"), category.to_string());
+    category
 }
 
 #[tokio::test]
@@ -298,9 +293,7 @@ async fn matching_repository_suffix_on_another_authority_is_refused_before_conta
     );
     f.witness.credential_context_sha256 = Some("a".repeat(64));
     let result = verify_registered(&f.pair, &f.witness, "", None, Some("disposable-token")).await;
-    assert!(result
-        .unwrap_err_text()
-        .contains("Git endpoint differs from registered repository"));
+    assert_eq!(refusal(result), HistoricalVerifyError::Registration);
     assert!(matches!(receiver.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
 }
 
