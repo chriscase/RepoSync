@@ -231,6 +231,92 @@ mod tests {
     }
 
     #[test]
+    fn offline_preflight_reports_both_installed_catalogs_and_ambiguous_history() {
+        use crate::db::upgrade_preflight::inspect;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.db");
+        let open = || Connection::open(&path).unwrap();
+        let source = open();
+        source
+            .execute_batch(include_str!(
+                "../../../../daemon/tests/fixtures/schema-v12.sql"
+            ))
+            .unwrap();
+        source.execute_batch(INSTALLED_V13).unwrap();
+        source
+            .execute_batch(
+                "PRAGMA user_version=13;
+            INSERT INTO repositories (id,name,svn_url,created_at,updated_at)
+            VALUES ('test','Team','file:///test','t','t');",
+            )
+            .unwrap();
+        drop(source);
+        let clean = inspect(&path).unwrap();
+        assert_eq!(clean.schema_version, 13);
+        assert!(!clean.needs_review());
+
+        let source = open();
+        source
+            .execute_batch(
+                "INSERT INTO kv_state(key,value,updated_at) VALUES ('last_sync_at','t','t');
+            INSERT INTO audit_log(action,created_at) VALUES ('sync_cycle','t');",
+            )
+            .unwrap();
+        drop(source);
+        let poll = inspect(&path).unwrap();
+        assert!(poll.poll_only && poll.needs_review());
+        assert!(!poll.pairs[0].retained && !poll.unattributed_history);
+
+        let source = open();
+        source.execute_batch(INSTALLED_V14).unwrap();
+        source
+            .execute_batch(
+                "PRAGMA user_version=14;
+            INSERT INTO kv_state(key,value,updated_at)
+            VALUES ('last_git_sha_test','history','t'),('secret_svn_password_test','ignored','t');",
+            )
+            .unwrap();
+        drop(source);
+        let held = inspect(&path).unwrap();
+        assert_eq!(held.schema_version, 14);
+        assert!(!held.poll_only);
+        assert!(held.pairs[0].retained && held.needs_review());
+        assert!(!held.unattributed_history && !held.unexpected_identity_records);
+
+        let source = open();
+        source
+            .execute_batch(
+                "DELETE FROM kv_state;
+            INSERT INTO kv_state(key,value,updated_at) VALUES
+                ('last_git_hash','history','t'),('import_operation_v1:latest:test','missing','t');",
+            )
+            .unwrap();
+        drop(source);
+        let unknown = inspect(&path).unwrap();
+        assert!(!unknown.pairs[0].retained);
+        assert!(unknown.unattributed_history && unknown.unexpected_identity_records);
+        assert!(unknown.needs_review());
+
+        let source = open();
+        source
+            .execute_batch(
+                "DELETE FROM kv_state;
+            INSERT INTO audit_log(action, repo_id, svn_rev, created_at)
+            VALUES ('sync','test',2,'t'),('import_full',NULL,2,'t');",
+            )
+            .unwrap();
+        drop(source);
+        let audit_only = inspect(&path).unwrap();
+        assert!(audit_only.pairs[0].retained && audit_only.unattributed_history);
+
+        open()
+            .execute_batch("DROP INDEX idx_repositories_cloned_from;")
+            .unwrap();
+        assert!(inspect(&path).is_err());
+    }
+
+    #[test]
     fn recognized_install_upgrades_with_existing_scope_migration_and_survives_restart() {
         let _serial = crate::writer_fence::tests::TEST_LOCK
             .lock()

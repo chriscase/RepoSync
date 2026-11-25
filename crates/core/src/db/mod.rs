@@ -10,6 +10,7 @@ pub mod import_operations;
 pub mod late_pair_publish_operations;
 pub mod lineage_checkpoints;
 pub mod managed_remove;
+mod offline_snapshot;
 pub mod ordinary_writer_windows;
 mod pair_refresh_competing_journals;
 pub mod pair_refresh_credentials;
@@ -22,6 +23,7 @@ pub(crate) mod startup;
 mod startup_rollback;
 pub mod svn_commit_operations;
 pub mod team_cycle_mapping_operations;
+pub mod upgrade_preflight;
 pub mod watermark_recovery;
 
 pub(crate) mod opened_file;

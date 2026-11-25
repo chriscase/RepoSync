@@ -8,6 +8,7 @@
 
 mod personal;
 mod status;
+mod upgrade_preflight;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -50,6 +51,13 @@ struct Cli {
 enum Commands {
     /// Show current synchronization status.
     Status,
+
+    /// Inspect a quiesced pre-upgrade Team database for missing historical SVN identity.
+    UpgradePreflight {
+        /// Checkpointed standalone snapshot of the legacy reposync.db.
+        #[arg(long)]
+        database: PathBuf,
+    },
 
     /// Manage sync conflicts.
     Conflicts {
@@ -167,6 +175,7 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init { output } => cmd_init(&output),
+        Commands::UpgradePreflight { database } => upgrade_preflight::run(&database),
         Commands::Validate => cmd_validate(&cli.config),
         Commands::Personal {
             personal_config,
