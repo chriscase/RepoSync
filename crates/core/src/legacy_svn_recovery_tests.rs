@@ -17,6 +17,16 @@ fn file_url(path: &Path) -> String {
 }
 
 fn git_commit(repo: &Repository, reference: &str, bytes: &[u8], parent: Option<Oid>) -> Oid {
+    git_commit_message(repo, reference, bytes, parent, "import")
+}
+
+fn git_commit_message(
+    repo: &Repository,
+    reference: &str,
+    bytes: &[u8],
+    parent: Option<Oid>,
+    message: &str,
+) -> Oid {
     let id = repo.blob(bytes).unwrap();
     let mut builder = repo.treebuilder(None).unwrap();
     builder.insert("example.txt", id, 0o100644).unwrap();
@@ -30,7 +40,7 @@ fn git_commit(repo: &Repository, reference: &str, bytes: &[u8], parent: Option<O
         Some(reference),
         &sig,
         &sig,
-        "import",
+        message,
         &tree,
         &parents.iter().collect::<Vec<_>>(),
     )
@@ -105,6 +115,8 @@ impl Fixture {
             last_svn_rev: 2,
             last_git_sha: tip.to_string(),
             mappings: vec![(1, first.to_string()), (2, tip.to_string())],
+            import_completion_svn_rev: None,
+            import_log_entry_count: None,
             storage_sha256: "a".repeat(64),
         };
         let witness = HistoricalSvnWitness {
@@ -115,6 +127,7 @@ impl Fixture {
             configured_git_url: file_url(&git),
             git_mirror: git,
             credential_context_sha256: None,
+            minimum_live_revision: None,
         };
         Self {
             _directory: directory,
@@ -164,6 +177,7 @@ async fn both_sources_bind_the_same_history_with_separate_review_authority() {
             &format!("{}/trunk/later", f.pair.svn_url),
         ],
     );
+    f.witness.minimum_live_revision = Some(pre.reviewed_svn_floor());
     let later = f.verify().await.unwrap();
     assert_eq!(pre.review_sha256(), later.review_sha256());
     assert_eq!(pre.provenance(), later.provenance());
@@ -364,4 +378,191 @@ async fn active_head_can_advance_during_a_scan_but_cannot_recede_or_replace_the_
     assert!(require_stable_source(&live, &before, &f.pair, false)
         .await
         .is_err());
+}
+
+#[derive(Clone, Copy)]
+enum SkippedChange {
+    BinaryMime,
+    FileContents,
+    UnknownProperty,
+}
+
+async fn sparse_import(skipped: SkippedChange) -> Fixture {
+    let mut f = Fixture::new();
+    // Reuse the registration and approved local Git repository. Build a
+    // differently shaped, independently restored history in this fixture only.
+    let base = f._directory.path();
+    fs::rename(&f.active, base.join("original-svn")).unwrap();
+    fs::rename(&f.backup, base.join("original-backup")).unwrap();
+    command("svnadmin", &["create", f.active.to_str().unwrap()]);
+    let branch = branch_url(&f.pair).unwrap();
+    let target = format!("{branch}/example.txt");
+    let data = base.join("sparse-data");
+    command("svnmucc", &["-m", "empty branch", "mkdir", &branch]);
+    fs::write(&data, b"one\n").unwrap();
+    command(
+        "svnmucc",
+        &["-m", "first file", "put", data.to_str().unwrap(), &target],
+    );
+    match skipped {
+        SkippedChange::BinaryMime => {
+            command(
+                "svnmucc",
+                &[
+                    "-m",
+                    "binary metadata",
+                    "propset",
+                    "svn:mime-type",
+                    "application/octet-stream",
+                    &target,
+                ],
+            );
+        }
+        SkippedChange::FileContents => {
+            fs::write(&data, b"unrepresented intermediate bytes\n").unwrap();
+            command(
+                "svnmucc",
+                &["-m", "data", "put", data.to_str().unwrap(), &target],
+            );
+        }
+        SkippedChange::UnknownProperty => {
+            command(
+                "svnmucc",
+                &[
+                    "-m",
+                    "unknown metadata",
+                    "propset",
+                    "custom:meaning",
+                    "x",
+                    &target,
+                ],
+            );
+        }
+    }
+    fs::write(&data, b"two\n").unwrap();
+    command(
+        "svnmucc",
+        &[
+            "-m",
+            "second file revision",
+            "put",
+            data.to_str().unwrap(),
+            &target,
+        ],
+    );
+    command(
+        "svnadmin",
+        &[
+            "hotcopy",
+            f.active.to_str().unwrap(),
+            base.join("before-audit-head").to_str().unwrap(),
+        ],
+    );
+    command(
+        "svnmucc",
+        &[
+            "-m",
+            "other team",
+            "mkdir",
+            &format!("{}/elsewhere", f.pair.svn_url),
+        ],
+    );
+    command(
+        "svnadmin",
+        &[
+            "hotcopy",
+            f.active.to_str().unwrap(),
+            f.backup.to_str().unwrap(),
+        ],
+    );
+    command(
+        "svnmucc",
+        &["-m", "pending work", "mkdir", &format!("{branch}/pending")],
+    );
+    f.pair.git_branch = "sparse".into();
+    let mirror = open_mirror(&f.witness.git_mirror).unwrap();
+    let live = SvnClient::new_isolated_refresh(&branch, "", None).unwrap();
+    let log = live.copy_history_at_rev(6).await.unwrap();
+    let reference = "refs/heads/sparse";
+    let mut parent = None;
+    f.pair.mappings.clear();
+    for (rev, bytes) in [(2, b"one\n"), (4, b"two\n")] {
+        let e = log.iter().find(|e| e.revision == rev).unwrap();
+        let message = format!(
+            "{}\n\n[reposync] imported from SVN r{}\nSVN-Author: {}\nSVN-Date: {}",
+            e.message, rev, e.author, e.date
+        );
+        let commit = git_commit_message(&mirror, reference, bytes, parent, &message);
+        f.pair.mappings.push((rev, commit.to_string()));
+        parent = Some(commit);
+    }
+    f.pair.last_git_sha = parent.unwrap().to_string();
+    f.pair.last_svn_rev = 4;
+    f.pair.import_completion_svn_rev = Some(5);
+    f.pair.import_log_entry_count = Some(4);
+    f
+}
+
+#[tokio::test]
+async fn empty_creation_and_noop_property_changes_are_verified_through_the_old_audit_head() {
+    let mut f = sparse_import(SkippedChange::BinaryMime).await;
+    let approved = f.verify().await.unwrap();
+    assert_eq!(approved.verified_branch_revisions(), 4);
+    assert_eq!(approved.projected_tree_ids().len(), 2);
+    assert_eq!(approved.reviewed_svn_floor(), 6);
+    f.witness.minimum_live_revision = Some(6);
+    command(
+        "svnmucc",
+        &["-m", "later", "mkdir", &format!("{}/other", f.pair.svn_url)],
+    );
+    assert_eq!(
+        approved.review_sha256(),
+        f.verify().await.unwrap().review_sha256()
+    );
+    // Roll the active repository back to r5 between preview and apply, keeping
+    // the old watermark, named Git ref, complete import and UUID unchanged.
+    fs::rename(&f.active, f._directory.path().join("advanced")).unwrap();
+    command(
+        "svnadmin",
+        &[
+            "hotcopy",
+            f.backup.to_str().unwrap(),
+            f.active.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(refusal(f.verify().await), HistoricalVerifyError::SvnHistory);
+    f.witness.minimum_live_revision = None;
+    f.witness.source = HistoricalSvnSource::Restored {
+        repository: f._directory.path().join("before-audit-head"),
+        original_root_url: f.pair.svn_url.clone(),
+    };
+    assert_eq!(refusal(f.verify().await), HistoricalVerifyError::Archive);
+}
+
+#[tokio::test]
+async fn gaps_cannot_hide_intermediate_contents_unknown_properties_or_a_misattributed_commit() {
+    for change in [SkippedChange::FileContents, SkippedChange::UnknownProperty] {
+        let f = sparse_import(change).await;
+        assert_eq!(refusal(f.verify().await), HistoricalVerifyError::SvnTree);
+    }
+    let mut f = sparse_import(SkippedChange::BinaryMime).await;
+    f.pair.import_log_entry_count = Some(3);
+    assert_eq!(refusal(f.verify().await), HistoricalVerifyError::SvnHistory);
+    f.pair.import_log_entry_count = Some(4);
+    let mirror = open_mirror(&f.witness.git_mirror).unwrap();
+    let parent = oid(&f.pair.mappings[0].1).unwrap();
+    let id = git_commit_message(
+        &mirror,
+        "refs/heads/misassigned",
+        b"two\n",
+        Some(parent),
+        "wrong original SVN revision",
+    );
+    f.pair.git_branch = "misassigned".into();
+    f.pair.mappings[1].1 = id.to_string();
+    f.pair.last_git_sha = id.to_string();
+    assert_eq!(
+        refusal(f.verify().await),
+        HistoricalVerifyError::GitAncestry
+    );
 }

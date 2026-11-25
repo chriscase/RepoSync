@@ -38,6 +38,9 @@ pub enum HistoricalSvnSource {
 pub(crate) struct HistoricalSvnWitness {
     pub source: HistoricalSvnSource,
     pub git_mirror: PathBuf,
+    /// None selects the current active SVN revision for a fresh preview.
+    /// Apply supplies the lower bound recorded when the operator reviewed it.
+    pub minimum_live_revision: Option<i64>,
     /// A keyed digest of the selected registered credential context. Raw
     /// credentials never appear in receipts, including public provenance.
     pub credential_context_sha256: Option<String>,
@@ -75,6 +78,8 @@ impl HistoricalVerifyError {
 
 pub struct VerifiedHistoricalLineage {
     trees: Vec<Oid>,
+    reviewed_floor: i64,
+    branch_revisions: usize,
     pair: LegacyPairPins,
     lineage: CanonicalLineage,
     history: String,
@@ -91,6 +96,12 @@ impl VerifiedHistoricalLineage {
         &self.lineage
     }
     /// Verified trees in exactly the same order as the retained SVN/Git pairs.
+    pub fn reviewed_svn_floor(&self) -> i64 {
+        self.reviewed_floor
+    }
+    pub fn verified_branch_revisions(&self) -> usize {
+        self.branch_revisions
+    }
     pub fn projected_tree_ids(&self) -> &[Oid] {
         &self.trees
     }
@@ -240,6 +251,13 @@ struct SvnEvidence {
     head: i64,
     log: String,
     snapshots: String,
+    branch_revisions: usize,
+}
+
+struct ScopedHistory {
+    digest: String,
+    identity: LiveSvnIdentity,
+    revisions: Vec<SvnLogEntry>,
 }
 
 async fn history_at_head(
@@ -247,8 +265,13 @@ async fn history_at_head(
     info: &SvnInfo,
     branch: &str,
     pair: &LegacyPairPins,
-) -> Result<(String, LiveSvnIdentity)> {
+) -> Result<ScopedHistory> {
     let head = info.latest_rev;
+    let completion = pair.import_completion_svn_rev.unwrap_or(pair.last_svn_rev);
+    ensure!(
+        completion >= pair.last_svn_rev && head >= completion,
+        "SVN does not cover the original import completion"
+    );
     let xml = client.copy_history_xml_at_rev(head, true).await?;
     let mut log = parse_copy_history_entries(&xml, true)?;
     let identity =
@@ -307,17 +330,19 @@ async fn history_at_head(
         log[0].changed_paths.iter().any(|p| p.path == branch),
         "SVN branch creation is not directly proved"
     );
-    let retained: Vec<&SvnLogEntry> = log
-        .iter()
-        .take_while(|e| e.revision <= pair.last_svn_rev)
-        .collect();
+    log.retain(|entry| entry.revision <= completion);
     ensure!(
-        retained
+        pair.mappings
             .iter()
-            .map(|e| e.revision)
-            .eq(pair.mappings.iter().map(|m| m.0)),
-        "retained mappings do not cover every historical SVN branch revision"
+            .all(|(rev, _)| log.binary_search_by_key(rev, |e| e.revision).is_ok()),
+        "retained mapping names a revision outside this SVN branch history"
     );
+    if let Some(expected) = pair.import_log_entry_count {
+        ensure!(
+            usize::try_from(expected).ok() == Some(log.len()),
+            "old import progress and SVN log disagree"
+        );
+    }
     // The normal observer models actions and copy ancestry. Also preserve the
     // verbose node kinds, text/property flags and any future validated
     // attributes so two different changes cannot collapse into one receipt.
@@ -329,7 +354,7 @@ async fn history_at_head(
             .attribute("revision")
             .context("missing SVN revision")?
             .parse()?;
-        if rev > pair.last_svn_rev {
+        if rev > completion {
             continue;
         }
         let mut groups = entry
@@ -386,7 +411,11 @@ async fn history_at_head(
             && identity.copy_from_rev.is_none(),
         "historical SVN incarnation is ambiguous"
     );
-    Ok((digest(&(&retained, attributes, revprops))?, identity))
+    Ok(ScopedHistory {
+        digest: digest(&(&log, attributes, revprops))?,
+        identity,
+        revisions: log,
+    })
 }
 
 async fn observe_svn(
@@ -407,16 +436,43 @@ async fn observe_svn(
                 .is_ok_and(|id| !id.is_nil() && id.to_string() == info.uuid),
         "SVN repository identity, location or revision differs"
     );
-    let (log, identity) = history_at_head(client, &info, &branch, pair).await?;
+    let history = history_at_head(client, &info, &branch, pair).await?;
+    let branch_revisions = history.revisions.len();
+    let has_skipped = branch_revisions != pair.mappings.len();
     tracing::info!(
         mapping_count = trees.len(),
-        through_revision = pair.last_svn_rev,
-        "Verifying one complete SVN checkout and matching Git tree per retained mapping"
+        branch_revisions,
+        through_revision = pair.import_completion_svn_rev.unwrap_or(pair.last_svn_rev),
+        "Verifying one complete SVN checkout for each historical branch revision"
     );
     let started = std::time::Instant::now();
-    let mut snapshots = Vec::with_capacity(trees.len());
-    for (i, ((rev, _), tree)) in pair.mappings.iter().zip(trees).enumerate() {
-        let checkout = observe_subtree(client, *rev)
+    let mut snapshots = Vec::with_capacity(branch_revisions);
+    let git = open_mirror(mirror)?;
+    let mut previous_tree = None;
+    for (i, entry) in history.revisions.iter().enumerate() {
+        let rev = entry.revision;
+        let mapped = pair.mappings.binary_search_by_key(&rev, |(r, _)| *r).ok();
+        if let Some(index) = mapped {
+            previous_tree = Some(trees[index]);
+            if has_skipped {
+                // With possible identical-tree gaps, corroborate the actual
+                // shipped full import's revision attribution in the Git object.
+                let commit = git.find_commit(oid(&pair.mappings[index].1)?)?;
+                let message = format!(
+                    "{}\n\n[reposync] imported from SVN r{}\nSVN-Author: {}\nSVN-Date: {}",
+                    entry.message, rev, entry.author, entry.date
+                );
+                ensure!(
+                    commit
+                        .message_bytes()
+                        .strip_suffix(b"\n")
+                        .unwrap_or(commit.message_bytes())
+                        == message.as_bytes(),
+                    HistoricalVerifyError::GitAncestry
+                );
+            }
+        }
+        let checkout = observe_subtree(client, rev)
             .await
             .context(HistoricalVerifyError::SvnTree)?;
         let pinned = checkout.info();
@@ -430,26 +486,37 @@ async fn observe_svn(
         let properties = visible_checkout_properties(client, checkout.path(), pinned)
             .await
             .context(HistoricalVerifyError::SvnTree)?;
-        verify_refresh_svn_tree(
-            mirror,
-            &tree.to_string(),
-            checkout.path(),
-            &properties,
-            None,
-            &branch,
-        )
-        .context(HistoricalVerifyError::SvnTree)?;
+        if let Some(tree) = previous_tree {
+            verify_refresh_svn_tree(
+                mirror,
+                &tree.to_string(),
+                checkout.path(),
+                &properties,
+                None,
+                &branch,
+            )
+            .context(HistoricalVerifyError::SvnTree)?;
+        } else {
+            // Pre-first-commit SVN must be exactly a property-free, fully
+            // visible empty branch. No nested directory, file or inherited
+            // transformation can silently disappear from a missing mapping.
+            ensure!(
+                checkout.node_count() == 1 && properties.values().all(|values| values.is_empty()),
+                HistoricalVerifyError::SvnTree
+            );
+        }
         snapshots.push((
-            *rev,
-            tree.to_string(),
+            rev,
+            mapped.is_some(),
+            previous_tree.map(|id| id.to_string()),
             checkout.node_count(),
             digest(&properties)?,
         ));
         let completed = i + 1;
-        if completed == 1 || completed % 100 == 0 || completed == trees.len() {
+        if completed == 1 || completed % 100 == 0 || completed == branch_revisions {
             tracing::info!(
                 completed,
-                total = trees.len(),
+                total = branch_revisions,
                 revision = rev,
                 elapsed_seconds = started.elapsed().as_secs(),
                 "Verified historical SVN and Git snapshots"
@@ -457,10 +524,11 @@ async fn observe_svn(
         }
     }
     Ok(SvnEvidence {
-        identity,
+        identity: history.identity,
         head: info.latest_rev,
-        log,
+        log: history.digest,
         snapshots: digest(&snapshots)?,
+        branch_revisions,
     })
 }
 
@@ -486,10 +554,9 @@ async fn require_stable_source(
             && after.root_url == evidence.identity.root_url,
         "SVN source changed during review"
     );
-    let (log, identity) =
-        history_at_head(client, &after, &format!("/{}", pair.svn_branch), pair).await?;
+    let history = history_at_head(client, &after, &format!("/{}", pair.svn_branch), pair).await?;
     ensure!(
-        log == evidence.log && identity == evidence.identity,
+        history.digest == evidence.log && history.identity == evidence.identity,
         "SVN history changed during review"
     );
     tracing::info!(
@@ -619,6 +686,12 @@ async fn verify_isolated(
     let active = observe_svn(live, &pair.svn_url, pair, &mirror, &trees)
         .await
         .map_err(|e| HistoricalVerifyError::specific_or(&e, HistoricalVerifyError::SvnHistory))?;
+    let reviewed_floor = witness.minimum_live_revision.unwrap_or(active.head);
+    ensure!(
+        reviewed_floor >= pair.import_completion_svn_rev.unwrap_or(pair.last_svn_rev)
+            && active.head >= reviewed_floor,
+        HistoricalVerifyError::SvnHistory
+    );
     let (planned, archive) = match &witness.source {
         HistoricalSvnSource::Restored {
             repository,
@@ -661,6 +734,8 @@ async fn verify_isolated(
         "last_git_sha": pair.last_git_sha,
         "last_svn_rev": pair.last_svn_rev,
         "mappings": pair.mappings,
+        "original_import_completion_revision": pair.import_completion_svn_rev,
+        "original_import_log_entries": pair.import_log_entry_count,
         "branch_log_sha256": active.log,
         "projected_trees_sha256": active.snapshots
     }))?;
@@ -672,6 +747,9 @@ async fn verify_isolated(
         "svn_branch": id.branch_path,
         "creation_revision": id.incarnation_created_rev,
         "through_revision": pair.last_svn_rev,
+        "reviewed_svn_floor": reviewed_floor,
+        "verified_branch_revisions": active.branch_revisions,
+        "original_import_completion_revision": pair.import_completion_svn_rev,
         "mapping_count": pair.mappings.len(),
         "git_url": git_url.as_str(),
         "git_ref": reference,
@@ -701,6 +779,8 @@ async fn verify_isolated(
     };
     Ok(VerifiedHistoricalLineage {
         trees,
+        reviewed_floor,
+        branch_revisions: active.branch_revisions,
         pair: pair.clone(),
         lineage,
         history,
