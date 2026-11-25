@@ -17,8 +17,8 @@
 //!    unacknowledged. A retry must be refused by the persisted-conflict gate
 //!    (`UnresolvableConflict` with the "persisted conflict row(s) block
 //!    apply" detail, same row id/scope/status) and not mutate either side.
-//!    The row is also re-read through a separate `Database` handle; no engine
-//!    or process restart is exercised.
+//!    Drop the engine, reopen its database and checkout, and exercise the
+//!    same gate on the first cycle of the replacement engine.
 //!
 //! Known limit (remaining whole-#73 gate): on the unresolved-conflict path the
 //! engine returns `Err(UnresolvableConflict { detail: "N unresolved
@@ -27,7 +27,6 @@
 //! `run_sync_cycle`. This test asserts the equivalent public surfaces instead
 //! (error variant + the engine-reported count in `detail`, and the persisted
 //! conflict row count) and does not claim to assert the `SyncStats` field.
-//! Exposing it requires a production change (reserved `sync_engine.rs`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -321,6 +320,33 @@ token_env = "REPOSYNC_TEST_GH_TOKEN"
     config
 }
 
+fn open_engine(
+    db: Database,
+    git: GitClient,
+    svn_root: &str,
+    trunk_url: &str,
+    data_dir: &Path,
+) -> SyncEngine {
+    let mut config = make_app_config(svn_root, data_dir);
+    config.svn.layout = SvnLayout::Standard;
+    config.svn.trunk_path = "trunk".into();
+    config.sync.auto_merge = false;
+    let mapper = IdentityMapper::new(&IdentityConfig {
+        email_domain: Some("example.com".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut engine = SyncEngine::new(
+        config,
+        db,
+        SvnClient::new(trunk_url, "", ""),
+        git,
+        Arc::new(mapper),
+    );
+    engine.set_repo_id(REPO_ID.into());
+    engine
+}
+
 // ---------------------------------------------------------------------------
 // State captured before/after to prove nothing was acknowledged or rewritten
 // ---------------------------------------------------------------------------
@@ -352,7 +378,7 @@ struct State {
 }
 
 struct Fixture {
-    _tmp: TempDir,
+    tmp: TempDir,
     svn_root: String,
     trunk_url: String,
     wc: PathBuf,
@@ -458,20 +484,7 @@ impl Fixture {
         })
         .expect("insert repository");
 
-        let mut config = make_app_config(&svn_root, tmp.path());
-        config.svn.layout = SvnLayout::Standard;
-        config.svn.trunk_path = "trunk".into();
-        config.sync.auto_merge = false;
-        let mapper = Arc::new(
-            IdentityMapper::new(&IdentityConfig {
-                email_domain: Some("example.com".into()),
-                ..Default::default()
-            })
-            .unwrap(),
-        );
-        let mut engine =
-            SyncEngine::new(config, db, SvnClient::new(&trunk_url, "", ""), git, mapper);
-        engine.set_repo_id(REPO_ID.into());
+        let engine = open_engine(db, git, &svn_root, &trunk_url, tmp.path());
 
         // Verified SVN-origin baseline through the real engine.
         let baseline = engine
@@ -538,7 +551,7 @@ impl Fixture {
         assert_eq!(head_sha(&developer), imported_base);
 
         Self {
-            _tmp: tmp,
+            tmp,
             svn_root,
             trunk_url,
             wc,
@@ -680,7 +693,7 @@ fn assert_bridge_intact(fx: &Fixture, git_edit_sha: &str) {
 /// directional checkpoint or mapping acknowledges the pending work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rs73_overlapping_shared_file_edits_surface_persisted_conflict_without_acknowledgement() {
-    let fx = Fixture::new().await;
+    let mut fx = Fixture::new().await;
     let baseline = fx.state();
     assert_eq!(baseline.svn_youngest, fx.baseline_svn_rev);
     assert_eq!(baseline.remote_sha, fx.imported_base);
@@ -738,10 +751,7 @@ async fn rs73_overlapping_shared_file_edits_surface_persisted_conflict_without_a
     match &result {
         Err(SyncError::UnresolvableConflict { file_path, detail }) => {
             assert_eq!(file_path, "shared.txt", "conflict must name the shared file");
-            assert!(
-                detail.contains("1 unresolved conflict(s) recorded"),
-                "engine-reported conflict count must be exactly 1: {detail}"
-            );
+            assert_eq!(detail, "1 unresolved conflict(s) recorded; refusing SVN/Git working-copy mutation");
         }
         other => panic!(
             "expected UnresolvableConflict for shared.txt (not an apply error or success), got {other:?}"
@@ -831,12 +841,45 @@ async fn rs73_overlapping_shared_file_edits_surface_persisted_conflict_without_a
     assert_bridge_intact(&fx, &git_edit_sha);
     assert!(after.git_push_active.is_none() && after.svn_commit_active.is_none());
 
-    // Retry: the engine's persisted-conflict gate (the first apply gate in
-    // the sync cycle) must be what blocks it. Its wording differs from the
-    // first-cycle detection wording ("N persisted conflict row(s) block
-    // apply; ..." vs "N unresolved conflict(s) recorded; ..."). Any other
-    // error (AlreadyRunning, admission/database failure, history or hold
-    // errors) or success fails here.
+    assert_blocked_cycle(&fx, &first_row, &before, &git_edit_sha).await;
+
+    // Release the first SQLite connection and all in-memory engine state.
+    // A fresh engine must see the same pending conflict before its first cycle.
+    drop(fx.engine);
+    let db = Database::new(&fx.db_path).unwrap();
+    db.initialize().unwrap();
+    assert_single_blocking_row(&db, &first_row, "after reopening the database");
+    fx.engine = open_engine(
+        db,
+        GitClient::new(&fx.bridge).unwrap(),
+        &fx.svn_root,
+        &fx.trunk_url,
+        fx.tmp.path(),
+    );
+    assert_blocked_cycle(&fx, &first_row, &before, &git_edit_sha).await;
+
+    eprintln!(
+        "RS73_EVIDENCE {}",
+        serde_json::json!({
+            "case": "RS73_OVERLAP_CONFLICT",
+            "layout": "standard trunk/branches/tags",
+            "baseline_svn_rev": fx.baseline_svn_rev,
+            "svn_edit_rev": svn_edit_rev,
+            "imported_base": fx.imported_base,
+            "git_edit_sha": git_edit_sha,
+            "persisted_conflicts": rows.len(),
+            "state_unchanged_after_conflict_and_retry": true,
+            "persisted_hold_after_engine_restart": true
+        })
+    );
+}
+
+async fn assert_blocked_cycle(
+    fx: &Fixture,
+    first_row: &reposync_core::db::queries::ConflictEntry,
+    before: &State,
+    git_edit_sha: &str,
+) {
     let retry = fx.engine.run_sync_cycle().await;
     match &retry {
         Err(SyncError::UnresolvableConflict { file_path, detail }) => {
@@ -854,36 +897,11 @@ async fn rs73_overlapping_shared_file_edits_surface_persisted_conflict_without_a
             "retry must fail with the persisted-conflict UnresolvableConflict gate, got {other:?}"
         ),
     }
-    assert_single_blocking_row(fx.engine.db(), &first_row, "after blocked retry");
+    assert_single_blocking_row(fx.engine.db(), first_row, "after blocked retry");
     assert_eq!(
-        fx.state(),
+        &fx.state(),
         before,
         "retry must not mutate or acknowledge anything"
     );
-    assert_bridge_intact(&fx, &git_edit_sha);
-
-    // Persistence through a separate Database handle on the same SQLite
-    // file. This is NOT an engine/process restart: no SyncEngine is rebuilt
-    // or run against the reopened handle.
-    let reopened = Database::new(&fx.db_path).unwrap();
-    reopened.initialize().unwrap();
-    assert_single_blocking_row(&reopened, &first_row, "via separate Database handle");
-    assert_eq!(
-        reopened.get_repo_watermark(REPO_ID).unwrap(),
-        (fx.baseline_svn_rev, fx.imported_base.clone())
-    );
-
-    eprintln!(
-        "RS73_EVIDENCE {}",
-        serde_json::json!({
-            "case": "RS73_OVERLAP_CONFLICT",
-            "layout": "standard trunk/branches/tags",
-            "baseline_svn_rev": fx.baseline_svn_rev,
-            "svn_edit_rev": svn_edit_rev,
-            "imported_base": fx.imported_base,
-            "git_edit_sha": git_edit_sha,
-            "persisted_conflicts": rows.len(),
-            "state_unchanged_after_conflict_and_retry": true
-        })
-    );
+    assert_bridge_intact(fx, git_edit_sha);
 }
