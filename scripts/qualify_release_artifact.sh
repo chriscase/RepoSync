@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# Native Linux qualification for the #118 archive. Synthetic prefix only.
+# Native qualification for the #118 archive. Synthetic prefix only.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="${ROOT}/target/release"
-OUT="${ROOT}/target/reposync-candidate-x86_64-unknown-linux-gnu.tar.gz"
+target="$(rustup run stable rustc -vV | sed -n 's/^host: //p')"
+case "$(uname -s)/$(uname -m)/$target" in
+    Linux/x86_64/x86_64-unknown-linux-gnu|Linux/aarch64/aarch64-unknown-linux-gnu|Darwin/arm64/aarch64-apple-darwin|Darwin/x86_64/x86_64-apple-darwin) ;;
+    *) echo "Unsupported native build host: $(uname -sm) ($target)" >&2; exit 1 ;;
+esac
+if [[ -n "${REPOSYNC_EXPECTED_TARGET:-}" && "$target" != "$REPOSYNC_EXPECTED_TARGET" ]]; then
+    echo "Expected native $REPOSYNC_EXPECTED_TARGET, got $target" >&2
+    exit 1
+fi
+OUT="${ROOT}/target/reposync-candidate-${target}.tar.gz"
 
 : >/tmp/rs118-inner-exits.txt
 echo "QUALIFY_ARGV bash scripts/qualify_release_artifact.sh"
-echo "HOST $(uname -s) $(uname -m)"
-echo "NOT_RUN docker"
-echo "NOT_RUN aarch64-unknown-linux-gnu"
-echo "NOT_RUN x86_64-apple-darwin"
-echo "NOT_RUN aarch64-apple-darwin"
-echo "NARROW this host builds only x86_64-unknown-linux-gnu."
-echo "NARROW Docker image startup is covered by its separate qualification workflow."
+echo "HOST $(uname -s) $(uname -m) $target"
+echo "Docker image startup is covered by its separate qualification workflow."
 
 python3 "${ROOT}/scripts/check_docker_context.py"
 
@@ -23,17 +27,24 @@ fail() {
     exit 1
 }
 
+node_state() {
+    python3 - "$1" <<'PYTHON'
+import os
+import sys
+try:
+    node = os.lstat(sys.argv[1])
+except FileNotFoundError:
+    print("ABSENT")
+else:
+    print(node.st_mode, node.st_size, node.st_mtime_ns)
+PYTHON
+}
 host_unit="/etc/systemd/system/reposync.service"
-if [[ -e "$host_unit" ]]; then
-    host_unit_before="$(stat -c '%F %s %Y' "$host_unit")"
-else
-    host_unit_before="ABSENT"
-fi
-if [[ -e /etc/reposync ]]; then
-    etc_before="$(stat -c '%F %s %Y' /etc/reposync)"
-else
-    etc_before="ABSENT"
-fi
+host_unit_before="$(node_state "$host_unit")"
+etc_before="$(node_state /etc/reposync)"
+
+sum=(sha256sum)
+if ! command -v sha256sum >/dev/null; then sum=(shasum -a 256); fi
 
 # Assembler output is checked with sha256sum -c from the artifact directory.
 verified_digest() {
@@ -45,7 +56,7 @@ verified_digest() {
     set +e
     (
         cd "$dir"
-        sha256sum -c "${base}.sha256"
+        "${sum[@]}" -c "${base}.sha256"
     ) >/tmp/rs118-${label}.out 2>/tmp/rs118-${label}.err
     code=$?
     set -e
@@ -67,10 +78,19 @@ printf 'external-sentinel\n' > "$sentinel"
 
 state_of() {
     local prefix="$1"
-    {
-        find "$prefix" -printf '%P %y %s\n' | sort
-        sha256sum "$sentinel"
-    } | sha256sum | awk '{print $1}'
+    python3 - "$prefix" "$sentinel" <<'PYTHON'
+import hashlib
+from pathlib import Path
+import sys
+root, sentinel = map(Path, sys.argv[1:])
+state = hashlib.sha256(sentinel.read_bytes())
+for path in sorted(root.rglob("*")):
+    state.update(str(path.relative_to(root)).encode() + b"\0")
+    state.update(str(path.lstat().st_mode).encode() + b"\0")
+    if path.is_file() and not path.is_symlink():
+        state.update(hashlib.sha256(path.read_bytes()).digest())
+print(state.hexdigest())
+PYTHON
 }
 
 write_variant() {
@@ -166,7 +186,7 @@ refuse() {
     case "$sentinel" in
         "$prefix"|"$prefix"/*) fail "sentinel is inside the ${label} prefix" ;;
     esac
-    digest="$(sha256sum "$archive" | awk '{print $1}')"
+    digest="$("${sum[@]}" "$archive" | awk '{print $1}')"
     before="$(state_of "$prefix")"
     set +e
     bash "${ROOT}/scripts/install.sh" --from-archive \
@@ -247,8 +267,15 @@ REPOSYNC_SYSTEMD_UNIT_DIR="${default_root}/etc/systemd/system" \
     bash "${ROOT}/scripts/install.sh" --from-archive --archive "$stub_archive" --sha256 "$stub_sha"
 [[ -f "${default_root}/etc/reposync/config.toml" ]] || fail "default config was not installed"
 [[ -x "${default_root}/usr/local/bin/reposync" ]] || fail "default binary parent was not created"
-[[ -f "${default_root}/etc/systemd/system/reposync.service" ]] || fail "default install did not place the unit"
-diff -r --exclude='*.map' "${ROOT}/web-ui/dist" "${default_root}/usr/local/bin/static" || fail "default install differs from the product UI"
+check_service_destination() {
+    if [[ "$(uname -s)" == Linux ]]; then
+        [[ -f "$1/etc/systemd/system/reposync.service" ]] || fail "missing Linux systemd unit"
+    else
+        [[ ! -e "$1/etc/systemd" ]] || fail "macOS install created a systemd destination"
+    fi
+}
+check_service_destination "$default_root"
+diff -r -x '*.map' "${ROOT}/web-ui/dist" "${default_root}/usr/local/bin/static" || fail "default install differs from the product UI"
 rm -rf "$default_root"
 
 # The same default destination as uid 0, still confined to a temp root.
@@ -264,7 +291,7 @@ root_code=$?
 set -e
 printf 'INNER_EXIT direct_root %s\n' "$root_code" | tee -a /tmp/rs118-inner-exits.txt
 [[ "$root_code" -eq 0 ]] || fail "direct-root temp install failed"
-[[ -f "${root_root}/etc/systemd/system/reposync.service" ]] || fail "direct-root install did not place the unit"
+check_service_destination "$root_root"
 sudo rm -rf "$root_root"
 
 prefix="$(mktemp -d)"
@@ -283,8 +310,8 @@ REPOSYNC_SYSTEMD_UNIT_DIR="${unit_trap}" \
 [[ "$(cat "${prefix}/etc/reposync/env")" == "kept-secret" ]] || fail "key file was replaced"
 [[ "$(cat "${prefix}/var/lib/reposync/reposync.db")" == "kept-data" ]] || fail "data was replaced"
 [[ -f "${prefix}/etc/reposync/reposync.service" ]] || fail "prefix install did not keep the unit under the prefix"
-[[ -z "$(find "$unit_trap" -mindepth 1 -print -quit)" ]] || fail "prefix install wrote the systemd directory"
-diff -r --exclude='*.map' "${ROOT}/web-ui/dist" "${prefix}/bin/static" || fail "prefix install differs from the product UI"
+[[ -z "$(ls -A "$unit_trap")" ]] || fail "prefix install wrote the systemd directory"
+diff -r -x '*.map' "${ROOT}/web-ui/dist" "${prefix}/bin/static" || fail "prefix install differs from the product UI"
 
 echo "building native release binaries"
 (cd "$ROOT" && rustup run stable cargo build --release --bin reposync --bin reposync-daemon)
@@ -297,7 +324,7 @@ bash "${ROOT}/scripts/install.sh" --from-archive --archive "$OUT" --sha256 "$pro
 previous_prefix="$prefix"
 prefix="$(mktemp -d)"
 bash "${ROOT}/scripts/install.sh" --from-archive --archive "$OUT" --sha256 "$product_sha" --prefix "$prefix"
-diff -r --exclude='*.map' "${ROOT}/web-ui/dist" "${prefix}/bin/static" || fail "clean install differs from the product UI"
+diff -r -x '*.map' "${ROOT}/web-ui/dist" "${prefix}/bin/static" || fail "clean install differs from the product UI"
 help_out="$("${prefix}/bin/reposync" --help)"
 printf '%s\n' "$help_out" | grep -q "reposync" || fail "CLI help missing"
 
@@ -417,21 +444,13 @@ if grep -q 'window.reposyncStatic = "synthetic"' /tmp/rs118-app.js; then
 fi
 cmp /tmp/rs118-app.js "${ROOT}/web-ui/dist${asset}" || fail "served asset differs from the web-ui build"
 
-if [[ -e "$host_unit" ]]; then
-    [[ "$(stat -c '%F %s %Y' "$host_unit")" == "$host_unit_before" ]] || fail "host systemd unit changed"
-else
-    [[ "$host_unit_before" == "ABSENT" && ! -e "$host_unit" ]] || fail "host systemd unit was created"
-fi
-if [[ -e /etc/reposync ]]; then
-    [[ "$(stat -c '%F %s %Y' /etc/reposync)" == "$etc_before" ]] || fail "live /etc/reposync changed"
-else
-    [[ "$etc_before" == "ABSENT" && ! -e /etc/reposync ]] || fail "live /etc/reposync was created"
-fi
+[[ "$(node_state "$host_unit")" == "$host_unit_before" ]] || fail "host systemd unit changed"
+[[ "$(node_state /etc/reposync)" == "$etc_before" ]] || fail "live /etc/reposync changed"
 
 echo "INNER_EXITS_BEGIN"
 cat /tmp/rs118-inner-exits.txt
 echo "INNER_EXITS_END"
-echo "QUALIFIED native x86_64-unknown-linux-gnu prefix=${prefix}"
+echo "QUALIFIED native $target prefix=${prefix}"
 kill "$daemon_pid"
 wait "$daemon_pid" || true
 trap - EXIT

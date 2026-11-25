@@ -15,6 +15,7 @@ INSTALL_DIR="${REPOSYNC_INSTALL_DIR:-/usr/local/bin}"
 CONFIG_DIR="${REPOSYNC_CONFIG_DIR:-/etc/reposync}"
 DATA_DIR="${REPOSYNC_DATA_DIR:-/var/lib/reposync}"
 SYSTEMD_UNIT_DIR="${REPOSYNC_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+INSTALL_OS="$(uname -s)"
 
 # Members install.sh will copy. Validated after the digest check and before
 # any install-prefix, config, key, or data mutation.
@@ -29,7 +30,11 @@ REQUIRED_ARCHIVE_MEMBERS=(
 )
 
 archive_sha256() {
-    sha256sum "$1" | awk '{print $1}'
+    if command -v sha256sum >/dev/null; then
+        sha256sum "$1"
+    else
+        shasum -a 256 "$1"
+    fi | awk '{print $1}'
 }
 
 verify_archive_digest() {
@@ -167,13 +172,13 @@ install_from_verified_archive() {
     if [[ "$use_sudo" -eq 1 ]]; then
         sudo mkdir -p "$install_dir" "$config_dir" "$data_dir" \
             "${install_dir}/static/assets"
-        if [[ -z "$prefix" ]]; then
+        if [[ -z "$prefix" && "$INSTALL_OS" == Linux ]]; then
             sudo mkdir -p "$SYSTEMD_UNIT_DIR"
         fi
     else
         mkdir -p "$install_dir" "$config_dir" "$data_dir" \
             "${install_dir}/static/assets"
-        if [[ -z "$prefix" ]]; then
+        if [[ -z "$prefix" && "$INSTALL_OS" == Linux ]]; then
             mkdir -p "$SYSTEMD_UNIT_DIR"
         fi
     fi
@@ -184,9 +189,9 @@ install_from_verified_archive() {
     copy_file() {
         local src="$1" dest="$2" mode="$3"
         if [[ "$use_sudo" -eq 1 ]]; then
-            sudo install -D -m "$mode" "$src" "$dest"
+            sudo install -m "$mode" "$src" "$dest"
         else
-            install -D -m "$mode" "$src" "$dest"
+            install -m "$mode" "$src" "$dest"
         fi
     }
     copy_tree_file() {
@@ -229,7 +234,7 @@ install_from_verified_archive() {
     # root installs place the unit. Prefix installs keep it under the prefix.
     if [[ -n "$prefix" ]]; then
         copy_file "${stage}/reposync.service" "${config_dir}/reposync.service" 644
-    else
+    elif [[ "$INSTALL_OS" == Linux ]]; then
         echo "==> Installing systemd unit to ${SYSTEMD_UNIT_DIR}"
         copy_file "${stage}/reposync.service" "${SYSTEMD_UNIT_DIR}/reposync.service" 644
         if [[ "$SYSTEMD_UNIT_DIR" == "/etc/systemd/system" ]] && command -v systemctl &>/dev/null; then
@@ -325,7 +330,7 @@ members="$(release_members archive "${TMP_DIR}/reposync.tar.gz")"
 install_from_verified_archive "${TMP_DIR}/reposync.tar.gz" "" "$members"
 
 # Create system user if running as root
-if [ "$(id -u)" = "0" ] || [ -n "${SUDO_USER:-}" ]; then
+if [[ "$INSTALL_OS" == Linux && ( "$(id -u)" == 0 || -n "${SUDO_USER:-}" ) ]]; then
     if ! id -u reposync &>/dev/null; then
         echo "==> Creating reposync system user"
         sudo useradd -r -s /usr/sbin/nologin -d "$DATA_DIR" reposync || true
@@ -345,5 +350,9 @@ echo "       REPOSYNC_SVN_PASSWORD=your-svn-password"
 echo "       REPOSYNC_GITHUB_TOKEN=your-github-token"
 echo "       REPOSYNC_ADMIN_PASSWORD=your-dashboard-password"
 echo "       REPOSYNC_SESSION_SECRET=$(openssl rand -hex 32)"
-echo "  4. Start the daemon: sudo systemctl enable --now reposync"
+if [[ "$INSTALL_OS" == Linux ]]; then
+    echo "  4. Start the daemon: sudo systemctl enable --now reposync"
+else
+    echo "  4. Export the variables above and run ${INSTALL_DIR}/reposync-daemon --config ${CONFIG_DIR}/config.toml"
+fi
 echo "  5. Open http://your-server:8080 for the dashboard"

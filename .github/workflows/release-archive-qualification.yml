@@ -17,9 +17,19 @@ permissions:
   contents: read
 
 jobs:
-  qualify-linux-archive:
-    name: Install and run the native Linux archive
-    runs-on: ubuntu-latest
+  qualify-archive:
+    name: Install and run ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-gnu, os: ubuntu-24.04}
+          - {target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm}
+          - {target: x86_64-apple-darwin, os: macos-15-intel}
+          - {target: aarch64-apple-darwin, os: macos-15}
+    runs-on: ${{ matrix.os }}
+    env:
+      REPOSYNC_EXPECTED_TARGET: ${{ matrix.target }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
