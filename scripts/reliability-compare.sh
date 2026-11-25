@@ -66,6 +66,7 @@ for index in "${!sources[@]}"; do
   [[ "$status" -eq 0 ]] || aggregate_status=1
 done
 status=0
+REPOSYNC_LOCK_SOURCE=candidate \
 REPOSYNC_SOURCE_HEAD_OVERRIDE="$candidate_sha" \
 REPOSYNC_SOURCE_TREE_OVERRIDE="$candidate_tree" \
 REPOSYNC_ARTIFACT_DIR="$comparison_dir/candidate" \

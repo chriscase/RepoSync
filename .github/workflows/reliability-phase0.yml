@@ -11,7 +11,8 @@ permissions:
 jobs:
   isolated-diagnostics:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Full comparisons execute both labels of the growing candidate core suite serially.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:

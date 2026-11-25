@@ -155,6 +155,7 @@ docker run --rm --network none --read-only --cap-drop ALL \
   --env REPOSYNC_HOST_LISTENER_PORT="$(cat "$listener_info")" \
   --env REPOSYNC_SOURCE_HEAD="$source_head" --env REPOSYNC_SOURCE_TREE="$source_tree" \
   --env REPOSYNC_GOAL_SHA256="$goal_hash" --env REPOSYNC_LOCK_SHA256="$lock_hash" \
+  --env REPOSYNC_LOCK_SOURCE="$lock_source" \
   "$image" "${mode#--}" || runtime_status=$?
 printf '%s\n' "$runtime_status" > "$artifact_dir/runtime-exit-code.txt"
 [[ "$(cat "$host_private/canary")" == 'synthetic host-private file' ]] || {

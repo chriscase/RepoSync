@@ -736,6 +736,44 @@ def parse_baseline_stdout(name, stdout, returncode):
     return dict(passed=passed, failed=failed, ignored=ignored, filtered_out=filtered), matched
 
 
+def baseline_deadline(lock_source, name):
+    # The candidate core catalog took 363.80s in ordinary CI with 897 cases.
+    if lock_source == "candidate" and name in ("reposync-core", "reposync_core"):
+        return 900
+    return 300
+
+
+def baseline_timeout_progress(binary, error, completed_processes):
+    """Describe incomplete output without publishing any fixture stdout or stderr."""
+    import re
+    receipt = {"outcome": "TIMEOUT", "timeout_seconds": error.timeout,
+               "completed_processes_before_timeout": completed_processes,
+               "latest_listed_test_in_stdout_tail": None}
+    stdout = error.stdout or b""
+    # subprocess.TimeoutExpired carries bytes even when run(text=True).
+    for channel, data in (("stdout", stdout), ("stderr", error.stderr or b"")):
+        receipt[channel + "_bytes"] = len(data)
+        receipt[channel + "_sha256"] = digest(data)
+    tail = stdout[-65536:]
+    receipt["stdout_tail_bytes_inspected"] = len(tail)
+    if len(tail) < len(stdout):
+        tail = tail.partition(b"\n")[2]  # Drop a possibly partial first line.
+    names = re.findall(rb"(?m)^test ([A-Za-z_][A-Za-z_0-9:]{0,511}) \.\.\.(?: |$)", tail)
+    if not names:
+        return receipt
+    try:
+        listing = subprocess.run([str(binary), "--list", "--format", "terse"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return receipt
+    listed = set(listing.stdout.splitlines())
+    for name in reversed(names):
+        if name + b": test" in listed and SECRET.encode() not in name:
+            receipt["latest_listed_test_in_stdout_tail"] = name.decode("ascii")
+            break
+    return receipt
+
+
 def run_baseline(binaries):
     def capture_failure_mounts(label):
         diagnostic = {}
@@ -756,9 +794,18 @@ def run_baseline(binaries):
     processes = {}
     for name, filename in sorted(binaries.items()):
         binary = TESTS / filename
+        timeout = baseline_deadline(environment.get("REPOSYNC_LOCK_SOURCE"), name)
         try:
             result = subprocess.run([str(binary), "--nocapture", "--test-threads=1"],
-                                    capture_output=True, text=True, timeout=300, env=environment)
+                                    capture_output=True, text=True, timeout=timeout, env=environment)
+        except subprocess.TimeoutExpired as error:
+            capture_failure_mounts("baseline-" + name)
+            progress = baseline_timeout_progress(binary, error, len(processes))
+            try:
+                (OUTPUT / f"baseline-{name}.timeout.json").write_text(json.dumps(progress, indent=2) + "\n")
+            except OSError as write_error:
+                print(f"Timeout receipt write failed: {type(write_error).__name__}", file=sys.stderr)
+            raise
         except Exception:
             capture_failure_mounts("baseline-" + name)
             raise
@@ -770,7 +817,7 @@ def run_baseline(binaries):
         (OUTPUT / f"baseline-{name}.log").write_text(output)
         (OUTPUT / f"baseline-{name}.stdout.log").write_text(result.stdout)
         (OUTPUT / f"baseline-{name}.stderr.log").write_text(result.stderr)
-        process = {"exit_code": result.returncode, "authoritative_channel": "stdout",
+        process = {"exit_code": result.returncode, "timeout_seconds": timeout, "authoritative_channel": "stdout",
                    "stdout_sha256": digest(result.stdout.encode()),
                    "stderr_sha256": digest(result.stderr.encode())}
         (OUTPUT / f"baseline-{name}.process.json").write_text(json.dumps(process, indent=2) + "\n")
@@ -857,6 +904,41 @@ def baseline_self_test():
         assert (evidence / "baseline-fixture.log").read_text() == stdout + stderr
         assert (evidence / "baseline-fixture.stdout.log").read_text() == stdout
         assert (evidence / "baseline-fixture.stderr.log").read_text() == stderr
+        core_names = ("reposync-core", "reposync_core")
+        assert all(baseline_deadline("candidate", name) == 900 for name in core_names)
+        assert baseline_deadline("candidate", "team_mode_e2e") == 300
+        for role in [None, "unrecognized", *(r["source_head"] for r in NATIVE_ABSENCE_REGISTRY)]:
+            assert all(baseline_deadline(role, name) == 300 for name in core_names)
+
+        partial = (b"x" * 70000 + b"\ntest trusted::case ... ok\n"
+                   b"test unlisted_private_name ... secret fixture output\n" +
+                   b"test " + SECRET.encode() + b" ... ")
+        timed = subprocess.TimeoutExpired(["fixture"], 900, output=partial, stderr=b"private stderr data")
+        listing = subprocess.CompletedProcess([], 0, stdout=b"trusted::case: test\n" + SECRET.encode() + b": test\n")
+        timed_evidence = root / "timeout-evidence"
+        timed_evidence.mkdir()
+        with patch.dict(globals(), TESTS=root, OUTPUT=timed_evidence), \
+                patch.dict(os.environ, {"REPOSYNC_LOCK_SOURCE": "candidate"}), \
+                patch.object(subprocess, "run", side_effect=[timed, listing]) as run:
+            try:
+                run_baseline({"reposync-core": "fixture", "reposync_core": "fixture"})
+            except subprocess.TimeoutExpired as error:
+                assert error is timed
+            else:
+                raise AssertionError("timed-out catalog returned a verdict")
+            assert len(run.call_args_list) == 2
+            command = run.call_args_list[0]
+            assert command.args[0] == [str(binary), "--nocapture", "--test-threads=1"] and command.kwargs["timeout"] == 900
+            assert run.call_args_list[1].args[0] == [str(binary), "--list", "--format", "terse"]
+        receipt_bytes = (timed_evidence / "baseline-reposync-core.timeout.json").read_bytes()
+        receipt = json.loads(receipt_bytes)
+        assert receipt == {"outcome": "TIMEOUT", "timeout_seconds": 900, "completed_processes_before_timeout": 0,
+                           "stdout_tail_bytes_inspected": 65536, "latest_listed_test_in_stdout_tail": "trusted::case",
+                           "stdout_bytes": len(partial), "stdout_sha256": digest(partial),
+                           "stderr_bytes": len(timed.stderr), "stderr_sha256": digest(timed.stderr)}
+        assert all(raw not in receipt_bytes for raw in (SECRET.encode(), b"unlisted_private", b"private stderr", b"fixture output"))
+        assert not (timed_evidence / "baseline-results.json").exists()
+        assert not list(timed_evidence.glob("*.stdout.log")) and not list(timed_evidence.glob("*.stderr.log"))
         # Probe/setup failures stay durable and cannot suppress a real catalog.
         with patch.dict(globals(), TESTS=root, OUTPUT=evidence), patch.dict(os.environ, {
             "REPOSYNC_SOURCE_HEAD": "fixture", "REPOSYNC_SOURCE_TREE": "fixture",
