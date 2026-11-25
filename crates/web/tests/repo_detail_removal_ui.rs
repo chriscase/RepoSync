@@ -73,8 +73,8 @@ fn repo_root() -> PathBuf {
     .unwrap_or_else(|error| panic!("repo root: {error}"))
 }
 
-fn accepts_strip_types(bin: &Path) -> bool {
-    let probe = Command::new(bin)
+fn accepts_strip_types(bin: &Path, mut command: Command) -> bool {
+    let probe = command
         .args(["--experimental-strip-types", "-e", "process.exit(0)"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -112,18 +112,19 @@ fn select_node_runtime(
     override_bin: Option<&str>,
     path_dirs: &[PathBuf],
     system_fallbacks: &[PathBuf],
+    command_for: impl Fn(&Path) -> Command,
 ) -> Result<PathBuf, String> {
     if let Some(bin) = override_bin.map(str::trim).filter(|bin| !bin.is_empty()) {
         return Ok(PathBuf::from(bin));
     }
     for dir in path_dirs {
         let candidate = dir.join("node");
-        if candidate.is_file() && accepts_strip_types(&candidate) {
+        if candidate.is_file() && accepts_strip_types(&candidate, command_for(&candidate)) {
             return Ok(candidate);
         }
     }
     for candidate in system_fallbacks {
-        if candidate.is_file() && accepts_strip_types(candidate) {
+        if candidate.is_file() && accepts_strip_types(candidate, command_for(candidate)) {
             return Ok(candidate.clone());
         }
     }
@@ -140,8 +141,10 @@ fn node_command() -> Command {
         .iter()
         .map(PathBuf::from)
         .collect::<Vec<_>>();
-    let selected = select_node_runtime(override_bin.as_deref(), &path_dirs, &fallbacks)
-        .unwrap_or_else(|error| panic!("node runtime: {error}"));
+    let selected = select_node_runtime(override_bin.as_deref(), &path_dirs, &fallbacks, |bin| {
+        Command::new(bin)
+    })
+    .unwrap_or_else(|error| panic!("node runtime: {error}"));
     Command::new(selected)
 }
 
@@ -401,27 +404,25 @@ if (readManagedRemovalReceipt('repo-a') !== null) process.exit(6);
     );
 }
 
-fn write_executable(path: &Path, body: &str) {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
+// A subprocess spawned by another parallel test can inherit a newly opened
+// writer until exec. Run the shell fixture as input to the installed interpreter
+// so exec never targets an inode that the suite has opened for writing.
+fn shell_fixture(path: &Path) -> Command {
+    let mut command = Command::new("/bin/sh");
+    command.arg(path);
+    command
+}
+
+fn write_node_fixture(path: &Path, body: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, body).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
-    }
 }
 
-fn compatible_node_script() -> &'static str {
-    "#!/bin/sh\nif [ \"$1\" = \"--experimental-strip-types\" ]; then exit 0; fi\nexit 1\n"
-}
-
-fn older_node_script() -> &'static str {
-    "#!/bin/sh\nexit 1\n"
-}
+const COMPATIBLE_NODE: &str = r#"
+[ "$#" = 3 ] && [ "$1" = "--experimental-strip-types" ] &&
+    [ "$2" = "-e" ] && [ "$3" = "process.exit(0)" ]
+"#;
+const OLDER_NODE: &str = "exit 1\n";
 
 fn write_ui_root(root: &Path, behavior: &str) {
     let source = root.join("web-ui/src");
@@ -445,7 +446,7 @@ fn executed_ui_behavior(root: &Path) -> String {
         .iter()
         .map(PathBuf::from)
         .collect::<Vec<_>>();
-    let node = select_node_runtime(None, &path_dirs, &fallbacks)
+    let node = select_node_runtime(None, &path_dirs, &fallbacks, |bin| Command::new(bin))
         .expect("host Node is required to prove UI behavior");
     let script = r#"
 import { rootBehavior } from './web-ui/src/branchPairDeletion.ts';
@@ -477,8 +478,8 @@ fn node_runtime_prefers_compatible_path_over_older_system_node() {
     let system = dir.path().join("system");
     let path_node = path_dir.join("node");
     let system_nodejs = system.join("nodejs");
-    write_executable(&path_node, compatible_node_script());
-    write_executable(&system_nodejs, older_node_script());
+    write_node_fixture(&path_node, COMPATIBLE_NODE);
+    write_node_fixture(&system_nodejs, OLDER_NODE);
     eprintln!(
         "node fixture path_candidate={} system_candidate={}",
         path_node.display(),
@@ -489,6 +490,7 @@ fn node_runtime_prefers_compatible_path_over_older_system_node() {
         None,
         std::slice::from_ref(&path_dir),
         std::slice::from_ref(&system_nodejs),
+        shell_fixture,
     )
     .unwrap();
     assert_eq!(
@@ -503,12 +505,13 @@ fn node_runtime_uses_nodejs_only_fallback() {
     let path_dir = dir.path().join("path");
     fs::create_dir_all(&path_dir).unwrap();
     let system_nodejs = dir.path().join("nodejs");
-    write_executable(&system_nodejs, compatible_node_script());
+    write_node_fixture(&system_nodejs, COMPATIBLE_NODE);
 
     let selected = select_node_runtime(
         None,
         std::slice::from_ref(&path_dir),
         std::slice::from_ref(&system_nodejs),
+        shell_fixture,
     )
     .unwrap();
     assert_eq!(selected, system_nodejs);
@@ -521,14 +524,15 @@ fn node_runtime_honors_explicit_override() {
     let override_bin = dir.path().join("override-node");
     let path_node = path_dir.join("node");
     let system_nodejs = dir.path().join("nodejs");
-    write_executable(&override_bin, older_node_script());
-    write_executable(&path_node, compatible_node_script());
-    write_executable(&system_nodejs, compatible_node_script());
+    write_node_fixture(&override_bin, OLDER_NODE);
+    write_node_fixture(&path_node, COMPATIBLE_NODE);
+    write_node_fixture(&system_nodejs, COMPATIBLE_NODE);
 
     let selected = select_node_runtime(
         Some(override_bin.to_str().unwrap()),
         &[path_dir],
         &[system_nodejs],
+        shell_fixture,
     )
     .unwrap();
     assert_eq!(selected, override_bin);
@@ -542,8 +546,13 @@ fn node_runtime_rejects_when_no_runtime_exists() {
     let missing_node = dir.path().join("missing-node");
     let missing_nodejs = dir.path().join("missing-nodejs");
 
-    let error = select_node_runtime(None, &[path_dir], &[missing_node, missing_nodejs])
-        .expect_err("absent runtimes must not fall through to a bare node name");
+    let error = select_node_runtime(
+        None,
+        &[path_dir],
+        &[missing_node, missing_nodejs],
+        shell_fixture,
+    )
+    .expect_err("absent runtimes must not fall through to a bare node name");
     assert!(
         error.contains("no compatible Node runtime"),
         "unexpected error: {error}"
