@@ -61,9 +61,9 @@ pub(crate) struct RepoPathPolicyRead {
     pub version: u32,
     pub allowed_paths: PolicyFieldRead,
     pub blocked_patterns: PolicyFieldRead,
-    /// The only direction this build filters with these rules.
+    /// Directions covered by registered Team repository rules during scheduled sync.
     pub enforced_direction: &'static str,
-    /// SVN→Git path filtering (#53) is not part of this build.
+    /// Scope of inbound filtering. Imports and existing Git history are outside this capability.
     pub svn_to_git_filtering: &'static str,
     /// Included paths keep their branch-relative path; rewriting is not editable.
     pub path_rewriting: &'static str,
@@ -88,8 +88,8 @@ pub(crate) fn read_policy(allowed: Option<&str>, blocked: Option<&str>) -> RepoP
         version: READ_VERSION,
         allowed_paths: read_field(allowed),
         blocked_patterns: read_field(blocked),
-        enforced_direction: "git_to_svn",
-        svn_to_git_filtering: "not_applied",
+        enforced_direction: "bidirectional",
+        svn_to_git_filtering: "managed_incremental",
         path_rewriting: "none_read_only",
     }
 }
@@ -312,6 +312,6 @@ mod tests {
             json["blocked_patterns"],
             serde_json::json!({"state": "unset"})
         );
-        assert_eq!(json["svn_to_git_filtering"], "not_applied");
+        assert_eq!(json["svn_to_git_filtering"], "managed_incremental");
     }
 }

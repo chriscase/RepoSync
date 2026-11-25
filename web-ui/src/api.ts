@@ -938,8 +938,8 @@ export interface RepositoryPathPolicyRead {
   version: 1;
   allowed_paths: RepositoryPolicyFieldRead;
   blocked_patterns: RepositoryPolicyFieldRead;
-  enforced_direction: 'git_to_svn';
-  svn_to_git_filtering: 'not_applied';
+  enforced_direction: 'git_to_svn' | 'bidirectional';
+  svn_to_git_filtering: 'not_applied' | 'managed_incremental';
   path_rewriting: 'none_read_only';
 }
 

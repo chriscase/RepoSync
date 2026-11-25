@@ -878,19 +878,9 @@ impl Database {
         };
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
-        if !no_target_row_proven(&tx, Some(repo_id), direction, svn_rev)? {
-            return Err(DatabaseError::Other(format!(
-                "a no-target commit_map row for r{svn_rev} requires an existing canonical \
-                 intentionally_filtered_no_target outcome for this repository scope and generation"
-            )));
-        }
-        let now = chrono::Utc::now().to_rfc3339();
-        tx.execute(
-            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
-             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6)",
-            params![svn_rev, direction, now, svn_author, git_author, repo_id],
+        let id = insert_proven_no_target_row_tx(
+            &tx, svn_rev, direction, svn_author, git_author, repo_id,
         )?;
-        let id = tx.last_insert_rowid();
         tx.commit()?;
         tracing::debug!(
             id,
@@ -975,3 +965,172 @@ impl Database {
 #[cfg(test)]
 #[path = "nullable_commit_map_tests.rs"]
 mod tests;
+
+/// Insert one proven no-target `commit_map` row inside the caller's open
+/// transaction, and return its row id.
+///
+/// This is the single NULL-target INSERT. `insert_commit_map_no_target` and
+/// the #53 filtered SVN finalizer both call it, so the proof check and the
+/// row shape cannot diverge. It never creates canonical authority: the
+/// caller must already have written the `intentionally_filtered_no_target`
+/// outcome for this repository scope and generation in the same transaction.
+/// It refuses outside a transaction, for any direction other than
+/// `svn_to_git`, and without a managed repository scope.
+pub(crate) fn insert_proven_no_target_row_tx(
+    tx: &Connection,
+    svn_rev: i64,
+    direction: &str,
+    svn_author: &str,
+    git_author: &str,
+    repo_id: &str,
+) -> Result<i64, DatabaseError> {
+    if tx.is_autocommit() {
+        return Err(DatabaseError::Other(
+            "a no-target commit_map row must be written inside an open transaction".into(),
+        ));
+    }
+    if direction != "svn_to_git" {
+        return Err(DatabaseError::Other(
+            "a no-target commit_map row is only valid for svn_to_git".into(),
+        ));
+    }
+    if repo_id.is_empty() {
+        return Err(DatabaseError::Other(
+            "a no-target commit_map row requires a managed repository scope".into(),
+        ));
+    }
+    if !no_target_row_proven(tx, Some(repo_id), direction, svn_rev)? {
+        return Err(DatabaseError::Other(format!(
+            "a no-target commit_map row for r{svn_rev} requires an existing canonical \
+                 intentionally_filtered_no_target outcome for this repository scope and generation"
+        )));
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    tx.execute(
+        "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6)",
+        params![svn_rev, direction, now, svn_author, git_author, repo_id],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+#[cfg(test)]
+mod insert_proven_no_target_row_tests {
+    use super::*;
+    use crate::db::lineage_checkpoints::{record_mapping_outcome, MappingWrite};
+
+    fn managed(dir: &std::path::Path) -> Database {
+        let db = Database::new(dir.join("helper.db")).unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
+                 VALUES ('pair','pair','file:///repo','trunk','','','r','main',1,'t','t','scope-pair')",
+                [],
+            )
+            .unwrap();
+        db
+    }
+
+    fn rows(db: &Database) -> i64 {
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM commit_map", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn record_filtered_tx(tx: &Connection, svn_rev: i64) -> Result<(), DatabaseError> {
+        let generation = current_generation_read_only(tx, "pair", "scope-pair")?;
+        record_mapping_outcome(
+            tx,
+            "scope-pair",
+            generation,
+            MappingWrite {
+                direction: CheckpointDirection::SvnToGit,
+                source_key: &svn_source_key(svn_rev),
+                outcome: MappingOutcome::IntentionallyFilteredNoTarget,
+                target_git_sha: None,
+                target_svn_rev: None,
+                reason: Some("svn_filtered_no_git_content"),
+                policy_snapshot: Some("{\"allowed_paths\":[\"team/\"]}"),
+            },
+        )
+    }
+
+    #[test]
+    fn refuses_outside_an_open_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = managed(dir.path());
+        let error = {
+            let conn = db.conn();
+            insert_proven_no_target_row_tx(&conn, 2, "svn_to_git", "alice", "", "pair").unwrap_err()
+        };
+        assert!(error.to_string().contains("inside an open transaction"));
+        assert_eq!(rows(&db), 0);
+    }
+
+    #[test]
+    fn refuses_other_directions_and_unscoped_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = managed(dir.path());
+        let direction = db
+            .transaction(|tx| {
+                record_filtered_tx(tx, 2)?;
+                insert_proven_no_target_row_tx(tx, 2, "git_to_svn", "alice", "", "pair")
+            })
+            .unwrap_err();
+        assert!(direction.to_string().contains("only valid for svn_to_git"));
+        let unscoped = db
+            .transaction(|tx| {
+                record_filtered_tx(tx, 2)?;
+                insert_proven_no_target_row_tx(tx, 2, "svn_to_git", "alice", "", "")
+            })
+            .unwrap_err();
+        assert!(unscoped.to_string().contains("managed repository scope"));
+        assert_eq!(rows(&db), 0);
+    }
+
+    #[test]
+    fn refuses_without_the_canonical_filtered_outcome_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = managed(dir.path());
+        let error = db
+            .transaction(|tx| {
+                insert_proven_no_target_row_tx(tx, 2, "svn_to_git", "alice", "", "pair")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("requires an existing canonical"));
+        assert_eq!(rows(&db), 0);
+    }
+
+    #[test]
+    fn inserts_one_proven_row_after_the_outcome_in_the_same_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = managed(dir.path());
+        let id = db
+            .transaction(|tx| {
+                record_filtered_tx(tx, 2)?;
+                insert_proven_no_target_row_tx(tx, 2, "svn_to_git", "alice", "", "pair")
+            })
+            .unwrap();
+        assert!(id > 0);
+        let listed = db.list_commit_map_rows(Some("pair"), 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].git_sha, None);
+        assert_eq!(listed[0].target, CommitMapTarget::FilteredNoTarget);
+    }
+
+    #[test]
+    fn a_failed_later_write_rolls_the_row_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = managed(dir.path());
+        let error = db
+            .transaction(|tx| {
+                record_filtered_tx(tx, 2)?;
+                insert_proven_no_target_row_tx(tx, 2, "svn_to_git", "alice", "", "pair")?;
+                Err::<(), _>(DatabaseError::Other("injected later write failure".into()))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("injected later write failure"));
+        assert_eq!(rows(&db), 0);
+    }
+}

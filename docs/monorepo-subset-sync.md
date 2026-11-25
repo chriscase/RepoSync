@@ -1,12 +1,13 @@
-# Limit which Git changes reach an SVN monorepo
+# Limit paths in scheduled Team sync
 
-On `epic/reposync-partial-52`, a team can limit which paths its **scheduled Git→SVN writes** may change. For example, the team that owns `trunk/team/` can publish changes under `team/` and leave `trunk/team-other/` alone. Each included path keeps its name relative to the paired branch.
+On `epic/reposync-partial-52`, a team can limit which paths its **scheduled Team sync** publishes in either direction. For example, the team that owns `trunk/team/` can publish changes under `team/` and leave `trunk/team-other/` alone. Each included path keeps its name relative to the paired branch.
 
-**Can everyone with access to the Git destination read the entire selected SVN branch and the history you plan to import?** If the answer is no, stop before initial import. This receiver applies no inbound path filter during import or subsequent SVN→Git sync. A dedicated Git repository can still receive sibling teams' files.
+**Can everyone with access to the Git destination read the entire selected SVN branch and the history you plan to import?** If the answer is no, stop before initial import. Full and snapshot imports can include sibling teams' files. Filtering later SVN revisions leaves imported files and existing Git history visible.
 
 | What you need | What this receiver supports |
 | --- | --- |
 | Limit writes back to SVN, keeping paths such as `team/readme.md` | Set the team repository policy below. |
+| Filter new SVN edits under `team/` after import | Set the same Team policy. A mixed revision publishes only selected content. A fully excluded revision advances the processing watermark without creating a Git commit. |
 | Give Git readers only `team/`, or split a Git monorepo into several repositories | Subset export and Git repository splitting are unavailable. |
 | Put SVN's `trunk/team/readme.md` at Git's root as `readme.md` | The receiver has no `path_rewrite_rules` setting. It cannot remap paths, including LFS paths, or rewrite existing history. |
 | Use the same policy with `reposync personal` | Personal mode supports branch sync. Its config has no subset-policy fields and its outbound engine uses empty path rules. [Personal configuration](../crates/core/src/personal_config.rs) · [Personal Git→SVN implementation](../crates/personal/src/git_to_svn.rs) |
@@ -23,8 +24,10 @@ On `epic/reposync-partial-52`, a team can limit which paths its **scheduled Git�
    | `team/skip.exe` | Excluded by `*.exe` |
    | `team-other/leak.txt` | Outside the `team/` prefix |
 
-4. For a fresh registration, use the repository's import panel when it offers a start action. **Full SVN history** replays branch history. **Snapshot at pinned SVN revision** starts from the selected revision or HEAD. Both can bring sibling paths into Git. Check the import result and Git tree before turning on scheduled sync. For example, if `trunk/team-other/notes.txt` is present at the baseline, it can appear at `team-other/notes.txt` in Git. A later SVN edit to that sibling file can also reach Git.
+4. For a fresh registration, use the repository's import panel when it offers a start action. **Full SVN history** replays branch history. **Snapshot at pinned SVN revision** starts from the selected revision or HEAD. Both can bring sibling paths into Git. Check the import result and Git tree before turning on scheduled sync. For example, if `trunk/team-other/notes.txt` is present at the baseline, it can appear at `team-other/notes.txt` in Git. With the `team/` policy active, later scheduled SVN changes to that sibling file are excluded. Its imported contents remain readable.
 5. Turn on scheduled sync in the rehearsal. Make one Git commit changing all three sample paths and push it to the disposable registration's `main` branch. Wait until the scheduler handles that SHA. Git keeps all three changes. Of those paths, only `trunk/team/ok.txt` should change in SVN. Record the SVN revision, then push a second commit touching only `team/skip.exe` to the same branch. After the scheduler handles that SHA, the SVN revision should be unchanged if the fixture has no other writers. An existing excluded SVN file retains its prior content.
+
+6. Commit an SVN revision changing both `team/ok.txt` and `team-other/leak.txt`. After scheduled sync, verify Git received only the selected edit. Commit a second SVN revision touching only the sibling path. Verify the Git tip stays fixed and the `svn_to_git_filtered` audit event records the processed revision.
 
 The daemon loads these lists from the repository record. Neither the service TOML nor `personal.toml` provides these settings. `reposync validate` checks service configuration. **Avoid `reposync sync now` for a policy-controlled pair.** It constructs an engine from service configuration without loading the registration's path rules. [Scheduler](../crates/daemon/src/scheduler.rs) · [Service configuration](../crates/core/src/config.rs) · [CLI commands](../crates/cli/src/main.rs)
 
@@ -40,7 +43,7 @@ Before changing scope, record the current lists and preview paths on both sides 
 
 ### Read or update the policy through the API
 
-Read `GET /api/repos/{id}` and inspect `path_policy`. On this receiver, version 1 reports `enforced_direction: "git_to_svn"`, `svn_to_git_filtering: "not_applied"` and `path_rewriting: "none_read_only"`. Each list has a state of `unset`, `list` (with `entries`), or `malformed`.
+Read `GET /api/repos/{id}` and inspect `path_policy`. On this receiver, version 1 reports `enforced_direction: "bidirectional"`, `svn_to_git_filtering: "managed_incremental"` and `path_rewriting: "none_read_only"`. An older receiver reporting `not_applied` also leaves subsequent SVN revisions unfiltered. Each list has a state of `unset`, `list` (with `entries`), or `malformed`.
 
 An administrator can update the same registration with `PUT /api/repos/{id}`. The example is a request body. Supply a fresh request ID and copy `updated_at` from the detail read. Each write field is a **string containing a JSON array**.
 
@@ -70,8 +73,10 @@ cargo test -p reposync-web --test repo_path_policy_56 \
 
 Look for **one passing named test per command**. The first emits `RS_C02_MIXED_AND_SIBLING` and checks that the SVN journal contains only `team/ok.txt`. The second emits `RS_C02_FILTERED_THEN_ALLOWED` and checks that two allowed commits surrounding a fully blocked commit create exactly two SVN revisions. The third reads back replacements and explicit clears and checks that omitted fields survive. [Engine fixtures](../crates/core/tests/team_mode_e2e.rs) · [API fixture](../crates/web/tests/repo_path_policy_56.rs)
 
+The inbound fixtures cover a mixed revision, a fully filtered revision across restart, and empty-policy compatibility. Run the complete target with `cargo test -p reposync-core --test partial_sync_53`. [Inbound selection and holds](reliability/contracts/53-svn-to-git-filtering.md)
+
 ## Troubleshooting a rehearsal
 
 - **Why did my Git push drop files on the SVN side?** Inspect the source commit with `git show --name-status -M <sha>` in the local Git clone. In the repository's audit log, or in `reposync --config <local-config.toml> audit --limit 30` on the fixture host, look for `path_violation_filtered` (some paths excluded) or `path_violation_skipped` (all excluded). Compare the SVN revision with `svnlook changed -r <revision> <local-svn-repository>`. A filter event explains path selection. Check the resulting SVN revision or sync record to confirm publication.
-- **Why is my SVN file missing in Git?** Check the registered SVN branch, import completion, snapshot revision if applicable, and subsequent sync records. Verify the path on the destination branch with `git ls-tree -r --name-only main` in the local clone at the received revision. Changing `allowed_paths` cannot fix inbound delivery.
+- **Why is my SVN file missing in Git?** Check the registered SVN branch, import completion, snapshot revision if applicable, and subsequent sync records. Verify the path on the destination branch with `git ls-tree -r --name-only main` in the local clone at the received revision. For subsequent scheduled changes, check the active rules and the `svn_to_git_filtered` event. A missing or ambiguous diff, or a selected executable/symlink property change, can hold the revision for inspection. Widening the policy does not replay earlier revisions.
 - **Why has this repository stopped syncing?** A malformed stored list makes the scheduler refuse that repository. Look for the field name and `refusing repository sync` in daemon logs. Use the editor's **Replace with a new list** or an intentional **Clear** and verify the reread. If the editor says the policy is unavailable, check which server build answered. If a conflict is holding the pair, inspect the source paths and revisions in **Conflicts** before resolving it. [Conflict workflow](conflict-resolution.md)

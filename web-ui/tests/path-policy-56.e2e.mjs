@@ -51,7 +51,7 @@ async function startPolicyApi(fixtureOrigin) {
   };
   api.detail = () => ({ ...api.settings, ...(api.hidePolicy ? {} : { path_policy: { version: 1,
     allowed_paths: readField(api.raw.allowed), blocked_patterns: readField(api.raw.blocked),
-    enforced_direction: 'git_to_svn', svn_to_git_filtering: 'not_applied', path_rewriting: 'none_read_only' } }) });
+    enforced_direction: 'bidirectional', svn_to_git_filtering: 'managed_incremental', path_rewriting: 'none_read_only' } }) });
   api.puts = () => api.requests.filter(request => request.method === 'PUT' && request.path === '/api/repos/P');
   const server = createServer(async (req, res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
@@ -347,8 +347,8 @@ test('rs56 collapsed lists and Git→SVN preview are keyboard operable and match
       [' src/lead.rs', 'Excluded: not under an allowed path prefix', marked],
       ['src/tool.exe ', 'Included in Git→SVN', marked],
     ]);
-    await section(page).getByRole('status').filter({ hasText: '3 of 6 sample paths included in Git→SVN. SVN→Git is not filtered in this build.' }).waitFor();
-    await section(page).getByText(/SVN→Git imports every path on the SVN branch in this build/).waitFor();
+    await section(page).getByRole('status').filter({ hasText: '3 of 6 sample paths included in Git→SVN.' }).waitFor();
+    await section(page).getByText(/Initial imports can include all branch paths/).waitFor();
     assert.equal(policy.puts().length, 0, 'preview must not write');
     await audit(page, 'path policy read-only preview');
     assert.deepEqual(pageErrors, []);

@@ -1,10 +1,8 @@
 # #56 — Repository path-policy editor (RS-14)
 
-Parent: #61. Source-only candidate on base `1ddda4750c9c4ea55e471f794a89f3dfa43aa67a`
-(tree `044886e72d7396a75f37622e98d6348b5f0a4ab0`). **No test, build, type check, lint,
-browser or runtime step has been executed for this candidate.** Everything under
-"Evidence" is authored regression source whose results are NOT RUN. This does not close
-#56, qualify a release or change engine behaviour.
+The original [#56 editor change](https://github.com/chriscase/RepoSync/pull/261) was
+prepared against `1ddda475`. Its historical evidence section describes that change.
+This revision describes the read contract after integration with [#53](53-svn-to-git-filtering.md).
 
 ## Defect in the base
 
@@ -16,12 +14,13 @@ browser or runtime step has been executed for this candidate.** Everything under
   refuse to sync that repository.
 - The "Git Hook" download link depended on the same never-returned fields and never appeared.
 
-## Storage and enforcement (unchanged)
+## Storage and enforcement
 
 The columns stay nullable JSON text. `NULL` and `[]` both mean "no rule of this kind".
 The scheduler parses each column as a JSON array of strings, and refuses to sync the
 repository if that fails. `reposync_core::path_projection` is the only matching
-implementation. There are no schema, engine, scheduler or `path_projection.rs` changes.
+implementation. The scheduler passes these lists into the Team engine. With #53, registered
+Team repositories also apply them during incremental SVN→Git sync.
 
 ## API contract
 
@@ -34,7 +33,7 @@ receipt replays. The raw columns stay write-only and are not returned.
 {"version":1,
  "allowed_paths":{"state":"list","entries":["src/","config/"]},
  "blocked_patterns":{"state":"unset"},
- "enforced_direction":"git_to_svn","svn_to_git_filtering":"not_applied","path_rewriting":"none_read_only"}
+ "enforced_direction":"bidirectional","svn_to_git_filtering":"managed_incremental","path_rewriting":"none_read_only"}
 ```
 
 | `state` | Stored value | Extra fields |
@@ -137,11 +136,11 @@ with both sides passing would be the parity evidence; neither side has been run.
 
 ## Disclosed limitations
 
-1. **SVN→Git isolation.** This base does not contain qualified #53. The policy filters
-   Git→SVN only; SVN→Git imports every path on the SVN branch. In that direction a
-   non-empty policy only disables convergence and settling shortcuts. The UI states this
-   in a note, in every preview summary and in the read DTO (`svn_to_git_filtering:
-   "not_applied"`).
+1. **SVN→Git scope.** With [#53](53-svn-to-git-filtering.md), scheduled Team sync
+   projects new SVN revisions under the registration’s active rules. Initial imports can
+   include the entire branch, and existing Git history remains visible. The sample-path
+   preview covers outbound selection. The editor reads the server capability, shows the
+   outbound-only limitation on older receivers and treats an unknown capability conservatively.
 2. **Rewriting is read-only.** Included paths keep their branch-relative path. No rewrite
    mapping is offered.
 3. **Other readers are unchanged.** `GET /hooks/pre-commit` and SVN-commit reconciliation

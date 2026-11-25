@@ -22,10 +22,12 @@ export const MAX_POLICY_ENTRIES = 256;
 export const MAX_POLICY_ENTRY_BYTES = 1024;
 export const MAX_PREVIEW_PATHS = 50;
 
-export const PATH_POLICY_LIMITATIONS = [
-  'These rules filter Git→SVN only. SVN→Git imports every path on the SVN branch in this build; SVN→Git path filtering (#53) is not included.',
-  'Paths are not rewritten: an included Git path is written to the same branch-relative SVN path. Rewriting is read-only and cannot be configured here.',
-] as const;
+type InboundFiltering = 'managed_incremental' | 'not_applied' | 'unknown';
+export const inboundFilteringNote: Record<InboundFiltering, string> = {
+  managed_incremental: 'Scheduled Team sync filters new SVN changes using these rules. Initial imports can include all branch paths, and files already published remain in Git history.',
+  not_applied: 'This server applies these rules only to Git→SVN. Imports and subsequent SVN changes can publish all branch paths to Git.',
+  unknown: 'This server has not confirmed inbound path filtering. Treat the entire SVN branch as visible to Git readers.',
+};
 
 const UNAVAILABLE = 'This server did not report the path policy, so it cannot be shown or edited here. Saving other settings leaves it unchanged.';
 const UNRECOGNISED = 'The reported path policy was not recognised, so it cannot be edited here. Saving other settings leaves it unchanged.';
@@ -41,6 +43,7 @@ export type PolicyOrigin =
 export type PolicyMode = 'keep' | 'edit' | 'clear';
 export interface PolicyFieldDraft { origin: PolicyOrigin; mode: PolicyMode; entries: string[] }
 export interface PathPolicyDraft {
+  inboundFiltering: InboundFiltering;
   allowed_paths: PolicyFieldDraft;
   blocked_patterns: PolicyFieldDraft;
   /** Visible notes, e.g. a recovered draft clear that was deliberately not restored. */
@@ -120,7 +123,16 @@ export function pathPolicyDraft(repo: Pick<Repository, 'path_policy'> | null | u
     if (!isStringArray(parsed)) throw new Error('The recovered path policy draft could not be read. Review the current settings before saving.');
     return { origin, mode: 'edit', entries: parsed };
   };
-  return { allowed_paths: field('allowed_paths'), blocked_patterns: field('blocked_patterns'), notices };
+  const policy = repo?.path_policy;
+  let inboundFiltering: InboundFiltering = 'unknown';
+  if (policy?.version === 1) {
+    if (policy.enforced_direction === 'bidirectional' && policy.svn_to_git_filtering === 'managed_incremental') {
+      inboundFiltering = 'managed_incremental';
+    } else if (policy.enforced_direction === 'git_to_svn' && policy.svn_to_git_filtering === 'not_applied') {
+      inboundFiltering = 'not_applied';
+    }
+  }
+  return { allowed_paths: field('allowed_paths'), blocked_patterns: field('blocked_patterns'), inboundFiltering, notices };
 }
 
 function sameEntries(left: string[], right: string[]): boolean {

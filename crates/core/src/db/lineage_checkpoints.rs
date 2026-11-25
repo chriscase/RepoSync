@@ -878,6 +878,10 @@ pub async fn verify_or_pin_live_svn_identity(
     let live = observe_live_svn_identity(svn, info)
         .await
         .map_err(SyncError::SvnError)?;
+    // #53 (E3): before the first canonical lineage pin of a snapshot-backed
+    // baseline, the incarnation that snapshot read at its revision must be the
+    // live one. Unknown or different evidence holds before any row is written.
+    guard_first_snapshot_pin_53(db, repo_id, svn, &live).await?;
     adopt_or_hold_live_svn_identity(db, repo_id, &live)
 }
 
@@ -1479,5 +1483,708 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #53 imported-origin historical incarnation
+// (RS53-IMPORTED-ORIGIN-HISTORICAL-INCARNATION-1, L1)
+// ---------------------------------------------------------------------------
+
+/// The SVN identity of the configured target as it was at explicit peg revision
+/// `rev`, observed now through the configured client (`svn info URL@rev` and the
+/// stop-on-copy history at that peg). Path identity and incarnation extraction
+/// are the live observer's, unchanged. History that is empty, outside
+/// `1..=rev` or not strictly descending is refused, never guessed.
+pub(crate) async fn observe_historical_svn_identity_at(
+    svn: &SvnClient,
+    rev: i64,
+) -> Result<LiveSvnIdentity, SvnError> {
+    let info = svn.info_at_rev(rev).await?;
+    if info.uuid.trim().is_empty() {
+        return Err(SvnError::LineageRefused {
+            reason: "svn_uuid_missing".into(),
+            detail: format!("SVN info at r{rev} did not report a repository UUID"),
+        });
+    }
+    let identity = svn_path_identity(&info.root_url, &info.url)?;
+    let history = svn.copy_history_at_rev(rev).await?;
+    let descending = history
+        .windows(2)
+        .all(|pair| pair[0].revision > pair[1].revision);
+    let in_range = history
+        .iter()
+        .all(|entry| (1..=rev).contains(&entry.revision));
+    if history.is_empty() || !descending || !in_range {
+        return Err(SvnError::LineageRefused {
+            reason: "svn_incarnation_unproved".into(),
+            detail: format!(
+                "stop-on-copy history at r{rev} is empty or not a descending log within r1..r{rev}; refusing to guess the incarnation"
+            ),
+        });
+    }
+    let (created, copy_from_path, copy_from_rev) =
+        incarnation_from_history(&history, &identity.branch_path);
+    Ok(LiveSvnIdentity {
+        uuid: info.uuid.clone(),
+        root_url: identity.root_url,
+        url: info.url.trim_end_matches('/').to_string(),
+        branch_path: identity.branch_path,
+        incarnation_created_rev: created,
+        copy_from_path,
+        copy_from_rev,
+    })
+}
+
+/// The first field in which two observed identities differ, if any: UUID,
+/// root, target URL, branch path, incarnation creation revision and the
+/// path-specific creation copy pair.
+pub(crate) fn svn_identity_difference(
+    historical: &LiveSvnIdentity,
+    other: &LiveSvnIdentity,
+) -> Option<String> {
+    let differs =
+        |field: &str, a: String, b: String| (a != b).then(|| format!("{field}: {a} != {b}"));
+    differs("uuid", historical.uuid.clone(), other.uuid.clone())
+        .or_else(|| {
+            differs(
+                "root_url",
+                historical.root_url.clone(),
+                other.root_url.clone(),
+            )
+        })
+        .or_else(|| differs("url", historical.url.clone(), other.url.clone()))
+        .or_else(|| {
+            differs(
+                "branch_path",
+                historical.branch_path.clone(),
+                other.branch_path.clone(),
+            )
+        })
+        .or_else(|| {
+            differs(
+                "incarnation_created_rev",
+                historical.incarnation_created_rev.to_string(),
+                other.incarnation_created_rev.to_string(),
+            )
+        })
+        .or_else(|| {
+            differs(
+                "copy_from",
+                format!(
+                    "{:?}@{:?}",
+                    historical.copy_from_path, historical.copy_from_rev
+                ),
+                format!("{:?}@{:?}", other.copy_from_path, other.copy_from_rev),
+            )
+        })
+}
+
+/// The first field in which a historical observation differs from a pinned
+/// canonical lineage, if any (the same fields as `svn_identity_difference`).
+pub(crate) fn lineage_identity_difference(
+    historical: &LiveSvnIdentity,
+    lineage: &CanonicalLineage,
+) -> Option<String> {
+    svn_identity_difference(
+        historical,
+        &LiveSvnIdentity {
+            uuid: lineage.svn_uuid.clone(),
+            root_url: lineage.svn_root_url.clone(),
+            url: lineage.svn_url.clone(),
+            branch_path: lineage.svn_branch_path.clone(),
+            incarnation_created_rev: lineage.incarnation_created_rev,
+            copy_from_path: lineage.copy_from_path.clone(),
+            copy_from_rev: lineage.copy_from_rev,
+        },
+    )
+}
+
+/// The snapshot pin records the repository UUID and URL the snapshot read at
+/// its revision; an observed identity must carry the same. The pin's optional
+/// copy fields are revision-local data (possibly absent after an old read
+/// failure) and are neither compared nor treated as path-creation authority.
+pub(crate) fn pin_identity_difference(
+    observed: &LiveSvnIdentity,
+    pin: &crate::db::import_operations::SnapshotPin,
+) -> Option<String> {
+    if observed.uuid != pin.svn_uuid {
+        return Some(format!(
+            "uuid: {} != pinned {}",
+            observed.uuid, pin.svn_uuid
+        ));
+    }
+    let pinned_url = pin.canonical_url.trim_end_matches('/');
+    (observed.url != pinned_url).then(|| format!("url: {} != pinned {pinned_url}", observed.url))
+}
+
+/// Every retained snapshot claim of the repository, whatever commit it names:
+/// - each `snapshot-import:` origin row;
+/// - each snapshot-import journal of this repository that is completed or names
+///   any Git commit (local, confirmed or intended).
+///
+/// A snapshot journal that never named a commit and never completed claims no
+/// baseline. Malformed or unsupported journal documents are errors.
+fn retained_snapshot_claims_53(
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<Vec<String>, DatabaseError> {
+    use crate::db::import_operations::{ImportOperation, ImportOperationState};
+    let mut claims = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, git_sha FROM sync_records \
+             WHERE repo_id = ?1 AND substr(id, 1, 16) = 'snapshot-import:' ORDER BY id",
+        )?;
+        let rows = stmt.query_map([repo_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (id, sha) = row?;
+            claims.push(format!("origin {id} -> {sha:?}"));
+        }
+    }
+    let prefix = "import_operation_v1:document:";
+    let mut stmt = tx.prepare(
+        "SELECT key, value FROM kv_state WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key",
+    )?;
+    let rows = stmt.query_map([prefix], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (name, raw) = row?;
+        let op: ImportOperation = serde_json::from_str(&raw)
+            .map_err(|e| DatabaseError::Other(format!("invalid import operation {name}: {e}")))?;
+        if op.version != 1 {
+            return Err(DatabaseError::Other(format!(
+                "unsupported import operation version in {name}"
+            )));
+        }
+        let named: Vec<&str> = [
+            op.last_local_git_sha.as_deref(),
+            op.last_confirmed_git_sha.as_deref(),
+            op.intended_git_sha.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if op.repo_id == repo_id
+            && op.operation_type == "snapshot_import"
+            && (op.state == ImportOperationState::Completed || !named.is_empty())
+        {
+            claims.push(format!(
+                "journal {} ({:?}) -> {named:?}",
+                name.get(prefix.len()..).unwrap_or(""),
+                op.state
+            ));
+        }
+    }
+    Ok(claims)
+}
+
+/// Whether the next lineage pin is the first for the repository's current scope
+/// generation and, if so, what the records say about a snapshot origin of its
+/// Git baseline. One read transaction that is rolled back: it never writes and
+/// never mints a scope.
+///
+/// `None` means not a first pin, or genuinely not snapshot-backed: there is no
+/// retained snapshot claim at all (the fresh or full-import path). Any retained
+/// claim makes absence of exact-baseline evidence a refusal, never fresh:
+/// - an empty baseline;
+/// - a baseline that no snapshot origin names, while other snapshot claims are
+///   retained.
+fn first_pin_snapshot_origin_53(
+    db: &Database,
+    repo_id: &str,
+) -> Result<Option<crate::db::import_operations::SnapshotOriginEvidence>, DatabaseError> {
+    use crate::db::import_operations::{snapshot_origin_evidence, SnapshotOriginEvidence};
+    let conn = db.conn();
+    let tx = conn.unchecked_transaction()?;
+    let read = || -> Result<Option<SnapshotOriginEvidence>, DatabaseError> {
+        if !tables_ready(&tx)? {
+            return Ok(None);
+        }
+        let row: Option<(Option<String>, String)> = tx
+            .query_row(
+                "SELECT scope_uuid, last_git_sha FROM repositories WHERE id = ?1",
+                [repo_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((scope, baseline)) = row else {
+            return Ok(None);
+        };
+        if let Some(scope) = scope.filter(|scope| !scope.is_empty()) {
+            let generation =
+                crate::db::nullable_commit_map::current_generation_read_only(&tx, repo_id, &scope)?;
+            if load_canonical_lineage_tx(&tx, &scope, generation)?.is_some() {
+                return Ok(None);
+            }
+        }
+        let claims = retained_snapshot_claims_53(&tx, repo_id)?;
+        if baseline.is_empty() {
+            return Ok((!claims.is_empty()).then(|| {
+                SnapshotOriginEvidence::Refused(format!(
+                    "the repository has no Git baseline but retains snapshot claims {claims:?}"
+                ))
+            }));
+        }
+        match snapshot_origin_evidence(&tx, repo_id, &baseline)? {
+            SnapshotOriginEvidence::Absent if claims.is_empty() => Ok(None),
+            SnapshotOriginEvidence::Absent => Ok(Some(SnapshotOriginEvidence::Refused(format!(
+                "no snapshot origin names the Git baseline {baseline}, but the repository retains snapshot claims {claims:?}"
+            )))),
+            other => Ok(Some(other)),
+        }
+    };
+    let result = read();
+    drop(tx);
+    result
+}
+
+/// E3: before the first canonical lineage pin of a snapshot-backed baseline,
+/// the live identity must be the snapshot's: the pin's UUID and URL, then the
+/// identity observed now at peg R (incarnation creation revision and creation
+/// copy pair included). A refused origin, an unobservable history, any
+/// difference, or records that change across the SVN reads hold through the
+/// existing hold path before any lineage row is written. No SQLite reservation
+/// is held across the SVN reads. Existing lineage rows are never touched here.
+async fn guard_first_snapshot_pin_53(
+    db: &Database,
+    repo_id: &str,
+    svn: &SvnClient,
+    live: &LiveSvnIdentity,
+) -> Result<(), SyncError> {
+    use crate::db::import_operations::SnapshotOriginEvidence;
+    let Some(origin) =
+        first_pin_snapshot_origin_53(db, repo_id).map_err(SyncError::DatabaseError)?
+    else {
+        return Ok(());
+    };
+    let record = match origin {
+        SnapshotOriginEvidence::Verified(record) => record,
+        SnapshotOriginEvidence::Refused(detail) => {
+            return hold_unproved_identity(
+                db,
+                repo_id,
+                live,
+                "svn_snapshot_origin_unproved",
+                detail,
+            )
+        }
+        SnapshotOriginEvidence::Absent => return Ok(()),
+    };
+    if let Some(difference) = pin_identity_difference(live, &record.pin) {
+        return hold_unproved_identity(
+            db,
+            repo_id,
+            live,
+            "svn_identity_changed",
+            format!("live SVN identity differs from the snapshot pin: {difference}"),
+        );
+    }
+    let historical = match observe_historical_svn_identity_at(svn, record.svn_rev).await {
+        Ok(historical) => historical,
+        Err(error) => {
+            return hold_unproved_identity(
+                db,
+                repo_id,
+                live,
+                "svn_incarnation_unproved",
+                format!(
+                    "SVN identity at snapshot r{} could not be observed: {error}",
+                    record.svn_rev
+                ),
+            )
+        }
+    };
+    if let Some(difference) = pin_identity_difference(&historical, &record.pin)
+        .or_else(|| svn_identity_difference(&historical, live))
+    {
+        return hold_unproved_identity(
+            db,
+            repo_id,
+            live,
+            "svn_identity_changed",
+            format!(
+                "SVN identity at snapshot r{} differs from the live identity: {difference}",
+                record.svn_rev
+            ),
+        );
+    }
+    match first_pin_snapshot_origin_53(db, repo_id).map_err(SyncError::DatabaseError)? {
+        Some(SnapshotOriginEvidence::Verified(again)) if again == record => Ok(()),
+        _ => hold_unproved_identity(
+            db,
+            repo_id,
+            live,
+            "svn_snapshot_origin_unproved",
+            "snapshot origin records changed while its historical identity was observed".into(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod imported_origin_identity_tests {
+    //! Pure comparison coverage for the E3 first-pin guard and the E2 witness.
+    //! SVN observation itself is native (`tests/partial_sync_53.rs`).
+    use super::*;
+    use crate::db::import_operations::SnapshotPin;
+
+    fn identity(created: i64, copy: Option<(&str, i64)>) -> LiveSvnIdentity {
+        LiveSvnIdentity {
+            uuid: "uuid-1".into(),
+            root_url: "file:///svn".into(),
+            url: "file:///svn/trunk".into(),
+            branch_path: "trunk".into(),
+            incarnation_created_rev: created,
+            copy_from_path: copy.map(|(path, _)| path.to_owned()),
+            copy_from_rev: copy.map(|(_, rev)| rev),
+        }
+    }
+
+    fn pin(uuid: &str, url: &str) -> SnapshotPin {
+        SnapshotPin {
+            svn_uuid: uuid.into(),
+            canonical_url: url.into(),
+            operative_rev: 2,
+            peg_rev: 2,
+            copy_from_path: Some("/elsewhere".into()),
+            copy_from_rev: Some(1),
+            requested: "HEAD".into(),
+        }
+    }
+
+    #[test]
+    fn same_uuid_and_url_with_another_uncopied_incarnation_is_a_difference() {
+        let difference = svn_identity_difference(&identity(1, None), &identity(4, None));
+        assert_eq!(
+            difference.as_deref(),
+            Some("incarnation_created_rev: 1 != 4")
+        );
+        assert_eq!(
+            svn_identity_difference(&identity(1, None), &identity(1, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn recopy_from_the_same_source_differs_in_creation_revision() {
+        let before = identity(3, Some(("/trunk", 2)));
+        let after = identity(6, Some(("/trunk", 2)));
+        assert!(svn_identity_difference(&before, &after)
+            .unwrap()
+            .starts_with("incarnation_created_rev"));
+        let other_source = identity(3, Some(("/branches/x", 2)));
+        assert!(svn_identity_difference(&before, &other_source)
+            .unwrap()
+            .starts_with("copy_from"));
+    }
+
+    #[test]
+    fn every_identity_field_is_compared_with_a_pinned_lineage() {
+        let historical = identity(1, None);
+        let mut lineage = CanonicalLineage {
+            scope_uuid: "scope".into(),
+            generation: 1,
+            repo_id: "repo".into(),
+            svn_uuid: "uuid-1".into(),
+            svn_root_url: "file:///svn".into(),
+            svn_url: "file:///svn/trunk".into(),
+            svn_branch_path: "trunk".into(),
+            incarnation_created_rev: 1,
+            copy_from_path: None,
+            copy_from_rev: None,
+            git_baseline_sha: Some("b".repeat(40)),
+            git_ref: Some("main".into()),
+            projection_version: String::new(),
+            policy_hash: String::new(),
+        };
+        assert_eq!(lineage_identity_difference(&historical, &lineage), None);
+        type LineageEdit = Box<dyn Fn(&mut CanonicalLineage)>;
+        let edits: Vec<LineageEdit> = vec![
+            Box::new(|l| l.svn_uuid = "uuid-2".into()),
+            Box::new(|l| l.svn_root_url = "file:///other".into()),
+            Box::new(|l| l.svn_url = "file:///svn/branches/b".into()),
+            Box::new(|l| l.svn_branch_path = "branches/b".into()),
+            Box::new(|l| l.incarnation_created_rev = 4),
+            Box::new(|l| l.copy_from_path = Some("/trunk".into())),
+            Box::new(|l| l.copy_from_rev = Some(2)),
+        ];
+        for edit in edits {
+            let mut changed = lineage.clone();
+            edit(&mut changed);
+            assert!(lineage_identity_difference(&historical, &changed).is_some());
+        }
+        lineage.git_baseline_sha = None;
+        assert_eq!(
+            lineage_identity_difference(&historical, &lineage),
+            None,
+            "baseline and policy fields are not identity fields"
+        );
+    }
+
+    #[test]
+    fn the_pin_contributes_uuid_and_url_only_and_never_its_copy_fields() {
+        let observed = identity(1, None);
+        assert_eq!(
+            pin_identity_difference(&observed, &pin("uuid-1", "file:///svn/trunk/")),
+            None
+        );
+        assert!(
+            pin_identity_difference(&observed, &pin("uuid-2", "file:///svn/trunk"))
+                .unwrap()
+                .starts_with("uuid")
+        );
+        assert!(
+            pin_identity_difference(&observed, &pin("uuid-1", "file:///svn/other"))
+                .unwrap()
+                .starts_with("url")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // E3 first-pin controls: retained snapshot evidence that does not link the
+    // current Git baseline is never classified as fresh, and holds before any
+    // lineage row. Each refusal has a genuinely-no-snapshot control that pins.
+    // Rows are fabricated; this establishes classification, not provenance.
+    // -----------------------------------------------------------------------
+
+    const REPO: &str = "pair-e3";
+    const SCOPE: &str = "00000000-0000-4000-8000-0000000000e3";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const X: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    fn e3_db(dir: &std::path::Path, baseline: &str) -> Database {
+        let db = Database::new(dir.join("state.db")).unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid,last_svn_rev,last_git_sha)
+                 VALUES (?1,'pair','file:///svn/trunk','','','','r','main',1,'t','t',?2,?3,?4)",
+                params![REPO, SCOPE, if baseline.is_empty() { 0 } else { 2 }, baseline],
+            )
+            .unwrap();
+        db
+    }
+
+    fn journal(
+        op_id: &str,
+        operation_type: &str,
+        state: crate::db::import_operations::ImportOperationState,
+        sha: Option<&str>,
+    ) -> crate::db::import_operations::ImportOperation {
+        crate::db::import_operations::ImportOperation {
+            version: 1,
+            id: op_id.into(),
+            repo_id: REPO.into(),
+            operation_type: operation_type.into(),
+            initiator_id: "admin".into(),
+            request_id: "req".into(),
+            target_fingerprint: "fp".into(),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            state,
+            cancel_requested: false,
+            processed_revisions: 1,
+            total_revisions: Some(1),
+            local_commits: 1,
+            confirmed_batches: 1,
+            last_local_svn_rev: sha.map(|_| 2),
+            last_local_git_sha: sha.map(str::to_owned),
+            last_confirmed_svn_rev: sha.map(|_| 2),
+            last_confirmed_git_sha: sha.map(str::to_owned),
+            intended_ref: None,
+            intended_git_sha: None,
+            outcome_detail: None,
+            resume_authorized: false,
+            snapshot_pin: (operation_type == "snapshot_import").then(|| SnapshotPin {
+                svn_uuid: "uuid-1".into(),
+                canonical_url: "file:///svn/trunk".into(),
+                operative_rev: 2,
+                peg_rev: 2,
+                copy_from_path: None,
+                copy_from_rev: None,
+                requested: "2".into(),
+            }),
+            pending_commit_maps: Vec::new(),
+        }
+    }
+
+    fn put_journal(db: &Database, op: &crate::db::import_operations::ImportOperation) {
+        db.set_state(
+            &format!("import_operation_v1:document:{}", op.id),
+            &serde_json::to_string(op).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn put_origin(db: &Database, op_id: &str, sha: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+                 VALUES (?1, ?2, 2, ?3, 'svn_to_git', '', 'Verified SVN snapshot baseline', 't', 't', 'applied')",
+                params![format!("snapshot-import:{op_id}"), REPO, sha],
+            )
+            .unwrap();
+    }
+
+    fn lineage_count(db: &Database) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM canonical_lineage WHERE repo_id = ?1",
+                [REPO],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The SVN client is never read on these paths: a refusal holds before any
+    /// SVN read, and a genuinely-no-snapshot pair needs none.
+    fn unread_svn() -> SvnClient {
+        SvnClient::new("file:///rs53-e3-not-read", "", "")
+    }
+
+    fn trunk_identity() -> LiveSvnIdentity {
+        LiveSvnIdentity {
+            uuid: "uuid-1".into(),
+            root_url: "file:///svn".into(),
+            url: "file:///svn/trunk".into(),
+            branch_path: "trunk".into(),
+            incarnation_created_rev: 1,
+            copy_from_path: None,
+            copy_from_rev: None,
+        }
+    }
+
+    async fn assert_held_before_first_pin(db: &Database, needle: &str) {
+        use crate::db::import_operations::SnapshotOriginEvidence;
+        match first_pin_snapshot_origin_53(db, REPO).unwrap() {
+            Some(SnapshotOriginEvidence::Refused(detail)) => {
+                assert!(detail.contains(needle), "{needle:?} in {detail}")
+            }
+            other => panic!("incomplete retained snapshot evidence must refuse, got {other:?}"),
+        }
+        let held = guard_first_snapshot_pin_53(db, REPO, &unread_svn(), &trunk_identity())
+            .await
+            .unwrap_err();
+        match held {
+            SyncError::HistoryBlocked { reason, .. } => {
+                assert_eq!(reason, "svn_snapshot_origin_unproved")
+            }
+            other => panic!("expected the existing hold, got {other:?}"),
+        }
+        assert_eq!(lineage_count(db), 0, "no first lineage pin");
+    }
+
+    #[tokio::test]
+    async fn journal_only_snapshot_claim_with_an_empty_baseline_is_not_fresh_and_never_pins() {
+        use crate::db::import_operations::ImportOperationState;
+        // A completed snapshot journal survives while its origin row is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let db = e3_db(dir.path(), "");
+        put_journal(
+            &db,
+            &journal(
+                "op-orphan",
+                "snapshot_import",
+                ImportOperationState::Completed,
+                Some(B),
+            ),
+        );
+        assert_held_before_first_pin(&db, "no Git baseline").await;
+        assert_held_before_first_pin(&db, "op-orphan").await;
+        // Control: the genuinely fresh pair (no snapshot claim) still pins.
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh = e3_db(fresh_dir.path(), "");
+        assert!(first_pin_snapshot_origin_53(&fresh, REPO)
+            .unwrap()
+            .is_none());
+        guard_first_snapshot_pin_53(&fresh, REPO, &unread_svn(), &trunk_identity())
+            .await
+            .unwrap();
+        adopt_or_hold_live_svn_identity(&fresh, REPO, &trunk_identity()).unwrap();
+        assert_eq!(lineage_count(&fresh), 1, "the fresh path pins once");
+    }
+
+    #[tokio::test]
+    async fn retained_snapshot_origin_for_another_baseline_is_not_fresh_and_never_pins() {
+        use crate::db::import_operations::{
+            snapshot_origin_evidence, ImportOperationState, SnapshotOriginEvidence,
+        };
+        // The original snapshot published B; the current baseline is X.
+        let dir = tempfile::tempdir().unwrap();
+        let db = e3_db(dir.path(), X);
+        put_journal(
+            &db,
+            &journal(
+                "op-original",
+                "snapshot_import",
+                ImportOperationState::Completed,
+                Some(B),
+            ),
+        );
+        put_origin(&db, "op-original", B);
+        assert_eq!(
+            snapshot_origin_evidence(&db.conn(), REPO, X).unwrap(),
+            SnapshotOriginEvidence::Absent,
+            "exact-baseline evidence alone is absent for X"
+        );
+        assert_held_before_first_pin(&db, "no snapshot origin names the Git baseline").await;
+        // Control: a genuine full import of X, with only a snapshot attempt that
+        // never named a commit, is not snapshot-backed and pins.
+        let full_dir = tempfile::tempdir().unwrap();
+        let full = e3_db(full_dir.path(), X);
+        put_journal(
+            &full,
+            &journal(
+                "op-full",
+                "full_import",
+                ImportOperationState::Completed,
+                Some(X),
+            ),
+        );
+        put_journal(
+            &full,
+            &journal(
+                "op-abandoned",
+                "snapshot_import",
+                ImportOperationState::Cancelled,
+                None,
+            ),
+        );
+        record_independently_established_svn_uuid(&full, REPO, "uuid-1").unwrap();
+        assert!(first_pin_snapshot_origin_53(&full, REPO).unwrap().is_none());
+        guard_first_snapshot_pin_53(&full, REPO, &unread_svn(), &trunk_identity())
+            .await
+            .unwrap();
+        adopt_or_hold_live_svn_identity(&full, REPO, &trunk_identity()).unwrap();
+        assert_eq!(lineage_count(&full), 1, "the full-import path pins once");
+    }
+
+    #[tokio::test]
+    async fn incomplete_retained_claims_never_pass_and_malformed_journals_are_errors() {
+        use crate::db::import_operations::ImportOperationState;
+        // A snapshot journal that published locally but never completed, with no
+        // origin row, beside an unrelated baseline.
+        let dir = tempfile::tempdir().unwrap();
+        let db = e3_db(dir.path(), X);
+        put_journal(
+            &db,
+            &journal(
+                "op-local",
+                "snapshot_import",
+                ImportOperationState::ReconciliationRequired,
+                Some(B),
+            ),
+        );
+        assert_held_before_first_pin(&db, "op-local").await;
+        db.set_state("import_operation_v1:document:op-broken", "{not json")
+            .unwrap();
+        assert!(
+            first_pin_snapshot_origin_53(&db, REPO).is_err(),
+            "a malformed journal is an error, never fresh"
+        );
+        assert_eq!(lineage_count(&db), 0);
     }
 }

@@ -7,7 +7,7 @@ import { addPolicyEntry, beginPolicyEdit, pathPolicyDraft, type PathPolicyDraft 
 
 // Static-render component regressions (no DOM, no browser). Keyboard focus and axe
 // checks live in web-ui/tests/path-policy-56.e2e.mjs.
-const LIMITS = { enforced_direction: 'git_to_svn', svn_to_git_filtering: 'not_applied', path_rewriting: 'none_read_only' } as const;
+const LIMITS = { enforced_direction: 'bidirectional', svn_to_git_filtering: 'managed_incremental', path_rewriting: 'none_read_only' } as const;
 function draftFor(policy: unknown): PathPolicyDraft {
   return pathPolicyDraft({ path_policy: policy as RepositoryPathPolicyRead | undefined });
 }
@@ -29,10 +29,21 @@ describe('#56 PathPolicyEditor56 static rendering', () => {
       expect(html).toContain(`id="${panel}" hidden=""`);
     }
     expect(html).toContain('role="note"');
-    expect(html).toContain('SVN→Git imports every path on the SVN branch in this build; SVN→Git path filtering (#53) is not included.');
+    expect(html).toContain('Initial imports can include all branch paths, and files already published remain in Git history.');
     expect(html).toContain('Rewriting is read-only and cannot be configured here.');
     expect(html).toContain('2 allowed path prefixes');
     expect(html).toContain('1 blocked pattern');
+  });
+
+  it('uses the capability reported by older servers and handles incomplete responses conservatively', () => {
+    const fields = { version: 1, allowed_paths: { state: 'unset' }, blocked_patterns: { state: 'unset' } };
+    const render = (policy: unknown) => renderToStaticMarkup(createElement(PathPolicyEditor56, { draft: draftFor(policy) }));
+    expect(render({ ...fields, enforced_direction: 'git_to_svn', svn_to_git_filtering: 'not_applied' }))
+      .toContain('This server applies these rules only to Git→SVN.');
+    for (const policy of [undefined, fields, { ...fields, ...LIMITS, version: 9 },
+      { ...fields, enforced_direction: 'git_to_svn', svn_to_git_filtering: 'managed_incremental' }]) {
+      expect(render(policy)).toContain('This server has not confirmed inbound path filtering.');
+    }
   });
 
   it('is read-only without onChange: stored entries, no inputs and no edit actions', () => {
@@ -93,7 +104,7 @@ describe('#56 PathPolicyEditor56 static rendering', () => {
     expect(html).toContain('Included in Git→SVN');
     expect(html).toContain('Excluded: matches blocked pattern *.exe');
     expect(html).toContain('Excluded: not under an allowed path prefix');
-    expect(html).toContain('1 of 3 sample paths included in Git→SVN. SVN→Git is not filtered in this build.');
+    expect(html).toContain('1 of 3 sample paths included in Git→SVN.');
     expect(html).toMatch(/<label for="([^"]+)"[^>]*>Sample Git paths \(one per line\)<\/label><textarea id="\1"/);
   });
 
