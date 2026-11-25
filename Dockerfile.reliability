@@ -43,6 +43,7 @@ RUN --mount=type=cache,id=rust-1.98.1-bookworm-old-${RELIABILITY_OLD_TARGET_CACH
         > /tmp/old-preparation.jsonl && \
       python3 /usr/local/bin/reliability-prep /tmp/old-preparation.jsonl /opt/reliability-old-tests && \
       sha256sum /opt/reliability-old-tests/legacy_import_generator-* > /opt/reliability-old-tests/generator.sha256 && \
+      python3 /usr/local/bin/reliability-prep --stage-old-adapter crates/web/tests/legacy_import_generator.rs /opt/reliability-tests && \
       sha256sum crates/web/tests/legacy_import_generator.rs > /opt/reliability-old-tests/overlay.sha256 && \
       sha256sum Cargo.lock > /opt/reliability-old-tests/lock.sha256; \
     fi

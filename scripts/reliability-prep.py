@@ -262,6 +262,23 @@ def artifacts(source):
             yield item
 
 
+def stage_old_adapter(source, tests):
+    """Enroll the same non-executable adapter bytes that Cargo compiled in /old-src."""
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("invalid old-generator build input")
+    manifest = tests / "runtime-inputs.json"
+    inputs = strict_json_loads(manifest.read_text())
+    relative = "scripts/legacy_import_generator.rs"
+    target = tests.parent / "reliability-runtime-inputs" / relative
+    target.parent.mkdir()
+    data = source.read_bytes()
+    target.write_bytes(data)
+    target.chmod(0o444)
+    inputs["files"][relative] = {"kind": "fixture", "bytes": len(data), "mode": 0o444,
+                                "sha256": hashlib.sha256(data).hexdigest()}
+    manifest.write_text(json.dumps(inputs, indent=2, sort_keys=True) + "\n")
+
+
 def package(source, destination, applications=None, fixtures=None, runtime_root=None):
     destination.mkdir(parents=True, exist_ok=True)
     if destination.is_symlink():
@@ -614,6 +631,13 @@ def self_test():
         enrolled = json.loads((root / "with-startup/runtime-inputs.json").read_text())
         assert enrolled["absent_fixtures"] == []
         assert enrolled["files"][startup_relative]["sha256"] == sha(startup)
+        stage_old_adapter(repo / "scripts/legacy_import_generator.rs", root / "with-startup")
+        relative = "scripts/legacy_import_generator.rs"
+        staged = root / "reliability-runtime-inputs" / relative
+        sealed = json.loads((root / "with-startup/runtime-inputs.json").read_text())["files"][relative]
+        assert sealed == {"kind": "fixture", "bytes": staged.stat().st_size, "mode": 0o444,
+                          "sha256": sha(repo / relative)}
+        assert stat.S_IMODE(staged.stat().st_mode) == 0o444 and sha(staged) == sealed["sha256"]
         startup.unlink()
         manifest = json.loads((root / "valid/binaries.json").read_text())
         assert manifest == {"reposync_core": "deps/reposync_core-123", "reposync-core": "deps/reposync_core-123"}
@@ -699,6 +723,12 @@ def self_test():
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
         self_test()
+    elif sys.argv[1:2] == ["--stage-old-adapter"]:
+        parser = argparse.ArgumentParser(description="Seal the old generator adapter used by R01")
+        parser.add_argument("source", type=Path)
+        parser.add_argument("tests", type=Path)
+        args = parser.parse_args(sys.argv[2:])
+        stage_old_adapter(args.source, args.tests)
     elif sys.argv[1:2] == ["--stage-fixtures"]:
         parser = argparse.ArgumentParser(description="Record archived fixture provenance; no fallback by default")
         parser.add_argument("context", type=Path)

@@ -14,6 +14,7 @@ from urllib.parse import unquote, urlsplit
 FIXTURE = Path("/fixture")
 OUTPUT = Path("/evidence")
 TESTS = Path("/opt/reliability-tests")
+OLD_ADAPTER = "scripts/legacy_import_generator.rs"
 SECRET = "REPOSYNC_SYNTHETIC_SECRET_CANARY_72"
 MANDATORY = {
     "diagnostics": {"R02_R03_ROUTE", "R06_CHECKPOINT"},
@@ -219,7 +220,7 @@ def runtime_absences(inputs):
         raise ValueError("runtime absences are not sorted")
     applications = {"target/debug/reposync", "target/debug/reposync-personal"}
     present = set(inputs["files"])
-    if (not applications <= present <= applications | known
+    if (not applications <= present <= applications | known | {OLD_ADAPTER}
             or set(absent) != known - present):
         raise ValueError("inconsistent runtime present/absent partition")
     admission = native_admission(inputs["historical_admission"])
@@ -283,6 +284,10 @@ def validate_runtime_inputs(src=Path("/src"), tests=TESTS, runtime_inputs=None, 
     """Compose ed56's exact inventory with PR214's fixture and package binding."""
     inputs = (strict_json_loads((tests / "runtime-inputs.json").read_text())
               if runtime_inputs is None else runtime_inputs)
+    if mode is not None and (OLD_ADAPTER in inputs["files"]) != (mode != "baseline"):
+        raise ValueError("old generator adapter enrollment differs from runtime mode")
+    if OLD_ADAPTER in inputs["files"] and inputs["files"][OLD_ADAPTER]["mode"] != 0o444:
+        raise ValueError("old generator adapter must be read-only data")
     assert_runtime_source_isolation(src, inputs)
     absent, admission = runtime_absences(inputs)
     if admission is not None and ((source_head, source_tree, mode) !=
@@ -326,6 +331,32 @@ def validate_runtime_inputs(src=Path("/src"), tests=TESTS, runtime_inputs=None, 
         mode = stat.S_IMODE(binary.stat().st_mode)
         assert mode == entry["mode"] and mode & 0o111, f"packaged application mode mismatch: {name}"
     return inputs
+
+
+def verify_old_generator(old_tests, inputs):
+    """Bind the Cargo-selected executable and its witnessed adapter to their build receipts."""
+    binaries = strict_json_loads((old_tests / "binaries.json").read_text())
+    name = binaries["legacy_import_generator"]
+    if Path(name).name != name or not name.startswith("legacy_import_generator-"):
+        raise ValueError("old generator manifest selected an unexpected binary")
+    generator = old_tests / name
+    if generator.is_symlink() or not generator.is_file() or not os.access(generator, os.X_OK):
+        raise ValueError("pinned old import generator is not an executable regular file")
+    binary_hash = digest(generator.read_bytes())
+    adapter_hash = inputs["files"][OLD_ADAPTER]["sha256"]
+    for receipt, expected in (
+        ("generator.sha256", [binary_hash, str(generator)]),
+        ("overlay.sha256", [adapter_hash, "crates/web/tests/legacy_import_generator.rs"]),
+    ):
+        if (old_tests / receipt).read_text().split() != expected:
+            raise ValueError(f"pinned old generator build receipt differs: {receipt}")
+    listing = subprocess.run([generator, "--list"], check=True, capture_output=True,
+                             text=True, timeout=30).stdout.splitlines()
+    if "generate_legacy_import: test" not in listing:
+        raise ValueError("pinned executable does not list generate_legacy_import")
+    return generator, {"generator_sha256": binary_hash, "generator_path": str(generator),
+                       "listed_test": "generate_legacy_import", "adapter_sha256": adapter_hash,
+                       "adapter_path": OLD_ADAPTER}
 
 
 def persist_prerequisites(receipt):
@@ -887,12 +918,53 @@ def baseline_self_test():
             (root / "runtime-inputs.json").write_text(json.dumps(inputs))
         write_inputs()
         validate_runtime_inputs(src, root)
-        def reject_layout():
+        def reject_layout(**kwargs):
             try:
-                validate_runtime_inputs(src, root)
+                validate_runtime_inputs(src, root, **kwargs)
             except (AssertionError, FileNotFoundError, KeyError, ValueError):
                 return
             raise AssertionError("invalid runtime source/package accepted")
+        reject_layout(mode="candidate")  # Missing R01 adapter.
+        adapter = src / OLD_ADAPTER
+        adapter.parent.mkdir()
+        adapter.write_text("// read-only generator adapter control")
+        adapter.chmod(0o444)
+        inputs["files"][OLD_ADAPTER] = entry(adapter, "fixture")
+        write_inputs()
+        validate_runtime_inputs(src, root, mode="candidate")
+        # Exercise selection before any native fixture runs; mismatched receipts must stop before --list.
+        import unittest
+        old_tests = root / "old-tests"
+        old_tests.mkdir()
+        generator = old_tests / "legacy_import_generator-control"
+        generator.write_bytes(b"synthetic binary identity")
+        generator.chmod(0o555)
+        (old_tests / "binaries.json").write_text(json.dumps({"legacy_import_generator": generator.name}))
+        (old_tests / "generator.sha256").write_text(f"{digest(generator.read_bytes())}  {generator}\n")
+        overlay = old_tests / "overlay.sha256"
+        overlay.write_text(f"{inputs['files'][OLD_ADAPTER]['sha256']}  crates/web/tests/legacy_import_generator.rs\n")
+        with patch.object(subprocess, "run") as probe:
+            probe.return_value.stdout = "generate_legacy_import: test\n"
+            selected, receipt = verify_old_generator(old_tests, inputs)
+            assert selected == generator and receipt["listed_test"] == "generate_legacy_import"
+            probe.assert_called_once_with([generator, "--list"], check=True, capture_output=True, text=True, timeout=30)
+            probe.return_value.stdout = "another_case: test\n"
+            with unittest.TestCase().assertRaisesRegex(ValueError, "does not list"):
+                verify_old_generator(old_tests, inputs)
+            probe.reset_mock()
+            overlay.write_text("wrong build digest")
+            with unittest.TestCase().assertRaisesRegex(ValueError, "overlay.sha256"):
+                verify_old_generator(old_tests, inputs)
+            probe.assert_not_called()
+        reject_layout(mode="baseline")
+        adapter.chmod(0o644)
+        inputs["files"][OLD_ADAPTER]["mode"] = 0o644
+        write_inputs()
+        reject_layout(mode="candidate")
+        adapter.unlink()
+        adapter.parent.rmdir()
+        del inputs["files"][OLD_ADAPTER]
+        write_inputs()
         for forbidden in (src / "crates/web/lib.rs", src / "Cargo.toml", src / "crates/core/tests/fixtures/owned_process_group.rs"):
             forbidden.write_text("forbidden runtime content")
             reject_layout()
@@ -1034,8 +1106,10 @@ def main():
             "manifest_sha256": digest(input_manifest), "inputs": inputs,
         }, indent=2) + "\n")
         assert not Path("/var/run/docker.sock").exists(), "Docker socket was mounted into runtime"
-        return inputs, boundary_canaries()
-    inputs, canaries = require_runtime_integrity(preflight)
+        canaries = boundary_canaries()
+        generator = None if mode == "baseline" else verify_old_generator(Path("/opt/reliability-old-tests"), inputs)
+        return inputs, canaries, generator
+    inputs, canaries, generator = require_runtime_integrity(preflight)
     (OUTPUT / "canaries.json").write_text(json.dumps(canaries, indent=2) + "\n")
     prerequisites = runtime_prerequisites(inputs)
     manifest = json.loads(Path("/opt/reliability/required-cases.json").read_text())
@@ -1047,17 +1121,13 @@ def main():
         versions += (TESTS / "build-toolchain.txt").read_text()
         (OUTPUT / "tool-versions.txt").write_text(versions)
         return
-    old_tests = Path("/opt/reliability-old-tests")
-    old_binaries = json.loads((old_tests / "binaries.json").read_text())
-    old_generator = old_tests / old_binaries["legacy_import_generator"]
-    assert old_generator.is_file(), "pinned old import generator missing"
+    old_generator, old_provenance = generator
     os.environ["REPOSYNC_OLD_GENERATOR"] = str(old_generator)
     os.environ["REPOSYNC_INVENTORY_SCRIPT"] = "/usr/local/bin/reliability-inventory.py"
     os.environ["REPOSYNC_INVENTORY_PROBES_SCRIPT"] = "/usr/local/bin/reliability-inventory-probes.py"
     (OUTPUT / "old-generator-provenance.json").write_text(json.dumps({
         "old_code_sha": "87379741779a6259f7eeb52a68cc6f061174e5ef",
-        "generator_sha256": digest(old_generator.read_bytes()),
-        "adapter_sha256": (old_tests / "overlay.sha256").read_text().split()[0],
+        **old_provenance,
         "lock_sha256": os.environ["REPOSYNC_LOCK_SHA256"],
     }, indent=2) + "\n")
     require_mandatory_cases(manifest)
