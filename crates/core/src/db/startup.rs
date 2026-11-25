@@ -137,17 +137,6 @@ impl Database {
         Ok((db, result))
     }
 
-    pub(super) fn require_historical_owner(&self, tx: &Connection) -> Result<(), DatabaseError> {
-        let owner = self.startup_owner.as_ref().ok_or_else(|| {
-            DatabaseError::WriterFenced(
-                "historical enrollment requires native CLI writer ownership".into(),
-            )
-        })?;
-        owner._lock.require_current(&owner.data_dir)?;
-        self.opened_file()?.require_unaliased_owner(tx)?;
-        crate::writer_fence::require_owned_current_readonly(tx).map(|_| ())
-    }
-
     pub(super) fn open_reserved_startup(
         path: &Path,
         prior: Option<super::OpenedDatabaseFile>,

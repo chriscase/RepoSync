@@ -35,7 +35,7 @@ use crate::legacy_svn_recovery::VerifiedHistoricalLineage;
 
 const ACTION: &str = "historical_lineage_enrolled";
 
-fn refused(reason: &str) -> DatabaseError {
+fn refused(reason: &'static str) -> DatabaseError {
     DatabaseError::Other(format!("historical lineage enrollment refused: {reason}"))
 }
 
@@ -49,7 +49,9 @@ pub enum EnrollmentOutcome {
 fn is_installed(conn: &Connection) -> Result<bool, DatabaseError> {
     let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let installed = schema::installed_team::pending(conn, version)?;
-    if !installed && version != schema::CURRENT_SCHEMA_VERSION {
+    if !installed
+        && (version != schema::CURRENT_SCHEMA_VERSION || !schema::installed_team::converted(conn)?)
+    {
         return Err(refused(
             "a supported installed or current Team catalog is required",
         ));
@@ -94,8 +96,7 @@ fn stored_pair(
     let mut pair = conn.query_row(
         "SELECT id, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch,
                 last_svn_rev,last_git_sha FROM repositories WHERE id=?1 AND parent_id IS NULL
-         AND sync_mode='direct' AND (enabled=0 OR sync_status='error_paused')
-         AND sync_status NOT IN ('syncing','importing') AND COALESCE(allowed_paths,'[]')='[]'
+         AND sync_mode='direct' AND ((enabled=0 AND sync_status='idle') OR sync_status='error_paused') AND COALESCE(allowed_paths,'[]')='[]'
          AND COALESCE(blocked_patterns,'[]')='[]'",
         [id], |r| Ok(LegacyPairPins {
             repo_id:r.get(0)?, svn_url:r.get(1)?, svn_branch:r.get(2)?, svn_username:r.get(3)?,
@@ -105,9 +106,20 @@ fn stored_pair(
         })
     ).optional()?.ok_or_else(|| refused("the requested paused full-import root was not found"))?;
     if !installed {
-        pair.scope_uuid = super::repo_scope_identity::repository_scope_uuid(conn, id)?;
+        pair.scope_uuid = conn
+            .query_row(
+                "SELECT scope_uuid FROM repositories WHERE id=?1",
+                [id],
+                |r| r.get::<_, Option<String>>(0),
+            )?
+            .ok_or_else(|| refused("missing registered scope"))?;
+        let scope = uuid::Uuid::parse_str(&pair.scope_uuid)
+            .map_err(|_| refused("invalid registered scope"))?;
+        if scope.is_nil() || scope.to_string() != pair.scope_uuid {
+            return Err(refused("invalid registered scope"));
+        }
         pair.generation = crate::echo_receipt_scope::repo_echo_generation_tx(conn, id)?;
-        if uuid::Uuid::parse_str(&pair.scope_uuid).is_err() || pair.generation < 1 {
+        if pair.generation < 1 {
             return Err(refused("invalid active scope or generation"));
         }
     }
@@ -115,9 +127,10 @@ fn stored_pair(
     super::pair_refresh_operations::require_no_pair_refresh_hold(conn, Some(id))?;
     super::pair_refresh_competing_journals::require_globally_quiet(conn)?;
     let uncertain: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM commit_map WHERE repo_id IS NULL OR (repo_id=?1 AND direction!='svn_to_git'))
-          OR EXISTS(SELECT 1 FROM sync_records WHERE repo_id IS NULL OR (repo_id=?1 AND
+        "SELECT EXISTS(SELECT 1 FROM commit_map m WHERE NOT EXISTS(SELECT 1 FROM repositories r WHERE r.id=m.repo_id) OR (repo_id=?1 AND direction!='svn_to_git'))
+          OR EXISTS(SELECT 1 FROM sync_records s WHERE NOT EXISTS(SELECT 1 FROM repositories r WHERE r.id=s.repo_id) OR (repo_id=?1 AND
           (direction!='svn_to_git' OR status!='applied' OR svn_rev IS NULL OR git_sha IS NULL)))
+          OR EXISTS(SELECT 1 FROM conflicts c WHERE (repo_id=?1 OR NOT EXISTS(SELECT 1 FROM repositories r WHERE r.id=c.repo_id)) AND status NOT IN ('resolved','dismissed'))
           OR EXISTS(SELECT 1 FROM import_progress WHERE (repo_id=?1 OR repo_id IS NULL) AND phase NOT IN ('idle','completed'))",
         [id], |r|r.get(0))?;
     if uncertain {
@@ -219,6 +232,72 @@ fn receipt(conn: &Connection, id: &str) -> Result<Option<Value>, DatabaseError> 
     ))
 }
 
+// Migration assigns scopes to the whole database. A single-pair cutover must first
+// demonstrate that it will not strand a different original published registration.
+fn require_single_published_pair(
+    conn: &Connection,
+    pair: &LegacyPairPins,
+) -> Result<(), DatabaseError> {
+    let other:Option<String>=conn.query_row(
+        "SELECT id FROM repositories AS r WHERE id<>?1 AND (
+          last_svn_rev<>0 OR last_git_sha<>'' OR last_sync_at IS NOT NULL OR total_syncs<>0
+          OR EXISTS(SELECT 1 FROM commit_map WHERE repo_id=r.id)
+          OR EXISTS(SELECT 1 FROM sync_records WHERE repo_id=r.id)
+          OR EXISTS(SELECT 1 FROM conflicts WHERE repo_id=r.id)
+          OR EXISTS(SELECT 1 FROM audit_log WHERE repo_id=r.id AND (svn_rev IS NOT NULL OR COALESCE(git_sha,'')<>''))
+          OR EXISTS(SELECT 1 FROM import_progress WHERE repo_id=r.id AND (phase<>'idle' OR current_rev<>0 OR commits_created<>0 OR batches_pushed<>0))
+          OR EXISTS(SELECT 1 FROM kv_state WHERE (key='last_git_sha_'||r.id AND value<>'') OR (key='last_svn_rev_'||r.id AND value NOT IN ('','0'))))
+          ORDER BY id LIMIT 1", [&pair.repo_id], |r|r.get(0)).optional()?;
+    if let Some(id) = other {
+        let label = uuid::Uuid::parse_str(&id)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|_| "<unrecognized ID>".into());
+        return Err(DatabaseError::Other(format!("historical lineage enrollment refused: another registered pair ({label}) has retained history and needs a coordinated cutover")));
+    }
+    let unexplained:bool=conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM (
+           SELECT repo_id FROM commit_map UNION ALL SELECT repo_id FROM sync_records
+           UNION ALL SELECT repo_id FROM conflicts
+           UNION ALL SELECT repo_id FROM audit_log WHERE repo_id IS NOT NULL AND (svn_rev IS NOT NULL OR COALESCE(git_sha,'')<>'')
+           UNION ALL SELECT repo_id FROM import_progress WHERE repo_id IS NOT NULL AND (phase<>'idle' OR current_rev<>0 OR commits_created<>0 OR batches_pushed<>0)
+         ) h WHERE NOT EXISTS(SELECT 1 FROM repositories r WHERE r.id=h.repo_id))
+        OR EXISTS(SELECT 1 FROM sync_state) OR EXISTS(SELECT 1 FROM pr_sync_log)
+        OR EXISTS(SELECT 1 FROM kv_state WHERE key GLOB 'independently_established_svn_uuid:*' OR key GLOB 'import_operation_*'
+            OR (key GLOB 'last_git_sha_*' AND value<>'' AND key<>'last_git_sha_'||?1)
+            OR (key GLOB 'last_svn_rev_*' AND value NOT IN ('','0') AND key<>'last_svn_rev_'||?1)
+            OR (key IN ('last_git_hash','last_git_sha') AND value NOT IN ('',?2))
+            OR (key='last_svn_rev' AND value NOT IN ('','0',CAST(?3 AS TEXT))))
+        OR EXISTS(SELECT 1 FROM watermarks WHERE value NOT IN ('','0') AND source NOT IN ('svn_rev','git_sha'))",
+        params![pair.repo_id,pair.last_git_sha,pair.last_svn_rev],|r|r.get(0))?;
+    if unexplained {
+        return Err(refused(
+            "unattributed history needs review before migrating this database",
+        ));
+    }
+    // Both original daemons emitted these two singleton records without repo_id.
+    // Corroborate the one documented full import against this pair's real keyed rows.
+    let ambiguous:bool=conn.query_row(
+        "WITH progress AS (
+           SELECT * FROM import_progress WHERE repo_id IS NULL AND (phase<>'idle' OR current_rev<>0 OR commits_created<>0 OR batches_pushed<>0)
+         ), audit AS (SELECT * FROM audit_log WHERE repo_id IS NULL AND (svn_rev IS NOT NULL OR COALESCE(git_sha,'')<>''))
+         SELECT (SELECT COUNT(*) FROM progress)>1 OR (SELECT COUNT(*) FROM audit)>1
+         OR EXISTS(SELECT 1 FROM progress p WHERE p.phase<>'completed' OR p.current_rev<>?2 OR p.commits_created<>?3
+            OR julianday(p.started_at) IS NULL OR julianday(p.completed_at) IS NULL OR julianday(p.started_at)>julianday(p.completed_at)
+            OR EXISTS(SELECT 1 FROM (SELECT synced_at FROM commit_map WHERE repo_id=?1 UNION ALL SELECT synced_at FROM sync_records WHERE repo_id=?1) m
+                 WHERE julianday(m.synced_at) IS NULL OR julianday(m.synced_at) NOT BETWEEN julianday(p.started_at) AND julianday(p.completed_at)))
+         OR EXISTS(SELECT 1 FROM audit a WHERE a.action<>'import_full' OR a.success<>1 OR a.direction IS NOT 'svn_to_git'
+            OR a.svn_rev IS NOT ?2 OR COALESCE(a.git_sha,'')<>'' OR NOT EXISTS(SELECT 1 FROM progress p
+                WHERE julianday(a.created_at) BETWEEN julianday(p.started_at) AND julianday(p.completed_at)
+                AND a.details='Full history import: '||p.commits_created||' commits from '||p.total_revs||' revisions'))",
+        params![pair.repo_id,pair.last_svn_rev,pair.mappings.len() as i64],|r|r.get(0))?;
+    if ambiguous {
+        return Err(refused(
+            "unassigned older import evidence cannot be correlated to the selected mapped history",
+        ));
+    }
+    Ok(())
+}
+
 fn planned_view(mut pins: LegacyPairPins) -> LegacyPairPins {
     pins.scope_uuid.clear();
     pins.generation = 0;
@@ -235,7 +314,9 @@ pub fn read_planned_cutover_pins(
                 "unexpected enrollment evidence on the original catalog",
             ));
         }
-        return stored_pair(conn, id, true);
+        let pins = stored_pair(conn, id, true)?;
+        require_single_published_pair(conn, &pins)?;
+        return Ok(pins);
     }
     let pins = read_legacy_pair_pins(conn, id)?;
     let audit = receipt(conn, id)?
@@ -389,24 +470,10 @@ fn persist(
     Ok(EnrollmentOutcome::Enrolled)
 }
 
-/// Claim an existing upgraded database without creating data or running a migration.
-pub fn open_historical_enrollment_writer(data_dir: &Path) -> Result<Database, DatabaseError> {
-    Database::open_existing_for_historical_enrollment(
-        data_dir,
-        |tx| {
-            if is_installed(tx)? {
-                return Err(refused("the registered database still requires migration"));
-            }
-            Ok(())
-        },
-        |_, ()| Ok(()),
-    )
-    .map(|(db, ())| db)
-}
-
-/// Retrospective enrollment requires independently verified historical provenance.
+/// Apply an independent archived witness to an existing upgraded database. Claim,
+/// evidence revalidation and enrollment roll back together on every refusal.
 pub fn enroll_verified_lineage<F>(
-    db: &Database,
+    data_dir: &Path,
     id: &str,
     review_sha256: &str,
     verify: F,
@@ -417,14 +484,15 @@ where
         &RegisteredTransport,
     ) -> Result<VerifiedHistoricalLineage, DatabaseError>,
 {
-    db.immediate_transaction(|tx| {
-        db.require_historical_owner(tx)?;
-        let pins = read_legacy_pair_pins(tx, id)?;
-        let verified = verify_review(tx, pins, review_sha256, false, verify)?;
-        let outcome = persist(tx, verified, false)?;
-        db.require_historical_owner(tx)?;
-        Ok(outcome)
-    })
+    let (_owner, outcome) = Database::open_existing_for_historical_enrollment(
+        data_dir,
+        |tx| {
+            let pins = read_legacy_pair_pins(tx, id)?;
+            verify_review(tx, pins, review_sha256, false, verify)
+        },
+        |tx, checked| persist(tx, checked, false),
+    )?;
+    Ok(outcome)
 }
 
 /// Capture and bind a stopped original registration while its installed catalog still
@@ -455,3 +523,6 @@ where
     )?;
     Ok(outcome)
 }
+
+#[cfg(test)]
+mod tests;

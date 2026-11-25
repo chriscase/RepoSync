@@ -9,10 +9,10 @@ use super::{apply_migration_body, get_schema_version, MIGRATIONS};
 use crate::errors::DatabaseError;
 
 // These statements match the two deployed schema registries (blob 7feb27af).
-const INSTALLED_V13: &str = "
+pub(in crate::db) const INSTALLED_V13: &str = "
         CREATE INDEX IF NOT EXISTS idx_sync_records_repo_dir_status_rev
             ON sync_records (repo_id, direction, status, svn_rev);";
-const INSTALLED_V14: &str = "
+pub(in crate::db) const INSTALLED_V14: &str = "
         ALTER TABLE repositories ADD COLUMN cloned_from_id TEXT;
         CREATE INDEX IF NOT EXISTS idx_repositories_cloned_from
             ON repositories(cloned_from_id);";
@@ -89,6 +89,13 @@ fn is_copy_artifact(name: &str) -> bool {
             | "pair_outcomes"
             | "legacy_evidence_links"
     )
+}
+
+/// Distinguish the converted installed Team registry from a native Reliability database.
+pub(crate) fn converted(conn: &Connection) -> Result<bool, DatabaseError> {
+    Ok(reference_catalogs()?
+        .converted_14
+        .is_subset(&catalog(conn)?))
 }
 
 /// True only for the complete installed schema. Converted and native operational
