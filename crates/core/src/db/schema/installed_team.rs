@@ -9,10 +9,10 @@ use super::{apply_migration_body, get_schema_version, MIGRATIONS};
 use crate::errors::DatabaseError;
 
 // These statements match the two deployed schema registries (blob 7feb27af).
-const INSTALLED_V13: &str = "
+pub(in crate::db) const INSTALLED_V13: &str = "
         CREATE INDEX IF NOT EXISTS idx_sync_records_repo_dir_status_rev
             ON sync_records (repo_id, direction, status, svn_rev);";
-const INSTALLED_V14: &str = "
+pub(in crate::db) const INSTALLED_V14: &str = "
         ALTER TABLE repositories ADD COLUMN cloned_from_id TEXT;
         CREATE INDEX IF NOT EXISTS idx_repositories_cloned_from
             ON repositories(cloned_from_id);";
@@ -89,6 +89,13 @@ fn is_copy_artifact(name: &str) -> bool {
             | "pair_outcomes"
             | "legacy_evidence_links"
     )
+}
+
+/// Distinguish the converted installed Team registry from a native Reliability database.
+pub(crate) fn converted(conn: &Connection) -> Result<bool, DatabaseError> {
+    Ok(reference_catalogs()?
+        .converted_14
+        .is_subset(&catalog(conn)?))
 }
 
 /// True only for the complete installed schema. Converted and native operational
@@ -228,6 +235,92 @@ mod tests {
             INSERT INTO kv_state(key,value,updated_at) VALUES
               ('last_git_sha_team','abc','t'),('user-configuration','keep this','t');").unwrap();
         conn
+    }
+
+    #[test]
+    fn offline_preflight_reports_both_installed_catalogs_and_ambiguous_history() {
+        use crate::db::upgrade_preflight::inspect;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.db");
+        let open = || Connection::open(&path).unwrap();
+        let source = open();
+        source
+            .execute_batch(include_str!(
+                "../../../../daemon/tests/fixtures/schema-v12.sql"
+            ))
+            .unwrap();
+        source.execute_batch(INSTALLED_V13).unwrap();
+        source
+            .execute_batch(
+                "PRAGMA user_version=13;
+            INSERT INTO repositories (id,name,svn_url,created_at,updated_at)
+            VALUES ('test','Team','file:///test','t','t');",
+            )
+            .unwrap();
+        drop(source);
+        let clean = inspect(&path).unwrap();
+        assert_eq!(clean.schema_version, 13);
+        assert!(!clean.needs_review());
+
+        let source = open();
+        source
+            .execute_batch(
+                "INSERT INTO kv_state(key,value,updated_at) VALUES ('last_sync_at','t','t');
+            INSERT INTO audit_log(action,created_at) VALUES ('sync_cycle','t');",
+            )
+            .unwrap();
+        drop(source);
+        let poll = inspect(&path).unwrap();
+        assert!(poll.poll_only && poll.needs_review());
+        assert!(!poll.pairs[0].retained && !poll.unattributed_history);
+
+        let source = open();
+        source.execute_batch(INSTALLED_V14).unwrap();
+        source
+            .execute_batch(
+                "PRAGMA user_version=14;
+            INSERT INTO kv_state(key,value,updated_at)
+            VALUES ('last_git_sha_test','history','t'),('secret_svn_password_test','ignored','t');",
+            )
+            .unwrap();
+        drop(source);
+        let held = inspect(&path).unwrap();
+        assert_eq!(held.schema_version, 14);
+        assert!(!held.poll_only);
+        assert!(held.pairs[0].retained && held.needs_review());
+        assert!(!held.unattributed_history && !held.unexpected_identity_records);
+
+        let source = open();
+        source
+            .execute_batch(
+                "DELETE FROM kv_state;
+            INSERT INTO kv_state(key,value,updated_at) VALUES
+                ('last_git_hash','history','t'),('import_operation_v1:latest:test','missing','t');",
+            )
+            .unwrap();
+        drop(source);
+        let unknown = inspect(&path).unwrap();
+        assert!(!unknown.pairs[0].retained);
+        assert!(unknown.unattributed_history && unknown.unexpected_identity_records);
+        assert!(unknown.needs_review());
+
+        let source = open();
+        source
+            .execute_batch(
+                "DELETE FROM kv_state;
+            INSERT INTO audit_log(action, repo_id, svn_rev, created_at)
+            VALUES ('sync','test',2,'t'),('import_full',NULL,2,'t');",
+            )
+            .unwrap();
+        drop(source);
+        let audit_only = inspect(&path).unwrap();
+        assert!(audit_only.pairs[0].retained && audit_only.unattributed_history);
+
+        open()
+            .execute_batch("DROP INDEX idx_repositories_cloned_from;")
+            .unwrap();
+        assert!(inspect(&path).is_err());
     }
 
     #[test]

@@ -354,3 +354,25 @@ fn production_client_keeps_normal_certificate_verification() {
         .unwrap_or_default()
         .is_empty());
 }
+
+#[test]
+fn historical_git_tip_only_reads_the_registered_upload_pack_advertisement() {
+    let f = Fixture::new();
+    let before = f.refs();
+    let read = |expected, token| {
+        super::historical_git_tip_with_client(
+            &f.url,
+            "refs/heads/main",
+            expected,
+            token,
+            f.client(),
+        )
+    };
+    read(f.parent, Some("disposable-source-token")).unwrap();
+    assert!(read(f.root, Some("disposable-source-token")).is_err());
+    assert!(read(f.parent, Some("wrong-disposable-token")).is_err());
+    assert_eq!(before, f.refs());
+    f.reads_only();
+    let requests = std::fs::read_to_string(&f.log).unwrap();
+    assert!(!requests.contains("POST"));
+}

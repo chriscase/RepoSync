@@ -24,6 +24,7 @@ pub mod import;
 pub mod late_pair;
 pub mod late_pair_publish;
 pub mod ldap_auth;
+pub mod legacy_svn_recovery;
 pub mod lfs;
 pub mod managed_remove;
 pub mod models;

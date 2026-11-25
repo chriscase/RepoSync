@@ -163,6 +163,16 @@ pub fn parse_svn_last_changed_revision(xml: &str) -> Result<i64, SvnError> {
 /// ordinary log parser is intentionally tolerant; a proof must not drop an
 /// unclosed or otherwise unparsed changed path.
 pub fn parse_svn_copy_history(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
+    parse_copy_history_entries(xml, false)
+}
+
+/// Historical verification also requests custom revision properties. Its
+/// caller validates and binds those properties; the usual strict parser
+/// continues to refuse that extension in its own response profile.
+pub(crate) fn parse_copy_history_entries(
+    xml: &str,
+    with_revprops: bool,
+) -> Result<Vec<SvnLogEntry>, SvnError> {
     fn malformed(detail: impl Into<String>) -> SvnError {
         SvnError::XmlParseError(detail.into())
     }
@@ -231,9 +241,10 @@ pub fn parse_svn_copy_history(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
                 .children()
                 .filter(|child| child.is_element())
                 .any(|child| {
-                    !["author", "date", "msg", "paths"]
-                        .iter()
-                        .any(|name| named(child, name))
+                    !(with_revprops && named(child, "revprops"))
+                        && !["author", "date", "msg", "paths"]
+                            .iter()
+                            .any(|name| named(child, name))
                 })
         {
             return Err(malformed("unsupported copy-history entry"));

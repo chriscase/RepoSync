@@ -104,6 +104,48 @@ impl Database {
         Self::open_ordinary_writer(data_dir.as_ref(), "reposync.db")
     }
 
+    /// Open an existing Team database with ordinary writer ownership. The caller
+    /// controls the exact original catalog and binds its proof in the claim transaction.
+    pub(super) fn open_existing_for_historical_enrollment<P, T>(
+        data_dir: &Path,
+        before: impl FnOnce(&Connection) -> Result<P, DatabaseError>,
+        after: impl FnOnce(&Connection, P) -> Result<T, DatabaseError>,
+    ) -> Result<(Self, T), DatabaseError> {
+        let data_dir = data_dir.canonicalize()?;
+        let path = data_dir.join("reposync.db");
+        let lock = crate::data_dir::acquire(&data_dir)?;
+        lock.require_current(&data_dir)?;
+        super::startup_rollback::require_safe_unrecovered_open(&path)?;
+        if super::startup_rollback::has_journal(&path)? {
+            return Err(DatabaseError::Other(
+                "historical enrollment requires a stopped, recovered database".into(),
+            ));
+        }
+        let prior = super::OpenedDatabaseFile::capture(&path)
+            .ok_or_else(|| DatabaseError::Other("existing Team database required".into()))?;
+        let mut db = Self::open_reserved_startup(&path, Some(prior))?;
+        let (claim, result) = crate::writer_fence::claim_for_ordinary_startup_with(
+            &db,
+            &lock,
+            &data_dir,
+            before,
+            |tx, checked| {
+                let result = after(tx, checked)?;
+                lock.require_current(&data_dir)?;
+                db.opened_file()?.require_unaliased_owner(tx)?;
+                Ok(result)
+            },
+        )?;
+        db.startup_owner = Some(StartupOwner {
+            _lock: lock,
+            fence: claim.fence,
+            data_dir,
+            lease: claim.lease,
+            native: claim.native,
+        });
+        Ok((db, result))
+    }
+
     pub(super) fn open_reserved_startup(
         path: &Path,
         prior: Option<super::OpenedDatabaseFile>,

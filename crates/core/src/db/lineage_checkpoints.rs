@@ -12,7 +12,7 @@ use super::repo_scope_identity::repository_scope_uuid;
 use super::Database;
 use crate::echo_receipt_scope::repo_echo_generation_tx;
 use crate::errors::{DatabaseError, SvnError, SyncError};
-use crate::path_projection::svn_path_identity;
+use crate::path_projection::{svn_path_identity, SvnPathIdentity};
 use crate::svn::{SvnClient, SvnInfo, SvnLogEntry};
 
 /// Typed mapping / checkpoint outcome. NULL SHA, empty string, and a missing
@@ -529,15 +529,26 @@ pub async fn observe_live_svn_identity(
     svn: &SvnClient,
     info: &SvnInfo,
 ) -> Result<LiveSvnIdentity, SvnError> {
+    let path = observed_svn_identity_path(info)?;
+    let history = svn.copy_history_at_rev(info.latest_rev.max(1)).await?;
+    observed_svn_identity_from_history(info, path, &history)
+}
+
+pub(crate) fn observed_svn_identity_path(info: &SvnInfo) -> Result<SvnPathIdentity, SvnError> {
     if info.uuid.trim().is_empty() {
         return Err(SvnError::LineageRefused {
             reason: "svn_uuid_missing".into(),
             detail: "live SVN info did not report a repository UUID".into(),
         });
     }
-    let identity = svn_path_identity(&info.root_url, &info.url)?;
-    let peg = info.latest_rev.max(1);
-    let history = svn.copy_history_at_rev(peg).await?;
+    svn_path_identity(&info.root_url, &info.url)
+}
+
+pub(crate) fn observed_svn_identity_from_history(
+    info: &SvnInfo,
+    identity: SvnPathIdentity,
+    history: &[SvnLogEntry],
+) -> Result<LiveSvnIdentity, SvnError> {
     if history.is_empty() {
         return Err(SvnError::LineageRefused {
             reason: "svn_incarnation_unproved".into(),
@@ -545,7 +556,7 @@ pub async fn observe_live_svn_identity(
         });
     }
     let (created, copy_from_path, copy_from_rev) =
-        incarnation_from_history(&history, &identity.branch_path);
+        incarnation_from_history(history, &identity.branch_path);
     Ok(LiveSvnIdentity {
         uuid: info.uuid.clone(),
         root_url: identity.root_url,
@@ -574,7 +585,10 @@ fn blocked(reason: &str, detail: impl Into<String>) -> SyncError {
     }
 }
 
-fn retained_legacy_baseline(conn: &Connection, repo_id: &str) -> Result<bool, DatabaseError> {
+pub(super) fn retained_legacy_baseline(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<bool, DatabaseError> {
     let (last_svn, last_git): (i64, String) = conn.query_row(
         "SELECT last_svn_rev, last_git_sha FROM repositories WHERE id = ?1",
         [repo_id],
