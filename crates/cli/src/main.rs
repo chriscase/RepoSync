@@ -162,14 +162,20 @@ enum IdentityAction {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // Minimal logging for CLI
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("warn"))
-        .with_target(false)
-        .without_time()
-        .init();
-
     let cli = Cli::parse();
+    let logging = tracing_subscriber::fmt().with_target(false).without_time();
+    if matches!(cli.command, Commands::RecoverSvnLineage { .. }) {
+        // Long historical tree checks have numeric progress messages. Keep
+        // those on stderr so the reviewed evidence remains usable on stdout.
+        logging
+            .with_env_filter(EnvFilter::new(
+                "warn,reposync_core::legacy_svn_recovery=info",
+            ))
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        logging.with_env_filter(EnvFilter::new("warn")).init();
+    }
 
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,

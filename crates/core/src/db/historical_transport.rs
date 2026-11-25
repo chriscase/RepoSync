@@ -191,7 +191,7 @@ pub fn read_offline_recovery_inputs(
     repo_id: &str,
     planned: bool,
 ) -> Result<(LegacyPairPins, RegisteredTransport), DatabaseError> {
-    offline_snapshot::with_snapshot(path, |conn| {
+    offline_snapshot::with_recovery_snapshot(path, |conn| {
         let pins = if planned {
             read_planned_cutover_pins(conn, repo_id)?
         } else {

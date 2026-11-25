@@ -41,7 +41,7 @@ pub(crate) struct RecoveryInputs {
     /// Registration UUID reported by upgrade-preflight.
     #[arg(long, value_parser = RecoveryText::Pair)]
     pub pair: String,
-    /// Local Git repository containing the configured ref and its imported history.
+    /// Complete local bare Git mirror containing the configured branch and all imported commits.
     #[arg(long)]
     pub git_mirror: PathBuf,
     /// Local SVN repository independently restored from a trusted pre-upgrade backup.
