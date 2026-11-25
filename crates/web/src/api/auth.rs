@@ -482,8 +482,8 @@ async fn me(
         .ok_or_else(|| AppError::Unauthorized("missing or invalid Authorization header".into()))?;
 
     // Check DB session
+    let db = &state.db;
     let db_result = {
-        let db = &state.db;
         if let Ok(Some(session)) = db.get_session(token) {
             if let Ok(Some(user)) = db.get_user(&session.user_id) {
                 if !user.enabled {
