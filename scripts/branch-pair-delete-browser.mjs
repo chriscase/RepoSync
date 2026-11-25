@@ -405,8 +405,13 @@ async function runScenarios(uiOrigin, session, mode) {
     if (!clicked) throw new Error(`Missing [data-testid=${testId}]${descendant}\n${await body()}`);
   };
   const goto = async (pathname, ready) => {
-    await send('Page.navigate', { url: `${uiOrigin}${pathname}` });
-    await until(async () => (await pathOf()) === pathname && (!ready || await ready()), `open ${pathname}`);
+    const { loaderId, errorText } = await send('Page.navigate', { url: `${uiOrigin}${pathname}` });
+    if (!loaderId || errorText) throw new Error(`Could not load ${pathname}: ${errorText || 'no new document'}`);
+    await until(async () => {
+      // A reload can still show the previous document at the same pathname.
+      const { frameTree } = await send('Page.getFrameTree');
+      return frameTree.frame.loaderId === loaderId && (await pathOf()) === pathname && (!ready || await ready());
+    }, `open ${pathname}`);
   };
   const fill = async (gitBranch) => {
     await evaluate(`(() => {
@@ -589,7 +594,8 @@ async function runScenarios(uiOrigin, session, mode) {
   if (gonePolls.length) throw new Error(`Queued-gone detail kept being fetched: ${JSON.stringify(gonePolls)}`);
   results.push('queued-gone-leaves-without-claiming-completion');
 
-  await goto('/repos/parent-1', async () => (await heading()).includes('Parent trunk'));
+  await goto('/repos/parent-1', async () => (await heading()).includes('Parent trunk')
+    && await evaluate(`!!document.querySelector('[data-testid="delete-child-pair-child-stay"]')`));
   await click('delete-child-pair-child-stay');
   await confirmDelete('child-stay', 'stay-branch');
   await until(async () => !(await evaluate(`!!document.querySelector('[data-testid="branch-pair-row-child-stay"]')`)), 'mock child row removed');
