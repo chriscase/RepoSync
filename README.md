@@ -243,7 +243,7 @@ Use `recover-svn-lineage` to rehearse an upgrade for a pair that brings changes 
 
 For a **planned cutover**, begin while you can identify the working old installation, its company SVN repository and the team’s Git repository. This live pair is the starting point for continuity going forward. You can use it without a historical SVN backup. Arrange a maintenance window. Pause the pair, stop the supervised RepoSync service and hold separate CLI jobs, automation or users that could write the database or either repository. Keep SVN and Git reachable for reads. Confirm in-flight work has finished. A disabled pair can still have work in progress.
 
-Keep a checkpointed copy of the old database before applying changes. Set `DATABASE` to the stopped installation’s `reposync.db`, `PAIR` to its registration UUID from `upgrade-preflight`, and `GIT_MIRROR` to a local repository containing the configured team Git ref and its full imported commits. These paths depend on the installation. The tool reads the registered company SVN location and branch from that database.
+Keep a checkpointed copy of the old database before applying changes. Set `DATABASE` to the stopped installation’s `reposync.db`, `PAIR` to its registration UUID from `upgrade-preflight`, and `GIT_MIRROR` to a local repository containing the configured team Git ref and its full imported commits. These paths depend on the installation. The tool reads the registered company SVN location and branch from that database. Rehearse on an independently consistent database copy first. Measure preview and apply against repositories that represent the full imported history. Verification reads the complete SVN tree and corresponding Git tree at each retained revision. Preview reads them once. Apply repeats that work before and during the database transaction and keeps the local writer lock through the final pass. With a historical restore, each pass also reads the restored SVN tree. Use those measured times to plan the pause. Large imports can take substantially longer than the examples.
 
 ```bash
 reposync recover-svn-lineage preview \
@@ -271,7 +271,7 @@ reposync recover-svn-lineage apply \
   --reviewed-digest "$REVIEWED_DIGEST" --confirm-stopped-writers --attest-trusted-backup
 ```
 
-Apply checks the evidence again before recording continuity for the selected pair in its database. A changed digest or incomplete evidence requires a new review. The pair stays paused after apply. Review the result and check the expected SVN revision and team Git commit before using the normal pair controls to re-enable sync. Keep the database backup and reviewed evidence for the cutover record.
+Planned apply performs the first migration of the old database and records the selected pair’s verified SVN identity in the same transaction. The single-pair workflow requires any other registrations to have no retained or ambiguous history requiring their own capture. If another pair needs continuity proof, the upgrade must preserve the original database until those pairs can be handled together. In restored-backup mode, apply records verified continuity on an already-migrated database. A changed digest or incomplete evidence requires a new review. The pair stays paused after apply. Review the result and check the expected SVN revision and team Git commit before using the normal pair controls to re-enable sync. Keep the database backup and reviewed evidence for the cutover record.
 
 ### Personal Mode Commands
 

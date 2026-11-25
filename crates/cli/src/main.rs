@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use reposync_core::config::AppConfig;
@@ -47,21 +47,6 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
-}
-
-impl Cli {
-    fn from_checked_matches(mut matches: clap::ArgMatches) -> Result<Self, clap::Error> {
-        // A global option can occur before the nested subcommand as well as after it.
-        if matches.subcommand_name() == Some("recover-svn-lineage")
-            && matches.value_source("config") == Some(clap::parser::ValueSource::CommandLine)
-        {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::ArgumentConflict,
-                "recover-svn-lineage uses the supplied database and does not accept --config",
-            ));
-        }
-        Self::from_arg_matches_mut(&mut matches)
-    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -184,7 +169,7 @@ async fn main() -> ExitCode {
         .without_time()
         .init();
 
-    let cli = Cli::from_checked_matches(Cli::command().get_matches()).unwrap_or_else(|e| e.exit());
+    let cli = Cli::parse();
 
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,

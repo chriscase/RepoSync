@@ -113,7 +113,7 @@ impl TypedValueParser for RecoveryText {
 mod tests {
     use super::RecoveryAction;
     use crate::{Cli, Commands};
-    use clap::CommandFactory;
+    use clap::Parser;
 
     const PAIR: &str = "7D156383-EC0A-459D-A7C3-B1D12C7320CE";
     const DIGEST: &str = "b38f42d62640f3201f3a442c60795f9e808825999f6a98dfd55aa371229c6021";
@@ -137,9 +137,7 @@ mod tests {
             "--git-mirror",
             "/mirror/team",
         ];
-        let matches =
-            Cli::command().try_get_matches_from(args.into_iter().chain(extra.iter().copied()))?;
-        let cli = Cli::from_checked_matches(matches)?;
+        let cli = Cli::try_parse_from(args.into_iter().chain(extra.iter().copied()))?;
         let Commands::RecoverSvnLineage { action } = cli.command else {
             unreachable!()
         };
@@ -204,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_rejects_config_credentials_and_malformed_evidence_without_echoing_values() {
+    fn recovery_preserves_global_options_and_rejects_malformed_evidence_without_echoing_values() {
         const PRIVATE: &str = "EXAMPLE_private_value";
         let leading = [
             "reposync",
@@ -219,14 +217,10 @@ mod tests {
             "--pair",
             PAIR,
         ];
-        let err = Cli::command()
-            .try_get_matches_from(leading)
-            .and_then(Cli::from_checked_matches)
-            .unwrap_err();
-        assert!(!err.to_string().contains(PRIVATE));
+        assert!(Cli::try_parse_from(leading).is_ok());
+        assert!(parse("preview", &["--config", PRIVATE]).is_ok());
         let invalid_url = format!("https://reader:{PRIVATE}@example.test/team");
         for extra in [
-            vec!["--config", PRIVATE],
             vec!["--password", PRIVATE],
             vec!["--token=EXAMPLE_private_value"],
             vec![
@@ -264,23 +258,21 @@ mod tests {
                 ],
             ),
         ] {
-            let err = Cli::command()
-                .try_get_matches_from(
-                    [
-                        "reposync",
-                        "recover-svn-lineage",
-                        action,
-                        "--database",
-                        "team.db",
-                        "--git-mirror",
-                        "local",
-                    ]
-                    .into_iter()
-                    .chain(args),
-                )
-                .and_then(Cli::from_checked_matches)
-                .unwrap_err()
-                .to_string();
+            let err = Cli::try_parse_from(
+                [
+                    "reposync",
+                    "recover-svn-lineage",
+                    action,
+                    "--database",
+                    "team.db",
+                    "--git-mirror",
+                    "local",
+                ]
+                .into_iter()
+                .chain(args),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(!err.contains(PRIVATE));
         }
     }
