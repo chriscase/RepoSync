@@ -562,6 +562,9 @@ def native_absence_self_test():
 
 
 def self_test():
+    import subprocess
+
+    repo = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="reposync-package-") as temporary:
         root = Path(temporary)
         debug = root / "target/debug"
@@ -649,7 +652,12 @@ def self_test():
         fixture_source = harness / "crates/core/tests/fixtures"
         fixture_source.mkdir(parents=True)
         for name in FIXTURES:
-            shutil.copy2(Path(__file__).resolve().parents[1] / "crates/core/tests/fixtures" / name, fixture_source / name)
+            # Exercise the fallback with bytes from its reviewed historical source.
+            # The current server fixture may have changed since that review.
+            source = f"{FIXTURE_ANCHOR['source_head']}:crates/core/tests/fixtures/{name}"
+            (fixture_source / name).write_bytes(subprocess.check_output(
+                ["git", "-C", str(repo), "show", source]
+            ))
         context = root / "archive"
         existing = context / "crates/core/tests/fixtures" / FIXTURES[0]
         existing.parent.mkdir(parents=True)
