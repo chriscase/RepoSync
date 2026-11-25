@@ -148,6 +148,18 @@ impl SvnClient {
         }
     }
 
+    pub(crate) fn source_username(&self) -> &str {
+        &self.username
+    }
+
+    pub(crate) fn isolated_historical_reader(&self) -> Result<Self, SvnError> {
+        Self::new_isolated_refresh(
+            &self.url,
+            &self.username,
+            (!self.password.is_empty()).then_some(self.password.as_str()),
+        )
+    }
+
     pub fn url(&self) -> &str {
         &self.url
     }
@@ -310,24 +322,30 @@ impl SvnClient {
         &self,
         peg_revision: i64,
     ) -> Result<Vec<SvnLogEntry>, SvnError> {
+        let xml = self.copy_history_xml_at_rev(peg_revision).await?;
+        super::parser::parse_svn_copy_history(&xml)
+    }
+
+    pub(crate) async fn copy_history_xml_at_rev(
+        &self,
+        peg_revision: i64,
+    ) -> Result<String, SvnError> {
         if peg_revision < 1 {
             return Err(SvnError::RevisionNotFound(peg_revision));
         }
         let range = format!("{peg_revision}:1");
         let target = literal_url(&self.url, Some(peg_revision))?;
-        let output = self
-            .run_svn(&[
-                "log",
-                "--xml",
-                "--verbose",
-                "--stop-on-copy",
-                "-r",
-                &range,
-                "--",
-                &target,
-            ])
-            .await?;
-        super::parser::parse_svn_copy_history(&output)
+        self.run_svn(&[
+            "log",
+            "--xml",
+            "--verbose",
+            "--stop-on-copy",
+            "-r",
+            &range,
+            "--",
+            &target,
+        ])
+        .await
     }
 
     #[instrument(skip(self), fields(url = %diagnostic_url(&self.url), rev))]
