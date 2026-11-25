@@ -67,11 +67,15 @@ else
     [[ $? -eq 1 ]] || exit 1
 fi
 
-tar -C "$stage" -czf "$OUT" "${tar_members[@]}"
+COPYFILE_DISABLE=1 tar -C "$stage" -czf "$OUT" "${tar_members[@]}"
 out_dir="$(cd -- "$(dirname -- "$OUT")" && pwd)"
 out_name="$(basename -- "$OUT")"
 (
     cd "$out_dir"
-    sha256sum "$out_name" > "${out_name}.sha256"
+    if command -v sha256sum >/dev/null; then
+        sha256sum "$out_name"
+    else
+        shasum -a 256 "$out_name"
+    fi > "${out_name}.sha256"
 )
 echo "assembled ${out_dir}/${out_name}"
