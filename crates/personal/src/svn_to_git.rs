@@ -128,15 +128,30 @@ impl SvnToGitSync {
             None => 0,
         };
 
+        let scope = &self.config.options.allowed_paths;
+        let svn = if scope.is_empty() {
+            self.svn_client.clone()
+        } else {
+            reposync_core::personal_projection::scoped_source(
+                &self.svn_client,
+                &self.config.options,
+            )?
+        };
+        let cover_numbered_revisions = !scope.is_empty()
+            && reposync_core::svn::operand::checked_url(svn.url())?.scheme() == "svn";
         info!(watermark, "starting SVN-to-Git sync pass");
 
         // 2. Query SVN HEAD revision.
-        let svn_info = self
-            .svn_client
+        let svn_info = svn
             .info()
             .await
             .context("failed to get SVN repository info")?;
-        let head_rev = svn_info.latest_rev;
+        // Bound network checkout work without crossing unexamined revisions.
+        let head_rev = if cover_numbered_revisions {
+            svn_info.latest_rev.min(watermark.saturating_add(32))
+        } else {
+            svn_info.latest_rev
+        };
 
         if head_rev <= watermark {
             debug!(head_rev, watermark, "SVN is up to date, nothing to sync");
@@ -149,15 +164,37 @@ impl SvnToGitSync {
             "found new SVN revisions to sync"
         );
 
+        if cover_numbered_revisions {
+            reposync_core::personal_projection::require_live_network_checkpoint(&svn, watermark)
+                .await
+                .context("scoped Personal network checkpoint admission refused")?;
+        }
+
         // 3. Fetch the log entries for the new revision range.
-        let log_entries = self
-            .svn_client
+        let log_entries = svn
             .log(watermark + 1, head_rev)
             .await
             .context("failed to fetch SVN log entries")?;
 
         let mut synced_count: usize = 0;
-        let scope = &self.config.options.allowed_paths;
+        let revisions: Vec<_> = if cover_numbered_revisions {
+            let mut indexed = std::collections::BTreeMap::new();
+            for entry in &log_entries {
+                anyhow::ensure!(
+                    (watermark + 1..=head_rev).contains(&entry.revision)
+                        && indexed.insert(entry.revision, entry).is_none(),
+                    "invalid Personal SVN log range"
+                );
+            }
+            (watermark + 1..=head_rev)
+                .map(|rev| (rev, indexed.remove(&rev)))
+                .collect()
+        } else {
+            log_entries
+                .iter()
+                .map(|entry| (entry.revision, Some(entry)))
+                .collect()
+        };
         let projection = if scope.is_empty() {
             PERSONAL_NO_TARGET_PROJECTION.to_owned()
         } else {
@@ -170,13 +207,16 @@ impl SvnToGitSync {
             no_target_projection: &projection,
         };
 
-        for entry in &log_entries {
-            let rev = entry.revision;
+        for (rev, entry) in revisions {
             let predecessor = previous;
             previous = rev;
 
-            match classify_incoming_svn_revision_personal(&echo_ctx, rev, &entry.message)
-                .map_err(|e| anyhow::anyhow!(e))?
+            match classify_incoming_svn_revision_personal(
+                &echo_ctx,
+                rev,
+                entry.map_or("", |e| e.message.as_str()),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?
             {
                 EchoDisposition::SkipEcho => {
                     debug!(rev, "skipping echo SVN revision (repo-scoped receipt)");
@@ -212,10 +252,11 @@ impl SvnToGitSync {
                 dir
             } else {
                 let Some(dir) = reposync_core::personal_projection::prepare(
-                    &self.svn_client,
+                    &svn,
                     &self.db,
                     &self.config.options,
                     entry,
+                    rev,
                     predecessor,
                 )
                 .await
@@ -257,6 +298,9 @@ impl SvnToGitSync {
             .with_context(|| {
                 format!("independent SVN→Git projection verification failed for r{rev}")
             })?;
+
+            let entry =
+                entry.context("missing SVN metadata for a positive Personal publication")?;
 
             // 7. Format the commit message with metadata trailers.
             let commit_message =

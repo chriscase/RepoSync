@@ -40,7 +40,7 @@ def loopback_svn(root):
         process.wait(timeout=10)
 
 
-def exercise(root, personal, cli, network=None):
+def exercise(root, personal, cli, network=None, hidden=None, nested=False, replacement=False):
     events = []
 
     class API(BaseHTTPRequestHandler):
@@ -76,11 +76,29 @@ def exercise(root, personal, cli, network=None):
     repo = root/"svn"
     svn = shutil.which("svn")
     run("svnadmin", "create", repo)
+    if hidden:
+        # Synthetic fixture policy installed before serving this disposable
+        # repository. Neither the access profile nor actor changes mid-cycle.
+        (repo/"conf"/"svnserve.conf").write_text(
+            "[general]\nanon-access = none\nauth-access = read\npassword-db = passwd\nauthz-db = authz\n")
+        (repo/"conf"/"passwd").write_text("[users]\nfixture = fixture\n")
+        (repo/"conf"/"authz").write_text("[svn:/]\nfixture = r\n[svn:/foo/denied]\nfixture =\n")
     run(svn, "checkout", repo.as_uri(), wc)
+    if nested:
+        checkout = wc
+        network += "/trunk"
+        (checkout/"trunk").mkdir()
+        (checkout/"elsewhere").mkdir()
+        (checkout/"elsewhere"/"unrelated").write_text("elsewhere")
+        wc = checkout/"trunk"
     (wc/"foo").mkdir()
     (wc/"foo"/"seed").write_text("seed")
-    run(svn, "add", "foo", cwd=wc)
-    run(svn, "commit", "-m", "initial selected file", cwd=wc)
+    if nested:
+        run(svn, "add", "trunk", "elsewhere", cwd=checkout)
+        run(svn, "commit", "-m", "initial selected file", cwd=checkout)
+    else:
+        run(svn, "add", "foo", cwd=wc)
+        run(svn, "commit", "-m", "initial selected file", cwd=wc)
     run("git", "init", "--bare", "--initial-branch=main", remote)
     run("git", "clone", remote, data/"git-repo")
     conf = root/"personal.toml"
@@ -114,9 +132,10 @@ ignore_patterns = ["foo/*.tmp"]
         with sqlite3.connect(data/"personal.db") as conn:
             return conn.execute(query, args).fetchall()
 
-    chosen = "foo/seed" if network else "foo/"
+    chosen = "foo/"
+    profile = 'network_directory_profile = "apache_svnserve_wc31"\n' if network else ''
     def configure(prefix):
-        conf.write_text(base+'allowed_paths = '+json.dumps([prefix])+'\n')
+        conf.write_text(base+profile+'allowed_paths = '+json.dumps([prefix])+'\n')
 
     configure(chosen)
     assert "refusing bootstrap" in ps("sync", ok=False)
@@ -137,20 +156,80 @@ ignore_patterns = ["foo/*.tmp"]
     assert "unrestricted import refused" in ps("import", "--full", ok=False)
     assert "unrestricted import refused" in op("import", "--snapshot", ok=False)
 
-    (wc/"bar").mkdir()
-    (wc/"bar"/"baz.txt").write_text("excluded")
-    run(svn, "add", "bar", cwd=wc)
-    run(svn, "commit", "-m", "outside foo", cwd=wc)
-    if network:
-        # Successful directory lists (including an absent name) do not prove
-        # server-side completeness. Neither case can advance the checkpoint.
-        for uncertain in ["foo/", "not-present"]:
-            configure(uncertain)
-            assert "cannot prove complete visibility" in ps("sync", ok=False)
-            assert remote_ref() == tip
-            assert db("SELECT value FROM watermarks WHERE source='svn_rev'") == [("1",)]
-            assert not db("SELECT 1 FROM canonical_mapping_outcomes WHERE source_key='svn:2'")
-        configure(chosen)
+    if replacement:
+        # An older, real, positive SVN effect is within the next batch, but
+        # the live branch URL now points to a different SVN node incarnation.
+        (wc/"foo"/"seed").write_text("pending effect from retired incarnation")
+        run(svn, "commit", "-m", "pending old branch edit", cwd=wc)
+        temporary = root/"elsewhere-content"
+        for n in range(33):
+            temporary.write_text(f"unrelated SVN revision {n}")
+            run("svnmucc", "-m", "unrelated global revision",
+                "put", temporary, repo.as_uri()+"/elsewhere/unrelated")
+        run("svnmucc", "-m", "replace trunk with a fresh copy of the old seed",
+            "rm", repo.as_uri()+"/trunk", "cp", "1", repo.as_uri()+"/trunk", repo.as_uri()+"/trunk")
+        result = ps("sync", ok=False)
+        assert "current nested SVN incarnation differs from the Personal checkpoint" in result, result
+        assert remote_ref() == tip and not events
+        assert db("SELECT value FROM watermarks WHERE source='svn_rev'") == [("1",)]
+        assert db("SELECT count(*) FROM canonical_mapping_outcomes") == [(0,)]
+        assert (data/"git-repo"/"foo"/"seed").read_text() == "seed"
+        server.shutdown()
+        server.server_close()
+        print("PASS nested svn:// replaced beyond batch: prior real positive revision held with its cursor and Git tree preserved.")
+        return
+    if nested:
+        # An ordinary global revision outside the configured SVN branch.
+        # The scoped checkout must cover its number without treating the
+        # empty branch log as either proof or a missing-content failure.
+        (checkout/"elsewhere"/"unrelated").write_text("changed outside the trunk branch")
+        run(svn, "commit", "-m", "outside the configured branch", cwd=checkout/"elsewhere")
+        (wc/"bar").mkdir()
+        (wc/"bar"/"baz.txt").write_text("excluded")
+        run(svn, "add", "bar", cwd=wc)
+    else:
+        (wc/"bar").mkdir()
+        (wc/"bar"/"baz.txt").write_text("excluded")
+        run(svn, "add", "bar", cwd=wc)
+        run(svn, "commit", "-m", "outside foo", cwd=wc)
+    if hidden:
+        # A visible outside revision, then two revisions whose hidden selected
+        # effect cancels, then a visible selected edit. A branch log or a
+        # comparison only against HEAD must not skip the hidden interval.
+        target = wc/"foo"/"denied"
+        if hidden == "directory":
+            target.mkdir()
+            (target/"child").write_text("not readable by the fixture reader")
+        else:
+            target.write_text("not readable by the fixture reader")
+        run(svn, "add", "foo/denied", cwd=wc)
+        if hidden == "directory":
+            (wc/"bar"/"baz.txt").write_text("visible change in the same revision")
+        run(svn, "commit", "-m", "selected path unseen by fixture reader", cwd=wc)
+        run(svn, "rm", "foo/denied", cwd=wc)
+        run(svn, "commit", "-m", "remove unseen path", cwd=wc)
+        (wc/"foo"/"seed").write_text("later visible change")
+        run(svn, "commit", "-m", "selected visible file", cwd=wc)
+        result = ps("sync", ok=False)
+        assert "failed to project personal SVN r3" in result, result
+        assert "network SVN cannot prove complete visibility of the selected directory" in result, result
+        assert remote_ref() == tip and not events
+        assert db("SELECT value FROM watermarks WHERE source='svn_rev'") == [("2",)]
+        assert db("SELECT source_key FROM canonical_mapping_outcomes ORDER BY source_key") == [("svn:2",)]
+        assert db("SELECT count(*) FROM pr_sync_log") == [(0,)]
+        assert not (data/"git-repo"/"foo"/"denied").exists()
+        assert "filtered, no commit" in op("log")
+        # Request the hidden path itself: a listing that cannot see the
+        # selected root must not cause it to be treated as absent.
+        configure("foo/denied")
+        again = ps("sync", ok=False)
+        assert "cannot prove absence of the selected path from its pinned SVN parent" in again, again
+        assert remote_ref() == tip and not events, again
+        assert db("SELECT value FROM watermarks WHERE source='svn_rev'") == [("2",)]
+        server.shutdown()
+        server.server_close()
+        print(f"PASS loopback svn:// denied {hidden}: preceding filtered revision checkpointed; hidden and later revisions held without publication.")
+        return
     assert "SVN→Git: 0 commits" in ps("sync")
     assert tip == remote_ref()
     scope = "__reposync_personal__"
@@ -176,16 +255,23 @@ ignore_patterns = ["foo/*.tmp"]
     # scope so recomputing the old decision would now incorrectly publish bar.
     with sqlite3.connect(data/"personal.db") as conn:
         conn.execute("UPDATE watermarks SET value='1' WHERE source='svn_rev'")
-    conf.write_text(base+'allowed_paths = ["bar/"]\n')
+    configure('bar/')
     wrapper = root/"shim"
     wrapper.mkdir()
     trace = root/"svn-verbs"
-    (wrapper/"svn").write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" >> "{trace}"\nexec "{svn}" "$@"\n')
+    (wrapper/"svn").write_text(f"""#!/bin/sh
+printf "%s\\n" "$1" >> "{trace}"
+if [ "$1" = update ] && [ "$FIXTURE_SHORT_UPDATE" = 1 ]; then
+  printf "Updating 'foo':\\n"
+  exit 0
+fi
+exec "{svn}" "$@"
+""")
     (wrapper/"svn").chmod(0o755)
     env["PATH"] = str(wrapper)+os.pathsep+env["PATH"]
     assert "SVN→Git: 0 commits" in ps("sync")
     verbs = trace.read_text().splitlines()
-    assert "log" in verbs and not {"export", "diff", "proplist", "list"}.intersection(verbs), verbs
+    assert "log" in verbs and not {"export", "diff", "proplist", "list", "checkout"}.intersection(verbs), verbs
     assert remote_ref() == tip and db(marks) == bookmarks and db(rows,(scope,2)) == [(None,)]
     assert db("SELECT count(*) FROM audit_log WHERE action='svn_to_git_filtered'") == [(1,)]
 
@@ -210,17 +296,19 @@ ignore_patterns = ["foo/*.tmp"]
     # A deleted prefix is a positive selected deletion; a sibling named
     # foo-other is not selected, even when foo no longer exists.
     run(svn, "update", cwd=wc)
-    run(svn, "rm", "foo/seed" if network else "foo", cwd=wc)
+    run(svn, "rm", "foo", cwd=wc)
     run(svn, "commit", "-m", "remove selected subtree", cwd=wc)
+    if network:
+        # An abbreviated but zero-status tool completion must not count as
+        # confirmed named-child absence or advance any durable cursor.
+        env["FIXTURE_SHORT_UPDATE"] = "1"
+        short_result = ps("sync", ok=False)
+        del env["FIXTURE_SHORT_UPDATE"]
+        assert "named-child SVN update did not complete" in short_result, short_result
+        assert remote_ref() == applied and dict(db(marks))["svn_rev"] == "3"
     assert "SVN→Git: 1 commits" in ps("sync")
     deletion = remote_ref()
     assert deletion != applied and not run("git","--git-dir",remote,"ls-tree","-r","--name-only","main").strip()
-    if network:
-        assert db("SELECT count(*) FROM pr_sync_log") == [(0,)] and not events
-        server.shutdown()
-        server.server_close()
-        print("PASS loopback svn://: ambiguous directory/absence held, exact file projected and affirmative file deletion published; absent checkpoint and scope removal refused.")
-        return
     (wc/"foo-other").mkdir()
     (wc/"foo-other"/"keep").write_text("sibling")
     run(svn, "add", "foo-other", cwd=wc)
@@ -236,11 +324,25 @@ ignore_patterns = ["foo/*.tmp"]
     db("DROP TRIGGER fixture_veto")
     assert "SVN→Git: 0 commits" in ps("sync") and db(rows,(scope,5)) == [(None,)]
     assert remote_ref() == deletion and dict(db(marks))["svn_rev"] == "5"
+    (wc/"foo").mkdir()
+    (wc/"foo"/"returned").write_text("returned")
+    run(svn, "add", "foo", cwd=wc)
+    run(svn, "commit", "-m", "restore selected root", cwd=wc)
+    assert "SVN→Git: 1 commits" in ps("sync")
+    recreated = remote_ref()
+    assert recreated != deletion
+    assert run("git", "--git-dir", remote, "show", "main:foo/returned") == "returned"
+    run(svn, "propset", "svn:executable", "*", "foo/returned", cwd=wc)
+    run(svn, "commit", "-m", "selected executable-bit-only change", cwd=wc)
+    assert "SVN→Git: 1 commits" in ps("sync")
+    assert remote_ref() != recreated
+    assert run("git", "--git-dir", remote, "ls-tree", "-r", "main").startswith("100755 blob")
     assert not events, events
     assert db("SELECT count(*) FROM pr_sync_log") == [(0,)]
     server.shutdown()
     server.server_close()
-    print("PASS #55: verified filtered receipt, actual no-export replay after policy change, orphan NULL rejection, selected mixed commit, selected deletion, transaction rollback and retry, fresh processes, PR isolation, CLI status/log/doctor and guarded imports.")
+    prefix = ("qualified svn:// nested branch" if nested else "qualified svn:// directory") if network else "file:// directory"
+    print(f"PASS #55 {prefix}: verified filtered receipt, actual no-export replay after policy change, orphan NULL rejection, selected mixed commit, selected deletion, transaction rollback and retry, fresh processes, PR isolation, CLI status/log/doctor and guarded imports.")
 
 
 if __name__ == "__main__":
@@ -250,9 +352,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="reposync-personal-filter55-") as directory:
         root = Path(directory)
-        local, network = root/"local", root/"network"
+        local = root/"local"
         local.mkdir()
-        network.mkdir()
         exercise(local, args.personal.resolve(), args.cli.resolve())
-        with loopback_svn(network) as url:
-            exercise(network, args.personal.resolve(), args.cli.resolve(), url)
+        for mode in ["full", "nested", "replaced", "file", "directory"]:
+            network = root/f"network-{mode}"
+            network.mkdir()
+            with loopback_svn(network) as url:
+                exercise(network, args.personal.resolve(), args.cli.resolve(), url,
+                         mode if mode in ("file", "directory") else None,
+                         nested=mode in ("nested", "replaced"), replacement=mode=="replaced")

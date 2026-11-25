@@ -163,6 +163,25 @@ impl SvnClient {
         self.refresh_config.is_some()
     }
 
+    /// Isolate read-only proof traffic to the configured Personal actor.
+    /// No fallback to cached or ambient credentials is permitted.
+    pub(crate) fn isolated_personal_visibility(&self) -> Result<Self, SvnError> {
+        let password = (!self.password.is_empty()).then_some(self.password.as_str());
+        Self::new_isolated_refresh(&self.url, &self.username, password)
+    }
+
+    pub(crate) fn personal_visibility_operand(&self, path: &str) -> Result<Self, SvnError> {
+        if !self.has_refresh_isolation() {
+            return Err(SvnError::LineageRefused {
+                reason: "unproved_svn_subtree_visibility".into(),
+                detail: "Personal directory proof requires the same isolated source actor".into(),
+            });
+        }
+        let mut scoped = self.clone();
+        scoped.url = repository_url(&self.url, path)?;
+        Ok(scoped)
+    }
+
     pub(crate) fn refresh_ancestor_client(&self, url: &str) -> Result<Self, SvnError> {
         let refused = || SvnError::LineageRefused {
             reason: "unproved_svn_ancestor_visibility".into(),
@@ -534,6 +553,66 @@ impl SvnClient {
             destination,
         ])
         .await?;
+        Ok(())
+    }
+
+    /// A pinned empty-depth parent provides a disposable anchor for a
+    /// one-child visibility probe without fetching sibling contents.
+    pub(crate) async fn checkout_empty_pinned(
+        &self,
+        path: &Path,
+        rev: i64,
+    ) -> Result<(), SvnError> {
+        let destination = local_destination(path)?;
+        self.run_svn(&[
+            "checkout",
+            "--ignore-externals",
+            "--depth",
+            "empty",
+            "-r",
+            &rev.to_string(),
+            "--",
+            &literal_url(&self.url, Some(rev))?,
+            destination,
+        ])
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn probe_named_child(
+        &self,
+        path: &Path,
+        name: &str,
+        rev: i64,
+    ) -> Result<(), SvnError> {
+        super::operand::validate_relative_path(name)?;
+        if name.contains('/') {
+            return Err(SvnError::XmlParseError(
+                "expected one literal child of the pinned parent".into(),
+            ));
+        }
+        let operand = literal_path(name)?;
+        let result = self
+            .run_svn_at(
+                &[
+                    "update",
+                    "--ignore-externals",
+                    "--depth",
+                    "empty",
+                    "-r",
+                    &rev.to_string(),
+                    "--",
+                    &operand,
+                ],
+                Some(path),
+            )
+            .await?;
+        // Successful status or partial output alone is not an acknowledgement.
+        if result.trim_end() != format!("Updating '{name}':\nAt revision {rev}.") {
+            return Err(SvnError::XmlParseError(
+                "named-child SVN update did not complete as an unchanged pinned target".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1043,7 +1122,18 @@ impl SvnClient {
     // -- Internal helpers ----------------------------------------------------
 
     async fn run_svn(&self, args: &[&str]) -> Result<String, SvnError> {
+        self.run_svn_at(args, None).await
+    }
+
+    async fn run_svn_at(
+        &self,
+        args: &[&str],
+        for_named_child: Option<&Path>,
+    ) -> Result<String, SvnError> {
         let mut cmd = self.svn_command();
+        if let Some(path) = for_named_child {
+            cmd.current_dir(path).env("LC_ALL", "C.UTF-8");
+        }
         let (verb, rest) = args
             .split_first()
             .ok_or_else(|| SvnError::XmlParseError("missing SVN command".into()))?;
@@ -1077,10 +1167,16 @@ impl SvnClient {
             warn!(exit_code, %stderr, "svn command failed");
             return Err(SvnError::CommandFailed { exit_code, stderr });
         }
-        let stdout = if args
-            .iter()
-            .take_while(|arg| **arg != "--")
-            .any(|arg| *arg == "--xml")
+        if for_named_child.is_some() && !output.stderr.is_empty() {
+            return Err(SvnError::XmlParseError(
+                "named-child SVN update emitted diagnostics; absence unproved".into(),
+            ));
+        }
+        let stdout = if for_named_child.is_some()
+            || args
+                .iter()
+                .take_while(|arg| **arg != "--")
+                .any(|arg| *arg == "--xml")
         {
             String::from_utf8(output.stdout)
                 .map_err(|_| SvnError::XmlParseError("SVN XML output is not UTF-8".into()))?

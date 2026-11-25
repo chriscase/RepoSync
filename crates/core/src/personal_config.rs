@@ -249,6 +249,10 @@ pub struct PersonalOptionsConfig {
     #[serde(default)]
     pub allowed_paths: Vec<String>,
 
+    /// Explicit opt-in to the qualified stock Apache svnserve checkout proof.
+    #[serde(default)]
+    pub network_directory_profile: Option<NetworkDirectoryProfile>,
+
     /// Normalize CRLF to LF during sync.
     #[serde(default = "default_true")]
     pub normalize_line_endings: bool,
@@ -290,10 +294,17 @@ pub struct PersonalOptionsConfig {
     pub lfs_patterns: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkDirectoryProfile {
+    ApacheSvnserveWc31,
+}
+
 impl Default for PersonalOptionsConfig {
     fn default() -> Self {
         Self {
             allowed_paths: Vec::new(),
+            network_directory_profile: None,
             normalize_line_endings: true,
             sync_executable_bit: true,
             max_file_size: 0,
@@ -391,6 +402,26 @@ impl PersonalConfig {
             });
         }
 
+        let network_profile = self.options.network_directory_profile.is_some();
+        if !self.options.allowed_paths.is_empty() || network_profile {
+            let transport = crate::svn::operand::checked_url(&self.svn.url).map_err(|e| {
+                ConfigError::InvalidValue {
+                    field: "svn.url".into(),
+                    detail: e.to_string(),
+                }
+            })?;
+            if self.options.allowed_paths.is_empty()
+                || !matches!(
+                    (transport.scheme(), network_profile),
+                    ("file", false) | ("svn", true)
+                )
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "options.network_directory_profile".into(),
+                    detail: "scoped Personal sync requires local file://, or qualified svn:// with apache_svnserve_wc31; unsupported configuration held".into(),
+                });
+            }
+        }
         for prefix in &self.options.allowed_paths {
             crate::svn::operand::validate_relative_path(prefix.trim_end_matches('/')).map_err(
                 |e| ConfigError::InvalidValue {
@@ -460,6 +491,7 @@ sync_executable_bit = true
 # max_file_size = 0         # 0 = no limit
 # ignore_patterns = []
 # allowed_paths = []        # incremental SVN→Git only when scoped
+# network_directory_profile = "apache_svnserve_wc31"  # qualified stock svn:// only
 # sync_externals = false
 # sync_direct_pushes = false
 auto_merge = true

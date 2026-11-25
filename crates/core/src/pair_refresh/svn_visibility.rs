@@ -198,6 +198,48 @@ impl VisibleSvnCheckout {
         }
         Ok(())
     }
+    /// Verify the materialized file/directory inventory matches the same
+    /// observed BASE rows. SVN client output alone is not attestation.
+    pub(crate) fn attest_materialized_tree(
+        &self,
+    ) -> Result<crate::import::IndependentTreeManifest, SvnError> {
+        use crate::import::ManifestEntry;
+        let native = read_metadata(&self.path, |conn| {
+            let (_, _, digest) = inspect_rows(conn, &self.info)?;
+            if digest != self.presence_digest {
+                return Err(refused("checkout metadata changed after visibility proof"));
+            }
+            let mut stmt = conn
+                .prepare("SELECT local_relpath,kind FROM NODES WHERE local_relpath <> ''")
+                .map_err(|_| refused("cannot open checkout path inventory"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|_| refused("cannot read checkout path inventory"))?;
+            rows.collect::<Result<BTreeMap<_, _>, _>>()
+                .map_err(|_| refused("invalid checkout path inventory"))
+        })?;
+        let mut manifest = crate::import::require_supported_export(&self.path)
+            .map_err(|_| refused("checkout contains unsupported filesystem entries"))?;
+        manifest.entries.remove(".svn");
+        if manifest.entries.len() != native.len()
+            || manifest.entries.iter().any(|(path, entry)| {
+                let expected = match entry {
+                    ManifestEntry::Directory { .. } => "dir",
+                    ManifestEntry::File { .. } => "file",
+                    _ => return true,
+                };
+                native.get(path).is_none_or(|kind| kind != expected)
+            })
+        {
+            return Err(refused(
+                "materialized checkout paths differ from proved BASE nodes",
+            ));
+        }
+        Ok(manifest)
+    }
+
     pub fn presence_digest(&self) -> &str {
         &self.presence_digest
     }
@@ -246,6 +288,59 @@ pub async fn observe_subtree(
         node_count,
         max_changed_revision,
         presence_digest,
+    })
+}
+
+/// Positive absence on the qualified stock Apache svnserve profile. It is
+/// not a whole-parent export: pin a pristine depth-empty parent and update
+/// only the named direct child. A denied path may error or leave an excluded
+/// BASE row, neither of which is absence.
+pub(crate) async fn prove_absent_child(
+    client: &SvnClient,
+    revision: i64,
+    name: &str,
+) -> Result<SvnInfo, SvnError> {
+    if !client.has_refresh_isolation()
+        || revision < 1
+        || crate::svn::operand::checked_url(client.url())?.scheme() != "svn"
+    {
+        return Err(refused("isolated qualified svnserve child proof required"));
+    }
+    let info = client.info_at_rev(revision).await?;
+    if info.url != client.url() || info.latest_rev != revision {
+        return Err(refused("absence parent differs from the pinned endpoint"));
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("reposync-svn-absence-")
+        .tempdir()?;
+    let path = directory.path().join("parent");
+    client.checkout_empty_pinned(&path, revision).await?;
+    let pristine = || inspect_empty_presence(&path, &info);
+    let parent_digest = pristine()?;
+    client.probe_named_child(&path, name, revision).await?;
+    let after = client.info_at_rev(revision).await?;
+    if pristine()? != parent_digest
+        || !matches!(std::fs::symlink_metadata(path.join(name)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        || info.uuid != after.uuid
+        || info.root_url != after.root_url
+        || info.url != after.url
+        || info.latest_rev != after.latest_rev
+    {
+        return Err(refused(
+            "named child absence is unproved at the pinned parent",
+        ));
+    }
+    Ok(info)
+}
+
+fn inspect_empty_presence(path: &Path, info: &SvnInfo) -> Result<String, SvnError> {
+    read_metadata(path, |conn| {
+        let (count, _, digest) = inspect_rows_sql(conn, info, "empty")
+            .map_err(|_| refused("pinned parent or named child is not pristine and observable"))?;
+        if count != 1 {
+            return Err(refused("named child exists or its absence is unproved"));
+        }
+        Ok(digest)
     })
 }
 
@@ -348,11 +443,15 @@ fn read_metadata<T>(
 }
 
 fn inspect_rows(conn: &Connection, expected: &SvnInfo) -> Result<(usize, i64, String), SvnError> {
-    inspect_rows_sql(conn, expected)
+    inspect_rows_sql(conn, expected, "infinity")
         .map_err(|_| refused("working-copy metadata is incomplete, excluded or unsupported"))
 }
 
-fn inspect_rows_sql(conn: &Connection, expected: &SvnInfo) -> anyhow::Result<(usize, i64, String)> {
+fn inspect_rows_sql(
+    conn: &Connection,
+    expected: &SvnInfo,
+    directory_depth: &str,
+) -> anyhow::Result<(usize, i64, String)> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     anyhow::ensure!(version == 31, "unqualified WC schema");
     let integrity: Vec<String> = conn
@@ -413,7 +512,7 @@ fn inspect_rows_sql(conn: &Connection, expected: &SvnInfo) -> anyhow::Result<(us
         );
         anyhow::ensure!(
             if node.kind == "dir" {
-                node.depth.as_deref() == Some("infinity")
+                node.depth.as_deref() == Some(directory_depth)
             } else {
                 node.depth.is_none()
             },

@@ -119,6 +119,40 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn named_child_absence_distinguishes_absent_visible_and_denied_nodes() {
+    let f = Fixture::new(true).await;
+    let before = f.youngest();
+    // The anchor has unreadable siblings. The targeted observation does
+    // not need them, but cannot grant authority to either absent callback.
+    let proof = prove_absent_child(&f.client, 1, "does-not-exist")
+        .await
+        .unwrap();
+    assert_eq!(proof.latest_rev, 1);
+    for target in ["visible", "hidden-file", "hidden-dir", "hidden-dir/nested"] {
+        assert!(
+            prove_absent_child(&f.client, 1, target).await.is_err(),
+            "{target}"
+        );
+    }
+    assert_eq!(before, f.youngest());
+}
+
+#[tokio::test]
+async fn absent_child_parent_refuses_unknown_native_metadata() {
+    let f = Fixture::new(false).await;
+    let wc = f.root.path().join("depth-empty-parent");
+    f.client.checkout_empty_pinned(&wc, 1).await.unwrap();
+    let info = f.client.info_at_rev(1).await.unwrap();
+    assert!(inspect_empty_presence(&wc, &info).is_ok());
+    Connection::open(wc.join(".svn/wc.db"))
+        .unwrap()
+        .execute_batch("PRAGMA user_version=32")
+        .unwrap();
+    assert!(inspect_empty_presence(&wc, &info).is_err());
+    assert_eq!(f.youngest().trim(), "1");
+}
+
+#[tokio::test]
 async fn full_visibility_checkout_proves_all_nodes_and_never_changes_repository() {
     let f = Fixture::new(false).await;
     let before = f.youngest();
