@@ -257,6 +257,18 @@ mod tests {
         assert!(!clean.needs_review());
 
         let source = open();
+        source
+            .execute_batch(
+                "INSERT INTO kv_state(key,value,updated_at) VALUES ('last_sync_at','t','t');
+            INSERT INTO audit_log(action,created_at) VALUES ('sync_cycle','t');",
+            )
+            .unwrap();
+        drop(source);
+        let poll = inspect(&path).unwrap();
+        assert!(poll.poll_only && poll.needs_review());
+        assert!(!poll.pairs[0].retained && !poll.unattributed_history);
+
+        let source = open();
         source.execute_batch(INSTALLED_V14).unwrap();
         source
             .execute_batch(
@@ -268,6 +280,7 @@ mod tests {
         drop(source);
         let held = inspect(&path).unwrap();
         assert_eq!(held.schema_version, 14);
+        assert!(!held.poll_only);
         assert!(held.pairs[0].retained && held.needs_review());
         assert!(!held.unattributed_history && !held.unexpected_identity_records);
 

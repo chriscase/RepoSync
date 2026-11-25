@@ -19,11 +19,13 @@ pub struct InstalledTeamPreflight {
     pub pairs: Vec<PairHistory>,
     pub unattributed_history: bool,
     pub unexpected_identity_records: bool,
+    pub poll_only: bool,
 }
 
 impl InstalledTeamPreflight {
     pub fn needs_review(&self) -> bool {
-        self.unattributed_history
+        self.poll_only
+            || self.unattributed_history
             || self.unexpected_identity_records
             || self.pairs.iter().any(|pair| pair.retained)
     }
@@ -84,7 +86,7 @@ fn inspect_catalog(conn: &Connection) -> Result<InstalledTeamPreflight, Database
 
     // Legacy singletons and orphan records cannot be assigned by guessing from the
     // number of current registrations. Inspect their existence without reading payloads.
-    let unattributed_history = conn.query_row(
+    let unattributed_history: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM (
              SELECT repo_id FROM commit_map UNION ALL SELECT repo_id FROM sync_records
              UNION ALL SELECT repo_id FROM conflicts
@@ -95,7 +97,7 @@ fn inspect_catalog(conn: &Connection) -> Result<InstalledTeamPreflight, Database
          OR EXISTS(SELECT 1 FROM watermarks WHERE value NOT IN ('', '0'))
          OR EXISTS(SELECT 1 FROM sync_state) OR EXISTS(SELECT 1 FROM pr_sync_log)
          OR EXISTS(SELECT 1 FROM kv_state WHERE
-              (key IN ('last_git_hash','last_git_sha','last_sync_at') AND value <> '')
+              (key IN ('last_git_hash','last_git_sha') AND value <> '')
            OR (key = 'last_svn_rev' AND value NOT IN ('','0'))
            OR (key GLOB 'last_git_sha_*' AND value <> '' AND NOT EXISTS(
                 SELECT 1 FROM repositories r WHERE key = 'last_git_sha_' || r.id))
@@ -106,16 +108,27 @@ fn inspect_catalog(conn: &Connection) -> Result<InstalledTeamPreflight, Database
     )?;
     // Neither installed binary wrote the later producer records or snapshot journal.
     // Their presence in this older physical catalog cannot establish how they got there.
-    let unexpected_identity_records = conn.query_row(
+    let unexpected_identity_records: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key GLOB 'independently_established_svn_uuid:*'
                      OR key GLOB 'import_operation_v1:*')",
         [],
         |r| r.get(0),
     )?;
+    // Both old daemons stamped every poll, including empty and failed cycles.
+    // A poll alone supplies neither a revision nor evidence that a pair published.
+    let poll_only = !unattributed_history
+        && !unexpected_identity_records
+        && !pairs.iter().any(|pair| pair.retained)
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key='last_sync_at' AND value <> '')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?;
     Ok(InstalledTeamPreflight {
         schema_version: version,
         pairs,
         unattributed_history,
         unexpected_identity_records,
+        poll_only,
     })
 }

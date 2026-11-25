@@ -40,6 +40,10 @@ pub(super) fn run(path: &Path) -> Result<()> {
     if report.unexpected_identity_records {
         println!("Unknown provenance: these installed versions did not write the identity or import records found here.");
     }
+    if report.poll_only {
+        println!("A sync poll was recorded. This timestamp also occurs after an empty or failed poll. No stored revision, commit or other publication evidence was found. Check the old deployment's records for any published work before resuming.");
+        bail!("Inconclusive: the poll alone cannot establish whether any pair published");
+    }
     if report.needs_review() {
         println!("Keep affected pairs paused. Identify a trusted pre-upgrade SVN backup or dump, its original repository URL and branch creation or copy history through the retained revision. A saved working copy can corroborate the URL and UUID. Match the configured Git ref and full mapped commits to that history.");
         bail!("Historical evidence requires operator review before incremental sync");
