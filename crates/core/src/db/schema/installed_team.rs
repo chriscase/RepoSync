@@ -97,13 +97,33 @@ pub(crate) fn pending(conn: &Connection, version: u32) -> Result<bool, DatabaseE
     if version < 13 {
         // The legacy runner committed its DDL before setting user_version. A
         // crash between those writes can leave the deployed v13 index on v12.
-        let partial: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name IN
-             ('idx_sync_records_repo_dir_status_rev','idx_repositories_cloned_from',
-              'idx_repositories_scope_uuid','repo_migration_state','pair_lineages','pair_frontiers','pair_outcomes','commit_map_v13'))
-             OR EXISTS(SELECT 1 FROM pragma_table_info('repositories') WHERE name IN ('cloned_from_id','scope_uuid'))",
-            [], |row| row.get(0))?;
-        if partial {
+        let mut objects =
+            conn.prepare("SELECT name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'")?;
+        let names = objects.query_map([], |r| r.get::<_, String>(0))?;
+        let mut partial = false;
+        for name in names {
+            let name = name?;
+            if is_copy_artifact(&name)
+                || name.starts_with("canonical_")
+                || matches!(
+                    name.as_str(),
+                    "idx_canonical_mapping_outcomes_scope"
+                        | "idx_sync_records_repo_dir_status_rev"
+                        | "idx_repositories_cloned_from"
+                        | "idx_repositories_scope_uuid"
+                )
+            {
+                partial = true;
+                break;
+            }
+        }
+        let scope_or_clone_column: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('repositories')
+             WHERE name IN ('cloned_from_id','scope_uuid'))",
+            [],
+            |row| row.get(0),
+        )?;
+        if partial || scope_or_clone_column {
             return Err(DatabaseError::Other(
                 "partial schema ahead of its registry version; upgrade refused".into(),
             ));
@@ -308,6 +328,33 @@ mod tests {
             )
             .unwrap();
         assert!(pending(&native, 14).is_err());
+    }
+
+    #[test]
+    fn owned_startup_preserves_v12_with_a_partial_canonical_table() {
+        let _serial = crate::writer_fence::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reposync.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!(
+            "../../../../daemon/tests/fixtures/schema-v12.sql"
+        ))
+        .unwrap();
+        conn.execute_batch("CREATE TABLE canonical_lineage(incomplete TEXT)")
+            .unwrap();
+        let before = catalog(&conn).unwrap();
+        assert!(Database::open_with_exclusive_owner(dir.path()).is_err());
+        assert!(Database::open_cli_writer(dir.path()).is_err());
+        assert_eq!(catalog(&conn).unwrap(), before);
+        assert_eq!(get_schema_version(&conn).unwrap(), 12);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM kv_state", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
