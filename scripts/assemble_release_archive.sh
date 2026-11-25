@@ -36,7 +36,7 @@ cp "${ROOT}/authors.example.toml" "${stage}/authors.example.toml"
 cp "${ROOT}/scripts/reposync.service" "${stage}/reposync.service"
 
 dist="${ROOT}/web-ui/dist"
-manifest="${ROOT}/scripts/release-archive.manifest"
+members="$(bash "${ROOT}/scripts/install.sh" --list-build-members "$dist")"
 declare -a tar_members=()
 while IFS= read -r member; do
     [[ -n "$member" ]] || continue
@@ -58,29 +58,14 @@ while IFS= read -r member; do
             fi
             ;;
     esac
-done < "$manifest"
+done <<< "$members"
 
-python3 - "$dist" "$stage" "$manifest" <<'PY'
-import sys
-from pathlib import Path
-
-dist = Path(sys.argv[1])
-stage = Path(sys.argv[2])
-manifest = Path(sys.argv[3]).read_text().splitlines()
-expected = {line[len("static/"):] for line in manifest if line.startswith("static/")}
-actual = {path.relative_to(dist).as_posix() for path in dist.rglob("*") if path.is_file() and path.suffix != ".map"}
-if actual != expected:
-    print("product web-ui files differ from the manifest", file=sys.stderr)
-    print("dist " + " ".join(sorted(actual)), file=sys.stderr)
-    print("manifest " + " ".join(sorted(expected)), file=sys.stderr)
-    sys.exit(1)
-sentinel = 'window.reposyncStatic = "synthetic"'
-for rel in expected:
-    data = (stage / "static" / rel).read_text(errors="replace")
-    if sentinel in data:
-        print(f"synthetic fixture leaked into {rel}", file=sys.stderr)
-        sys.exit(1)
-PY
+if grep -rqF 'window.reposyncStatic = "synthetic"' "$stage/static"; then
+    echo "synthetic fixture leaked into the product build" >&2
+    exit 1
+else
+    [[ $? -eq 1 ]] || exit 1
+fi
 
 tar -C "$stage" -czf "$OUT" "${tar_members[@]}"
 out_dir="$(cd -- "$(dirname -- "$OUT")" && pwd)"

@@ -14,7 +14,7 @@ echo "NOT_RUN aarch64-unknown-linux-gnu"
 echo "NOT_RUN x86_64-apple-darwin"
 echo "NOT_RUN aarch64-apple-darwin"
 echo "NARROW this host builds only x86_64-unknown-linux-gnu."
-echo "NARROW Docker image build is not run: no docker daemon, and Dockerfile FROM rust:1.83 cannot parse the locked edition2024 crates."
+echo "NARROW Docker image startup is covered by its separate qualification workflow."
 
 python3 "${ROOT}/scripts/check_docker_context.py"
 
@@ -138,6 +138,14 @@ with tarfile.open(dest, "w:gz") as out:
         for name, data in items:
             add_file(out, name, data)
         add_file(out, "notes.txt", b"nope\n")
+    elif kind == "missing_bundle":
+        for name, data in items:
+            if not (name.startswith("static/assets/") and name.endswith(".js")):
+                add_file(out, name, data)
+    elif kind == "unreferenced_bundle":
+        for name, data in items:
+            add_file(out, name, data)
+        add_file(out, "static/assets/unused-12345678.js", b"/* unused */")
     elif kind == "traversal":
         for name, data in items:
             add_file(out, name, data)
@@ -195,6 +203,8 @@ refuse hardlink "is a hard link"
 refuse duplicate "duplicate archive member"
 refuse extra "extra member"
 refuse traversal "not allowed"
+refuse missing_bundle "missing required member"
+refuse unreferenced_bundle "extra member"
 
 python3 - "$stub_archive" "${ROOT}/web-ui/dist" "${ROOT}/packaging/static/assets/app.js" <<'PY'
 import sys
@@ -238,7 +248,7 @@ REPOSYNC_SYSTEMD_UNIT_DIR="${default_root}/etc/systemd/system" \
 [[ -f "${default_root}/etc/reposync/config.toml" ]] || fail "default config was not installed"
 [[ -x "${default_root}/usr/local/bin/reposync" ]] || fail "default binary parent was not created"
 [[ -f "${default_root}/etc/systemd/system/reposync.service" ]] || fail "default install did not place the unit"
-[[ -f "${default_root}/usr/local/bin/static/assets/index-CMTDqfvH.js" ]] || fail "default install missed the product asset"
+diff -r --exclude='*.map' "${ROOT}/web-ui/dist" "${default_root}/usr/local/bin/static" || fail "default install differs from the product UI"
 rm -rf "$default_root"
 
 # The same default destination as uid 0, still confined to a temp root.
@@ -274,11 +284,7 @@ REPOSYNC_SYSTEMD_UNIT_DIR="${unit_trap}" \
 [[ "$(cat "${prefix}/var/lib/reposync/reposync.db")" == "kept-data" ]] || fail "data was replaced"
 [[ -f "${prefix}/etc/reposync/reposync.service" ]] || fail "prefix install did not keep the unit under the prefix"
 [[ -z "$(find "$unit_trap" -mindepth 1 -print -quit)" ]] || fail "prefix install wrote the systemd directory"
-[[ -f "${prefix}/bin/static/index.html" && -f "${prefix}/bin/static/assets/index-CMTDqfvH.js" ]] || fail "static members missing"
-grep -q "Welcome to RepoSync" "${prefix}/bin/static/assets/index-CMTDqfvH.js" || fail "installed asset is not the product bundle"
-if grep -q 'window.reposyncStatic = "synthetic"' "${prefix}/bin/static/assets/index-CMTDqfvH.js"; then
-    fail "installed asset is the synthetic fixture"
-fi
+diff -r --exclude='*.map' "${ROOT}/web-ui/dist" "${prefix}/bin/static" || fail "prefix install differs from the product UI"
 
 echo "building native release binaries"
 (cd "$ROOT" && rustup run stable cargo build --release --bin reposync --bin reposync-daemon)
@@ -287,6 +293,11 @@ product_sha="$(verified_digest "$OUT" sha256sum_c_product)"
 bash "${ROOT}/scripts/install.sh" --from-archive --archive "$OUT" --sha256 "$product_sha" --prefix "$prefix"
 [[ "$(cat "${prefix}/etc/reposync/config.toml")" == "kept-config" ]] || fail "config changed during binary replacement"
 [[ -f "${prefix}/etc/reposync/reposync.service" ]] || fail "prefix unit missing after binary replacement"
+# Exercise the real release payload from an empty root as well as replacement.
+previous_prefix="$prefix"
+prefix="$(mktemp -d)"
+bash "${ROOT}/scripts/install.sh" --from-archive --archive "$OUT" --sha256 "$product_sha" --prefix "$prefix"
+diff -r --exclude='*.map' "${ROOT}/web-ui/dist" "${prefix}/bin/static" || fail "clean install differs from the product UI"
 help_out="$("${prefix}/bin/reposync" --help)"
 printf '%s\n' "$help_out" | grep -q "reposync" || fail "CLI help missing"
 
@@ -316,7 +327,13 @@ if any(sentinel in data for data in payload.values()):
 print("PRODUCT_ARCHIVE_MATCHES_WEB_UI_DIST")
 PY
 
-port=18080
+port="$(python3 - <<'PYPORT'
+import socket
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PYPORT
+)"
 runtime="${prefix}/etc/reposync/runtime.toml"
 cat > "$runtime" <<EOF
 [daemon]
@@ -361,6 +378,7 @@ trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
 
 ready=0
 for _ in $(seq 1 40); do
+    kill -0 "$daemon_pid" 2>/dev/null || break
     if curl -fsS "http://127.0.0.1:${port}/api/status/health" >/tmp/rs118-health.out 2>/tmp/rs118-health.err; then
         ready=1
         break
@@ -368,8 +386,21 @@ for _ in $(seq 1 40); do
     sleep 0.5
 done
 [[ "$ready" -eq 1 ]] || { echo "daemon did not serve health"; tail -50 "$log"; fail "daemon startup"; }
+python3 - <<'PYHEALTH'
+import json
+with open("/tmp/rs118-health.out") as reply:
+    health = json.load(reply)
+if health.get("ok") is not True or not health.get("version"):
+    raise SystemExit("installed daemon returned an invalid health response")
+PYHEALTH
 curl -fsS "http://127.0.0.1:${port}/" -o /tmp/rs118-index.html
 grep -q "RepoSync Dashboard" /tmp/rs118-index.html || fail "product index missing"
+cmp /tmp/rs118-index.html "${ROOT}/web-ui/dist/index.html" || fail "served index differs from the web-ui build"
+for resource in "${prefix}/bin/static/assets/"* "${prefix}/bin/static/favicon.svg"; do
+    url="${resource#"${prefix}/bin/static"}"
+    curl -fsS "http://127.0.0.1:${port}${url}" -o /tmp/rs118-ui-resource
+    cmp /tmp/rs118-ui-resource "${ROOT}/web-ui/dist${url}" || fail "served resource differs: ${url}"
+done
 asset="$(python3 - <<'PY'
 import re
 html = open("/tmp/rs118-index.html").read()
@@ -384,7 +415,7 @@ grep -q "Welcome to RepoSync" /tmp/rs118-app.js || fail "served asset is not the
 if grep -q 'window.reposyncStatic = "synthetic"' /tmp/rs118-app.js; then
     fail "served asset is the synthetic fixture"
 fi
-cmp /tmp/rs118-app.js "${ROOT}/web-ui/dist/assets/index-CMTDqfvH.js" || fail "served asset differs from the web-ui build"
+cmp /tmp/rs118-app.js "${ROOT}/web-ui/dist${asset}" || fail "served asset differs from the web-ui build"
 
 if [[ -e "$host_unit" ]]; then
     [[ "$(stat -c '%F %s %Y' "$host_unit")" == "$host_unit_before" ]] || fail "host systemd unit changed"
@@ -404,5 +435,5 @@ echo "QUALIFIED native x86_64-unknown-linux-gnu prefix=${prefix}"
 kill "$daemon_pid"
 wait "$daemon_pid" || true
 trap - EXIT
-rm -rf "$prefix" "$unit_trap" "$stub_dir"
+rm -rf "$prefix" "$previous_prefix" "$unit_trap" "$stub_dir"
 echo "QUALIFY_EXIT 0"
