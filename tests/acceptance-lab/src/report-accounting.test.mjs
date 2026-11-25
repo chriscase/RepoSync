@@ -36,14 +36,33 @@ const receivingCriteria = {
   RS63_SVN_UUID_IDENTITY_HOLD: ["R09", "R15"],
   STARTUP_V14: ["R21"],
 };
+const currentReceivingCriteria = {
+  R04_DISABLE_FIRST: ["R04"],
+  R04_IMPORT_FIRST: ["R04"],
+  R04_PLAIN_PUT_IMPORT_FIRST: ["R04"],
+  R04_PLAIN_PUT_PAUSE_FIRST: ["R04"],
+  R04_RECEIPTED_PUT_IMPORT_FIRST: ["R04"],
+  R04_RECEIPTED_PUT_PAUSE_FIRST: ["R04"],
+  R04_TARGET_CHANGE_BEFORE_IMPORT_ADMISSION: ["R04"],
+  R04_UNRESOLVED_DISABLE: ["R04"],
+  R04_USERNAME_CHANGE_BEFORE_IMPORT_ADMISSION: ["R04"],
+  R04_VERIFIED_PARTIAL_RESUME: ["R04"],
+  R04_WAL_ENROLLMENT_AFTER_DISABLE: ["R04"],
+  R10_PERSONAL_MERGE_DAG_RESTART: ["R10"],
+  R15_SVNSERVE_ORDINARY_MERGE: ["R15"],
+  R15_SVNSERVE_RECREATED_TRUNK_HOLD: ["R15"],
+  R17_MANAGED_FULL_IMPORT_OVERLAP: ["R17"],
+};
 const receivingIds = Object.keys(receivingCriteria);
+const currentReceivingIds = Object.keys(currentReceivingCriteria);
 const matrixIds = new Set(matrix.harness_case_ids || []);
 for (const row of matrix.scenarios) {
   for (const id of [row.id, ...(row.required_case_ids || []), ...(row.supporting_case_ids || [])]) matrixIds.add(id);
 }
 const usesHistoricalMatrix = matrixIds.has("STARTUP_V12");
-const expectedMatrixOnlyCount = usesHistoricalMatrix ? 330 : 338;
-const requiredCaseCount = 524 + archiveCaseIds.length + receivingIds.length;
+const hasCurrentReceivingMatrix = matrixIds.has("R04_VERIFIED_PARTIAL_RESUME");
+const expectedMatrixOnlyCount = (usesHistoricalMatrix ? 330 : 338) + (hasCurrentReceivingMatrix ? currentReceivingIds.length : 0);
+const requiredCaseCount = 524 + archiveCaseIds.length + receivingIds.length + currentReceivingIds.length;
 const controls = plan.required_case_ids.filter((id) => id.startsWith("HARNESS_"));
 const pass = (id, extra = {}) => ({ id, status: "PASS", qualification: "executed", ...extra });
 const account = (rows, options = {}) => accountReport({ rows, selectedIds: ["selected"], requiredIds: ["selected", "other"], ...options });
@@ -54,15 +73,17 @@ test("the plan retains historical, single-side archive and receiving-matrix obli
   const transitionIds = ["STARTUP_V12", ...receivingIds];
   const declared = transitionIds.filter((id) => matrixIds.has(id));
   assert.deepEqual(declared, usesHistoricalMatrix ? ["STARTUP_V12"] : receivingIds);
-  for (const [id, criteria] of Object.entries(receivingCriteria)) {
+  const currentDeclared = currentReceivingIds.filter((id) => matrixIds.has(id));
+  assert.deepEqual(currentDeclared, hasCurrentReceivingMatrix ? currentReceivingIds : []);
+  for (const [id, criteria] of Object.entries({ ...receivingCriteria, ...currentReceivingCriteria })) {
     assert.deepEqual(plan.r_criteria_by_case[id], criteria, id);
-    if (!usesHistoricalMatrix) {
+    if (matrixIds.has(id)) {
       const actual = matrix.scenarios.filter((row) =>
         row.required_case_ids?.includes(id) || row.supporting_case_ids?.includes(id)).map((row) => row.id);
       assert.deepEqual(actual.sort(), [...criteria].sort(), id);
     }
   }
-  for (const id of transitionIds) ids.add(id);
+  for (const id of [...transitionIds, ...currentReceivingIds]) ids.add(id);
   const operationIds = new Set(catalog.operations.map((op) => op.id));
   for (const id of [...operationIds, ...matrixIds]) ids.add(id);
   const frozen = JSON.parse(await readFile(join(labRoot, "catalog/operation-catalog.json"), "utf8"));
@@ -185,11 +206,11 @@ async function syntheticReport(suite, options = {}) {
   }
 }
 
-test("counterfactual full executor success is 184 PASS / 353 NOT_RUN, never full PASS", async () => {
+test("counterfactual full executor success is 184 PASS / 368 NOT_RUN, never full PASS", async () => {
   const { report, markdown } = await syntheticReport("full");
   assert.equal(report.schema, "reposync.acceptance-lab.report.v1");
   assert.equal(report.rows.length, requiredCaseCount);
-  assert.deepEqual(report.counts, { PASS: 184, FAIL: 0, PARTIAL: 0, NOT_RUN: 353, SKIP: 0 });
+  assert.deepEqual(report.counts, { PASS: 184, FAIL: 0, PARTIAL: 0, NOT_RUN: 368, SKIP: 0 });
   assert.deepEqual(report.selected_suite_counts, { PASS: 166, FAIL: 0, PARTIAL: 0, NOT_RUN: 0, SKIP: 0 });
   assert.equal(report.selected_suite_result, "PASS");
   assert.equal(report.suite_result, "FAIL");
@@ -216,7 +237,7 @@ test("full executor receipts for the original catalog leave every unobserved arc
   for (const id of archiveCaseIds) {
     assert.equal(report.rows.find((row) => row.id === id)?.status, "NOT_RUN", id);
   }
-  assert.deepEqual(report.counts, { PASS: 180, FAIL: 0, PARTIAL: 0, NOT_RUN: 357, SKIP: 0 });
+  assert.deepEqual(report.counts, { PASS: 180, FAIL: 0, PARTIAL: 0, NOT_RUN: 372, SKIP: 0 });
   assert.equal(report.selected_suite_result, "FAIL");
   assert.equal(report.full_qualification, "FAIL");
 });
@@ -280,7 +301,7 @@ test("deleting an unavailable operation cannot delete its accepted obligation", 
 });
 
 // A minimal complete plan makes an ignored extra/invalid input observable as a
-// false PASS, rather than letting the production plan's 353 NOT_RUN hide it.
+// false PASS, rather than letting the production plan's 368 NOT_RUN hide it.
 const minimalOperations = [
   { id: "BROWSER_CASE", suite: "smoke", disposition: "execute", r_criteria: ["R01"] },
   { id: "ENGINE_CASE", suite: "full", disposition: "engine", r_criteria: ["R01"] },
