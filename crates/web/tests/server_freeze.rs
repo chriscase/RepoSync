@@ -128,6 +128,7 @@ async fn build_test_server() -> (
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
         import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(reposync_web::SchedulerServiceState::running()),
     });
 
     let app = Router::new()
@@ -299,6 +300,7 @@ async fn build_test_server_full() -> (
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
         import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(reposync_web::SchedulerServiceState::running()),
     });
 
     let app = Router::new()
@@ -422,6 +424,7 @@ async fn build_test_server_with_ldap(
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
         import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(reposync_web::SchedulerServiceState::running()),
     });
 
     let app = Router::new()
@@ -1727,6 +1730,7 @@ async fn import_fixture() -> (
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
         import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(reposync_web::SchedulerServiceState::running()),
     });
     state.sessions.write().await.insert(
         TEST_TOKEN.into(),

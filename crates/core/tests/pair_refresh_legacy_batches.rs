@@ -162,7 +162,18 @@ impl Fixture {
 async fn rejected_intermediate_batch_is_an_error_with_one_attempt_and_no_managed_receipt() {
     let f = Fixture::new(51);
     f.hook("#!/bin/sh\nprintf x >> attempts\nexit 1\n");
-    let error = f.run().await.unwrap_err();
+    let outcome = f.run().await;
+    let bare = f.dir.path().join("origin.git");
+    let witness = format!(
+        "{} {} {}",
+        exec_witness("hook", &bare.join("hooks/pre-receive")),
+        file_witness(&bare.join("attempts")),
+        file_witness(&bare.join("ready"))
+    );
+    let error = match outcome {
+        Err(error) => error,
+        Ok(completed) => panic!("intermediate batch completed; {witness}; completed {completed:?}"),
+    };
     assert!(
         format!("{error:#}")
             .contains("legacy Git publication outcome uncertain; writer window retained"),
@@ -198,7 +209,10 @@ async fn cancellation_during_final_push_confirms_its_exact_tip_and_checkpoints_b
         while !monitor_path.join("ready").exists() {
             assert!(
                 Instant::now() < deadline,
-                "publication barrier was never reached"
+                "publication barrier was never reached; {} {} {}",
+                exec_witness("hook", &monitor_path.join("hooks/pre-receive")),
+                file_witness(&monitor_path.join("ready")),
+                file_witness(&monitor_path.join("attempts"))
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -206,7 +220,15 @@ async fn cancellation_during_final_push_confirms_its_exact_tip_and_checkpoints_b
         std::fs::write(monitor_path.join("release"), b"release").unwrap();
     });
     let outcome = f.run().await;
-    monitor.join().unwrap();
+    let witness = format!(
+        "{} {} {}",
+        exec_witness("hook", &bare_path.join("hooks/pre-receive")),
+        file_witness(&bare_path.join("ready")),
+        file_witness(&bare_path.join("attempts"))
+    );
+    if let Err(panic) = monitor.join() {
+        panic!("monitor join failed; outcome={outcome:?}; {witness}; monitor_panic={panic:?}");
+    }
     let ImportOutcome::Completed {
         svn_rev,
         git_sha,
@@ -231,4 +253,37 @@ async fn cancellation_during_final_push_confirms_its_exact_tip_and_checkpoints_b
     assert_eq!(std::fs::read(bare_path.join("attempts")).unwrap(), b"x");
     assert!(f.windows().is_empty());
     drop(f.db.begin_ordinary_writer_window(None).unwrap());
+}
+
+fn exec_witness(label: &str, path: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map(|meta| format!("{:o}", meta.permissions().mode()))
+        .unwrap_or_else(|error| format!("metadata {error}"));
+    let test_x = std::process::Command::new("test")
+        .arg("-x")
+        .arg(path)
+        .status()
+        .map(|status| {
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into())
+        })
+        .unwrap_or_else(|error| format!("spawn {error}"));
+    format!(
+        "{label} path={} mode={mode} test_x={test_x}",
+        path.display()
+    )
+}
+
+fn file_witness(path: &std::path::Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => format!(
+            "{} bytes={}",
+            path.display(),
+            String::from_utf8_lossy(&bytes)
+        ),
+        Err(error) => format!("{} absent ({error})", path.display()),
+    }
 }

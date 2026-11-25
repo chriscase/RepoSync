@@ -791,6 +791,7 @@ impl SvnClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         self.apply_refresh_configuration(&mut cmd);
+        record_svn_diag(&cmd);
 
         debug!(cmd = ?format!("svn {}", args.join(" ")), "running svn command");
         let output = crate::process::run(cmd, SVN_COMMAND_TIMEOUT, self.cancel.as_ref())
@@ -841,6 +842,7 @@ impl SvnClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         self.apply_refresh_configuration(&mut cmd);
+        record_svn_diag(&cmd);
 
         debug!(cmd = ?format!("svn {} (in {})", args.join(" "), dir.display()), "running svn command in dir");
         let output = crate::process::run(cmd, SVN_COMMAND_TIMEOUT, self.cancel.as_ref())
@@ -869,6 +871,47 @@ impl SvnClient {
         } else {
             Ok(stdout)
         }
+    }
+}
+
+/// When `REPOSYNC_SVN_DIAG_LOG` is set, append the program and argv.
+/// Password values are replaced. The command result is unchanged.
+fn record_svn_diag(cmd: &Command) {
+    let Ok(path) = std::env::var("REPOSYNC_SVN_DIAG_LOG") else {
+        return;
+    };
+    let cmd = cmd.as_std();
+    let records_commit = cmd.get_args().next().is_some_and(|arg| arg == "commit");
+    if !records_commit {
+        return;
+    }
+    let mut redacted = Vec::new();
+    let mut hide_value = false;
+    for arg in cmd.get_args() {
+        let arg = arg.to_string_lossy();
+        if hide_value {
+            redacted.push("[REDACTED]".to_string());
+            hide_value = false;
+            continue;
+        }
+        if arg == "--password" {
+            redacted.push("--password".to_string());
+            hide_value = true;
+            continue;
+        }
+        redacted.push(arg.into_owned());
+    }
+    let line = format!(
+        "program={} argv={redacted:?}\n",
+        cmd.get_program().to_string_lossy()
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = file.write_all(line.as_bytes());
     }
 }
 

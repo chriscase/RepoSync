@@ -202,6 +202,7 @@ token_env = ""
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
         import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(reposync_web::SchedulerServiceState::running()),
     });
     state.sessions.write().await.insert(
         TEST_TOKEN.into(),
@@ -566,6 +567,28 @@ async fn candidate_64c07_setup_wizard_failed_clone_refuses_replacement_and_holds
     server.abort();
 }
 
+fn exec_witness(label: &str, path: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map(|meta| format!("{:o}", meta.permissions().mode()))
+        .unwrap_or_else(|error| format!("metadata {error}"));
+    let test_x = Command::new("test")
+        .arg("-x")
+        .arg(path)
+        .status()
+        .map(|status| {
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into())
+        })
+        .unwrap_or_else(|error| format!("spawn {error}"));
+    format!(
+        "{label} path={} mode={mode} test_x={test_x}",
+        path.display()
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_64c07_setup_wizard_reset_reimport_failed_clone_holds() {
     if !svn_available() {
@@ -609,6 +632,32 @@ async fn candidate_64c07_setup_wizard_reset_reimport_failed_clone_holds() {
     }
     let prev_path = std::env::var("PATH").unwrap();
     std::env::set_var("PATH", format!("{}:{prev_path}", bin.display()));
+    let resolved = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .map(|output| {
+            format!(
+                "status {:?} stdout {} stderr {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        })
+        .unwrap_or_else(|error| format!("spawn {error}"));
+    let shim_probe = Command::new(&wrapper).arg("version").output();
+    let shim_probe = match shim_probe {
+        Err(error) => format!(
+            "errno kind {:?} raw {:?}",
+            error.kind(),
+            error.raw_os_error()
+        ),
+        Ok(output) => format!(
+            "status {:?} stderr {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    };
+    let shim_exec = exec_witness("shim", &wrapper);
     std::env::set_var("GIT_AUTHOR_NAME", "RepoSync Test");
     std::env::set_var("GIT_AUTHOR_EMAIL", "reposync@localhost");
     std::env::set_var("GIT_COMMITTER_NAME", "RepoSync Test");
@@ -623,7 +672,22 @@ async fn candidate_64c07_setup_wizard_reset_reimport_failed_clone_holds() {
     std::env::set_var("PATH", prev_path);
     let status = started.status();
     let body: serde_json::Value = started.json().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{status} {body}");
+    let text = body["message"]
+        .as_str()
+        .or_else(|| body["error"].as_str())
+        .unwrap_or("");
+    let phase = if text.contains("git push failed") {
+        "push"
+    } else if text.contains("could not be cloned") {
+        "clone"
+    } else {
+        "other"
+    };
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "phase={phase} resolved={resolved} shim_probe={shim_probe} {shim_exec} {status} {body}"
+    );
     let error = body["error"].as_str().unwrap_or("");
     assert!(
         error.contains("could not be cloned") && error.contains("held"),

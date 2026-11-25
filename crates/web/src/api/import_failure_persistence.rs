@@ -536,6 +536,7 @@ async fn repo_import_handler_persists_failure_on_the_admitted_database() {
         repo_import_progress: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         login_attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
         import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(crate::SchedulerServiceState::running()),
     });
     state.sessions.write().await.insert(
         "token".into(),
@@ -777,6 +778,7 @@ async fn resume_handler_shows_unpersisted_failure_when_terminal_write_fails_once
         repo_import_progress: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         login_attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
         import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(crate::SchedulerServiceState::running()),
     });
     state.sessions.write().await.insert(
         "token".into(),
@@ -998,6 +1000,7 @@ async fn resume_status_ignores_previous_attempt_error_then_shows_current_failure
         repo_import_progress: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         login_attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
         import_handles: tokio::sync::Mutex::new(Vec::new()),
+        scheduler_service: std::sync::Mutex::new(crate::SchedulerServiceState::running()),
     });
     {
         let progress = state.get_repo_import_progress(repo_id).await;

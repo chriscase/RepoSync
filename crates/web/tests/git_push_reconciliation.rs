@@ -362,6 +362,7 @@ token_env = ""
             repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
             login_attempts: std::sync::Mutex::new(HashMap::new()),
             import_handles: tokio::sync::Mutex::new(Vec::new()),
+            scheduler_service: std::sync::Mutex::new(reposync_web::SchedulerServiceState::running()),
         });
         {
             let mut sessions = state.sessions.write().await;

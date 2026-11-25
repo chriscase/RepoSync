@@ -55,7 +55,7 @@
         "Cargo.toml": "a3f26cd64dd9e0d8f12dd16d2e461b1c72201809b8a3aae626aeadbec0819285",
         "crates/cli/Cargo.toml": "1172bdc9a72a96b0bb1d72e28ccf1e0e4a93bc24434e88c2cda1c2d20198bb9e",
         "crates/core/Cargo.toml": "efca5096361a144694dab5c2b0c60dc2c2108c227a1c3ba2b746730e5abfed41",
-        "crates/daemon/Cargo.toml": "17eaf441301e4adbaa0e4dbc50f716011a5a0ac276f905e514bb4a041a1691d1",
+        "crates/daemon/Cargo.toml": "3d371eef846c33fb78713c28d238bfb26cf4e5945d2aa357d9cd2686257bbb57",
         "crates/personal/Cargo.toml": "f89d7ff46a46170cfdb3742042e234e84f15cbf01b2f05490665ad31ed2f7523",
         "crates/web/Cargo.toml": "c3aca8315d7bfbf9a6925df5163a3a88345abbf11a55cfd5022dbc2a1b833178"
       },
