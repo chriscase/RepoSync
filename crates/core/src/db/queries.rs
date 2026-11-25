@@ -2197,7 +2197,7 @@ impl Database {
 
     // -- pr_sync_log (personal branch mode) ---------------------------------
 
-    /// Insert a new PR sync log entry (status = 'pending').
+    /// Begin or resume the pending replay for this exact PR and merge commit.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_pr_sync(
         &self,
@@ -2209,24 +2209,36 @@ impl Database {
         commit_count: i64,
     ) -> Result<i64, DatabaseError> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO pr_sync_log (pr_number, pr_title, pr_branch, merge_sha, merge_strategy,
-             commit_count, status, detected_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
-            params![
-                pr_number,
-                pr_title,
-                pr_branch,
-                merge_sha,
-                merge_strategy,
-                commit_count,
-                now
-            ],
-        )?;
-        let id = conn.last_insert_rowid();
-        debug!(id, pr_number, merge_sha, "inserted pr_sync_log entry");
-        Ok(id)
+        self.immediate_transaction(|tx| {
+            if let Some(id) = tx
+                .query_row(
+                    "SELECT id FROM pr_sync_log WHERE pr_number=?1 AND merge_sha=?2
+                 AND status='pending' ORDER BY id DESC LIMIT 1",
+                    params![pr_number, merge_sha],
+                    |row| row.get(0),
+                )
+                .optional()?
+            {
+                return Ok(id);
+            }
+            tx.execute(
+                "INSERT INTO pr_sync_log (pr_number, pr_title, pr_branch, merge_sha, merge_strategy,
+                 commit_count, status, detected_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+                params![
+                    pr_number,
+                    pr_title,
+                    pr_branch,
+                    merge_sha,
+                    merge_strategy,
+                    commit_count,
+                    now
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
+            debug!(id, pr_number, merge_sha, "inserted pr_sync_log entry");
+            Ok(id)
+        })
     }
 
     /// Mark a PR sync as completed with the SVN revision range.
@@ -2239,7 +2251,10 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
         let changed = conn.execute(
-            "UPDATE pr_sync_log SET status = 'completed', svn_rev_start = ?1, svn_rev_end = ?2,
+            "UPDATE pr_sync_log SET status = 'completed',
+             svn_rev_start = CASE WHEN ?1 > 0 AND svn_rev_start IS NOT NULL THEN MIN(svn_rev_start, ?1)
+                                  ELSE COALESCE(svn_rev_start, ?1) END,
+             svn_rev_end = MAX(COALESCE(svn_rev_end, ?2), ?2),
              completed_at = ?3 WHERE id = ?4",
             params![svn_rev_start, svn_rev_end, now, id],
         )?;
@@ -3311,15 +3326,15 @@ impl Database {
         repo_id: &str,
         status: &str,
     ) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        let conn = conn.unchecked_transaction()?;
-        require_mutable_pair(&conn, repo_id)?;
-        conn.execute(
-            "UPDATE repositories SET sync_status = ?1 WHERE id = ?2",
-            params![status, repo_id],
-        )?;
+        self.immediate_transaction(|tx| {
+            require_mutable_pair(tx, repo_id)?;
+            tx.execute(
+                "UPDATE repositories SET sync_status = ?1 WHERE id = ?2",
+                params![status, repo_id],
+            )?;
+            Ok(())
+        })?;
         debug!(repo_id, status, "updated repo sync status");
-        conn.commit()?;
         Ok(())
     }
 
@@ -3339,15 +3354,15 @@ impl Database {
 
     /// Increment the total_errors counter for a repository.
     pub fn increment_repo_error_count(&self, repo_id: &str) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        let conn = conn.unchecked_transaction()?;
-        require_mutable_pair(&conn, repo_id)?;
-        conn.execute(
-            "UPDATE repositories SET total_errors = total_errors + 1 WHERE id = ?1",
-            params![repo_id],
-        )?;
+        self.immediate_transaction(|tx| {
+            require_mutable_pair(tx, repo_id)?;
+            tx.execute(
+                "UPDATE repositories SET total_errors = total_errors + 1 WHERE id = ?1",
+                params![repo_id],
+            )?;
+            Ok(())
+        })?;
         debug!(repo_id, "incremented repo error count");
-        conn.commit()?;
         Ok(())
     }
 
@@ -3669,6 +3684,72 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+fn present_nullable_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    <Option<String> as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+/// Partial administrator edit. Field presence and order are part of the save receipt payload.
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct RepositorySettingsUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_updated_at: Option<String>,
+    name: Option<String>,
+    svn_url: Option<String>,
+    svn_branch: Option<String>,
+    svn_username: Option<String>,
+    git_provider: Option<String>,
+    git_api_url: Option<String>,
+    git_repo: Option<String>,
+    git_branch: Option<String>,
+    sync_mode: Option<String>,
+    poll_interval_secs: Option<i64>,
+    lfs_threshold_mb: Option<i64>,
+    auto_merge: Option<bool>,
+    enabled: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_nullable_string"
+    )]
+    pub allowed_paths: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_nullable_string"
+    )]
+    pub blocked_patterns: Option<Option<String>>,
+}
+
+impl RepositorySettingsUpdate {
+    fn apply(self, existing: models::Repository) -> models::Repository {
+        models::Repository {
+            name: self.name.unwrap_or(existing.name),
+            svn_url: self.svn_url.unwrap_or(existing.svn_url),
+            svn_branch: self.svn_branch.unwrap_or(existing.svn_branch),
+            svn_username: self.svn_username.unwrap_or(existing.svn_username),
+            git_provider: self.git_provider.unwrap_or(existing.git_provider),
+            git_api_url: self.git_api_url.unwrap_or(existing.git_api_url),
+            git_repo: self.git_repo.unwrap_or(existing.git_repo),
+            git_branch: self.git_branch.unwrap_or(existing.git_branch),
+            sync_mode: self.sync_mode.unwrap_or(existing.sync_mode),
+            poll_interval_secs: self
+                .poll_interval_secs
+                .unwrap_or(existing.poll_interval_secs),
+            lfs_threshold_mb: self.lfs_threshold_mb.unwrap_or(existing.lfs_threshold_mb),
+            auto_merge: self.auto_merge.unwrap_or(existing.auto_merge),
+            enabled: self.enabled.unwrap_or(existing.enabled),
+            allowed_paths: self.allowed_paths.unwrap_or(existing.allowed_paths),
+            blocked_patterns: self.blocked_patterns.unwrap_or(existing.blocked_patterns),
+            updated_at: Utc::now().to_rfc3339(),
+            ..existing
+        }
+    }
+}
+
 // #115: request receipts belong to the same SQLite transaction as their effects.
 // They are not execution permits and never contain credential plaintext.
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -3977,6 +4058,86 @@ impl Database {
         )
     }
 
+    /// Apply only submitted settings to the current row after reserving the writer.
+    pub fn save_repository_settings(
+        &self,
+        repo_id: &str,
+        actor: &str,
+        mut settings: RepositorySettingsUpdate,
+        payload: &[u8],
+    ) -> Result<(models::Repository, Option<RepositorySaveReceipt>), RepositorySaveError> {
+        if let Some(request_id) = settings.save_request_id.take() {
+            let expected_updated_at = settings.expected_updated_at.take();
+            let receipt = self.save_configuration_once(
+                repo_id,
+                actor,
+                &request_id,
+                expected_updated_at.as_deref(),
+                payload,
+                |current| settings.apply(current),
+            )?;
+            let current = self
+                .get_repository(repo_id)?
+                .ok_or(RepositorySaveError::NotFound)?;
+            return Ok((current, Some(receipt)));
+        }
+
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(DatabaseError::from)?;
+        let updated =
+            Self::edit_configuration_tx(&tx, repo_id, None, |current| settings.apply(current))?;
+        tx.commit().map_err(DatabaseError::from)?;
+        Ok((updated, None))
+    }
+
+    fn edit_configuration_tx(
+        tx: &rusqlite::Connection,
+        repo_id: &str,
+        expected_updated_at: Option<&str>,
+        edit: impl FnOnce(models::Repository) -> models::Repository,
+    ) -> Result<models::Repository, RepositorySaveError> {
+        super::managed_remove::require_import_released(tx, repo_id)?;
+        let current = Self::get_repository_tx(tx, repo_id)?.ok_or(RepositorySaveError::NotFound)?;
+        if expected_updated_at.is_some_and(|expected| expected != current.updated_at) {
+            return Err(RepositorySaveError::Conflict);
+        }
+        let updated = edit(current);
+        Self::update_repository_tx(tx, &updated)?;
+        Ok(updated)
+    }
+
+    fn save_configuration_once(
+        &self,
+        repo_id: &str,
+        actor: &str,
+        request_id: &str,
+        expected_updated_at: Option<&str>,
+        payload: &[u8],
+        edit: impl FnOnce(models::Repository) -> models::Repository,
+    ) -> Result<RepositorySaveReceipt, RepositorySaveError> {
+        self.repository_save_once(
+            actor,
+            request_id,
+            RepositorySaveKind::Configuration,
+            Some(repo_id),
+            payload,
+            |tx| {
+                let updated = Self::edit_configuration_tx(tx, repo_id, expected_updated_at, edit)?;
+                Ok(RepositorySaveReceipt {
+                    version: 1,
+                    request_id: request_id.into(),
+                    kind: RepositorySaveKind::Configuration,
+                    repo_id: repo_id.into(),
+                    configuration_updated_at: updated.updated_at,
+                    credential_fields: vec![],
+                    propagated_repositories: 0,
+                })
+            },
+        )
+    }
+
     pub fn update_repository_once(
         &self,
         repo: &models::Repository,
@@ -3985,18 +4146,13 @@ impl Database {
         expected_updated_at: Option<&str>,
         payload: &[u8],
     ) -> Result<RepositorySaveReceipt, RepositorySaveError> {
-        self.repository_save_once(
+        self.save_configuration_once(
+            &repo.id,
             actor,
             request_id,
-            RepositorySaveKind::Configuration,
-            Some(&repo.id),
+            expected_updated_at,
             payload,
-            |tx| {
-                let current =
-                    Self::get_repository_tx(tx, &repo.id)?.ok_or(RepositorySaveError::NotFound)?;
-                if expected_updated_at.is_some_and(|expected| expected != current.updated_at) {
-                    return Err(RepositorySaveError::Conflict);
-                }
+            |current| {
                 let mut updated = repo.clone();
                 // A settings save never restores a stale runtime snapshot over a live cursor.
                 updated.created_by = current.created_by;
@@ -4010,16 +4166,7 @@ impl Database {
                 updated.total_errors = current.total_errors;
                 updated.consecutive_errors = current.consecutive_errors;
                 updated.teams_webhook_url = current.teams_webhook_url;
-                Self::update_repository_tx(tx, &updated)?;
-                Ok(RepositorySaveReceipt {
-                    version: 1,
-                    request_id: request_id.into(),
-                    kind: RepositorySaveKind::Configuration,
-                    repo_id: repo.id.clone(),
-                    configuration_updated_at: updated.updated_at,
-                    credential_fields: vec![],
-                    propagated_repositories: 0,
-                })
+                updated
             },
         )
     }

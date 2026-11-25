@@ -1557,7 +1557,7 @@ mod cancellation_tests {
         replay_hold_lets_unrelated_repo_run(false).await;
     }
 
-    fn scheduler_fixture(
+    pub(super) fn scheduler_fixture(
         tmp: &tempfile::TempDir,
         repo_id: &str,
         last_sync_at: &str,
@@ -2243,6 +2243,10 @@ mod blocked_patterns_tests;
 #[cfg(test)]
 #[path = "scheduler/allowed_paths_tests.rs"]
 mod allowed_paths_tests;
+
+#[cfg(all(test, unix))]
+#[path = "scheduler/notification_isolation_tests.rs"]
+mod notification_isolation_tests;
 
 /// UNRUN. Source-only regression for BOB-RS216-001. Not executed here.
 #[cfg(test)]

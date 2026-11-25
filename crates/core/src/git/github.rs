@@ -68,6 +68,12 @@ pub struct PullRequestRef {
     pub sha: String,
 }
 
+/// A bounded scan may need local Git coverage to prove that older pages are irrelevant.
+pub struct MergedPrScan {
+    pub prs: Vec<PullRequest>,
+    pub has_more: bool,
+}
+
 /// Detailed commit info from `GET /repos/{owner}/{repo}/commits/{sha}`.
 /// Includes the `parents` array needed for merge strategy detection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,49 +334,80 @@ impl GitHubClient {
         base: &str,
         since: Option<&str>,
     ) -> Result<Vec<PullRequest>, GitHubError> {
+        let scan = self.scan_merged_pull_requests(repo, base, since).await?;
+        if scan.has_more {
+            return Err(GitHubError::IncompletePrDiscovery);
+        }
+        Ok(scan.prs)
+    }
+
+    /// Scan by immutable creation order across all PR states/branches. Moving a
+    /// PR between states or updating it cannot change its position. An insertion
+    /// at the front which shifts a numbered boundary repeats a PR and is refused.
+    pub async fn scan_merged_pull_requests(
+        &self,
+        repo: &str,
+        base: &str,
+        since: Option<&str>,
+    ) -> Result<MergedPrScan, GitHubError> {
         let first_url = format!("{}/repos/{}/pulls", self.api_url, repo);
         let base = base.to_string();
         let since = since.map(|s| s.to_string());
-        let resp = self
-            .retry_request(|| {
-                let mut req = self.auth(self.http.get(&first_url)).query(&[
-                    ("state", "closed"),
-                    ("base", base.as_str()),
-                    ("per_page", "100"),
-                ]);
-                if since.is_some() {
-                    req = req.query(&[("sort", "updated"), ("direction", "desc")]);
-                }
-                req
-            })
-            .await?;
-
-        let mut next_link = Self::parse_next_link(resp.headers());
-        let mut all_prs: Vec<PullRequest> = resp.json().await?;
-        let mut pages = 1usize;
-
-        while let Some(ref url) = next_link {
-            if pages >= 10 {
-                warn!(
-                    pages,
-                    "reached GitHub pagination limit for get_merged_pull_requests"
-                );
-                break;
-            }
-            let url_clone = url.clone();
-            let resp = self
-                .retry_request(|| self.auth(self.http.get(&url_clone)))
-                .await?;
-            next_link = Self::parse_next_link(resp.headers());
-            let page: Vec<PullRequest> = resp.json().await?;
-            all_prs.extend(page);
+        let mut all_prs = Vec::new();
+        let mut numbers_seen = std::collections::HashSet::new();
+        let mut pages = 0usize;
+        let has_more = loop {
             pages += 1;
-        }
-
+            let resp = self
+                .retry_request(|| {
+                    self.auth(self.http.get(&first_url))
+                        .query(&[
+                            ("state", "all"),
+                            ("per_page", "100"),
+                            ("sort", "created"),
+                            ("direction", "desc"),
+                        ])
+                        .query(&[("page", pages)])
+                })
+                .await?;
+            let next = Self::next_pr_page(&resp)?;
+            let rows: Vec<PullRequest> = resp.json().await?;
+            if rows.iter().any(|pr| !numbers_seen.insert(pr.number)) {
+                return Err(GitHubError::ParseError(
+                    "duplicate pull request in paged discovery".into(),
+                ));
+            }
+            all_prs.extend(rows);
+            let Some(url) = next else { break false };
+            // GitHub may emit a canonical numeric repository URL. Request the
+            // next numbered page on the original route with the original filters.
+            let numbers: Vec<_> = url
+                .query_pairs()
+                .filter(|(k, _)| k == "page")
+                .map(|(_, v)| v.parse::<usize>().ok())
+                .collect();
+            if numbers != [Some(pages + 1)] {
+                return Err(GitHubError::ParseError(
+                    "unexpected pull-request page sequence".into(),
+                ));
+            }
+            if pages == 10 {
+                break true;
+            }
+        };
         // Filter to only merged PRs, optionally after a timestamp
         let merged: Vec<PullRequest> = all_prs
             .into_iter()
-            .filter(|pr| pr.merged == Some(true))
+            // GitHub list responses identify merges by merged_at; the detail-only
+            // merged flag is optional on compatible providers. Honor an explicit false.
+            .filter(|pr| pr.base.ref_name == base && pr.state == "closed")
+            .filter(|pr| {
+                pr.merged.unwrap_or_else(|| {
+                    pr.merged_at
+                        .as_deref()
+                        .is_some_and(|date| chrono::DateTime::parse_from_rfc3339(date).is_ok())
+                })
+            })
             .filter(|pr| {
                 if let Some(ref since_dt) = since {
                     pr.merged_at
@@ -383,7 +420,10 @@ impl GitHubClient {
             })
             .collect();
         debug!(count = merged.len(), base = %base, pages, "fetched merged pull requests");
-        Ok(merged)
+        Ok(MergedPrScan {
+            prs: merged,
+            has_more,
+        })
     }
 
     /// Get commits for a specific pull request.
@@ -403,6 +443,9 @@ impl GitHubClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
+        if resp.headers().contains_key(reqwest::header::LINK) {
+            return Err(GitHubError::IncompletePrCommitList { pr_number });
+        }
         let commits: Vec<GitHubCommit> = resp.json().await?;
         debug!(count = commits.len(), pr_number, "fetched PR commits");
         Ok(commits)
@@ -653,6 +696,53 @@ impl GitHubClient {
         let user: GitHubUser = resp.json().await?;
         debug!(login = %user.login, "fetched authenticated user");
         Ok(user)
+    }
+
+    // GitHub may split Link across header fields. Read every relation and
+    // refuse unreadable metadata rather than treating a prefix as complete.
+    fn next_pr_page(resp: &reqwest::Response) -> Result<Option<reqwest::Url>, GitHubError> {
+        let malformed = || GitHubError::ParseError("invalid pull-request pagination link".into());
+        let mut next = None;
+        for header in resp.headers().get_all(reqwest::header::LINK) {
+            for link in header.to_str().map_err(|_| malformed())?.split(',') {
+                let (target, attrs) = link
+                    .trim()
+                    .strip_prefix('<')
+                    .and_then(|v| v.split_once('>'))
+                    .ok_or_else(malformed)?;
+                let mut has_rel = false;
+                for attr in attrs.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                    let (name, value) = attr.split_once('=').ok_or_else(malformed)?;
+                    if !name.trim().eq_ignore_ascii_case("rel") {
+                        continue;
+                    }
+                    has_rel = true;
+                    let value = value.trim();
+                    let relations = if let Some(quoted) = value.strip_prefix('"') {
+                        quoted.strip_suffix('"').ok_or_else(malformed)?
+                    } else {
+                        value
+                    };
+                    if relations.is_empty() {
+                        return Err(malformed());
+                    }
+                    if relations
+                        .split_ascii_whitespace()
+                        .any(|rel| rel.eq_ignore_ascii_case("next"))
+                    {
+                        let url = resp.url().join(target).map_err(|_| malformed())?;
+                        if url.origin() != resp.url().origin() || next.is_some() {
+                            return Err(malformed());
+                        }
+                        next = Some(url);
+                    }
+                }
+                if !has_rel {
+                    return Err(malformed());
+                }
+            }
+        }
+        Ok(next)
     }
 
     /// Parse the `rel="next"` URL from a GitHub `Link` response header.

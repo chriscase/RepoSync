@@ -7,12 +7,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::sync::Mutex;
 use tracing::{error, info, warn};
 
 use reposync_core::db::personal_scope::personal_scope_key;
-use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
 use reposync_core::db::Database;
 use reposync_core::git::client::GitClient;
 use reposync_core::git::github::GitHubClient;
@@ -25,7 +24,6 @@ use reposync_core::personal_config::PersonalConfig;
 use reposync_core::svn::SvnClient;
 
 use crate::git_to_svn::GitToSvnSync;
-use crate::pr_monitor::PrMonitor;
 use crate::svn_to_git::SvnToGitSync;
 
 /// Current state of the personal sync engine.
@@ -211,6 +209,12 @@ impl PersonalSyncEngine {
             Err(e) => {
                 self.set_state(PersonalSyncState::Error);
                 error!(error = %e, "Git→SVN sync failed");
+                let detail = match e.downcast_ref::<reposync_core::errors::GitHubError>() {
+                    Some(reason @ reposync_core::errors::GitHubError::IncompletePrDiscovery) => {
+                        reason.to_string()
+                    }
+                    _ => e.to_string(),
+                };
                 self.db
                     .insert_audit_log(
                         "git_to_svn",
@@ -218,7 +222,7 @@ impl PersonalSyncEngine {
                         None,
                         None,
                         None,
-                        Some(&e.to_string()),
+                        Some(&detail),
                         false,
                     )
                     .ok();
@@ -257,35 +261,8 @@ impl PersonalSyncEngine {
 
     /// Git → SVN sync phase (via merged PRs).
     async fn sync_git_to_svn(&self) -> Result<(u64, u64)> {
-        let held_git_to_svn_needs_promotion = self
-            .db
-            .active_personal_svn_commit_operation()
-            .context("failed to read active personal git-to-svn commit")?
-            .is_some_and(|op| op.state == SvnCommitOperationState::ReconciliationRequired);
-
-        let monitor = PrMonitor::new(&self.github_client, &self.db, &self.config);
-        let merged_prs = if held_git_to_svn_needs_promotion {
-            match monitor.check_for_merged_prs().await {
-                Ok(prs) => prs,
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "PR monitor failed while a held git-to-svn journal needs promotion; continuing with idle promotion only"
-                    );
-                    Vec::new()
-                }
-            }
-        } else {
-            monitor
-                .check_for_merged_prs()
-                .await
-                .context("failed to poll merged pull requests")?
-        };
-
-        if merged_prs.is_empty() && !held_git_to_svn_needs_promotion {
-            return Ok((0, 0));
-        }
-
+        // The syncer promotes any held journal before polling and fetches PR
+        // commits only when their merge reaches the front of the ordered queue.
         self.set_state(PersonalSyncState::ApplyingGitToSvn);
 
         let syncer = GitToSvnSync::new(

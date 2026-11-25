@@ -113,12 +113,14 @@ These are different in kind, not degree:
 | A repository entry in RepoSync was deleted and re-registered with the same label | The label (`id`) is not identity; RepoSync keys its recorded state by a separate scope identity so a reused label cannot adopt old state. |
 
 RepoSync's reviewed operations (late-pair and the v2 refresh) record the SVN
-UUID, URL, path and copy-ancestry of what they act on. **Re-anchor, the
-operation that would deliberately replace a pair's lineage, is not implemented**
-(`reanchor_not_implemented`), and it is deliberately not an alias for refresh,
-reset, force-push or deleting the old SVN path. We did not find code in the
-*ordinary* sync path that detects a branch recreation as such, so do not assume
-RepoSync will notice one.
+UUID, URL, path and copy-ancestry of what they act on. A separately approved
+[local re-anchor](refresh.md#local-only-update-and-re-anchor) normally starts
+a new generation without changing the old SVN path or the local paired branch
+tip. A separately approved same-name re-anchor instead commits replacement
+contents at the current SVN path and moves the local paired tip, while keeping
+prior history. Neither is network re-anchor, an ordinary refresh, a reset,
+a force-push or permission to delete an SVN path. Do not assume ordinary sync
+will detect every recreation or can reattach a reused path safely.
 
 **If you suspect a lineage event:** stop pushing, do not "reconnect" by editing
 anything, and ask an administrator to inspect with the preview and review tools in

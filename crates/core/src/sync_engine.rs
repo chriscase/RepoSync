@@ -151,6 +151,16 @@ pub struct SyncStats {
 struct TeamHistoryAdmission {
     checkpoint: String,
     remote_tip: String,
+    local_tip: String,
+    local_ref: String,
+}
+
+fn bridge_symbolic_head(git: &GitClient) -> Result<Option<String>, SyncError> {
+    let reference = git
+        .repo()
+        .find_reference("HEAD")
+        .map_err(crate::errors::GitError::from)?;
+    Ok(reference.symbolic_target().map(str::to_owned))
 }
 
 /// Git changes selected for one sync cycle, including continuation metadata.
@@ -2408,11 +2418,21 @@ impl SyncEngine {
             .git_client
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let local_ref = format!("refs/heads/{}", self.config.github.default_branch);
+        if bridge_symbolic_head(&git)?.as_deref() != Some(local_ref.as_str()) {
+            return Err(self.record_history_block(
+                "checkout_branch_mismatch",
+                "managed bridge HEAD is not on the configured branch",
+                p.as_deref(),
+                None,
+                None,
+                None,
+            ));
+        }
+        let local_tip = git.head_sha()?;
         let http_token = git.stored_http_auth_token();
         let refresh = match (self.effective_repo_id(), p.as_deref()) {
-            (Some(id), Some(checkpoint))
-                if git.head_sha().map_err(SyncError::GitError)? != checkpoint =>
-            {
+            (Some(id), Some(checkpoint)) if local_tip != checkpoint => {
                 // A refusal here grants no exception; the ordinary inspector
                 // remains authoritative for all other local-history shapes.
                 crate::pair_refresh::engine_checkout::CompletedRefreshCheckout::capture(
@@ -2433,10 +2453,26 @@ impl SyncEngine {
             http_token.as_deref(),
             refresh.as_ref(),
         ) {
-            Ok(admission) => Ok(TeamHistoryAdmission {
-                checkpoint: admission.checkpoint,
-                remote_tip: admission.remote_tip,
-            }),
+            Ok(admission) => {
+                if bridge_symbolic_head(&git)?.as_deref() != Some(local_ref.as_str())
+                    || git.head_sha()? != local_tip
+                {
+                    return Err(self.record_history_block(
+                        "checkout_drift",
+                        "managed bridge branch or tip changed during Git admission",
+                        Some(&admission.checkpoint),
+                        None,
+                        Some(&admission.remote_tip),
+                        Some(&local_tip),
+                    ));
+                }
+                Ok(TeamHistoryAdmission {
+                    checkpoint: admission.checkpoint,
+                    remote_tip: admission.remote_tip,
+                    local_tip,
+                    local_ref,
+                })
+            }
             Err(reject) => Err(self.record_history_block(
                 &reject.reason,
                 &reject.detail,
@@ -2492,21 +2528,6 @@ impl SyncEngine {
         // before that call, not merely before the later destructive reset.
         let admission = tokio::task::block_in_place(|| self.inspect_team_history())?;
 
-        // On a pinned old import, both legacy copies point to the imported
-        // SVN mapping. Materialize that verified baseline before diagnostics
-        // can expire; never derive it from a later retained row.
-        if let Some(rid) = self.effective_repo_id() {
-            let (revision, column) = self
-                .db
-                .get_repo_watermark(rid)
-                .map_err(SyncError::DatabaseError)?;
-            let kv = crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&self.db, rid)
-                .map_err(SyncError::DatabaseError)?;
-            if column == admission.checkpoint && kv.as_deref() == Some(column.as_str()) {
-                self.materialize_git_baseline(&column, revision)?;
-            }
-        }
-
         // 1. Fetch changes from both sides.
         let svn_changes = self.fetch_svn_changes().await?;
         let git_fetch = self.fetch_git_changes(&admission, &svn_changes).await?;
@@ -2525,6 +2546,9 @@ impl SyncEngine {
             return Ok(());
         }
 
+        self.refuse_ambiguous_svn_publication(&admission, &svn_changes, &git_fetch)
+            .await?;
+
         let batch_continuation =
             git_fetch
                 .continuation_to_persist
@@ -2537,10 +2561,6 @@ impl SyncEngine {
                         .map(|change| change.sha.clone())
                         .collect(),
                 });
-        if let Some(continuation) = batch_continuation.as_ref() {
-            self.persist_pre_batch_git_replay_continuation(continuation)?;
-        }
-
         // 2. Detect conflicts against the full admitted P→R path, not only the replay batch.
         self.ensure_conflict_coverage_before_detection(
             git_fetch.has_more,
@@ -2593,6 +2613,28 @@ impl SyncEngine {
         }
 
         self.refuse_apply_while_persisted_conflicts_block()?;
+
+        // On a pinned old import, both legacy copies point to the imported
+        // SVN mapping. Materialize that verified baseline before diagnostics
+        // can expire; never derive it from a later retained row.
+        if let Some(rid) = self.effective_repo_id() {
+            let (revision, column) = self
+                .db
+                .get_repo_watermark(rid)
+                .map_err(SyncError::DatabaseError)?;
+            let kv = crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&self.db, rid)
+                .map_err(SyncError::DatabaseError)?;
+            if column == admission.checkpoint && kv.as_deref() == Some(column.as_str()) {
+                self.materialize_git_baseline(&column, revision)?;
+            }
+        }
+
+        if let Some(continuation) = batch_continuation.as_ref() {
+            self.persist_pre_batch_git_replay_continuation(continuation)?;
+        }
+        tokio::task::block_in_place(|| {
+            self.checkout_admitted_git_batch(&admission, &git_fetch.reset_target)
+        })?;
 
         // 3. Apply SVN -> Git.
         let convergence = if git_fetch.replay_batch.is_empty()
@@ -3125,10 +3167,7 @@ impl SyncEngine {
 
             // 3. Commit with identity and sync marker, persist durable intent,
             // push, then confirm only with observed Git ref/tree evidence.
-            let commit_message = format!(
-                "{}\n\n{} synced from SVN r{}",
-                change.message, SYNC_MARKER, change.revision
-            );
+            let commit_message = svn_to_git_commit_message(&change.message, change.revision);
             let branch = self.config.github.default_branch.clone();
             let remote = "origin".to_string();
             let repo_id = self.effective_repo_id().map(str::to_owned);
@@ -5264,29 +5303,6 @@ impl SyncEngine {
             admission.remote_tip.clone()
         };
 
-        // Reset only through the replay batch tip while continuation is
-        // incomplete. A hard reset to the full admitted R would leave unreplayed
-        // Git history on the bridge and invite unsafe opposite-direction writes.
-        let reset = tokio::task::block_in_place(|| {
-            Command::new("git")
-                .args(["reset", "--hard", &reset_target])
-                .current_dir(git.repo_path())
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .output()
-        })
-        .map_err(crate::errors::GitError::IoError)?;
-        if !reset.status.success() {
-            return Err(SyncError::GitError(crate::errors::GitError::Git2Error(
-                git2::Error::from_str("git reset to replay target failed"),
-            )));
-        }
-        if git.head_sha().map_err(SyncError::GitError)? != reset_target {
-            return Err(SyncError::HistoryBlocked {
-                reason: "post_reset_tip_mismatch".into(),
-                detail: "bridge did not reach the replay checkout target".into(),
-            });
-        }
-
         let replay_batch = self.git_change_sets_from_commits(&git, &selection.commits)?;
         let conflict_coverage = self.git_change_sets_from_commits(&git, &conflict_commits)?;
         let conflict_coverage_skipped = conflict_commits.len() - conflict_coverage.len();
@@ -5310,6 +5326,311 @@ impl SyncEngine {
             continuation_to_persist,
             clear_continuation,
         })
+    }
+
+    /// Corroborate a narrow unreceipted publication without asserting provenance.
+    async fn refuse_ambiguous_svn_publication(
+        &self,
+        admission: &TeamHistoryAdmission,
+        svn_changes: &[SvnChangeSet],
+        git_fetch: &GitFetchResult,
+    ) -> Result<(), SyncError> {
+        use crate::db::lineage_checkpoints::{
+            load_canonical_lineage, load_directional_checkpoint, svn_source_key,
+            CheckpointDirection, MappingOutcome,
+        };
+        let (Some(repo_id), [svn_change], [git_change]) = (
+            self.effective_repo_id(),
+            svn_changes,
+            git_fetch.conflict_coverage.as_slice(),
+        ) else {
+            return Ok(());
+        };
+        if !self.allowed_paths.is_empty()
+            || !self.blocked_patterns.is_empty()
+            || git_fetch.has_more
+            || git_fetch.pending_total != 1
+            || git_change.sha != admission.remote_tip
+        {
+            return Ok(());
+        }
+        let ([svn_file], [git_file]) = (
+            svn_change.changed_files.as_slice(),
+            git_change.changed_files.as_slice(),
+        ) else {
+            return Ok(());
+        };
+        if svn_file.action != "A"
+            || git_file.action != "A"
+            || svn_file.rename_from.is_some()
+            || git_file.rename_from.is_some()
+            || svn_file.path != git_file.path
+        {
+            return Ok(());
+        }
+        let expected = svn_to_git_commit_message(&svn_change.message, svn_change.revision);
+        let message = git_change.message.as_str();
+        if message != expected.as_str() && message.strip_suffix('\n') != Some(expected.as_str()) {
+            return Ok(());
+        }
+
+        let Some(lineage) =
+            load_canonical_lineage(&self.db, repo_id).map_err(SyncError::DatabaseError)?
+        else {
+            return Ok(());
+        };
+        let (prior, checkpoint_sha) = self
+            .db
+            .get_repo_watermark(repo_id)
+            .map_err(SyncError::DatabaseError)?;
+        if prior <= 0
+            || prior.checked_add(1) != Some(svn_change.revision)
+            || checkpoint_sha != admission.checkpoint
+            || !self
+                .db
+                .has_repo_emitted_git_commit(repo_id, &checkpoint_sha)
+                .map_err(SyncError::DatabaseError)?
+        {
+            return Ok(());
+        }
+        let branch = self.config.github.default_branch.as_str();
+        if !matches!(lineage.git_ref.as_deref(), Some(value)
+            if value == branch || value == admission.local_ref.as_str())
+        {
+            return Ok(());
+        }
+        let Some(retained) = self
+            .db
+            .latest_git_push_operation(repo_id)
+            .map_err(SyncError::DatabaseError)?
+        else {
+            return Ok(());
+        };
+        if retained.state != GitPushOperationState::Completed
+            || retained.repo_id != repo_id
+            || retained.initiator_id != "team_worker"
+            || retained.source_svn_rev != prior
+            || retained.pre_push_git_remote != "origin"
+            || retained.pre_push_git_branch != branch
+            || retained.target_fingerprint != git_push_target_fingerprint(repo_id, "origin", branch)
+            || retained.intended_local_git_sha != checkpoint_sha
+            || retained.last_confirmed_git_sha.as_deref() != Some(checkpoint_sha.as_str())
+        {
+            return Ok(());
+        }
+
+        let checkpoint = load_directional_checkpoint(
+            &self.db.conn(),
+            &lineage.scope_uuid,
+            lineage.generation,
+            CheckpointDirection::SvnToGit,
+        )
+        .map_err(SyncError::DatabaseError)?;
+        if !checkpoint.is_some_and(|checkpoint| {
+            checkpoint.handled_source_key == svn_source_key(prior)
+                && checkpoint.outcome == MappingOutcome::AppliedAndVerified
+                && checkpoint.target_git_sha.as_deref() == Some(checkpoint_sha.as_str())
+        }) {
+            return Ok(());
+        }
+
+        let path = git_file.path.as_str();
+        let git_bytes = {
+            let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+            let repo = git.repo();
+            let (prior_parent, prior_tree) = git.commit_parent_and_tree(&checkpoint_sha)?;
+            if prior_parent.as_deref() != Some(retained.pre_push_git_sha.as_str())
+                || retained.intended_local_git_parent != prior_parent
+                || retained.intended_local_git_tree != prior_tree
+                || retained.last_confirmed_git_tree.as_deref() != Some(prior_tree.as_str())
+            {
+                return Ok(());
+            }
+            let oid =
+                git2::Oid::from_str(&git_change.sha).map_err(crate::errors::GitError::from)?;
+            let commit = repo
+                .find_commit(oid)
+                .map_err(crate::errors::GitError::from)?;
+            if commit.parent_count() != 1
+                || commit
+                    .parent_id(0)
+                    .map_err(crate::errors::GitError::from)?
+                    .to_string()
+                    != admission.checkpoint
+                || commit.committer().name() != Some("reposync")
+                || commit.committer().email() != Some("sync@reposync.local")
+                || git.changed_entry_modes(&git_change.sha, path)? != (None, Some(0o100644))
+            {
+                return Ok(());
+            }
+            let Some(bytes) = git.get_file_content_at_commit(&git_change.sha, path)? else {
+                return Ok(());
+            };
+            bytes
+        };
+
+        // Re-observe the pinned SVN UUID/path at the exact revision, rather
+        // than interpreting the remote Git object's public text as authority.
+        let svn = self
+            .svn_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        for revision in [prior, svn_change.revision] {
+            let source = svn.info_at_rev(revision).await?;
+            let Some(identity) = checked_svn_path_identity(&source.root_url, &source.url) else {
+                return Ok(());
+            };
+            if source.uuid != lineage.svn_uuid
+                || identity.root_url != lineage.svn_root_url
+                || identity.branch_path != lineage.svn_branch_path
+                || crate::path_projection::normalize_svn_url(&source.url) != lineage.svn_url
+            {
+                return Ok(());
+            }
+        }
+        // The old journal does not carry a UUID. Pair both independently
+        // pinned SVN snapshots with the retained journal's own prior log entry.
+        let prior_log = svn.log(prior, prior).await?;
+        if !matches!(prior_log.as_slice(), [entry]
+            if entry.revision == prior
+                && entry.author == retained.source_svn_author
+                && entry.message == retained.source_svn_message)
+        {
+            return Ok(());
+        }
+        let props = svn
+            .file_properties_at_rev(path, svn_change.revision)
+            .await?;
+        if props.contains("<property ") || props.contains("<property>") {
+            return Ok(());
+        }
+        let svn_text = svn.cat(path, svn_change.revision).await?;
+        // The text API can decode lossy; never corroborate on replacement bytes.
+        if svn_text.contains('\u{fffd}') || svn_text.as_bytes() != git_bytes.as_slice() {
+            return Ok(());
+        }
+
+        // Re-prove each cycle. No public signature is authority to mint a
+        // receipt or to create an irreversible block that cannot be corrected.
+        Err(self.record_history_block(
+            "unreceipted_svn_publication",
+            "a published Git child matches the verified SVN change but has no scoped receipt; reconcile repository state before sync",
+            Some(&admission.checkpoint),
+            None,
+            Some(&admission.remote_tip),
+            Some(&admission.local_tip),
+        ))
+    }
+
+    fn checkout_admitted_git_batch(
+        &self,
+        admission: &TeamHistoryAdmission,
+        reset_target: &str,
+    ) -> Result<(), SyncError> {
+        let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+        let local = git.head_sha()?;
+        let reject = |reason, detail| {
+            self.record_history_block(
+                reason,
+                detail,
+                Some(&admission.checkpoint),
+                None,
+                Some(&admission.remote_tip),
+                Some(&local),
+            )
+        };
+        let verify_admitted_checkout = || {
+            if admission.local_ref != format!("refs/heads/{}", self.config.github.default_branch)
+                || bridge_symbolic_head(&git)?.as_deref() != Some(admission.local_ref.as_str())
+                || git.head_sha()? != admission.local_tip
+            {
+                Err(reject(
+                    "checkout_drift",
+                    "managed bridge branch or tip changed since Git admission",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        verify_admitted_checkout()?;
+        let run = |args: &[&str]| {
+            crate::git::subprocess_auth::git_cli_output(git.repo_path(), args, None)
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| out.stdout)
+        };
+        // The cycle may have performed SVN I/O since inspecting the bridge.
+        let status = run(&[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ])
+        .ok_or_else(|| {
+            reject(
+                "local_status_error",
+                "bridge index/worktree could not be inspected",
+            )
+        })?;
+        if !status.is_empty() {
+            return Err(reject(
+                "local_dirty",
+                "bridge index or worktree has unpublished changes",
+            ));
+        }
+        let ignored = run(&[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ])
+        .ok_or_else(|| {
+            reject(
+                "local_status_error",
+                "ignored bridge paths could not be inspected",
+            )
+        })?;
+        let target =
+            run(&["ls-tree", "-r", "--name-only", "-z", reset_target]).ok_or_else(|| {
+                reject(
+                    "inspection_command_failed",
+                    "incoming batch tree could not be inspected",
+                )
+            })?;
+        if crate::history_inspect::ignored_checkout_path_collision(&ignored, &target) {
+            return Err(reject(
+                "ignored_path_collision",
+                "incoming tracked paths overlap ignored bridge data",
+            ));
+        }
+
+        // Use the preflighted object and exact symbolic branch; never refetch
+        // or reset to a moving ref at the mutation boundary.
+        verify_admitted_checkout()?;
+        // Reset only through the selected replay batch, never past unhandled work.
+        let reset = Command::new("git")
+            .args(["reset", "--hard", reset_target])
+            .current_dir(git.repo_path())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(crate::errors::GitError::IoError)?;
+        if !reset.status.success() {
+            return Err(SyncError::GitError(crate::errors::GitError::Git2Error(
+                git2::Error::from_str("git reset to replay target failed"),
+            )));
+        }
+        if bridge_symbolic_head(&git)?.as_deref() != Some(admission.local_ref.as_str())
+            || git.head_sha()? != reset_target
+        {
+            return Err(reject(
+                "post_reset_tip_mismatch",
+                "managed bridge branch or tip does not match the replay checkout target",
+            ));
+        }
+        Ok(())
     }
 
     fn git_change_sets_from_commits(
@@ -5753,6 +6074,10 @@ impl SyncEngine {
 // ---------------------------------------------------------------------------
 // SVN diff → git diff conversion
 // ---------------------------------------------------------------------------
+
+fn svn_to_git_commit_message(message: &str, revision: i64) -> String {
+    format!("{message}\n\n{SYNC_MARKER} synced from SVN r{revision}")
+}
 
 /// Convert SVN unified diff format to git-compatible format.
 ///
@@ -7711,6 +8036,70 @@ repo = "test/test-repo"
         let blocked = vec!["*.exe".to_string()];
         let files = vec![make_file("A", "source/foo.rs")];
         assert!(validate_file_paths_impl(&[], &blocked, &files).is_ok());
+    }
+
+    #[test]
+    fn team_checkout_refuses_same_sha_branch_switch_or_detach() {
+        let (engine, git_dir) = team_echo_engine_with_git_dir("pair");
+        let branch = format!("refs/heads/{}", engine.config.github.default_branch);
+        engine
+            .git_client
+            .lock()
+            .unwrap()
+            .ensure_head_on_branch(&engine.config.github.default_branch)
+            .unwrap();
+        let parent = git_fixture_commit(git_dir.path(), "base.txt", "base\n", "base");
+        let child = git_fixture_commit(git_dir.path(), "child.txt", "child\n", "child");
+        let repo = git2::Repository::open(git_dir.path()).unwrap();
+        let parent_oid = git2::Oid::from_str(&parent).unwrap();
+        let child_oid = git2::Oid::from_str(&child).unwrap();
+        repo.reset(
+            repo.find_commit(parent_oid).unwrap().as_object(),
+            git2::ResetType::Hard,
+            None,
+        )
+        .unwrap();
+        let unrelated_branch = "refs/heads/other";
+        repo.reference(unrelated_branch, parent_oid, false, "fixture")
+            .unwrap();
+        let admission = TeamHistoryAdmission {
+            checkpoint: parent.clone(),
+            remote_tip: child.clone(),
+            local_tip: parent,
+            local_ref: branch.clone(),
+        };
+        for detach in [false, true] {
+            if detach {
+                repo.set_head_detached(parent_oid).unwrap();
+            } else {
+                repo.set_head(unrelated_branch).unwrap();
+            }
+            assert_eq!(repo.head().unwrap().target(), Some(parent_oid));
+            assert!(matches!(
+                engine.checkout_admitted_git_batch(&admission, &child),
+                Err(SyncError::HistoryBlocked { reason, .. }) if reason == "checkout_drift"
+            ));
+            assert_eq!(repo.head().unwrap().target(), Some(parent_oid));
+            assert_eq!(repo.head_detached().unwrap(), detach);
+            assert_eq!(
+                repo.find_reference("HEAD").unwrap().symbolic_target(),
+                if detach { None } else { Some(unrelated_branch) },
+            );
+            assert_eq!(repo.refname_to_id(&branch).unwrap(), parent_oid);
+            assert_eq!(repo.refname_to_id(unrelated_branch).unwrap(), parent_oid);
+            assert!(!git_dir.path().join("child.txt").exists());
+        }
+
+        repo.set_head(&branch).unwrap();
+        engine
+            .checkout_admitted_git_batch(&admission, &child)
+            .unwrap();
+        assert_eq!(repo.refname_to_id(&branch).unwrap(), child_oid);
+        assert_eq!(repo.refname_to_id(unrelated_branch).unwrap(), parent_oid);
+        assert_eq!(
+            std::fs::read(git_dir.path().join("child.txt")).unwrap(),
+            b"child\n",
+        );
     }
 
     #[test]

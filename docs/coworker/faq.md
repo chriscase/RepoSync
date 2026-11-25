@@ -5,7 +5,9 @@
 Labels are defined in the [index](README.md#availability-labels). Everything here
 was checked against source at commit
 [`ade6f9c`](https://github.com/chriscase/RepoSync/commit/ade6f9cb383f76d65c6610ef21eec2199f6c23b5);
-nothing here was observed on a running installation.
+the refresh, status and safeguard entries below also account for
+[the later Reliability source](https://github.com/chriscase/RepoSync/blob/0f010a232a29489b31a1c73500040f766c739f81/docs/reliability/git-workflows.md).
+Nothing here was observed on a running installation.
 
 ## Current versus planned, at a glance
 
@@ -22,14 +24,14 @@ nothing here was observed on a running installation.
 | Late-pair publish, status, resume, cancel (reviewed v2); v1 publish | **In tree**; no live qualification claimed | [Pairing](svn-origin-and-pairing.md#step-2-publish-only-on-a-reviewed-result) |
 | "Start from now" (`skip_import`) | Refused unless a compatibility flag is also set; checkpoints are not advanced | [Pairing](svn-origin-and-pairing.md#what-not-to-use) |
 | Pair refresh preview (v1) | **In tree, read-only** | [Refresh](refresh.md) |
-| Pair refresh execute through v1 | **Not implemented** (`refresh_execute_not_implemented`) | [Refresh](refresh.md) |
-| Pair refresh v2 review (inspection) | **In tree, draft, read-only** | [Refresh](refresh.md#step-2-draft-v2-review-prepare-approve) |
-| Pair refresh v2 prepare, approve, execute, receipt, recovery mode | **In tree, draft**; qualification gates open | [Refresh](refresh.md#step-2-draft-v2-review-prepare-approve) |
-| Re-anchor / recreate a pair | **Not implemented** (`reanchor_not_implemented`) | [Refresh](refresh.md), [Rewrites](history-rewrites-and-svn-merges.md) |
+| Pair refresh execute through v1 | **Local-only, sandbox-evidenced**: service-backed update; a v1 preview is not approval | [Refresh](refresh.md#local-only-update-and-re-anchor) |
+| Pair refresh v2 review (inspection) | **In tree, read-only**; review does not authorize execution | [Refresh](refresh.md#step-2-v2-review-prepare-approve) |
+| Pair refresh v2 prepare, approve, execute, receipt, recovery mode | **In tree**, bounded; no live or release claim | [Refresh](refresh.md#step-2-v2-review-prepare-approve) |
+| Re-anchor / recreate a pair | **Local-only**: separately approved; default creates a new path, while same-name replaces current contents and moves the local paired tip; not network re-anchor | [Refresh](refresh.md#local-only-update-and-re-anchor) |
 | Automatic or push-triggered refresh | **Held / planned**; no safe auto-refresh is described or claimed | [Refresh](refresh.md) |
-| Opt-in manual request workflow and client | **Held** in this documentation lane | [Held and unavailable](held-and-unavailable.md) |
-| Hook installer / remover | **Held**; none exists | [Branch policy and hooks](branch-policy-and-hooks.md) |
-| Branch rules for paired refs | **Recommendation only**; nothing applied | [Branch policy and hooks](branch-policy-and-hooks.md#recommendation-for-paired-refs) |
+| Opt-in manual CLI/workflow | **In tree** for preview and named status; client sandbox-tested, Actions activation and approved refresh submission still held | [Operator guide](../reliability/git-workflows.md#manual-client-and-workflow) |
+| Paired-branch hook installer / remover | **Local-only, sandbox-evidenced** for a supported Git; opt-in for one clone and its linked worktrees | [Preview, install and remove](../reliability/git-workflows.md#local-hooks) |
+| Branch rules for paired refs | **Recommendation only**; no rule or bypass applied by this work | [Branch policy and hooks](branch-policy-and-hooks.md#recommendation-for-paired-refs) |
 | Downloadable Git `pre-commit` path-rule script | **In tree** | [Branch policy and hooks](branch-policy-and-hooks.md) |
 | A passing live qualification of any of the above | **Not claimed** | [Evidence](#what-evidence-exists-and-where-it-stops) |
 
@@ -47,9 +49,9 @@ pre-receive barrier. See [Branch policy](branch-policy-and-hooks.md#push-trigger
 
 ### Can a local Git hook stop it?
 
-Only on the machine that installed it, and only until someone passes `--no-verify`,
-changes `core.hooksPath`, uses a clone without the hook, or uses a tool that does
-not run it. It is a seatbelt, not a lock. See [Local hooks](branch-policy-and-hooks.md#local-hooks-useful-nudges-not-enforcement).
+The checks run in worktrees of the opted-in clone. A developer can bypass
+local hooks, use a different clone, or publish with another client. Only
+the host can apply a rule to pushes from every client. [Local checks and limits](../reliability/git-workflows.md#local-hooks)
 
 ### What can actually prevent it?
 
@@ -89,10 +91,9 @@ read-only preview or review. See [Requesting a refresh](refresh.md).
 
 **None is claimed.** What we can establish:
 
-- The repository has **no published GitHub release** (the release list was empty when this was written, 2026-11-06).
-- The only tags are ten evidence-style tags such as `rs69-lifecycle-…-v1`, `rs112-verify-…-v1` and `rs64-setup-idle-…-v1`. None is a `v*` tag, which is what the release workflow triggers on. This guide has not examined what those tags contain and does not treat them as a release or a qualification.
-- The workspace crate version is `0.1.0`.
-- So there is no release number to put in a support table, and we are not inventing one.
+- The repository's GitHub release list was empty when checked for this update.
+  Evidence tags and a workspace crate version are not released or supported versions.
+- The fixture and hosted CI receipts below identify source commits, not installed versions.
 
 To find out what a particular running server is: `GET /api/status/health` needs no
 sign-in and returns `ok`, `version` and `git_commit`. Compare `git_commit` to the commit
@@ -113,26 +114,32 @@ Where it stops:
 
 - Fixture and loopback tests are not an enterprise or live qualification. The matrix says
   "local/offline PASS is not enterprise/live PASS" and that no live acceptance is authorized by it.
-- The v2 refresh contract says its full qualification, exact-head CI and independent review
-  are still open, and that positive Linux restart recovery still needs to be executed.
-- Nothing in this guide set ran a build, a test suite, a server, a workflow or a live service.
-  The only things run were `git` commands in a throwaway repository, read-only lookups of the repository and
-  issue, and static checks of these pages (links, anchors, source line ranges, example syntax).
-- Hosted-runner, self-hosted-runner and GitHub Enterprise behavior for any workflow is untested here.
-- No sandbox run of a request workflow with live secrets exists to link.
+- [#258](https://github.com/chriscase/RepoSync/pull/258) closed #69 for the bounded local
+  update/re-anchor scope. Its [source CI](https://github.com/chriscase/RepoSync/actions/runs/42933526424)
+  does not establish network re-anchor, installed-version support, or enterprise use.
+- [#292](https://github.com/chriscase/RepoSync/pull/292) and its
+  [receiving CI](https://github.com/chriscase/RepoSync/actions/runs/44507834160)
+  exercised named operation status against the ordinary API and tested uncertain replies with
+  disposable fixtures. The workflow source was inspected; no dispatch with live credentials was run.
+- [#293](https://github.com/chriscase/RepoSync/pull/293) and its
+  [receiving CI](https://github.com/chriscase/RepoSync/actions/runs/44519363189)
+  exercised local paired-branch hooks on Git 2.56.1 and verified refusal on older Git.
+  They did not apply or qualify a live rule.
+- These are historical receipts at their linked commits. This guide update does
+  not rerun them or claim a released, deployed or enterprise configuration.
 
 ### Where older documents disagree with the source
 
-These documents were written for the first #71 slice and are not edited here. Where
-they differ from the pinned source, follow the source.
+These are historical descriptions of earlier implementations. Some have already
+been corrected in the current [operator guide](../reliability/git-workflows.md).
 
-| Older statement | At the pinned commit |
+| Older statement | What to use now |
 | --- | --- |
 | [`coworker-FAQ.md`](../reliability/coworker-FAQ.md) and [`git-workflows.md`](../reliability/git-workflows.md): a late-pair request with `dry_run: false` "returns `publish_not_implemented`" and "this slice does not create the SVN branch, the child row, or a checkpoint". | No code in `crates/` emits `publish_not_implemented`. The handler contains a publish path (v1) and a reviewed v2 publish/status/resume/cancel path. Whether either works in a live installation is not shown. |
 | `git-workflows.md`: "Status and cancel require the initiating user or an admin." | True for import status and cancel. **SVN-commit status and Git-push status require an admin**, and every reconcile route listed in the status page requires an admin (or, for v2 refresh, the original admin actor). |
 | Both: `POST /api/repos/{id}/sync` "records a scheduler request". | It writes an audit row; we found no reader of it. |
-| `git-workflows.md`: "Issue #69 execution is not implemented." | True of the v1 route. A separate **v2** prepare/approve/execute/receipt API exists in the tree as an unqualified draft. |
+| Earlier #71 docs: `refresh_execute_not_implemented` and `reanchor_not_implemented` were the only outcomes. | Current source has local service-backed operations. A v1 preview still cannot approve a writer, and network re-anchor is not supported. See [Refresh](refresh.md). |
 | `git-workflows.md`: the sections on reconciliation list one import reconcile route. | Separate reconcile routes also exist for SVN commits and Git pushes. |
 
-The first #71 slice also left a manual client script and a `workflow_dispatch`
-workflow in the tree; see [Held and unavailable](held-and-unavailable.md#the-first-slice-artifacts-already-in-the-tree).
+See [what is still held](held-and-unavailable.md#the-held-remainder) before
+considering any workflow or host changes.

@@ -258,7 +258,7 @@ email_domain = "example.com"
 [web]
 listen = "127.0.0.1:3000"
 auth_mode = "simple"
-admin_password_env = "ADMIN_PASSWORD"
+admin_password_env = "REPOSYNC_ADMIN_PASSWORD"
 
 [notifications]
 # slack_webhook_url_env = "SLACK_WEBHOOK_URL"

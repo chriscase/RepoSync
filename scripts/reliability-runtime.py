@@ -22,7 +22,7 @@ MANDATORY = {
                   "R16_TRANSPORT", "R16_AUTH", "R16_FETCH", "R10_MISSING_OBJECT",
                   "R10_MISSING_CURSOR", "R10_AMBIGUOUS",
                   "R10_SHALLOW", "R10_ANCESTRY_ERROR", "R09_LOCAL", "R10_MERGE",
-                  "R10_OVERFLOW", "R17_SCOPE",
+                  "R10_OVERFLOW", "R17_SCOPE", "R17_MANAGED_FULL_IMPORT_OVERLAP",
                   "R17_SVNSERVE_CONCURRENT_OVERLAP", "R17_SVNSERVE_CHECKPOINT_ISOLATION",
                   "R17_SVNSERVE_CREDENTIAL_ISOLATION", "R17_SVNSERVE_JOB_ISOLATION"},
 }
@@ -86,7 +86,7 @@ MANDATORY["candidate"].update({"74_CLEANUP_CLASSIFIER", "74_UNCERTAIN_APPLY_TIME
 MANDATORY["candidate"].update({"64B_LOST_REPLY_COMPLETE", "64B_FINALIZER_RECOVERY",
                                "64B_REMOTE_MISSING", "64B_REMOTE_MISMATCH", "64B_REMOTE_ADVANCED",
                                "64B_INSPECTION_FAILURE", "64B_CONFIG_CHANGED",
-                               "64B_PARTIAL_CONFIRMED", "64B_STALE_ID", "64B_AUTH", "64B_RACE"})
+                               "64B_PARTIAL_CONFIRMED", "R04_VERIFIED_PARTIAL_RESUME", "64B_STALE_ID", "64B_AUTH", "64B_RACE"})
 MANDATORY["candidate"].update({"64FENC_REFUSE_SECOND_HOST", "64FENC_STALE_TAKEOVER",
                                "64FENC_SUPERSEDED_FINALIZE", "64FENC_IMPORT_FINALIZE",
                                "64FENC_SYNC_CONFIRM", "64FENC_NO_IDENTITY_REFUSE",
@@ -1025,6 +1025,13 @@ def materialize_node_wrapper():
     return chosen
 
 
+def require_mandatory_cases(manifest):
+    for tier, mandatory in MANDATORY.items():
+        missing = mandatory - {case["id"] for case in manifest[tier]}
+        if missing:
+            raise AssertionError(f"required {tier} case omitted: {sorted(missing)}")
+
+
 def main():
     os.environ.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     materialize_node_wrapper()
@@ -1072,9 +1079,7 @@ def main():
         "adapter_sha256": (old_tests / "overlay.sha256").read_text().split()[0],
         "lock_sha256": os.environ["REPOSYNC_LOCK_SHA256"],
     }, indent=2) + "\n")
-    for tier, mandatory in MANDATORY.items():
-        actual = {c["id"] for c in manifest[tier]}
-        assert mandatory <= actual, f"required {tier} case omitted: {sorted(mandatory - actual)}"
+    require_mandatory_cases(manifest)
     omitted_r09 = {c["id"] for c in manifest["candidate"] if c["id"] != "R09_REPLACEMENT"}
     assert not MANDATORY["candidate"] <= omitted_r09, "R09 omission self-test failed"
     required = (manifest["diagnostics"] if mode in ("diagnostics", "all") else []) + \

@@ -12,6 +12,7 @@ use crate::errors::DatabaseError;
 use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
 
 const PREFIX: &str = "svn_to_git_push_v1:";
+const MANAGED_PUSH_CONFIRMED: &str = "SVN-to-Git push verified and recorded";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +107,161 @@ pub fn git_push_target_fingerprint(repo_id: &str, git_remote: &str, git_branch: 
     })
     .to_string();
     hex::encode(Sha256::digest(source.as_bytes()))
+}
+
+/// Strong local evidence may veto copying a stale column. It cannot establish a replacement baseline.
+pub(super) fn later_finalized_svn_checkpoint(
+    tx: &Connection,
+    repo_id: &str,
+    column_revision: i64,
+) -> Result<Option<i64>, DatabaseError> {
+    use super::lineage_checkpoints::{
+        load_directional_checkpoint, load_mapping_outcome, svn_source_key, CheckpointDirection,
+        MappingOutcome,
+    };
+    use super::personal_scope::PERSONAL_SCOPE_KEY;
+    use super::repo_scope_identity::{
+        legacy_repo_echo_generation_kv_key, repo_echo_generation_kv_key,
+        LEGACY_REPO_ID_KV_READS_KEY,
+    };
+
+    if repo_id == PERSONAL_SCOPE_KEY {
+        return Ok(None);
+    }
+    let canonical_tables: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('canonical_lineage','canonical_checkpoints','canonical_mapping_outcomes')",
+        [], |r| r.get(0),
+    )?;
+    match canonical_tables {
+        0 => return Ok(None),
+        3 => (),
+        _ => {
+            return Err(DatabaseError::Other(
+                "cannot backfill SVN cursor: canonical checkpoint schema is incomplete".into(),
+            ))
+        }
+    }
+    let Some(id) = read_value(tx, &key("latest", repo_id))? else {
+        return Ok(None);
+    };
+    let raw = read_value(tx, &key("document", &id))?.ok_or_else(|| {
+        DatabaseError::Other(
+            "cannot backfill SVN cursor: latest SVN-to-Git push document is missing".into(),
+        )
+    })?;
+    let op = parse(&raw)?;
+    if op.repo_id != repo_id || op.id != id {
+        return Err(DatabaseError::Other(
+            "cannot backfill SVN cursor: latest SVN-to-Git push identity differs from its pointer"
+                .into(),
+        ));
+    }
+    if op.state != GitPushOperationState::Completed || op.source_svn_rev <= column_revision {
+        return Ok(None);
+    }
+    let registration: Option<(Option<String>, String, bool)> = tx
+        .query_row(
+            "SELECT scope_uuid, git_branch, EXISTS (
+             SELECT 1 FROM repositories other WHERE other.id<>r.id AND
+                (other.scope_uuid=r.scope_uuid OR other.id=r.scope_uuid OR other.scope_uuid=r.id))
+         FROM repositories r WHERE id=?1",
+            [repo_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((scope, branch, conflicting_owner)) = registration else {
+        return Ok(None);
+    };
+    if op.pre_push_git_remote.is_empty()
+        || op.pre_push_git_branch.is_empty()
+        || op.target_fingerprint
+            != git_push_target_fingerprint(
+                repo_id,
+                &op.pre_push_git_remote,
+                &op.pre_push_git_branch,
+            )
+    {
+        return Err(DatabaseError::Other(
+            "cannot backfill SVN cursor: completed SVN-to-Git push target fingerprint differs"
+                .into(),
+        ));
+    }
+    // Late-pair publications share the push journal but pin an explicit remote URL.
+    if op.pre_push_git_remote != "origin" || op.pre_push_git_branch != branch {
+        return Ok(None);
+    }
+    if read_value(tx, &key("active", repo_id))?.is_some() {
+        return Err(DatabaseError::Other("cannot backfill SVN cursor: latest completed SVN-to-Git push still has an active pointer".into()));
+    }
+    let scope = scope.ok_or_else(|| {
+        DatabaseError::Other("cannot backfill SVN cursor: repository scope UUID is missing".into())
+    })?;
+    if conflicting_owner
+        || !Uuid::parse_str(&scope).is_ok_and(|id| !id.is_nil() && id.to_string() == scope)
+    {
+        return Err(DatabaseError::Other(
+            "cannot backfill SVN cursor: repository scope UUID is invalid or ambiguous".into(),
+        ));
+    }
+    // Match the SHA-1 commit and tree supported by the managed finalizer.
+    let full_oid = |s: &str| {
+        s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) && s.bytes().any(|b| b != b'0')
+    };
+    if op.resume_authorized
+        || !full_oid(&op.intended_local_git_sha)
+        || !full_oid(&op.intended_local_git_tree)
+        || op.last_confirmed_git_sha.as_deref() != Some(&op.intended_local_git_sha)
+        || op.last_confirmed_git_tree.as_deref() != Some(&op.intended_local_git_tree)
+    {
+        return Err(DatabaseError::Other("cannot backfill SVN cursor: completed SVN-to-Git push has inconsistent target or confirmation".into()));
+    }
+    // Read the same active generation without allocating scope IDs or revoking legacy keys.
+    let generation: Option<String> = tx.query_row(
+        "SELECT COALESCE((SELECT value FROM kv_state WHERE key=?1),
+            (SELECT value FROM kv_state WHERE key=?2 AND (SELECT COUNT(*) FROM repositories)=1
+             AND (SELECT value FROM kv_state WHERE key=?3)='1'))",
+        params![
+            repo_echo_generation_kv_key(&scope),
+            legacy_repo_echo_generation_kv_key(repo_id),
+            LEGACY_REPO_ID_KV_READS_KEY
+        ],
+        |r| r.get(0),
+    )?;
+    let generation = match generation {
+        None => crate::pair_refresh::PAIR_GENERATION,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(generation) if generation > 0 => generation,
+            _ => {
+                return Err(DatabaseError::Other(
+                    "cannot backfill SVN cursor: invalid repository echo generation".into(),
+                ))
+            }
+        },
+    };
+    let direction = CheckpointDirection::SvnToGit;
+    let source = svn_source_key(op.source_svn_rev);
+    let checkpoint = load_directional_checkpoint(tx, &scope, generation, direction)?
+        .filter(|checkpoint| checkpoint.handled_source_key == source);
+    let mapping = load_mapping_outcome(tx, &scope, generation, direction, &source)?;
+    if (checkpoint.is_some() || mapping.is_some())
+        && (op.initiator_id != "team_worker"
+            || op.request_id != format!("svn-r{}", op.source_svn_rev)
+            || op.outcome_detail.as_deref() != Some(MANAGED_PUSH_CONFIRMED))
+    {
+        return Err(DatabaseError::Other("cannot backfill SVN cursor: completed SVN-to-Git push owner or confirmation conflicts with managed evidence".into()));
+    }
+    let applied = MappingOutcome::AppliedAndVerified;
+    match (checkpoint, mapping) {
+        (None, None) => Ok(None),
+        (Some(checkpoint), Some(mapping))
+            if checkpoint.outcome == applied && mapping.outcome == applied
+                && checkpoint.target_git_sha.as_deref() == Some(op.intended_local_git_sha.as_str())
+                && mapping.target_git_sha == checkpoint.target_git_sha
+                && checkpoint.target_svn_rev.is_none() && mapping.target_svn_rev.is_none() => Ok(Some(op.source_svn_rev)),
+        _ => Err(DatabaseError::Other(format!(
+            "cannot backfill SVN cursor: canonical checkpoint and mapping do not both corroborate the completed SVN-to-Git push at r{}", op.source_svn_rev
+        ))),
+    }
 }
 
 fn write_op(tx: &Connection, op: &GitPushOperation) -> Result<(), DatabaseError> {
@@ -243,7 +399,7 @@ fn finalize_tx(
     op.resume_authorized = false;
     op.updated_at = now;
     if !removed {
-        op.outcome_detail = Some("SVN-to-Git push verified and recorded".into());
+        op.outcome_detail = Some(MANAGED_PUSH_CONFIRMED.into());
     }
     write_op(tx, &op)?;
     clear_active(tx, &op.repo_id, &op.id)?;
@@ -369,6 +525,46 @@ impl Database {
         })
     }
 
+    /// Prove a direct first-parent step for bounded Personal PR discovery.
+    /// Match the original publisher, its confirmed target, mapping and receipt.
+    pub fn is_confirmed_personal_push(
+        &self,
+        branch: &str,
+        sha: &str,
+        tree: &str,
+        parent: &str,
+    ) -> Result<bool, DatabaseError> {
+        let scopes = super::personal_scope::personal_repo_ids_for_read(self)?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT d.key, d.value FROM kv_state d
+             JOIN commit_map m ON m.git_sha=?1 AND m.direction='svn_to_git'
+             JOIN sync_records r ON r.repo_id=m.repo_id AND r.svn_rev=m.svn_rev AND r.git_sha=m.git_sha
+             WHERE m.repo_id IN (?2,?3) AND r.direction='svn_to_git' AND r.status='applied'
+             AND d.key GLOB 'svn_to_git_push_v1:document:*'
+             AND json_extract(d.value,'$.repo_id')=m.repo_id
+             AND json_extract(d.value,'$.source_svn_rev')=m.svn_rev
+             AND json_extract(d.value,'$.last_confirmed_git_sha')=m.git_sha"
+        )?;
+        let mut rows = stmt.query(params![sha, scopes[0], scopes.get(1)])?;
+        let Some(row) = rows.next()? else {
+            return Ok(false);
+        };
+        let op = parse(&row.get::<_, String>(1)?)?;
+        let matching = row.get::<_, String>(0)? == key("document", &op.id)
+            && op.state == GitPushOperationState::Completed
+            && op.initiator_id == "personal_worker"
+            && op.pre_push_git_remote == "origin"
+            && op.pre_push_git_branch == branch
+            && op.target_fingerprint == git_push_target_fingerprint(&op.repo_id, "origin", branch)
+            && op.pre_push_git_sha == parent
+            && op.intended_local_git_parent.as_deref() == Some(parent)
+            && op.intended_local_git_sha == sha
+            && op.intended_local_git_tree == tree
+            && op.last_confirmed_git_tree.as_deref() == Some(tree);
+        Ok(matching && rows.next()?.is_none())
+    }
+
     pub fn latest_git_push_operation(
         &self,
         repo_id: &str,
@@ -421,7 +617,9 @@ impl Database {
         &self,
         intent: GitPushIntent<'_>,
     ) -> Result<GitPushOperation, DatabaseError> {
-        self.transaction(|tx| {
+        // Wait for the WAL writer before reading the fences and active intent.
+        // A deferred read transaction can fail immediately on the journal insert.
+        self.immediate_transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
                 tx,
                 intent.repo_id,
@@ -632,7 +830,9 @@ impl Database {
         observed_git_sha: &str,
         observed_git_tree: &str,
     ) -> Result<GitPushOperation, DatabaseError> {
-        self.transaction(|tx| {
+        // The Git ref has already advanced. Reserve the writer before reading
+        // the active operation and recording its receipt and checkpoints.
+        self.immediate_transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
@@ -719,7 +919,7 @@ impl Database {
     where
         F: FnOnce(&mut GitPushOperation) -> Result<(), DatabaseError>,
     {
-        self.transaction(|tx| {
+        self.immediate_transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             let active = key("active", repo_id);
@@ -835,6 +1035,8 @@ impl GitPushOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod contention_tests;
 
     fn sample_intent<'a>() -> GitPushIntent<'a> {
         GitPushIntent {
