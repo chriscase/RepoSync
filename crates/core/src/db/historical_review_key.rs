@@ -5,7 +5,10 @@ use std::{
     ffi::OsStr,
     fs::{self, File, Metadata, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
+    },
     path::Path,
 };
 
@@ -47,6 +50,11 @@ struct Destination<'a> {
 impl<'a> Destination<'a> {
     fn new(path: &'a Path) -> Result<Self, DatabaseError> {
         let name = path.file_name().ok_or_else(refused)?;
+        // Path::file_name normalizes a trailing slash or "/.". Publishing
+        // through dirfd must not silently turn a directory operand into a file.
+        if path.as_os_str().as_bytes().rsplit(|&b| b == b'/').next() != Some(name.as_bytes()) {
+            return Err(refused());
+        }
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -118,7 +126,8 @@ fn stamp(md: Metadata) -> Result<KeyStamp, DatabaseError> {
     })
 }
 
-/// Load exactly one private review key. Never follow a symlink or open a FIFO in blocking mode.
+/// Load exactly one private review key. The directory and file operands must
+/// themselves be real entries. Ancestors may include normal system symlinks.
 pub fn open(path: &Path) -> Result<ReviewSessionKey, DatabaseError> {
     let dest = Destination::new(path)?;
     let mut file = dest.read_file(dest.name)?;
@@ -170,6 +179,7 @@ pub fn create(path: &Path) -> Result<(), DatabaseError> {
         )
         .map_err(|_| refused())?,
     );
+    let mut published = false;
     let result = (|| {
         rustix::fs::fchmod(&file, Mode::RUSR | Mode::WUSR).map_err(|_| refused())?;
         file.write_all(HEADER)
@@ -198,6 +208,7 @@ pub fn create(path: &Path) -> Result<(), DatabaseError> {
         .map_err(|_| refused())?;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         return Err(refused());
+        published = true;
         dest.directory.sync_all().map_err(|_| refused())?;
         let current = stamp(
             dest.read_file(dest.name)?
@@ -209,9 +220,14 @@ pub fn create(path: &Path) -> Result<(), DatabaseError> {
         }
         Ok(())
     })();
-    // A failed/no-clobber publication can leave our private stage behind.
-    // Never remove a replacement or an existing destination.
     if result.is_err() {
+        if published {
+            return Err(DatabaseError::Other(
+                "a complete review key was published but final verification failed; check the original private directory and verify the existing key before retrying".into(),
+            ));
+        }
+        // Cooperating creators use distinct stages in this operator-owned
+        // directory. Clean up only while our stage still names our inode.
         if let (Ok(fd), Ok(named)) = (
             rustix::fs::fstat(&file),
             rustix::fs::statat(&dest.directory, stage.as_str(), AtFlags::SYMLINK_NOFOLLOW),
@@ -311,5 +327,14 @@ mod tests {
         });
         assert!(open(&file).is_ok());
         assert_eq!(dir.path().read_dir().unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rejects_a_directory_spelling_before_creating_any_output() {
+        let dir = private_dir();
+        for spelling in ["new-key/", "new-key/."] {
+            assert!(create(&dir.path().join(spelling)).is_err());
+        }
+        assert_eq!(dir.path().read_dir().unwrap().count(), 0);
     }
 }
