@@ -28,8 +28,8 @@ pub(super) fn effective_writer_epoch(
 
 pub(crate) use noop::approval_digest as noop_approval_digest;
 
-const KEY_TABLE: &str = "pair_refresh_journal_key_v3";
-const KEY_SCHEMA: &str = "CREATE TABLE pair_refresh_journal_key_v3 (id INTEGER PRIMARY KEY CHECK(id=1), secret BLOB NOT NULL CHECK(length(secret)=32))";
+pub(super) const KEY_TABLE: &str = "pair_refresh_journal_key_v3";
+pub(super) const KEY_SCHEMA: &str = "CREATE TABLE pair_refresh_journal_key_v3 (id INTEGER PRIMARY KEY CHECK(id=1), secret BLOB NOT NULL CHECK(length(secret)=32))";
 const DOMAIN: &str = "reposync_pair_refresh_authority_v3";
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
