@@ -34,6 +34,7 @@ impl StartupOwner {
 pub(crate) fn require_quiet(conn: &Connection) -> Result<bool, DatabaseError> {
     let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     schema::refuse_future_schema(version)?;
+    schema::installed_team::pending(conn, version)?;
     let has_kv: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='kv_state')",
         [],
@@ -103,6 +104,32 @@ impl Database {
         Self::open_ordinary_writer(data_dir.as_ref(), "reposync.db")
     }
 
+    pub(super) fn open_reserved_startup(
+        path: &Path,
+        prior: Option<super::OpenedDatabaseFile>,
+    ) -> Result<Self, DatabaseError> {
+        let flags = if prior.is_some() {
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+        } else {
+            OpenFlags::default()
+        };
+        let conn = Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+        let opened_file =
+            super::OpenedDatabaseFile::attest(&conn, path, prior).ok_or_else(|| {
+                DatabaseError::Other("ordinary startup database identity changed".into())
+            })?;
+        opened_file.require_unaliased_owner(&conn)?;
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
+        Ok(Self {
+            conn: std::sync::Mutex::new(conn),
+            opened_file: Some(opened_file),
+            startup_owner: None,
+            #[cfg(test)]
+            test_force_echo_split_fail: std::sync::Mutex::new(false),
+        })
+    }
+
     fn open_ordinary_writer(data_dir: &Path, file: &str) -> Result<Self, DatabaseError> {
         std::fs::create_dir_all(data_dir)?;
         let data_dir = data_dir.canonicalize()?;
@@ -154,24 +181,7 @@ impl Database {
         } else {
             super::startup_rollback::require_safe_unrecovered_open(&path)?;
         }
-        let conn = Connection::open_with_flags(
-            &path,
-            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
-        let opened_file =
-            super::OpenedDatabaseFile::attest(&conn, &path, prior).ok_or_else(|| {
-                DatabaseError::Other("ordinary startup database identity changed".into())
-            })?;
-        opened_file.require_unaliased_owner(&conn)?;
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
-        let mut db = Self {
-            conn: std::sync::Mutex::new(conn),
-            opened_file: Some(opened_file),
-            startup_owner: None,
-            #[cfg(test)]
-            test_force_echo_split_fail: std::sync::Mutex::new(false),
-        };
+        let mut db = Self::open_reserved_startup(&path, prior)?;
         let claim = crate::writer_fence::claim_for_ordinary_startup(&db, &lock, &data_dir)?;
         db.startup_owner = Some(StartupOwner {
             _lock: lock,

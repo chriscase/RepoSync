@@ -80,11 +80,25 @@ impl Database {
         let conn = Connection::open(path)?;
         let connected_file = OpenedDatabaseFile::attest(&conn, path, prior_file);
 
+        // Refuse an incompatible layout without checkpointing its WAL on close.
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
         // Refuse a future schema before WAL checkpoint or other writes.
         let existing_version: u32 =
             conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         schema::refuse_future_schema(existing_version)?;
+        if schema::installed_team::pending(&conn, existing_version)? {
+            return Err(DatabaseError::Other(
+                "installed team schema requires owned startup".into(),
+            ));
+        }
 
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            false,
+        )?;
         // Enable WAL mode for better concurrent read performance.
         conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -153,7 +167,9 @@ impl Database {
         let opened_file = OpenedDatabaseFile::attest(&conn, path, Some(prior))
             .ok_or_else(|| DatabaseError::Other("recovery database identity changed".into()))?;
         let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != schema::CURRENT_SCHEMA_VERSION {
+        if version != schema::CURRENT_SCHEMA_VERSION
+            || schema::installed_team::pending(&conn, version)?
+        {
             return Err(DatabaseError::Other(
                 "recovery requires an already current database schema".into(),
             ));
@@ -251,7 +267,9 @@ impl Database {
         let data_dir = canonical_data_dir.as_path();
         let path = data_dir.join("reposync.db");
         startup_rollback::require_safe_unrecovered_open(&path)?;
+        let mut installed_team_file = None;
         if path.try_exists()? {
+            let prior = OpenedDatabaseFile::capture(&path);
             // Open read-only before ordinary startup can checkpoint, migrate,
             // seed credentials or claim a replacement lease. The local lock is
             // retained through startup; the lease claim rechecks in its writer
@@ -269,14 +287,33 @@ impl Database {
             pair_refresh_operations::require_no_authenticated_startup_hold(&probe)?;
             let version: u32 = probe.pragma_query_value(None, "user_version", |row| row.get(0))?;
             schema::refuse_future_schema(version)?;
-            if version < schema::CURRENT_SCHEMA_VERSION {
+            let installed = schema::installed_team::pending(&probe, version)?;
+            if installed || version < schema::CURRENT_SCHEMA_VERSION {
                 // Schema changes affect every repository, including disabled
                 // and paused rows. Establish quiet before any checkpoint or
                 // migration; current-schema startup keeps its existing policy.
                 startup::require_quiet(&probe)?;
             }
+            if installed {
+                installed_team_file = Some(
+                    OpenedDatabaseFile::attest(&probe, &path, prior).ok_or_else(|| {
+                        DatabaseError::Other("installed team database identity changed".into())
+                    })?,
+                );
+            }
         }
         startup_rollback::require_safe_unrecovered_open(&path)?;
+        if let Some(prior) = installed_team_file {
+            let db = Self::open_reserved_startup(&path, Some(prior))?;
+            let claim = crate::writer_fence::claim_for_ordinary_startup(&db, &lock, data_dir)?;
+            let owner = crate::data_dir::DataDirOwner {
+                lock,
+                fence: claim.into_daemon_guard(data_dir),
+            };
+            db.conn().execute_batch("PRAGMA journal_mode=WAL;")?;
+            db.initialize()?;
+            return Ok((db, owner));
+        }
         let db = Self::new(path)?;
         db.initialize()?;
         let deferred_scope_upgrade = {

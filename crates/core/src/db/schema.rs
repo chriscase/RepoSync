@@ -3,6 +3,8 @@
 //! Migrations are simple SQL strings applied in order. The `schema_version`
 //! user-version pragma tracks which migrations have already been applied.
 
+pub(crate) mod installed_team;
+
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use tracing::{debug, info};
 
