@@ -406,3 +406,32 @@ For quick reference, here are all fields and their defaults:
 | `options.sync_direct_pushes` | `false` (not implemented — fails if set to true) |
 | `options.lfs_threshold` | `0` (LFS disabled) |
 | `options.lfs_patterns` | `[]` |
+
+
+### Incremental SVN→Git scope
+
+In an existing Personal mirror, set `allowed_paths = ["foo/"]` in `[options]`
+to select files under that branch-relative prefix. Prefixes match complete path
+components. An absent or empty list keeps the normal bidirectional behavior on mirrors that have never enabled scope. Once enabled, the mirror is bound to scoped operation: removing the option will hold sync and import, not silently widen publication. Use a separately prepared mirror for unrestricted operation.
+The existing file-size, ignore and LFS policy applies inside the selected paths.
+
+This incremental mode is **SVN→Git only**: it does not poll or replay merged
+PRs, and refuses snapshot and full import rather than silently importing
+the entire SVN tree. Start with an existing checkpoint and a clean checkout
+matching the selected SVN files. If the trees diverge, positive updates stop
+before copying or deleting anything; preserve the checkout and reconcile.
+Do not expect a change in scope to backfill previously handled revisions.
+
+A fully filtered revision advances the Personal SVN watermark but creates no
+Git commit, push, or PR and does not move the Git cursor. Use
+`reposync personal status` or `reposync personal log` to see the revision's
+filtered outcome or the SHA for a published commit.
+
+
+**Transport proof boundary.** Local `file://` SVN can prove complete selected
+directories, including their deletion. Ordinary network SVN can redact paths
+from otherwise successful listings and exports. This increment accepts
+individually readable network *files*, including an exact add/delete proved by
+the revision log, but holds changes requiring directory completeness or
+unexplained absence. The hold leaves both repositories and cursors unchanged.
+Do not assume that a successful login or an empty listing proves full access.

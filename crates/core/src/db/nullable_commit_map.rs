@@ -752,15 +752,24 @@ pub(crate) fn no_target_row_proven(
     if !has_scope_column {
         return Ok(false);
     }
-    let scope: Option<String> = conn
-        .query_row(
+    // Personal writers have a reserved namespace in their own database, not a
+    // managed repository registration. Never manufacture a managed row.
+    let standalone_personal = repo_id == PERSONAL_SCOPE_KEY
+        && !conn.query_row("SELECT EXISTS(SELECT 1 FROM repositories)", [], |row| {
+            row.get::<_, bool>(0)
+        })?;
+    let scope: Option<String> = if standalone_personal {
+        Some(PERSONAL_SCOPE_KEY.to_owned())
+    } else {
+        conn.query_row(
             "SELECT scope_uuid FROM repositories WHERE id = ?1",
             [repo_id],
             |row| row.get::<_, Option<String>>(0),
         )
         .optional()?
         .flatten()
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+    };
     let Some(scope) = scope else {
         return Ok(false);
     };

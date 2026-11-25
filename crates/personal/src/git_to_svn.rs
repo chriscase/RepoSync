@@ -202,6 +202,7 @@ impl GitToSvnSync {
 
     #[instrument(skip(self), fields(repo = %self.github_repo))]
     pub async fn sync(&self) -> Result<GitToSvnResult> {
+        reposync_core::personal_projection::require_unrestricted(&self.db)?;
         if let Some(op) = self
             .db
             .active_personal_svn_commit_operation()

@@ -96,6 +96,7 @@ impl SvnToGitSync {
     /// or verified no-target receipts). Marker text is diagnostic only.
     /// Already-synced revisions are skipped via `commit_map` / SVN→Git receipts.
     pub async fn sync(&self) -> Result<usize> {
+        reposync_core::personal_projection::admit_sync(&self.db, &self.config)?;
         if let Some(op) = self
             .db
             .active_personal_git_push_operation()
@@ -156,14 +157,23 @@ impl SvnToGitSync {
             .context("failed to fetch SVN log entries")?;
 
         let mut synced_count: usize = 0;
+        let scope = &self.config.options.allowed_paths;
+        let projection = if scope.is_empty() {
+            PERSONAL_NO_TARGET_PROJECTION.to_owned()
+        } else {
+            reposync_core::personal_projection::policy_snapshot(&self.config.options)
+        };
+        let mut previous = watermark;
         let echo_ctx = TeamEchoContext {
             db: self.db.as_ref(),
             repo_id: PERSONAL_REPO_ID,
-            no_target_projection: PERSONAL_NO_TARGET_PROJECTION,
+            no_target_projection: &projection,
         };
 
         for entry in &log_entries {
             let rev = entry.revision;
+            let predecessor = previous;
+            previous = rev;
 
             match classify_incoming_svn_revision_personal(&echo_ctx, rev, &entry.message)
                 .map_err(|e| anyhow::anyhow!(e))?
@@ -193,13 +203,33 @@ impl SvnToGitSync {
             }
 
             // 5. Export the SVN revision to a temporary directory.
-            let export_dir = tempfile::tempdir()
-                .context("failed to create temporary directory for SVN export")?;
-
-            self.svn_client
-                .export("", rev, export_dir.path())
+            let export_dir = if scope.is_empty() {
+                let dir = tempfile::tempdir()?;
+                self.svn_client
+                    .export("", rev, dir.path())
+                    .await
+                    .with_context(|| format!("failed to export SVN revision r{rev}"))?;
+                dir
+            } else {
+                let Some(dir) = reposync_core::personal_projection::prepare(
+                    &self.svn_client,
+                    &self.db,
+                    &self.config.options,
+                    entry,
+                    predecessor,
+                )
                 .await
-                .with_context(|| format!("failed to export SVN revision r{}", rev))?;
+                .with_context(|| format!("failed to project personal SVN r{rev}"))?
+                else {
+                    continue;
+                };
+                let git = self.git_client.lock().unwrap();
+                anyhow::ensure!(
+                    git.repo().statuses(None)?.is_empty(),
+                    "Personal scoped publication requires a clean Git checkout"
+                );
+                dir.into_export(git.repo_path(), &self.policy)?
+            };
 
             // 6. Copy exported files into the Git working tree (with policy).
             let repo_path = {
@@ -267,10 +297,17 @@ impl SvnToGitSync {
                 let committer_email = author_email.clone();
                 let msg = commit_message.clone();
                 let gc = self.git_client.clone();
+                let scoped_lfs = !scope.is_empty() && self.policy.lfs_enabled();
 
                 tokio::task::spawn_blocking(move || {
                     let git_client = gc.lock().unwrap();
-                    git_client.commit(
+                    let commit = if scoped_lfs {
+                        GitClient::commit_via_cli
+                    } else {
+                        GitClient::commit
+                    };
+                    commit(
+                        &git_client,
                         &msg,
                         &author_name,
                         &author_email,
@@ -284,6 +321,11 @@ impl SvnToGitSync {
             };
 
             let sha_str = git_sha.to_string();
+            if !scope.is_empty() {
+                reposync_core::snapshot::verify_commit_matches_projection(
+                    export_dir.path(), &repo_path, &sha_str, &self.policy
+                ).context("scoped Personal Git commit differs from the verified projection; refusing publication")?;
+            }
             info!(rev, sha = %sha_str, "committed SVN revision as Git commit");
 
             let (intended_parent, intended_tree) = {

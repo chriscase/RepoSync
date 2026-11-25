@@ -130,6 +130,14 @@ impl PersonalSyncEngine {
             ..Default::default()
         };
 
+        if !self.config.options.allowed_paths.is_empty()
+            && self.db.active_personal_svn_commit_operation()?.is_some()
+        {
+            anyhow::bail!("pending Personal Git→SVN journal predates scoped inbound sync; reconcile it under its original configuration");
+        }
+
+        reposync_core::personal_projection::admit_sync(&self.db, &self.config)?;
+
         // Prove and finalize any held Git→SVN journal before P/O/R/L inspection.
         // Promotion uses SVN inspect-before-author (GitHub fallback only after proof).
         if let Err(e) = self.promote_held_git_to_svn_before_history_inspect().await {
@@ -188,6 +196,10 @@ impl PersonalSyncEngine {
                         false,
                     )
                     .ok();
+                if !self.config.options.allowed_paths.is_empty() {
+                    // Scoped mode has no outbound phase to salvage.
+                    return Err(e);
+                }
                 // Don't abort — still try Git→SVN
                 warn!("continuing to Git→SVN despite SVN→Git error");
             }
@@ -254,6 +266,11 @@ impl PersonalSyncEngine {
 
     /// Git → SVN sync phase (via merged PRs).
     async fn sync_git_to_svn(&self) -> Result<(u64, u64)> {
+        if !self.config.options.allowed_paths.is_empty() {
+            // Never send an unprojected change back to SVN. Scoped PR replay
+            // is #59; leave any pending PRs untouched.
+            return Ok((0, 0));
+        }
         let held_git_to_svn_needs_promotion = self
             .db
             .active_personal_svn_commit_operation()

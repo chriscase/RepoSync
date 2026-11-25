@@ -19,6 +19,13 @@ use crate::errors::SvnError;
 /// Default timeout for SVN commands (5 minutes).
 const SVN_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SelectedNode {
+    Directory,
+    File,
+    Missing,
+}
+
 /// Asynchronous client for interacting with an SVN repository via the CLI.
 #[derive(Clone)]
 pub struct SvnClient {
@@ -200,6 +207,81 @@ impl SvnClient {
             &literal_url(&self.url, Some(revision))?,
         ])
         .await
+    }
+
+    /// Check for one literal descendant in pinned, complete directory listings.
+    /// A failed command or malformed listing is never interpreted as absence.
+    pub(crate) async fn selected_node_at(
+        &self,
+        path: &str,
+        rev: i64,
+    ) -> Result<SelectedNode, SvnError> {
+        super::operand::validate_relative_path(path)?;
+        let bad = || SvnError::XmlParseError("incomplete or unexpected pinned SVN listing".into());
+        let mut parent = String::new();
+        let mut components = path.split('/').peekable();
+        while let Some(name) = components.next() {
+            let url = repository_url(&self.url, &parent)?;
+            let peg = literal_url(&url, Some(rev))?;
+            let xml = self
+                .run_svn(&[
+                    "list",
+                    "--xml",
+                    "--depth",
+                    "immediates",
+                    "-r",
+                    &rev.to_string(),
+                    "--",
+                    &peg,
+                ])
+                .await?;
+            let doc = roxmltree::Document::parse(&xml).map_err(|_| bad())?;
+            let root = doc.root_element();
+            let lists: Vec<_> = root.children().filter(|n| n.is_element()).collect();
+            let [list] = lists.as_slice() else {
+                return Err(bad());
+            };
+            if !root.has_tag_name("lists")
+                || !list.has_tag_name("list")
+                || list.attribute("path") != Some(url.as_str())
+            {
+                return Err(bad());
+            }
+            let mut children = std::collections::BTreeMap::new();
+            for e in list.children().filter(|n| n.is_element()) {
+                let names: Vec<_> = e.children().filter(|n| n.has_tag_name("name")).collect();
+                let [node] = names.as_slice() else {
+                    return Err(bad());
+                };
+                let child = node
+                    .text()
+                    .filter(|t| !t.is_empty() && !t.contains('/'))
+                    .ok_or_else(bad)?;
+                let kind = e
+                    .attribute("kind")
+                    .filter(|v| matches!(*v, "file" | "dir"))
+                    .ok_or_else(bad)?;
+                if !e.has_tag_name("entry") || children.insert(child, kind).is_some() {
+                    return Err(bad());
+                }
+            }
+            match children.get(name) {
+                None => return Ok(SelectedNode::Missing),
+                Some(&"file") => {
+                    return Ok(if components.peek().is_some() {
+                        SelectedNode::Missing
+                    } else {
+                        SelectedNode::File
+                    })
+                }
+                _ => {}
+            }
+            if !parent.is_empty() {
+                parent.push('/');
+            }
+            parent.push_str(name);
+        }
+        Ok(SelectedNode::Directory)
     }
 
     /// Import-scoped cancellation; ordinary sync clients remain unchanged.

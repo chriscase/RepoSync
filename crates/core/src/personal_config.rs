@@ -245,6 +245,10 @@ impl Default for CommitFormatConfig {
 /// Miscellaneous sync behaviour options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonalOptionsConfig {
+    /// SVN branch-relative prefixes selected by incremental Personal SVN→Git sync.
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+
     /// Normalize CRLF to LF during sync.
     #[serde(default = "default_true")]
     pub normalize_line_endings: bool,
@@ -289,6 +293,7 @@ pub struct PersonalOptionsConfig {
 impl Default for PersonalOptionsConfig {
     fn default() -> Self {
         Self {
+            allowed_paths: Vec::new(),
             normalize_line_endings: true,
             sync_executable_bit: true,
             max_file_size: 0,
@@ -386,6 +391,15 @@ impl PersonalConfig {
             });
         }
 
+        for prefix in &self.options.allowed_paths {
+            crate::svn::operand::validate_relative_path(prefix.trim_end_matches('/')).map_err(
+                |e| ConfigError::InvalidValue {
+                    field: "options.allowed_paths".into(),
+                    detail: e.to_string(),
+                },
+            )?;
+        }
+
         // Fail-fast: sync_direct_pushes is not yet implemented in personal mode.
         if self.options.sync_direct_pushes {
             return Err(ConfigError::InvalidValue {
@@ -445,6 +459,7 @@ normalize_line_endings = true
 sync_executable_bit = true
 # max_file_size = 0         # 0 = no limit
 # ignore_patterns = []
+# allowed_paths = []        # incremental SVN→Git only when scoped
 # sync_externals = false
 # sync_direct_pushes = false
 auto_merge = true

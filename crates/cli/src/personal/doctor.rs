@@ -25,6 +25,13 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
         }
     }
 
+    if !config.options.allowed_paths.is_empty() {
+        println!("  {}", style::warn(&format!(
+            "SVN→Git scope    {:?}. Scoped import and Git→SVN PR replay are unavailable; use a clean scoped checkout. Directory-scope proof requires file://; network scopes require individually readable files with affirmative evidence for absence.",
+            config.options.allowed_paths
+        )));
+    }
+
     // 2. Data directory
     let data_dir = &config.personal.data_dir;
     if data_dir.exists() {

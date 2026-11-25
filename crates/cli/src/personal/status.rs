@@ -67,7 +67,15 @@ pub fn run_status(config: &PersonalConfig) -> Result<()> {
                 println!(
                     "  {} {}",
                     style::dim(&entry.created_at[..19.min(entry.created_at.len())]),
-                    action_styled
+                    if entry.action == "svn_to_git_sync" || entry.action == "svn_to_git_filtered" {
+                        format!(
+                            "{} {}",
+                            action_styled,
+                            entry.details.as_deref().unwrap_or("")
+                        )
+                    } else {
+                        action_styled
+                    }
                 );
             }
         }

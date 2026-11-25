@@ -59,6 +59,11 @@ impl<'a> InitialImport<'a> {
         mode: ImportMode,
         window: OrdinaryWriterWindow<'_>,
     ) -> Result<u64> {
+        anyhow::ensure!(
+            self.config.options.allowed_paths.is_empty(),
+            "scoped Personal import is not supported; unrestricted import refused"
+        );
+        reposync_core::personal_projection::require_unrestricted(self.db)?;
         window
             .require_engine_scope(self.db, None)
             .context("Personal initial import writer handoff refused")?;
