@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use super::historical_enrollment::{
     read_legacy_pair_pins, read_planned_cutover_pins, LegacyPairPins,
 };
+use super::historical_review_key::ReviewSessionKey;
 use super::offline_snapshot;
 use crate::errors::DatabaseError;
 use crate::git::remote_url::derive_git_remote_url;
@@ -31,6 +32,7 @@ impl RegisteredTransport {
         pair: &LegacyPairPins,
         source: HistoricalSvnSource,
         mirror: &Path,
+        minimum_live_revision: Option<i64>,
     ) -> anyhow::Result<VerifiedHistoricalLineage> {
         anyhow::ensure!(
             pair == &self.pair,
@@ -41,6 +43,7 @@ impl RegisteredTransport {
             git_mirror: mirror.to_owned(),
             configured_git_url: self.git_url.clone(),
             credential_context_sha256: self.context_digest.clone(),
+            minimum_live_revision,
         };
         verify_registered(
             pair,
@@ -121,19 +124,28 @@ fn network_context(
     conn: &Connection,
     svn: Option<&Secret>,
     git: Option<&Secret>,
+    session: Option<&ReviewSessionKey>,
 ) -> Result<String, DatabaseError> {
-    if svn.is_none() && git.is_none() {
+    if svn.is_none() && git.is_none() && session.is_none() {
         return Ok(hex::encode(Sha256::digest(
             b"reposync-historical-anonymous-read-v1",
         )));
     }
     // The reviewed digest must change on replacement or revocation. An unkeyed
     // password hash in an operator receipt would allow offline guessing.
-    let key = super::pair_refresh_credentials::fingerprint_key(conn).map_err(|_| {
-        refuse("existing credential review key unavailable for authenticated lineage recovery")
-    })?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(&key).expect("SHA256 HMAC accepts a 32-byte key");
-    mac.update(b"reposync-historical-registered-read-v1");
+    let stored_key;
+    let key = match session {
+        Some(explicit) => explicit.bytes(),
+        None => {
+            stored_key = super::pair_refresh_credentials::fingerprint_key(conn).map_err(|_| {
+                refuse("registered lineage verification refused: Create a private review key and supply --review-key-file for this authenticated legacy installation.")
+            })?;
+            &stored_key
+        }
+    };
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("SHA256 HMAC accepts a 32-byte key");
+    mac.update(b"reposync-historical-registered-read-v2");
+    mac.update(&[u8::from(session.is_some())]);
     for secret in [svn, git] {
         match secret {
             None => mac.update(&[0]),
@@ -152,6 +164,7 @@ fn network_context(
 pub(super) fn read_registered_transport(
     conn: &Connection,
     pair: &LegacyPairPins,
+    session: Option<&ReviewSessionKey>,
 ) -> Result<RegisteredTransport, DatabaseError> {
     let git_url = derive_git_remote_url(&pair.git_api_url, None, &pair.git_repo);
     let network_svn = network_target(&pair.svn_url)?;
@@ -166,8 +179,8 @@ pub(super) fn read_registered_transport(
     } else {
         None
     };
-    let context_digest = if network_svn || network_git {
-        Some(network_context(conn, svn.as_ref(), git.as_ref())?)
+    let context_digest = if network_svn || network_git || session.is_some() {
+        Some(network_context(conn, svn.as_ref(), git.as_ref(), session)?)
     } else {
         None
     };
@@ -190,6 +203,7 @@ pub fn read_offline_recovery_inputs(
     path: &Path,
     repo_id: &str,
     planned: bool,
+    session: Option<&ReviewSessionKey>,
 ) -> Result<(LegacyPairPins, RegisteredTransport), DatabaseError> {
     offline_snapshot::with_recovery_snapshot(path, |conn| {
         let pins = if planned {
@@ -197,7 +211,7 @@ pub fn read_offline_recovery_inputs(
         } else {
             read_legacy_pair_pins(conn, repo_id)?
         };
-        let transport = read_registered_transport(conn, &pins)?;
+        let transport = read_registered_transport(conn, &pins, session)?;
         Ok((pins, transport))
     })
 }
@@ -219,6 +233,8 @@ mod tests {
             git_repo: "group/team".into(),
             git_branch: "main".into(),
             last_svn_rev: 2,
+            import_completion_svn_rev: None,
+            import_log_entry_count: None,
             last_git_sha: "a".repeat(40),
             mappings: vec![],
             storage_sha256: "a".repeat(64),
@@ -229,7 +245,7 @@ mod tests {
     async fn local_recovery_never_reads_credentials_or_transfers_a_registered_transport() {
         let conn = Connection::open_in_memory().unwrap(); // No credential table.
         let original = pair();
-        let transport = read_registered_transport(&conn, &original).unwrap();
+        let transport = read_registered_transport(&conn, &original, None).unwrap();
         assert!(transport.git_token.is_none() && transport.svn_password.is_none());
         assert!(transport.svn_username.is_empty() && transport.context_digest.is_none());
         let mut other = original;
@@ -239,6 +255,7 @@ mod tests {
                 &other,
                 HistoricalSvnSource::PlannedCutover,
                 Path::new("/unused"),
+                None,
             )
             .await;
         assert!(result.err().unwrap().to_string().contains("another pair"));
@@ -261,6 +278,54 @@ mod tests {
     }
 
     #[test]
+    fn local_session_key_protects_existing_authenticated_legacy_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let first_path = dir.path().join("first");
+        let second_path = dir.path().join("second");
+        super::super::historical_review_key::create(&first_path).unwrap();
+        super::super::historical_review_key::create(&second_path).unwrap();
+        let first = super::super::historical_review_key::open(&first_path).unwrap();
+        let second = super::super::historical_review_key::open(&second_path).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE kv_state(key TEXT PRIMARY KEY,value TEXT,updated_at TEXT);
+          INSERT INTO kv_state VALUES('secret_git_token_retained','fixture-git','t');
+          INSERT INTO kv_state VALUES('secret_svn_password_retained','fixture-svn','t');",
+        )
+        .unwrap();
+        let mut remote = pair();
+        remote.git_api_url = "https://git.example.invalid".into();
+        remote.svn_url = "https://svn.example.invalid/company".into();
+        let read = |key| {
+            read_registered_transport(&conn, &remote, Some(key))
+                .unwrap()
+                .context_digest
+                .unwrap()
+        };
+        let approved = read(&first);
+        assert_eq!(approved, read(&first));
+        assert_ne!(approved, read(&second));
+        conn.execute_batch(
+            "UPDATE kv_state SET value='fixture-rotation' WHERE key='secret_git_token_retained'",
+        )
+        .unwrap();
+        assert_ne!(approved, read(&first));
+        conn.execute_batch("UPDATE kv_state SET value='' WHERE key='secret_git_token_retained'")
+            .unwrap();
+        assert!(read_registered_transport(&conn, &remote, Some(&first)).is_err());
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM kv_state", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn authenticated_review_binds_the_selected_root_secret_and_its_source() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE kv_state(key TEXT PRIMARY KEY,value TEXT,updated_at TEXT);
@@ -271,7 +336,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
         };
-        let digest = || network_context(&conn, None, Some(&selected())).unwrap();
+        let digest = || network_context(&conn, None, Some(&selected()), None).unwrap();
         let global = digest();
         assert_eq!(selected().value, "test-global");
         conn.execute_batch(

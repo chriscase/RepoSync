@@ -4,13 +4,19 @@ use clap::{builder::TypedValueParser, error::ErrorKind, Args, Subcommand};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum RecoveryAction {
-    /// Read the evidence and print a SHA-256 digest for review.
+    /// Create a private local review key for authenticated historical installations.
+    CreateReviewKey {
+        /// New file in a private, operator-owned directory outside RepoSync data.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Read the evidence and print a revision-bound token for review.
     Preview(RecoveryInputs),
     /// Recheck the evidence and record the result while the pair stays paused.
     Apply {
         #[command(flatten)]
         inputs: RecoveryInputs,
-        /// Digest from the matching preview, as 64 lowercase hexadecimal digits.
+        /// Token copied from the reviewed preview, including its SVN revision and SHA-256 digest.
         #[arg(long, value_parser = RecoveryText::Digest)]
         reviewed_digest: String,
         /// Confirm the old service and other writers acting for this bridge are stopped.
@@ -44,12 +50,25 @@ pub(crate) struct RecoveryInputs {
     /// Complete local bare Git mirror containing the configured branch and all imported commits.
     #[arg(long)]
     pub git_mirror: PathBuf,
+    /// Private local review key used for both preview and apply when the old site has no credential review key.
+    #[arg(long)]
+    pub review_key_file: Option<PathBuf>,
     /// Local SVN repository independently restored from a trusted pre-upgrade backup.
     #[arg(long, requires = "historical_root_url")]
     pub svn_backup: Option<PathBuf>,
     /// Original SVN service root URL from independent records, without credentials.
     #[arg(long, requires = "svn_backup", value_parser = RecoveryText::RootUrl)]
     pub historical_root_url: Option<String>,
+}
+
+pub(crate) fn parse_review_token(value: &str) -> Option<(i64, &str)> {
+    let (number, hash) = value.strip_prefix('r')?.split_once('.')?;
+    let floor = number.parse::<i64>().ok()?;
+    (floor > 0
+        && number == floor.to_string()
+        && hash.len() == 64
+        && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    .then_some((floor, hash))
 }
 
 // Clap's ordinary parse errors repeat the input. These arguments may accidentally
@@ -87,14 +106,10 @@ impl TypedValueParser for RecoveryText {
                 "--pair requires a hyphenated registration UUID"
             }
             Self::Digest => {
-                if value.len() == 64
-                    && value
-                        .bytes()
-                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-                {
+                if parse_review_token(value).is_some() {
                     return Ok(value.to_owned());
                 }
-                "--reviewed-digest requires 64 lowercase hexadecimal digits"
+                "--reviewed-digest requires the full r<revision>.<sha256> token from the preview"
             }
             Self::RootUrl => {
                 if reposync_core::svn::operand::checked_url(value)
@@ -116,7 +131,7 @@ mod tests {
     use clap::Parser;
 
     const PAIR: &str = "7D156383-EC0A-459D-A7C3-B1D12C7320CE";
-    const DIGEST: &str = "b38f42d62640f3201f3a442c60795f9e808825999f6a98dfd55aa371229c6021";
+    const DIGEST: &str = "r23.b38f42d62640f3201f3a442c60795f9e808825999f6a98dfd55aa371229c6021";
     const BACKUP: [&str; 4] = [
         "--svn-backup",
         "/backup/restored",
@@ -142,6 +157,20 @@ mod tests {
             unreachable!()
         };
         Ok(action)
+    }
+
+    #[test]
+    fn token_requires_one_positive_canonical_revision_and_exact_lowercase_digest() {
+        let (_, digest) = super::parse_review_token(DIGEST).unwrap();
+        for invalid in [
+            digest.to_owned(),
+            format!("r0.{digest}"),
+            format!("r01.{digest}"),
+            format!("r+1.{digest}"),
+            format!("r1.{}", digest.to_ascii_uppercase()),
+        ] {
+            assert!(super::parse_review_token(&invalid).is_none());
+        }
     }
 
     #[test]
