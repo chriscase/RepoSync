@@ -10,6 +10,7 @@ pub struct LegacyPairPins {
     pub generation: i64,
     pub svn_url: String,
     pub svn_branch: String,
+    pub svn_username: String,
     pub git_provider: String,
     pub git_api_url: String,
     pub git_repo: String,
