@@ -200,9 +200,30 @@ fn isolate_import_git_env(command: &mut Command) {
 }
 
 pub async fn run(
+    command: Command,
+    timeout: Duration,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> io::Result<Output> {
+    run_capture(command, timeout, cancel, (Stdio::piped(), Stdio::piped())).await
+}
+
+/// The HTTPS pilot records command output in its own scratch budget instead
+/// of letting an unbounded child pipe grow the parent process's memory.
+pub(crate) async fn run_to_owned_files(
+    command: Command,
+    timeout: Duration,
+    cancel: Option<&Arc<AtomicBool>>,
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+) -> io::Result<Output> {
+    run_capture(command, timeout, cancel, (stdout.into(), stderr.into())).await
+}
+
+async fn run_capture(
     mut command: Command,
     timeout: Duration,
     cancel: Option<&Arc<AtomicBool>>,
+    output: (Stdio, Stdio),
 ) -> io::Result<Output> {
     if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
         return Err(io::Error::new(io::ErrorKind::Interrupted, ConfirmedStop));
@@ -210,7 +231,7 @@ pub async fn run(
     #[cfg(feature = "reliability-fixture")]
     fixture_cleanup_fault(&command).await?;
     isolate_import_git_env(&mut command);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.stdout(output.0).stderr(output.1);
     command.kill_on_drop(true);
     #[cfg(unix)]
     {

@@ -249,9 +249,13 @@ pub struct PersonalOptionsConfig {
     #[serde(default)]
     pub allowed_paths: Vec<String>,
 
-    /// Explicit opt-in to the qualified stock Apache svnserve checkout proof.
+    /// Explicit opt-in to a qualified stock Subversion checkout proof.
     #[serde(default)]
     pub network_directory_profile: Option<NetworkDirectoryProfile>,
+
+    /// Explicit, independently provisioned CA PEM bundle for HTTPS proof.
+    #[serde(default)]
+    pub svn_tls_ca_file: Option<PathBuf>,
 
     /// Normalize CRLF to LF during sync.
     #[serde(default = "default_true")]
@@ -298,6 +302,23 @@ pub struct PersonalOptionsConfig {
 #[serde(rename_all = "snake_case")]
 pub enum NetworkDirectoryProfile {
     ApacheSvnserveWc31,
+    ApacheModDavSvnHttpsWc31,
+}
+
+impl NetworkDirectoryProfile {
+    pub fn matches_scheme(self, scheme: &str) -> bool {
+        matches!(
+            (self, scheme),
+            (Self::ApacheSvnserveWc31, "svn") | (Self::ApacheModDavSvnHttpsWc31, "https")
+        )
+    }
+
+    pub fn revision_limit(self) -> i64 {
+        match self {
+            Self::ApacheSvnserveWc31 => 32,
+            Self::ApacheModDavSvnHttpsWc31 => 8,
+        }
+    }
 }
 
 impl Default for PersonalOptionsConfig {
@@ -305,6 +326,7 @@ impl Default for PersonalOptionsConfig {
         Self {
             allowed_paths: Vec::new(),
             network_directory_profile: None,
+            svn_tls_ca_file: None,
             normalize_line_endings: true,
             sync_executable_bit: true,
             max_file_size: 0,
@@ -402,23 +424,29 @@ impl PersonalConfig {
             });
         }
 
-        let network_profile = self.options.network_directory_profile.is_some();
-        if !self.options.allowed_paths.is_empty() || network_profile {
+        let profile = self.options.network_directory_profile;
+        let ca = self.options.svn_tls_ca_file.as_deref();
+        if !self.options.allowed_paths.is_empty() || profile.is_some() || ca.is_some() {
             let transport = crate::svn::operand::checked_url(&self.svn.url).map_err(|e| {
                 ConfigError::InvalidValue {
                     field: "svn.url".into(),
                     detail: e.to_string(),
                 }
             })?;
-            if self.options.allowed_paths.is_empty()
-                || !matches!(
-                    (transport.scheme(), network_profile),
-                    ("file", false) | ("svn", true)
-                )
-            {
+            let profile_matches = match profile {
+                None => transport.scheme() == "file",
+                Some(profile) => profile.matches_scheme(transport.scheme()),
+            };
+            let trust_matches = match profile {
+                Some(NetworkDirectoryProfile::ApacheModDavSvnHttpsWc31) => {
+                    ca.is_some_and(Path::is_absolute)
+                }
+                _ => ca.is_none(),
+            };
+            if self.options.allowed_paths.is_empty() || !profile_matches || !trust_matches {
                 return Err(ConfigError::InvalidValue {
                     field: "options.network_directory_profile".into(),
-                    detail: "scoped Personal sync requires local file://, or qualified svn:// with apache_svnserve_wc31; unsupported configuration held".into(),
+                    detail: "scoped Personal sync requires file://, explicit apache_svnserve_wc31 for svn://, or explicit apache_mod_dav_svn_https_wc31 plus an absolute svn_tls_ca_file for https://; unsupported configuration held".into(),
                 });
             }
         }
@@ -491,7 +519,9 @@ sync_executable_bit = true
 # max_file_size = 0         # 0 = no limit
 # ignore_patterns = []
 # allowed_paths = []        # incremental SVN→Git only when scoped
-# network_directory_profile = "apache_svnserve_wc31"  # qualified stock svn:// only
+# network_directory_profile = "apache_svnserve_wc31"  # qualified stock svn://
+# network_directory_profile = "apache_mod_dav_svn_https_wc31"  # qualified Apache DAV pilot
+# svn_tls_ca_file = "/absolute/path/to/trusted-ca.pem"
 # sync_externals = false
 # sync_direct_pushes = false
 auto_merge = true

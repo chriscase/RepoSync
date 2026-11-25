@@ -137,8 +137,13 @@ impl SvnToGitSync {
                 &self.config.options,
             )?
         };
-        let cover_numbered_revisions = !scope.is_empty()
-            && reposync_core::svn::operand::checked_url(svn.url())?.scheme() == "svn";
+        let profile = self
+            .config
+            .options
+            .network_directory_profile
+            .filter(|_| !scope.is_empty());
+        let cover_numbered_revisions = profile.is_some();
+        reposync_core::personal_projection::require_https_trust(&self.db, &svn)?;
         info!(watermark, "starting SVN-to-Git sync pass");
 
         // 2. Query SVN HEAD revision.
@@ -147,8 +152,11 @@ impl SvnToGitSync {
             .await
             .context("failed to get SVN repository info")?;
         // Bound network checkout work without crossing unexamined revisions.
-        let head_rev = if cover_numbered_revisions {
-            svn_info.latest_rev.min(watermark.saturating_add(32))
+        reposync_core::personal_projection::bind_https_source(&self.db, &svn, &svn_info)?;
+        let head_rev = if let Some(profile) = profile {
+            svn_info
+                .latest_rev
+                .min(watermark.saturating_add(profile.revision_limit()))
         } else {
             svn_info.latest_rev
         };
@@ -208,6 +216,7 @@ impl SvnToGitSync {
         };
 
         for (rev, entry) in revisions {
+            svn.require_visibility_budget()?;
             let predecessor = previous;
             previous = rev;
 
@@ -273,6 +282,7 @@ impl SvnToGitSync {
             };
 
             // 6. Copy exported files into the Git working tree (with policy).
+            svn.require_visibility_budget()?;
             let repo_path = {
                 let git_client = self.git_client.lock().unwrap();
                 git_client.repo_path().to_path_buf()

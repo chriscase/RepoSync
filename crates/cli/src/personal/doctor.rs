@@ -27,7 +27,7 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
 
     if !config.options.allowed_paths.is_empty() {
         println!("  {}", style::warn(&format!(
-            "SVN→Git scope    {:?}. Scoped import and Git→SVN PR replay are unavailable; use a clean scoped checkout. Network directory profile: {:?}. Qualified stock svnserve uses complete pinned WC31 checkouts; unsupported transports and incomplete visibility hold.",
+            "SVN→Git scope    {:?}. Scoped import and Git→SVN PR replay are unavailable; use a clean scoped checkout. Network directory profile: {:?}. Qualified stock Apache profiles use complete pinned WC31 checkouts. HTTPS requires an explicitly provisioned CA; unsupported transports and incomplete visibility hold.",
             config.options.allowed_paths, config.options.network_directory_profile
         )));
     }

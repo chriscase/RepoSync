@@ -40,7 +40,7 @@ def loopback_svn(root):
         process.wait(timeout=10)
 
 
-def exercise(root, personal, cli, network=None, hidden=None, nested=False, replacement=False):
+def exercise(root, personal, cli, network=None, hidden=None, nested=False, replacement=False, tls=None):
     events = []
 
     class API(BaseHTTPRequestHandler):
@@ -76,7 +76,7 @@ def exercise(root, personal, cli, network=None, hidden=None, nested=False, repla
     repo = root/"svn"
     svn = shutil.which("svn")
     run("svnadmin", "create", repo)
-    if hidden:
+    if hidden and not tls:
         # Synthetic fixture policy installed before serving this disposable
         # repository. Neither the access profile nor actor changes mid-cycle.
         (repo/"conf"/"svnserve.conf").write_text(
@@ -134,13 +134,22 @@ ignore_patterns = ["foo/*.tmp"]
 
     chosen = "foo/"
     profile = 'network_directory_profile = "apache_svnserve_wc31"\n' if network else ''
-    def configure(prefix):
-        conf.write_text(base+profile+'allowed_paths = '+json.dumps([prefix])+'\n')
+    if tls:
+        profile = 'network_directory_profile = "apache_mod_dav_svn_https_wc31"\n'
+    def configure(prefix, *, ca=None):
+        trust = ('svn_tls_ca_file = ' + json.dumps(str(ca or tls[0])) + '\n') if tls else ''
+        conf.write_text(base+profile+trust+'allowed_paths = '+json.dumps([prefix])+'\n')
 
     configure(chosen)
     assert "refusing bootstrap" in ps("sync", ok=False)
     assert not (data/"personal.db").exists()
     conf.write_text(base)
+    if tls:
+        # Only legacy fixture bootstrap uses this throwaway private HOME.
+        # Scoped HTTPS must ignore it, even when it trusts the right server.
+        servers = root/".subversion"/"servers"
+        servers.parent.mkdir(exist_ok=True)
+        servers.write_text("[global]\nssl-trust-default-ca = no\nssl-authority-files = "+str(tls[0])+"\n")
     ps("import", "--snapshot")
     tip = remote_ref()
     assert events == [("HEAD", "/repos/test/mirror")], events
@@ -192,6 +201,16 @@ ignore_patterns = ["foo/*.tmp"]
         (wc/"bar"/"baz.txt").write_text("excluded")
         run(svn, "add", "bar", cwd=wc)
         run(svn, "commit", "-m", "outside foo", cwd=wc)
+    if tls:
+        configure(chosen, ca=tls[1])
+        refused = ps("sync", ok=False)
+        assert "HTTPS SVN certificate verification refused" in refused, refused
+        assert str(tls[1]) not in refused
+        assert tip == remote_ref() and not events
+        assert db("SELECT value FROM watermarks WHERE source='svn_rev'") == [("1",)]
+        assert db("SELECT count(*) FROM canonical_mapping_outcomes") == [(0,)]
+        assert db("SELECT value FROM kv_state WHERE key LIKE 'personal_https_wc31_%'") == []
+        configure(chosen)
     if hidden:
         # A visible outside revision, then two revisions whose hidden selected
         # effect cancels, then a visible selected edit. A branch log or a
@@ -228,7 +247,7 @@ ignore_patterns = ["foo/*.tmp"]
         assert db("SELECT value FROM watermarks WHERE source='svn_rev'") == [("2",)]
         server.shutdown()
         server.server_close()
-        print(f"PASS loopback svn:// denied {hidden}: preceding filtered revision checkpointed; hidden and later revisions held without publication.")
+        print(f"PASS loopback {network.split(':',1)[0]} denied {hidden}: preceding filtered revision checkpointed; hidden and later revisions held without publication.")
         return
     assert "SVN→Git: 0 commits" in ps("sync")
     assert tip == remote_ref()
@@ -244,6 +263,25 @@ ignore_patterns = ["foo/*.tmp"]
     assert "filtered, no commit" in op("status") and "filtered, no commit" in op("log")
     assert "SVN→Git: 0 commits" in ps("sync")
     assert remote_ref() == tip and db(marks) == bookmarks
+
+    if tls:
+        # Test changing even the bytes of a syntactically valid existing CA;
+        # a previously bound mirror cannot accept a silently replaced bundle.
+        ca_original = tls[0].read_bytes()
+        tls[0].write_bytes(ca_original + b"\n")
+        changed = ps("sync", ok=False)
+        assert "CA bundle changed" in changed, changed
+        assert str(tls[0]) not in changed
+        assert tip == remote_ref() and db(marks) == bookmarks and not events
+        tls[0].write_bytes(ca_original)
+        source_key = "personal_https_wc31_source_sha256_v1"
+        bound = db("SELECT value FROM kv_state WHERE key=?", (source_key,))[0][0]
+        db("DELETE FROM kv_state WHERE key=?", (source_key,))
+        incomplete = ps("sync", ok=False)
+        assert "binding is incomplete" in incomplete, incomplete
+        assert tip == remote_ref() and db(marks) == bookmarks and not events
+        db("INSERT INTO kv_state(key,value,updated_at) VALUES (?,?,'fixture')",
+           (source_key, bound))
 
     conf.write_text(base)
     for command in [lambda: ps("sync", ok=False), lambda: ps("import", "--snapshot", ok=False),
@@ -337,11 +375,23 @@ exec "{svn}" "$@"
     assert "SVN→Git: 1 commits" in ps("sync")
     assert remote_ref() != recreated
     assert run("git", "--git-dir", remote, "ls-tree", "-r", "main").startswith("100755 blob")
+    if tls:
+        current = remote_ref()
+        for n in range(10):
+            scratch = root/"out-of-scope-source"
+            scratch.write_text(f"outside scope, sequential revision {n}")
+            run("svnmucc", "-m", "advance outside scope", "put",
+                scratch, repo.as_uri()+"/bar/baz.txt")
+        assert "SVN→Git: 0 commits" in ps("sync")
+        assert dict(db(marks))["svn_rev"] == "15" and remote_ref() == current
+        assert "SVN→Git: 0 commits" in ps("sync")
+        assert dict(db(marks))["svn_rev"] == "17" and remote_ref() == current
+
     assert not events, events
     assert db("SELECT count(*) FROM pr_sync_log") == [(0,)]
     server.shutdown()
     server.server_close()
-    prefix = ("qualified svn:// nested branch" if nested else "qualified svn:// directory") if network else "file:// directory"
+    prefix = (f"qualified {network.split(':',1)[0]}:// {'nested branch' if nested else 'directory'}") if network else "file:// directory"
     print(f"PASS #55 {prefix}: verified filtered receipt, actual no-export replay after policy change, orphan NULL rejection, selected mixed commit, selected deletion, transaction rollback and retry, fresh processes, PR isolation, CLI status/log/doctor and guarded imports.")
 
 

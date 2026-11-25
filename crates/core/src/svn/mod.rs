@@ -1,6 +1,7 @@
 //! SVN CLI wrapper for RepoSync.
 
 pub mod client;
+mod https_visibility;
 pub mod operand;
 pub mod parser;
 pub mod working_copy;

@@ -428,39 +428,57 @@ Git commit, push, or PR and does not move the Git cursor. Use
 filtered outcome or the SHA for a published commit.
 
 
-**Transport proof boundary.** Local `file://` SVN supports directory
-scopes. For a stock Apache `svnserve` source over `svn://` qualified against the
-WC31 compatibility profile, explicitly set
-`network_directory_profile = "apache_svnserve_wc31"` in `[options]`.
-This is a server-compatibility choice, not evidence of read permission.
-RepoSync still needs a complete pinned fresh checkout at each endpoint; native
-metadata must show no server-excluded, switched, sparse or incomplete nodes.
-An unreadable root, unproved absence, unsupported working-copy layout,
-or mismatch between the proved checkout and projected export holds the
-revision without publication. `https://`, `svn+ssh://` and unqualified
-directory servers are not supported by this rollout. Both present and absent paths are proved independently. An empty listing is not proof of absence. For a missing prefix, stock svnserve must complete a pinned update for exactly the named immediate child of a pristine depth-empty parent; denied or unknown endpoints hold. No sibling contents are fetched to prove absence.
+**Transport proof boundary.** Local `file://` supports directory scopes. Both
+network profiles are explicit stock Apache compatibility choices, not evidence
+that an account can see every path.
 
-A scoped `svn://` pass examines up to 32 consecutive revisions (a fixed limit) and cannot
-jump over an unseen one based on a later visible revision. A branch log may
-omit an unrelated revision; a no-target decision then requires that the
-independently proved selected trees on the two adjacent revisions agree.
-A missing log entry cannot authorize a changed Git tree.
+- Stock `svnserve` over `svn://`: set
+  `network_directory_profile = "apache_svnserve_wc31"` in `[options]`.
+- Qualified Apache `mod_dav_svn` over direct `https://`: set
+  `network_directory_profile = "apache_mod_dav_svn_https_wc31"` and
+  `svn_tls_ca_file = "/absolute/path/to/trusted-ca.pem"` in `[options]`.
+  Supply an independently trusted PEM certificate bundle. The client copies
+  it from a canonical regular-file path (no symlink) to its private per-cycle
+  configuration, performs standard TLS hostname
+  and chain validation and neither uses ambient trust nor ignores TLS failures.
+  After a valid direct SVN response, the mirror binds the repository identity
+  and CA bytes. A replaced CA bundle, mismatched origin, or malformed input
+  holds; it is not automatically admitted. Restore the admitted CA or use a
+  new separately prepared mirror after an intentional trust transition.
+  Redirected DAV, `http://`, `svn+ssh://`, unqualified servers and unknown WC
+  layouts are outside the profile. RepoSync compares the returned identity
+  to the configured direct URL before accepting evidence. It does not
+  intercept redirects in the SVN transport or promise that redirect traffic
+  cannot occur; configure a canonical endpoint that does not redirect.
 
+Full-depth checkouts are pinned independently at adjacent endpoints. Both
+must agree with complete WC31 metadata: excluded, switched, sparse or
+incomplete nodes hold the current revision. A separate export must agree
+with proved paths, bytes and modes before the Git writer can use it. A
+missing path is proved only by a pristine depth-empty parent and exact
+single-child update; no sibling contents are fetched and no parent above the
+configured SVN branch is read. An empty listing is not absence. In Apache DAV,
+a denied child can produce the same successful update message as an absent one
+but leaves a `server-excluded` WC31 row; RepoSync requires unchanged pristine
+metadata as well as the exact acknowledgment.
 
-Each non-receipted revision reads both adjacent endpoints for each selected
-subtree, including a separate pinned export to verify its content and modes.
-Nested branches also check their current SVN incarnation before effects.
-The 32-revision limit bounds the number of revisions per cycle, not their
-size or total execution time. Existing SVN subprocess deadlines are five
-minutes per command; there is no new wall-clock or disk byte quota across
-the whole cycle. Later cycles resume from the last confirmed SVN revision.
-A held revision is retried and prevents later numbers from being processed.
+**Fixed work limits.** Each `svn://` cycle examines at most 32 consecutive
+revision numbers and uses the existing five-minute per-command SVN deadline.
+HTTPS examines at most 8 consecutive numbers, with 30 seconds per SVN
+command and a 90-second planning budget shared across the cycle. HTTPS
+subprocesses on the qualified Unix profile have at most 64 MiB per written
+file, and command capture admits at most 16 MiB stdout and 1 MiB stderr.
+SVN subprocess temp files are directed to the same owned planning scratch.
+Owned private planning scratch is checked every 250 ms while commands run and
+at stage boundaries; 512 MiB or 25,000 entries stops planning. This is a
+sampled aggregate guard, not a filesystem quota: a write can grow between
+checks. The 90-second limit is a planning deadline, not a deadline for
+cleanup or an already journaled Git push. Each uncached revision can require
+multiple complete checkouts and exports and additional nested-lineage reads.
 
-
-The stock Apache Subversion 1.14.5 implementation checks read authorization
-on the complete requested update target before processing its report
-([svnserve update source](https://github.com/apache/subversion/blob/1.14.5/subversion/svnserve/serve.c#L1789-L1845)).
-A denied named child therefore cannot be treated as a successfully examined
-missing child. RepoSync also requires the unchanged pinned update
-acknowledgement and unchanged pristine parent metadata. It never checks an
-ancestor above the configured SVN branch.
+A branch log can omit unrelated revisions. The cursor cannot jump over an
+unseen number without matched, independently proved selected endpoints.
+Missing log metadata cannot authorize a changed Git tree. A timeout, trust
+failure or unresolved proof leaves the current revision pending, preserves
+already confirmed earlier revisions, and stops later ones. Catch-up resumes
+at the next number on a later cycle.

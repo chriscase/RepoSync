@@ -263,9 +263,7 @@ pub async fn observe_subtree(
             "pegged source identity differs from the requested snapshot",
         ));
     }
-    let directory = tempfile::Builder::new()
-        .prefix("reposync-svn-visibility-")
-        .tempdir()?;
+    let directory = client.visibility_tempdir("reposync-svn-visibility-")?;
     let path = directory.path().join("snapshot");
     client
         .checkout_full_pinned_without_externals(&path, revision)
@@ -302,17 +300,21 @@ pub(crate) async fn prove_absent_child(
 ) -> Result<SvnInfo, SvnError> {
     if !client.has_refresh_isolation()
         || revision < 1
-        || crate::svn::operand::checked_url(client.url())?.scheme() != "svn"
+        || !match crate::svn::operand::checked_url(client.url())?.scheme() {
+            "svn" => true,
+            "https" => client.https_trust_fingerprint().is_some(),
+            _ => false,
+        }
     {
-        return Err(refused("isolated qualified svnserve child proof required"));
+        return Err(refused(
+            "isolated qualified network SVN child proof required",
+        ));
     }
     let info = client.info_at_rev(revision).await?;
     if info.url != client.url() || info.latest_rev != revision {
         return Err(refused("absence parent differs from the pinned endpoint"));
     }
-    let directory = tempfile::Builder::new()
-        .prefix("reposync-svn-absence-")
-        .tempdir()?;
+    let directory = client.visibility_tempdir("reposync-svn-absence-")?;
     let path = directory.path().join("parent");
     client.checkout_empty_pinned(&path, revision).await?;
     let pristine = || inspect_empty_presence(&path, &info);

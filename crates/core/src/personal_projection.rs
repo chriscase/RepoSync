@@ -26,7 +26,7 @@ use crate::pair_refresh::svn_visibility::{
     observe_subtree, prove_absent_child, VisibleSvnCheckout,
 };
 use crate::path_projection::path_is_projected;
-use crate::personal_config::{NetworkDirectoryProfile, PersonalOptionsConfig};
+use crate::personal_config::PersonalOptionsConfig;
 use crate::svn::{SvnClient, SvnLogEntry};
 
 const MODE_LATCH: &str = "personal_incremental_scope_mode_v1";
@@ -111,18 +111,89 @@ fn selected_files(root: &Path, options: &PersonalOptionsConfig) -> Result<Files>
 
 /// Scoped network read evidence must never switch to ambient SVN credentials.
 pub fn scoped_source(svn: &SvnClient, options: &PersonalOptionsConfig) -> Result<SvnClient> {
-    match crate::svn::operand::checked_url(svn.url())?.scheme() {
-        "file" => Ok(svn.clone()),
-        "svn"
-            if options.network_directory_profile
-                == Some(NetworkDirectoryProfile::ApacheSvnserveWc31) =>
-        {
-            Ok(svn.isolated_personal_visibility()?)
+    let transport = crate::svn::operand::checked_url(svn.url())?;
+    match options.network_directory_profile {
+        None if transport.scheme() == "file" => Ok(svn.clone()),
+        Some(profile) if profile.matches_scheme(transport.scheme()) => {
+            let ca = options.svn_tls_ca_file.as_deref();
+            ensure!(
+                (transport.scheme() == "https") == ca.is_some(),
+                "scoped HTTPS needs an explicitly provisioned CA bundle"
+            );
+            Ok(svn.isolated_personal_visibility(ca)?)
         }
         _ => anyhow::bail!(
             "scoped network SVN visibility is unqualified for this transport; SVN revision held"
         ),
     }
+}
+
+const HTTPS_TRUST: &str = "personal_https_wc31_trust_sha256_v1";
+const HTTPS_SOURCE: &str = "personal_https_wc31_source_sha256_v1";
+
+/// A previously admitted CA cannot be silently replaced. Check before
+/// starting an SVN command so a stale trust file grants no new read.
+pub fn require_https_trust(db: &Database, svn: &SvnClient) -> Result<()> {
+    if let Some(current) = svn.https_trust_fingerprint() {
+        match (db.get_state(HTTPS_TRUST)?, db.get_state(HTTPS_SOURCE)?) {
+            (None, None) => {}
+            (Some(previous), Some(source)) if previous == current
+                && source.len() == 64 && source.bytes().all(|b| b.is_ascii_hexdigit()) => {}
+            _ => anyhow::bail!("scoped HTTPS SVN CA bundle changed or binding is incomplete; preserve the mirror and restore its admitted trust"),
+        }
+    }
+    Ok(())
+}
+
+/// Bind trust only after an authenticated, CA-verified direct SVN response.
+/// No first failure can seed durable trust or advance a source checkpoint.
+pub fn bind_https_source(db: &Database, svn: &SvnClient, info: &crate::svn::SvnInfo) -> Result<()> {
+    let Some(trust) = svn.https_trust_fingerprint() else {
+        return Ok(());
+    };
+    let expected = crate::svn::operand::checked_url(svn.url())?;
+    let seen = crate::svn::operand::checked_url(&info.url)?;
+    let root = crate::svn::operand::checked_url(&info.root_url)?;
+    ensure!(
+        expected.as_str().trim_end_matches('/') == seen.as_str().trim_end_matches('/')
+            && root.scheme() == "https"
+            && root.host_str() == seen.host_str()
+            && root.port_or_known_default() == seen.port_or_known_default()
+            && crate::path_projection::svn_path_identity(&info.root_url, &info.url).is_ok()
+            && !info.uuid.is_empty(),
+        "scoped HTTPS SVN endpoint or repository identity is not direct and unambiguous"
+    );
+    let source = serde_json::json!({"profile":"apache_mod_dav_svn_https_wc31","url":seen.as_str(),"root":root.as_str(),"uuid":info.uuid});
+    let source = hex::encode(Sha256::digest(source.to_string().as_bytes()));
+    db.immediate_transaction(|tx| {
+        Database::require_legacy_import_watermarks_available_tx(tx)?;
+        let refused = || {
+            DatabaseError::Other(
+                "scoped HTTPS SVN trust or repository identity changed; preserving the mirror"
+                    .into(),
+            )
+        };
+        let get = |key| {
+            tx.query_row("SELECT value FROM kv_state WHERE key=?1", [key], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+        };
+        match (get(HTTPS_TRUST)?, get(HTTPS_SOURCE)?) {
+            (None, None) => {
+                for (key, value) in [(HTTPS_TRUST, trust), (HTTPS_SOURCE, source.as_str())] {
+                    tx.execute(
+                        "INSERT INTO kv_state(key,value,updated_at) VALUES (?1,?2,?3)",
+                        params![key, value, chrono::Utc::now().to_rfc3339()],
+                    )?;
+                }
+            }
+            (Some(old_trust), Some(old_source)) if old_trust == trust && old_source == source => {}
+            _ => return Err(refused()),
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 async fn observe_directory(
@@ -355,13 +426,15 @@ pub async fn prepare(
     let window = db.begin_ordinary_writer_window(None)?;
     let generation = current_generation_read_only(&db.conn(), SCOPE, SCOPE)?;
     let transport = crate::svn::operand::checked_url(svn.url())?;
-    let network = transport.scheme() == "svn";
+    let network = matches!(transport.scheme(), "svn" | "https");
     ensure!(
         transport.scheme() == "file"
             || (network
                 && svn.has_refresh_isolation()
-                && options.network_directory_profile
-                    == Some(NetworkDirectoryProfile::ApacheSvnserveWc31)),
+                && options
+                    .network_directory_profile
+                    .is_some_and(|profile| profile.matches_scheme(transport.scheme()))
+                && (transport.scheme() == "https") == svn.https_trust_fingerprint().is_some()),
         "scoped source visibility profile is not qualified"
     );
     let historical = if network {
@@ -394,8 +467,8 @@ pub async fn prepare(
     } else {
         None
     };
-    let old_dir = tempfile::tempdir()?;
-    let new_dir = tempfile::tempdir()?;
+    let old_dir = svn.visibility_tempdir("prior-")?;
+    let new_dir = svn.visibility_tempdir("next-")?;
     let added_branch = !historical.branch_path.is_empty()
         && strict.as_ref().is_some_and(|log| {
             log.changed_paths.iter().any(|p| {
@@ -417,6 +490,7 @@ pub async fn prepare(
             "SVN branch identity changed during scoped projection"
         );
     }
+    svn.require_visibility_budget()?;
     window.require_engine_scope(db, None)?;
 
     if before != after {
@@ -426,7 +500,7 @@ pub async fn prepare(
         );
         // Move only admitted files between our private temporary directories.
         // No untrusted entry is followed, and renaming preserves execute bits.
-        let projection = tempfile::tempdir()?;
+        let projection = svn.visibility_tempdir("projected-")?;
         for path in after.keys() {
             let target = projection.path().join(path);
             std::fs::create_dir_all(target.parent().context("missing projected parent")?)?;
@@ -436,6 +510,7 @@ pub async fn prepare(
             selected_files(projection.path(), options)? == after,
             "materialized scope differs from independent SVN projection"
         );
+        svn.require_visibility_budget()?;
         window.finish_preparation()?;
         return Ok(Some(SelectedSnapshot {
             directory: projection,

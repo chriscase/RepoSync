@@ -34,6 +34,7 @@ pub struct SvnClient {
     password: String,
     cancel: Option<Arc<AtomicBool>>,
     refresh_config: Option<Arc<tempfile::TempDir>>,
+    https_visibility: Option<Arc<super::https_visibility::HttpsVisibility>>,
 }
 
 // Never log unvalidated userinfo/query text, including unsupported or malformed
@@ -98,6 +99,7 @@ impl SvnClient {
             password: password.into(),
             cancel: None,
             refresh_config: None,
+            https_visibility: None,
         };
         info!(url = %diagnostic_url(&client.url), username = %client.username, "created SvnClient");
         client
@@ -165,9 +167,42 @@ impl SvnClient {
 
     /// Isolate read-only proof traffic to the configured Personal actor.
     /// No fallback to cached or ambient credentials is permitted.
-    pub(crate) fn isolated_personal_visibility(&self) -> Result<Self, SvnError> {
+    pub(crate) fn isolated_personal_visibility(&self, ca: Option<&Path>) -> Result<Self, SvnError> {
         let password = (!self.password.is_empty()).then_some(self.password.as_str());
-        Self::new_isolated_refresh(&self.url, &self.username, password)
+        let mut isolated = Self::new_isolated_refresh(&self.url, &self.username, password)?;
+        if let Some(ca) = ca {
+            let private = isolated
+                .refresh_config
+                .as_ref()
+                .expect("isolated client has private config");
+            let digest = super::https_visibility::install_trust(ca, private.path())?;
+            isolated.https_visibility = Some(Arc::new(
+                super::https_visibility::HttpsVisibility::new(digest)?,
+            ));
+        }
+        Ok(isolated)
+    }
+
+    pub(crate) fn https_trust_fingerprint(&self) -> Option<&str> {
+        self.https_visibility
+            .as_ref()
+            .map(|pilot| pilot.trust_sha256.as_str())
+    }
+
+    pub(crate) fn visibility_tempdir(&self, prefix: &str) -> std::io::Result<tempfile::TempDir> {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(prefix);
+        match &self.https_visibility {
+            Some(pilot) => builder.tempdir_in(pilot.scratch()),
+            None => builder.tempdir(),
+        }
+    }
+
+    pub fn require_visibility_budget(&self) -> Result<(), SvnError> {
+        if let Some(pilot) = &self.https_visibility {
+            pilot.check()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn personal_visibility_operand(&self, path: &str) -> Result<Self, SvnError> {
@@ -1150,19 +1185,36 @@ impl SvnClient {
         cmd.args(rest);
         record_svn_diag(&cmd);
 
-        debug!(cmd = ?format!("svn {}", args.join(" ")), "running svn command");
-        let output = crate::process::run(cmd, SVN_COMMAND_TIMEOUT, self.cancel.as_ref())
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    SvnError::BinaryNotFound("svn".into())
-                } else {
-                    SvnError::IoError(e)
-                }
-            })?;
+        if self.https_visibility.is_some() {
+            debug!(verb, "running scoped HTTPS SVN command");
+        } else {
+            debug!(cmd = ?format!("svn {}", args.join(" ")), "running svn command");
+        }
+        let output = if let Some(pilot) = &self.https_visibility {
+            pilot.run(cmd).await?
+        } else {
+            crate::process::run(cmd, SVN_COMMAND_TIMEOUT, self.cancel.as_ref())
+                .await
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        SvnError::BinaryNotFound("svn".into())
+                    } else {
+                        SvnError::IoError(e)
+                    }
+                })?
+        };
 
         if !output.status.success() {
-            let stderr = self.command_stderr(&output.stderr);
+            let stderr = if self.https_visibility.is_some() {
+                let diagnostic = String::from_utf8_lossy(&output.stderr);
+                if diagnostic.contains("E230001") {
+                    "HTTPS SVN certificate verification refused".to_owned()
+                } else {
+                    "scoped HTTPS SVN command failed; current revision remains pending".to_owned()
+                }
+            } else {
+                self.command_stderr(&output.stderr)
+            };
             let exit_code = output.status.code().unwrap_or(-1);
             warn!(exit_code, %stderr, "svn command failed");
             return Err(SvnError::CommandFailed { exit_code, stderr });
