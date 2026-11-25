@@ -373,6 +373,7 @@
     "R21_PINNED_OLD_BINARY",
     "R22",
     "R23",
+    "R23_SCHEDULER_RESTORED_DATABASE",
     "R24",
     "R65_BLANK_GIT_REMOTE",
     "R65_BRANCH_PAIR_QUERY",
@@ -1616,6 +1617,7 @@
     "R23": [
       "R23"
     ],
+    "R23_SCHEDULER_RESTORED_DATABASE": ["R23"],
     "R24": [
       "R24"
     ],
