@@ -250,6 +250,8 @@ fn receipt(conn: &Connection, id: &str) -> Result<Option<Value>, DatabaseError> 
         serde_json::from_str(&raw).map_err(|_| refused("malformed enrollment receipt"))?;
     let rev: Option<i64> = row.get(2)?;
     let sha: Option<String> = row.get(3)?;
+    let canonical_json =
+        serde_json::to_string(&details).map_err(|_| refused("malformed enrollment receipt"))?;
     if row.get::<_, i64>(1)? != 1
         || rev.is_none()
         || sha.is_none()
@@ -257,7 +259,7 @@ fn receipt(conn: &Connection, id: &str) -> Result<Option<Value>, DatabaseError> 
         || sha.as_deref() != details["canonical_lineage"]["git_baseline_sha"].as_str()
         || row.get::<_, Option<String>>(4)?.is_some()
         || row.get::<_, Option<String>>(5)?.is_some()
-        || details.to_string() != raw
+        || canonical_json != raw
         || rows.next()?.is_some()
     {
         return Err(refused("contradictory enrollment audit records"));
