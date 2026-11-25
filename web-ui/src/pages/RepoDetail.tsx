@@ -271,7 +271,7 @@ function RepositoryDetailEditor() {
   const { data: repo, isLoading, isError, error } = repoQuery;
   const archived = repo?.status === 'archived';
   const repoMissing = isNotFoundError(error);
-  const detailLive = !!id && id !== retiredId && !repoMissing;
+  const detailLive = !!id && !!repo && id !== retiredId && !repoMissing;
 
   // Status query scoped to this repo. Stop it once this detail is gone.
   const statusQuery = useQuery<SyncStatus>({
@@ -600,7 +600,11 @@ function RepositoryDetailEditor() {
       setRemovalReceipt(durableReceipt);
       queryClient.setQueryData(['managed-removal', payload.target.id, payload.result.operation_id], payload.result);
       queryClient.invalidateQueries({ queryKey: ['managed-removal-target', id, payload.target.id] });
-      if (!payload.result.ok) {
+      // An accepted branch-pair operation can still be running after the
+      // registration disappears. Preserve its notice and retire the dead view.
+      const acceptedBranchPair = payload.kind === 'branch_pair'
+        && ['queued', 'running', 'cancelling'].includes(payload.result.state);
+      if (!payload.result.ok && !acceptedBranchPair) {
         setBranchPairDeleteError(payload.result.message);
         queryClient.invalidateQueries({ queryKey: ['repos'] });
         return;
