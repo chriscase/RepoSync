@@ -56,7 +56,9 @@ python3 "$repo_root/scripts/reliability-prep.py" --stage-fixtures "$prepared_con
   "$repo_root" "$artifact_dir/fixture-inputs.json"
 mkdir "$prepared_context/legacy-old"
 phase=old_source_archive
-git archive 87379741779a6259f7eeb52a68cc6f061174e5ef | tar -x -C "$prepared_context/legacy-old"
+git archive 87379741779a6259f7eeb52a68cc6f061174e5ef > "$prepared_context/legacy-old.tar"
+tar -xf "$prepared_context/legacy-old.tar" -C "$prepared_context/legacy-old"
+rm "$prepared_context/legacy-old.tar"
 python3 "$repo_root/scripts/reliability-lock-overlay.py" stage "$prepared_context/legacy-old" \
   --source 87379741779a6259f7eeb52a68cc6f061174e5ef \
   --receipt "$artifact_dir/old-generator-build-lock.json"

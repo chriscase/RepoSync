@@ -956,7 +956,7 @@ UI_IDENTITY_FILES = (
     "web-ui/src/branchPairDeletion.ts",
     "web-ui/src/managedRemoval.ts",
 )
-SYSTEM_NODE_FALLBACKS = (Path("/usr/bin/node"), Path("/usr/bin/nodejs"))
+SEALED_NODE = Path("/usr/local/bin/node")
 
 
 def ui_source_bind(root):
@@ -999,30 +999,11 @@ def accepts_strip_types(binary):
     return probe.returncode == 0
 
 
-def select_node_runtime(path_dirs, system_fallbacks):
-    """PATH Node that accepts strip-types, then a supported system fallback."""
-    for directory in path_dirs:
-        candidate = Path(directory) / "node"
-        if candidate.is_file() and accepts_strip_types(candidate):
-            return candidate
-    for candidate in system_fallbacks:
-        if Path(candidate).is_file() and accepts_strip_types(candidate):
-            return Path(candidate)
-    raise AssertionError("no compatible Node runtime (PATH or system fallback)")
-
-
-def materialize_node_wrapper():
-    """Point the explicit Node override at a compatible runtime, via a fixture shim."""
-    path_dirs = [item for item in os.environ.get("PATH", "").split(os.pathsep) if item]
-    chosen = select_node_runtime(path_dirs, SYSTEM_NODE_FALLBACKS)
-    wrapper = FIXTURE / "tmp" / "reposync-node"
-    wrapper.parent.mkdir(parents=True, exist_ok=True)
-    wrapper.write_text(f"#!/bin/sh\nexec {chosen} \"$@\"\n")
-    wrapper.chmod(0o755)
-    os.environ["REPOSYNC_NODE_BIN"] = str(wrapper)
-    if not accepts_strip_types(wrapper):
-        raise AssertionError(f"node wrapper probe failed for {chosen}")
-    return chosen
+def configure_node_runtime():
+    """Use the Node binary copied into the read-only runtime image."""
+    if not accepts_strip_types(SEALED_NODE):
+        raise AssertionError(f"sealed Node runtime cannot run strip-types: {SEALED_NODE}")
+    os.environ["REPOSYNC_NODE_BIN"] = str(SEALED_NODE)
 
 
 def require_mandatory_cases(manifest):
@@ -1034,7 +1015,7 @@ def require_mandatory_cases(manifest):
 
 def main():
     os.environ.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
-    materialize_node_wrapper()
+    configure_node_runtime()
     bind_relocated_ui_source()
     mode = sys.argv[1]
     assert mode in ("diagnostics", "candidate", "all", "baseline"), mode

@@ -16,7 +16,10 @@ prepare_source() {
   local source="$1" label="$2" context="$contexts/$2"
   mkdir -p "$context" || return $?
   printf '%s\n' archive > "$comparison_dir/$label-setup-stage.txt" || return $?
-  git archive "$source" | tar -x -C "$context" || return $?
+  local archive="$contexts/$label.tar"
+  git archive "$source" > "$archive" || return $?
+  tar -xf "$archive" -C "$context" || return $?
+  rm "$archive" || return $?
   printf '%s\n' lock_staging > "$comparison_dir/$label-setup-stage.txt" || return $?
   python3 scripts/reliability-lock-overlay.py stage "$context" --source "$source" \
     --receipt "$comparison_dir/$label-lock.json" || return $?
