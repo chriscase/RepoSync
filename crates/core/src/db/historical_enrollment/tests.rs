@@ -278,3 +278,24 @@ fn refused_retrospective_proof_does_not_retire_a_previous_writer_lease() {
     );
     assert!(receipt(&conn, ID).unwrap().is_none());
 }
+
+#[test]
+fn old_import_progress_counts_log_entries_on_a_sparse_svn_branch() {
+    let conn = fixture(Path::new(":memory:"));
+    let first = "1".repeat(40);
+    conn.execute("UPDATE repositories SET last_svn_rev=12 WHERE id=?1", [ID])
+        .unwrap();
+    conn.execute("UPDATE commit_map SET svn_rev=7,git_sha=?2,synced_at='2025-01-02T00:00:00Z' WHERE repo_id=?1",params![ID,first]).unwrap();
+    conn.execute("UPDATE sync_records SET svn_rev=7,git_sha=?2,synced_at='2025-01-02T00:00:00Z' WHERE repo_id=?1",params![ID,first]).unwrap();
+    conn.execute("INSERT INTO commit_map(repo_id,svn_rev,git_sha,direction,synced_at) VALUES(?1,12,?2,'svn_to_git','2025-01-02T00:00:01Z')",params![ID,TIP]).unwrap();
+    conn.execute("INSERT INTO sync_records(id,repo_id,svn_rev,git_sha,direction,status,timestamp,synced_at) VALUES('last',?1,12,?2,'svn_to_git','applied','t','2025-01-02T00:00:01Z')",params![ID,TIP]).unwrap();
+    conn.execute_batch("INSERT INTO import_progress(id,phase,current_rev,total_revs,commits_created,batches_pushed,started_at,completed_at)
+        VALUES(1,'completed',2,2,2,1,'2025-01-01T00:00:00Z','2025-01-03T00:00:00Z');
+        INSERT INTO audit_log(action,direction,svn_rev,details,created_at,success) VALUES('import_full','svn_to_git',12,'Full history import: 2 commits from 2 revisions','2025-01-02T00:00:02Z',1)").unwrap();
+    assert_eq!(
+        read_planned_cutover_pins(&conn, ID).unwrap().mappings.len(),
+        2
+    );
+    conn.execute_batch("UPDATE import_progress SET current_rev=12,total_revs=99; UPDATE audit_log SET details='Full history import: 2 commits from 99 revisions'").unwrap();
+    assert!(read_planned_cutover_pins(&conn, ID).is_err());
+}

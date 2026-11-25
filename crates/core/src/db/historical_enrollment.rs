@@ -281,7 +281,7 @@ fn require_single_published_pair(
            SELECT * FROM import_progress WHERE repo_id IS NULL AND (phase<>'idle' OR current_rev<>0 OR commits_created<>0 OR batches_pushed<>0)
          ), audit AS (SELECT * FROM audit_log WHERE repo_id IS NULL AND (svn_rev IS NOT NULL OR COALESCE(git_sha,'')<>''))
          SELECT (SELECT COUNT(*) FROM progress)>1 OR (SELECT COUNT(*) FROM audit)>1
-         OR EXISTS(SELECT 1 FROM progress p WHERE p.phase<>'completed' OR p.current_rev<>?2 OR p.commits_created<>?3
+         OR EXISTS(SELECT 1 FROM progress p WHERE p.phase<>'completed' OR p.current_rev<>p.total_revs OR p.total_revs<p.commits_created OR p.commits_created<>?3
             OR julianday(p.started_at) IS NULL OR julianday(p.completed_at) IS NULL OR julianday(p.started_at)>julianday(p.completed_at)
             OR EXISTS(SELECT 1 FROM (SELECT synced_at FROM commit_map WHERE repo_id=?1 UNION ALL SELECT synced_at FROM sync_records WHERE repo_id=?1) m
                  WHERE julianday(m.synced_at) IS NULL OR julianday(m.synced_at) NOT BETWEEN julianday(p.started_at) AND julianday(p.completed_at)))
