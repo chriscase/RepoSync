@@ -98,7 +98,7 @@ pub(crate) fn pending(conn: &Connection, version: u32) -> Result<bool, DatabaseE
         // The legacy runner committed its DDL before setting user_version. A
         // crash between those writes can leave the deployed v13 index on v12.
         let mut objects =
-            conn.prepare("SELECT name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'")?;
+            conn.prepare("SELECT lower(name) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'")?;
         let names = objects.query_map([], |r| r.get::<_, String>(0))?;
         let mut partial = false;
         for name in names {
@@ -119,7 +119,7 @@ pub(crate) fn pending(conn: &Connection, version: u32) -> Result<bool, DatabaseE
         }
         let scope_or_clone_column: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('repositories')
-             WHERE name IN ('cloned_from_id','scope_uuid'))",
+             WHERE name COLLATE NOCASE IN ('cloned_from_id','scope_uuid'))",
             [],
             |row| row.get(0),
         )?;
@@ -141,7 +141,8 @@ pub(crate) fn pending(conn: &Connection, version: u32) -> Result<bool, DatabaseE
         return Ok(true);
     }
     let has_mixed_objects = actual.iter().any(|(_, name, _, _)| {
-        is_copy_artifact(name) || (version == 13 && name.starts_with("canonical_"))
+        let identifier = name.to_ascii_lowercase();
+        is_copy_artifact(&identifier) || (version == 13 && identifier.starts_with("canonical_"))
     });
     if !has_mixed_objects {
         // Converted storage retains both legacy indexes and the clone column.
@@ -155,7 +156,7 @@ pub(crate) fn pending(conn: &Connection, version: u32) -> Result<bool, DatabaseE
         };
         let has_installed_index = actual.iter().any(|(_, name, _, _)| {
             matches!(
-                name.as_str(),
+                name.to_ascii_lowercase().as_str(),
                 "idx_sync_records_repo_dir_status_rev" | "idx_repositories_cloned_from"
             )
         });
@@ -319,12 +320,12 @@ mod tests {
             .unwrap();
         assert!(!pending(&native, 14).unwrap());
         native
-            .execute_batch("CREATE TABLE pair_lineages(id TEXT)")
+            .execute_batch("CREATE TABLE Pair_Lineages(id TEXT)")
             .unwrap();
         assert!(pending(&native, 14).is_err());
         native
             .execute_batch(
-                "DROP TABLE pair_lineages; DROP INDEX idx_canonical_mapping_outcomes_scope",
+                "DROP TABLE Pair_Lineages; DROP INDEX idx_canonical_mapping_outcomes_scope",
             )
             .unwrap();
         assert!(pending(&native, 14).is_err());
@@ -342,7 +343,7 @@ mod tests {
             "../../../../daemon/tests/fixtures/schema-v12.sql"
         ))
         .unwrap();
-        conn.execute_batch("CREATE TABLE canonical_lineage(incomplete TEXT)")
+        conn.execute_batch("CREATE TABLE Canonical_Lineage(incomplete TEXT)")
             .unwrap();
         let before = catalog(&conn).unwrap();
         assert!(Database::open_with_exclusive_owner(dir.path()).is_err());
