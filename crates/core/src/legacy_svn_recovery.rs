@@ -430,10 +430,19 @@ async fn require_stable_source(
     client: &SvnClient,
     evidence: &SvnEvidence,
     pair: &LegacyPairPins,
+    is_archive: bool,
 ) -> Result<()> {
     let after = client.info().await?;
-    ensure!(
+    // Pending revisions on the active company SVN are normal while bridge
+    // writers are stopped. Its HEAD may advance only if the current path is
+    // still the original incarnation and the mapped prefix remains identical.
+    let revision_ok = if is_archive {
         after.latest_rev == evidence.head
+    } else {
+        after.latest_rev >= evidence.head
+    };
+    ensure!(
+        revision_ok
             && after.uuid == evidence.identity.uuid
             && after.url == evidence.identity.url
             && after.root_url == evidence.identity.root_url,
@@ -444,6 +453,12 @@ async fn require_stable_source(
     ensure!(
         log == evidence.log && identity == evidence.identity,
         "SVN history changed during review"
+    );
+    tracing::info!(
+        start_head = evidence.head,
+        end_head = after.latest_rev,
+        through_revision = pair.last_svn_rev,
+        "Verified current SVN incarnation against the retained history"
     );
     Ok(())
 }
@@ -551,7 +566,7 @@ async fn verify_isolated(
                     && old.snapshots == active.snapshots,
                 "trusted backup and current SVN history differ"
             );
-            require_stable_source(&archived, &old, pair).await?;
+            require_stable_source(&archived, &old, pair, true).await?;
             (
                 false,
                 Some(
@@ -561,7 +576,7 @@ async fn verify_isolated(
         }
         HistoricalSvnSource::PlannedCutover => (true, None),
     };
-    require_stable_source(live, &active, pair).await?;
+    require_stable_source(live, &active, pair, false).await?;
     require_local_ref(&mirror, &reference, tip)?;
     registered_ref(&git_url, &reference, tip, token)?;
     let id = active.identity;
@@ -592,7 +607,6 @@ async fn verify_isolated(
         "svn_root_url": id.root_url,
         "svn_branch": id.branch_path,
         "creation_revision": id.incarnation_created_rev,
-        "observed_svn_head": active.head,
         "through_revision": pair.last_svn_rev,
         "mapping_count": pair.mappings.len(),
         "git_url": git_url.as_str(),

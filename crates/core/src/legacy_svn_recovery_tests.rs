@@ -156,6 +156,9 @@ async fn both_sources_bind_the_same_history_with_separate_review_authority() {
             &format!("{}/trunk/later", f.pair.svn_url),
         ],
     );
+    let later = f.verify().await.unwrap();
+    assert_eq!(pre.review_sha256(), later.review_sha256());
+    assert_eq!(pre.provenance(), later.provenance());
     f.pair.scope_uuid = "new-scope".into();
     f.pair.generation = 1;
     let migrated = f.verify().await.unwrap();
@@ -299,4 +302,73 @@ async fn matching_repository_suffix_on_another_authority_is_refused_before_conta
         .unwrap_err_text()
         .contains("Git endpoint differs from registered repository"));
     assert!(matches!(receiver.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
+}
+
+#[tokio::test]
+async fn active_head_can_advance_during_a_scan_but_cannot_recede_or_replace_the_branch() {
+    let f = Fixture::new();
+    let live = SvnClient::new_isolated_refresh(&branch_url(&f.pair).unwrap(), "", None).unwrap();
+    let trees = mapped_trees(&f.pair, &f.witness.git_mirror).unwrap();
+    let before = observe_svn(
+        &live,
+        &f.pair.svn_url,
+        &f.pair,
+        &f.witness.git_mirror,
+        &trees,
+    )
+    .await
+    .unwrap();
+    // Move the repository-wide HEAD, first without touching the branch and
+    // then with ordinary pending work on that same branch.
+    command(
+        "svnmucc",
+        &[
+            "-m",
+            "other team",
+            "mkdir",
+            &format!("{}/other-team", f.pair.svn_url),
+        ],
+    );
+    require_stable_source(&live, &before, &f.pair, false)
+        .await
+        .unwrap();
+    let branch = branch_url(&f.pair).unwrap();
+    command(
+        "svnmucc",
+        &[
+            "-m",
+            "pending team work",
+            "mkdir",
+            &format!("{branch}/later"),
+        ],
+    );
+    require_stable_source(&live, &before, &f.pair, false)
+        .await
+        .unwrap();
+    assert!(require_stable_source(&live, &before, &f.pair, true)
+        .await
+        .is_err());
+    command(
+        "svnmucc",
+        &[
+            "-m",
+            "replace branch",
+            "rm",
+            &branch,
+            "cp",
+            "2",
+            &branch,
+            &branch,
+        ],
+    );
+    assert!(require_stable_source(&live, &before, &f.pair, false)
+        .await
+        .is_err());
+    // Same UUID, same approved tree, same registered path, and an earlier
+    // repository HEAD from the retained pre-r3 snapshot.
+    fs::rename(&f.active, f._directory.path().join("replaced")).unwrap();
+    fs::rename(&f.backup, &f.active).unwrap();
+    assert!(require_stable_source(&live, &before, &f.pair, false)
+        .await
+        .is_err());
 }
