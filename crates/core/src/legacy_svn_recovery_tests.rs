@@ -214,6 +214,32 @@ async fn refuses_changed_log_metadata_and_substituted_archive() {
             f.backup.to_str().unwrap(),
             "-r",
             "1",
+            "corp:review",
+            message.to_str().unwrap(),
+        ],
+    );
+    assert!(f
+        .verify()
+        .await
+        .unwrap_err_text()
+        .contains("backup and current SVN history differ"));
+    command(
+        "svnadmin",
+        &[
+            "delrevprop",
+            f.backup.to_str().unwrap(),
+            "-r",
+            "1",
+            "corp:review",
+        ],
+    );
+    command(
+        "svnadmin",
+        &[
+            "setrevprop",
+            f.backup.to_str().unwrap(),
+            "-r",
+            "1",
             "svn:log",
             message.to_str().unwrap(),
         ],
@@ -256,4 +282,21 @@ impl Failure for Result<VerifiedHistoricalLineage> {
     fn unwrap_err_text(self) -> String {
         format!("{:#}", self.err().expect("expected refusal"))
     }
+}
+
+#[tokio::test]
+async fn matching_repository_suffix_on_another_authority_is_refused_before_contact() {
+    let mut f = Fixture::new();
+    let receiver = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    receiver.set_nonblocking(true).unwrap();
+    f.witness.configured_git_url = format!(
+        "https://{}/fixture/project.git",
+        receiver.local_addr().unwrap()
+    );
+    f.witness.credential_context_sha256 = Some("a".repeat(64));
+    let result = verify_registered(&f.pair, &f.witness, "", None, Some("disposable-token")).await;
+    assert!(result
+        .unwrap_err_text()
+        .contains("Git endpoint differs from registered repository"));
+    assert!(matches!(receiver.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
 }

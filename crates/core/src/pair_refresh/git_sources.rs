@@ -129,12 +129,22 @@ pub(crate) fn require_historical_git_tip(
     expected: Oid,
     token: Option<&str>,
 ) -> Result<(), GitError> {
+    historical_git_tip_with_client(url, reference, expected, token, source_client()?)
+}
+
+fn historical_git_tip_with_client(
+    url: &str,
+    reference: &str,
+    expected: Oid,
+    token: Option<&str>,
+    client: reqwest::Client,
+) -> Result<(), GitError> {
     let directory = tempfile::tempdir()?;
     let mut init = RepositoryInitOptions::new();
     init.bare(true).external_template(false).no_reinit(true);
     let repository = Repository::init_opts(directory.path(), &init)?;
     require_pinned_push_endpoint_with_policy(&repository, url, PinnedPushPolicy::SmartHttpV1)?;
-    let transport = HttpTransport::new(url, token, source_client()?)?;
+    let transport = HttpTransport::new(url, token, client)?;
     let mut remote = checked_anonymous_remote(&repository, &transport.endpoint)?;
     let connection = remote.connect_auth(git2::Direction::Fetch, Some(no_credentials()), None)?;
     let mut matching = connection

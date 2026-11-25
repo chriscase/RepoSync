@@ -14,13 +14,14 @@ use sha2::{Digest, Sha256};
 
 use crate::db::historical_enrollment::LegacyPairPins;
 use crate::db::lineage_checkpoints::{
-    observe_live_svn_identity, CanonicalLineage, LiveSvnIdentity,
+    observed_svn_identity_from_history, observed_svn_identity_path, CanonicalLineage,
+    LiveSvnIdentity,
 };
 use crate::pair_refresh::git_sources::require_historical_git_tip;
 use crate::pair_refresh::publication::require_complete_git_graph;
 use crate::pair_refresh::svn_preparation::{verify_refresh_svn_tree, visible_checkout_properties};
 use crate::pair_refresh::svn_visibility::{observe_subtree, require_empty_visible_ancestors};
-use crate::svn::{parse_svn_copy_history, SvnClient, SvnLogEntry};
+use crate::svn::{parser::parse_copy_history_entries, SvnClient, SvnInfo, SvnLogEntry};
 
 pub enum HistoricalSvnSource {
     /// A separately trusted pre-upgrade backup restored privately. SVN does
@@ -34,14 +35,14 @@ pub enum HistoricalSvnSource {
     PlannedCutover,
 }
 
-pub struct HistoricalSvnWitness {
+pub(crate) struct HistoricalSvnWitness {
     pub source: HistoricalSvnSource,
     pub git_mirror: PathBuf,
     /// A keyed digest of the selected registered credential context. Raw
     /// credentials never appear in receipts, including public provenance.
     pub credential_context_sha256: Option<String>,
-    /// Derived by the caller from the installed configuration, including an
-    /// existing explicit Git base override. Never taken from mirror metadata.
+    /// Derived from the stored Team registration by the credential owner.
+    /// Independently checked against the exact registered URL before contact.
     pub configured_git_url: String,
 }
 
@@ -103,7 +104,7 @@ fn checked_url(raw: &str, schemes: &[&str]) -> Result<Url> {
 }
 
 fn branch_url(pair: &LegacyPairPins) -> Result<String> {
-    checked_url(&pair.svn_url, &["file", "https", "svn"])?;
+    checked_url(&pair.svn_url, &["file", "https"])?;
     ensure!(
         !pair.svn_url.ends_with('/')
             && pair.svn_branch.split('/').all(|segment| {
@@ -211,12 +212,15 @@ struct SvnEvidence {
 
 async fn history_at_head(
     client: &SvnClient,
-    head: i64,
+    info: &SvnInfo,
     branch: &str,
     pair: &LegacyPairPins,
-) -> Result<(String, i64)> {
-    let xml = client.copy_history_xml_at_rev(head).await?;
-    let mut log = parse_svn_copy_history(&xml)?;
+) -> Result<(String, LiveSvnIdentity)> {
+    let head = info.latest_rev;
+    let xml = client.copy_history_xml_at_rev(head, true).await?;
+    let mut log = parse_copy_history_entries(&xml, true)?;
+    let identity =
+        observed_svn_identity_from_history(info, observed_svn_identity_path(info)?, &log)?;
     log.reverse();
     let created = log.first().context("missing SVN origin")?.revision;
     let prefix = format!("{branch}/");
@@ -287,6 +291,7 @@ async fn history_at_head(
     // attributes so two different changes cannot collapse into one receipt.
     let xml = roxmltree::Document::parse(&xml)?;
     let mut attributes = BTreeMap::new();
+    let mut revprops = BTreeMap::new();
     for entry in xml.root_element().children().filter(|n| n.is_element()) {
         let rev: i64 = entry
             .attribute("revision")
@@ -294,6 +299,44 @@ async fn history_at_head(
             .parse()?;
         if rev > pair.last_svn_rev {
             continue;
+        }
+        let mut groups = entry
+            .children()
+            .filter(|node| node.has_tag_name("revprops"));
+        if let Some(group) = groups.next() {
+            ensure!(
+                groups.next().is_none() && group.attributes().len() == 0,
+                "ambiguous SVN revision properties"
+            );
+            let mut values = BTreeMap::new();
+            for prop in group.children().filter(|n| n.is_element()) {
+                let name = prop
+                    .attribute("name")
+                    .context("unnamed SVN revision property")?;
+                let encoding = prop.attribute("encoding");
+                ensure!(
+                    prop.has_tag_name("property")
+                        && prop.tag_name().namespace().is_none()
+                        && !name.is_empty()
+                        && encoding.is_none_or(|e| e == "base64")
+                        && prop
+                            .attributes()
+                            .all(|a| a.namespace().is_none()
+                                && matches!(a.name(), "name" | "encoding"))
+                        && !prop.children().any(|n| n.is_element()),
+                    "unsupported SVN revision property"
+                );
+                let value: String = prop
+                    .children()
+                    .filter(|n| n.is_text())
+                    .filter_map(|n| n.text())
+                    .collect();
+                ensure!(
+                    values.insert(name, (encoding, value)).is_none(),
+                    "duplicate SVN revision property"
+                );
+            }
+            revprops.insert(rev, values);
         }
         for node in entry.descendants().filter(|n| n.has_tag_name("path")) {
             let path = node.text().context("missing SVN changed path")?;
@@ -304,7 +347,14 @@ async fn history_at_head(
                 .insert(path, attrs);
         }
     }
-    Ok((digest(&(&retained, attributes))?, created))
+    ensure!(
+        identity.incarnation_created_rev == created
+            && identity.branch_path == pair.svn_branch
+            && identity.copy_from_path.is_none()
+            && identity.copy_from_rev.is_none(),
+        "historical SVN incarnation is ambiguous"
+    );
+    Ok((digest(&(&retained, attributes, revprops))?, identity))
 }
 
 async fn observe_svn(
@@ -325,17 +375,15 @@ async fn observe_svn(
                 .is_ok_and(|id| !id.is_nil() && id.to_string() == info.uuid),
         "SVN repository identity, location or revision differs"
     );
-    let identity = observe_live_svn_identity(client, &info).await?;
-    let (log, created) = history_at_head(client, info.latest_rev, &branch, pair).await?;
-    ensure!(
-        identity.incarnation_created_rev == created
-            && identity.branch_path == pair.svn_branch
-            && identity.copy_from_path.is_none()
-            && identity.copy_from_rev.is_none(),
-        "historical SVN incarnation is ambiguous"
+    let (log, identity) = history_at_head(client, &info, &branch, pair).await?;
+    tracing::info!(
+        mapping_count = trees.len(),
+        through_revision = pair.last_svn_rev,
+        "Verifying one complete SVN checkout and matching Git tree per retained mapping"
     );
+    let started = std::time::Instant::now();
     let mut snapshots = Vec::with_capacity(trees.len());
-    for ((rev, _), tree) in pair.mappings.iter().zip(trees) {
+    for (i, ((rev, _), tree)) in pair.mappings.iter().zip(trees).enumerate() {
         let checkout = observe_subtree(client, *rev).await?;
         let pinned = checkout.info();
         ensure!(
@@ -359,6 +407,16 @@ async fn observe_svn(
             checkout.node_count(),
             digest(&properties)?,
         ));
+        let completed = i + 1;
+        if completed == 1 || completed % 100 == 0 || completed == trees.len() {
+            tracing::info!(
+                completed,
+                total = trees.len(),
+                revision = rev,
+                elapsed_seconds = started.elapsed().as_secs(),
+                "Verified historical SVN and Git snapshots"
+            );
+        }
     }
     Ok(SvnEvidence {
         identity,
@@ -381,21 +439,16 @@ async fn require_stable_source(
             && after.root_url == evidence.identity.root_url,
         "SVN source changed during review"
     );
-    let (log, created) = history_at_head(
-        client,
-        after.latest_rev,
-        &format!("/{}", pair.svn_branch),
-        pair,
-    )
-    .await?;
+    let (log, identity) =
+        history_at_head(client, &after, &format!("/{}", pair.svn_branch), pair).await?;
     ensure!(
-        log == evidence.log && created == evidence.identity.incarnation_created_rev,
+        log == evidence.log && identity == evidence.identity,
         "SVN history changed during review"
     );
     Ok(())
 }
 
-pub async fn verify_registered(
+pub(crate) async fn verify_registered(
     pair: &LegacyPairPins,
     witness: &HistoricalSvnWitness,
     svn_username: &str,
@@ -404,24 +457,6 @@ pub async fn verify_registered(
 ) -> Result<VerifiedHistoricalLineage> {
     let live = SvnClient::new_isolated_refresh(&branch_url(pair)?, svn_username, svn_password)?;
     verify_isolated(pair, witness, &live, git_token).await
-}
-
-pub async fn verify(
-    pair: &LegacyPairPins,
-    witness: &HistoricalSvnWitness,
-    live: &SvnClient,
-) -> Result<VerifiedHistoricalLineage> {
-    verify_with_git_token(pair, witness, live, None).await
-}
-
-pub async fn verify_with_git_token(
-    pair: &LegacyPairPins,
-    witness: &HistoricalSvnWitness,
-    live: &SvnClient,
-    git_token: Option<&str>,
-) -> Result<VerifiedHistoricalLineage> {
-    let isolated = live.isolated_historical_reader()?;
-    verify_isolated(pair, witness, &isolated, git_token).await
 }
 
 async fn verify_isolated(
@@ -438,7 +473,13 @@ async fn verify_isolated(
         pair.svn_url.starts_with("file://") || live.source_username() == pair.svn_username,
         "SVN identity differs from registration"
     );
-    let git_url = checked_url(&witness.configured_git_url, &["file", "https"])?;
+    let expected_git_url =
+        crate::git::derive_git_remote_url(&pair.git_api_url, None, &pair.git_repo);
+    ensure!(
+        witness.configured_git_url == expected_git_url,
+        "Git endpoint differs from registered repository"
+    );
+    let git_url = checked_url(&expected_git_url, &["file", "https"])?;
     ensure!(
         pair.git_repo.split('/').count() == 2
             && pair
@@ -446,9 +487,8 @@ async fn verify_isolated(
                 .split('/')
                 .all(|s| !matches!(s, "" | "." | "..")
                     && s.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
-            && git_url.path().ends_with(&format!("/{}.git", pair.git_repo)),
-        "Git endpoint differs from registered repository"
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))),
+        "unsupported Git repository registration"
     );
     let remote = git_url.scheme() != "file" || !pair.svn_url.starts_with("file://");
     ensure!(
