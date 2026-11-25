@@ -63,6 +63,10 @@ pub(super) async fn own_recovery(
         request_id: request,
         child_id: child,
         parent_id: op.pins.parent.repo_id,
+        git_tips: RefreshApprovalGitTips::new(
+            &op.pins.git.pins.child_tip,
+            &op.pins.git.pins.parent_tip,
+        ),
         approval_digest: digest.clone(),
         kind: "recovery".into(),
         expires_at: (chrono::Utc::now()

@@ -2939,7 +2939,17 @@ async fn owned_service_retains_preparation_and_returns_exact_publication_and_noo
         RefreshResponse::Approval(approval) => approval,
         other => panic!("unexpected {other:?}"),
     };
+    let remote_tips = || {
+        serde_json::json!({
+            "child": f.target.refname_to_id("refs/heads/feature").unwrap().to_string(),
+            "parent": f.target.refname_to_id("refs/heads/main").unwrap().to_string(),
+        })
+    };
     assert_eq!(approval.kind, "integration");
+    assert_eq!(
+        serde_json::to_value(&approval).unwrap()["git_tips"],
+        remote_tips()
+    );
     assert_ne!(approval.preparation_id, approval.operation_id);
     assert!(f.db.pair_refresh_operation(approval.operation_id).is_err());
     let before = journal_state(&f);
@@ -3016,6 +3026,11 @@ async fn owned_service_retains_preparation_and_returns_exact_publication_and_noo
         other => panic!("unexpected {other:?}"),
     };
     assert_eq!(noop.kind, "no_op");
+    assert_eq!(
+        serde_json::to_value(&noop).unwrap()["git_tips"],
+        remote_tips()
+    );
+    assert_ne!(noop.git_tips.child, approval.git_tips.child);
     let before = f.db.get_repo_watermark("child").unwrap();
     let noop_receipt = service
         .act(
