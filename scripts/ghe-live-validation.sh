@@ -304,7 +304,7 @@ log "─────────────────────────
 
 emit_event "preflight" "tools" "running" 0
 MISSING=""
-for tool in svn git curl cargo jq; do
+for tool in svn git curl cargo jq python3; do
     if command -v "$tool" &>/dev/null; then
         log "  ✓ $tool"
     else
@@ -663,6 +663,11 @@ TOML
     GIT_CONTENT="git-pr-add-${CANARY}"
     GIT_CONTENT_B64=$(echo -n "$GIT_CONTENT" | base64)
 
+    # A revision that existed before this PR cannot prove a new replay.
+    SVN_AUTH=(--username "$SVN_USERNAME" --password "$SVN_PASSWORD" --non-interactive --no-auth-cache)
+    S5_SVN_BASELINE=$(svn info "$SVN_URL" --show-item revision "${SVN_AUTH[@]}" 2>/dev/null) || S5_SVN_BASELINE=""
+    printf '%s\n' "$S5_SVN_BASELINE" > "$CYCLE_DIR/s5-svn-baseline.txt"
+
     # Get main branch SHA for creating the new branch.
     MAIN_REF_RESP=$(gh_api GET "/repos/${GHE_OWNER}/${GHE_REPO}/git/ref/heads/main" "")
     MAIN_REF_CODE=$(gh_status "$MAIN_REF_RESP")
@@ -678,12 +683,13 @@ TOML
             COMMIT_RESP=$(gh_api PUT "/repos/${GHE_OWNER}/${GHE_REPO}/contents/${GIT_FILE}" \
                 "{\"message\":\"Validation: add $GIT_FILE via PR\",\"content\":\"${GIT_CONTENT_B64}\",\"branch\":\"${PR_BRANCH}\"}")
             COMMIT_CODE=$(gh_status "$COMMIT_RESP")
-            if [[ "$COMMIT_CODE" == "201" ]]; then
-                GIT_SHA=$(gh_body "$COMMIT_RESP" | jq -r '.commit.sha // "unknown"' 2>/dev/null || echo "unknown")
+            GIT_SHA=$(gh_body "$COMMIT_RESP" | jq -er \
+                '.commit.sha | strings | select(test("^[0-9a-fA-F]{40}$"))' 2>/dev/null) || GIT_SHA=""
+            if [[ "$COMMIT_CODE" == "201" && -n "$GIT_SHA" ]]; then
                 echo "$GIT_SHA" > "$CYCLE_DIR/s5-git-sha.txt"
                 record_scenario "s5-git-branch-commit" "pass" "sha=${GIT_SHA:0:8} on ${PR_BRANCH}"
             else
-                record_scenario "s5-git-branch-commit" "fail" "commit HTTP $COMMIT_CODE"
+                record_scenario "s5-git-branch-commit" "fail" "commit unconfirmed or missing SHA (HTTP $COMMIT_CODE)"
                 gh_body "$COMMIT_RESP" > "$CYCLE_DIR/s5-error.json" 2>/dev/null || true
                 CYCLE_OK=false
             fi
@@ -710,16 +716,17 @@ TOML
             # Merge the PR (squash merge to keep it clean).
             sleep 1  # Give GitHub a moment for merge-ability check.
             MERGE_RESP=$(gh_api PUT "/repos/${GHE_OWNER}/${GHE_REPO}/pulls/${PR_NUMBER}/merge" \
-                "{\"merge_method\":\"squash\",\"commit_title\":\"Validation: merge ${CANARY}\"}")
+                "{\"merge_method\":\"squash\",\"sha\":\"${GIT_SHA}\",\"commit_title\":\"Validation: merge ${CANARY}\"}")
             MERGE_CODE=$(gh_status "$MERGE_RESP")
-            if [[ "$MERGE_CODE" == "200" ]]; then
-                PR_MERGE_SHA=$(gh_body "$MERGE_RESP" | jq -r '.sha // ""' 2>/dev/null || echo "")
+            PR_MERGE_SHA=$(gh_body "$MERGE_RESP" | jq -er \
+                'select(.merged == true) | .sha | strings | select(test("^[0-9a-fA-F]{40}$"))' 2>/dev/null) || PR_MERGE_SHA=""
+            if [[ "$MERGE_CODE" == "200" && -n "$PR_MERGE_SHA" ]]; then
                 PR_MERGED=true
                 echo "$PR_NUMBER" > "$CYCLE_DIR/s6-pr-number.txt"
                 echo "$PR_MERGE_SHA" > "$CYCLE_DIR/s6-merge-sha.txt"
                 record_scenario "s6-git-pr-merge" "pass" "PR #${PR_NUMBER} merged (sha=${PR_MERGE_SHA:0:8})"
             else
-                record_scenario "s6-git-pr-merge" "fail" "merge HTTP $MERGE_CODE"
+                record_scenario "s6-git-pr-merge" "fail" "merge unconfirmed or missing commit SHA (HTTP $MERGE_CODE)"
                 gh_body "$MERGE_RESP" > "$CYCLE_DIR/s6-merge-error.json" 2>/dev/null || true
                 CYCLE_OK=false
             fi
@@ -749,63 +756,32 @@ TOML
             svn update "$SVN_WC" --username "$SVN_USERNAME" --password "$SVN_PASSWORD" \
                 --non-interactive --no-auth-cache > "$CYCLE_DIR/s7-svn-update.log" 2>&1 || true
 
-            # (a) Verify the PR-committed file now exists in SVN with correct content.
-            VERIFY_SVN=$(svn cat "$SVN_URL/$GIT_FILE" --username "$SVN_USERNAME" --password "$SVN_PASSWORD" \
-                --non-interactive --no-auth-cache 2>/dev/null || echo "")
-            if [[ "$VERIFY_SVN" != "$GIT_CONTENT" ]]; then
-                SYNC_OUTPUT=$(cat "$CYCLE_DIR/s7-sync-stdout.log" 2>/dev/null || echo "")
-                if echo "$SYNC_OUTPUT" | grep -qE 'Git→SVN: [1-9][0-9]* commits|prs_synced.*[1-9]'; then
-                    record_scenario "s7-git-to-svn-sync" "fail" "sync reported commits but file not in SVN"
-                else
-                    record_scenario "s7-git-to-svn-sync" "fail" "no PR replay occurred — file not in SVN (content: '${VERIFY_SVN:0:40}')"
-                fi
+            # Pin both the byte comparison and the log to the file's last change.
+            S7_FILE_URL="$SVN_URL/$GIT_FILE"
+            S7_REV=$(svn info "$S7_FILE_URL" --show-item last-changed-revision \
+                "${SVN_AUTH[@]}" 2>/dev/null) || S7_REV=""
+            if [[ ! "$S7_REV" =~ ^[1-9][0-9]*$ ]]; then
+                record_scenario "s7-git-to-svn-sync" "fail" "could not select the replayed SVN file revision"
+                CYCLE_OK=false
+            elif ! svn cat -r "$S7_REV" "$S7_FILE_URL@$S7_REV" "${SVN_AUTH[@]}" \
+                    > "$CYCLE_DIR/s7-svn-file.txt" 2>/dev/null \
+                || ! cmp -s "$CYCLE_DIR/s7-svn-file.txt" <(printf '%s' "$GIT_CONTENT"); then
+                record_scenario "s7-git-to-svn-sync" "fail" "SVN content missing or different at r$S7_REV"
+                CYCLE_OK=false
+            elif ! svn log --xml -r "$S7_REV" -l 1 "$S7_FILE_URL@$S7_REV" "${SVN_AUTH[@]}" \
+                    > "$CYCLE_DIR/s7-svn-log.xml" 2>/dev/null; then
+                record_scenario "s7-git-to-svn-sync" "fail" "could not read SVN log at r$S7_REV"
                 CYCLE_OK=false
             else
-                # (b) Verify the replayed SVN commit carries EXACT Git/PR metadata.
-                # RepoSync formats commit messages with "Git-Commit: <sha>" and
-                # "PR: #N (<branch>)" trailers. We require an exact match to the
-                # values recorded in S6 — a generic "some trailer exists" is not
-                # sufficient to prove this cycle's PR was actually replayed.
-                SVN_LOG_XML=$(svn log "$SVN_URL/$GIT_FILE" --xml -l 3 \
-                    --username "$SVN_USERNAME" --password "$SVN_PASSWORD" \
-                    --non-interactive --no-auth-cache 2>/dev/null || echo "")
-                echo "$SVN_LOG_XML" > "$CYCLE_DIR/s7-svn-log.xml"
-
-                S7_PROOF_DETAILS="content=OK"
-                S7_PASS=true
-
-                # Load expected values from S6 artifacts.
-                EXPECTED_PR=$(cat "$CYCLE_DIR/s6-pr-number.txt" 2>/dev/null || echo "")
-                EXPECTED_SHA=$(cat "$CYCLE_DIR/s6-merge-sha.txt" 2>/dev/null || echo "")
-
-                # --- Git-Commit trailer: require exact SHA match ---
-                if [[ -z "$EXPECTED_SHA" ]]; then
-                    S7_PROOF_DETAILS="${S7_PROOF_DETAILS}, Git-Commit=FAIL(no expected SHA from S6)"
-                    S7_PASS=false
-                elif echo "$SVN_LOG_XML" | grep -q "Git-Commit: ${EXPECTED_SHA}"; then
-                    S7_PROOF_DETAILS="${S7_PROOF_DETAILS}, Git-Commit=${EXPECTED_SHA:0:8}=exact"
+                # Personal replays the member commit, even when GitHub lands a different squash SHA.
+                EXPECTED_PR=$(cat "$CYCLE_DIR/s6-pr-number.txt" 2>/dev/null || true)
+                EXPECTED_MEMBER=$(cat "$CYCLE_DIR/s5-git-sha.txt" 2>/dev/null || true)
+                EXPECTED_MERGE=$(cat "$CYCLE_DIR/s6-merge-sha.txt" 2>/dev/null || true)
+                if S7_PROOF=$(python3 "$SCRIPT_DIR/s7_provenance.py" "$CYCLE_DIR/s7-svn-log.xml" \
+                        "$S7_REV" "$S5_SVN_BASELINE" "$EXPECTED_PR" "$EXPECTED_MEMBER" "$EXPECTED_MERGE" 2>&1); then
+                    record_scenario "s7-git-to-svn-sync" "pass" "content=OK, $S7_PROOF"
                 else
-                    OBSERVED_SHA=$(echo "$SVN_LOG_XML" | sed -n 's/.*Git-Commit: \([0-9a-f]*\).*/\1/p' | head -1)
-                    S7_PROOF_DETAILS="${S7_PROOF_DETAILS}, Git-Commit=MISMATCH(expected=${EXPECTED_SHA:0:8},observed=${OBSERVED_SHA:-MISSING})"
-                    S7_PASS=false
-                fi
-
-                # --- PR trailer: require exact "#N" match ---
-                if [[ -z "$EXPECTED_PR" ]]; then
-                    S7_PROOF_DETAILS="${S7_PROOF_DETAILS}, PR=FAIL(no expected PR# from S6)"
-                    S7_PASS=false
-                elif echo "$SVN_LOG_XML" | grep -q "#${EXPECTED_PR}"; then
-                    S7_PROOF_DETAILS="${S7_PROOF_DETAILS}, PR=#${EXPECTED_PR}=exact"
-                else
-                    OBSERVED_PR=$(echo "$SVN_LOG_XML" | sed -n 's/.*PR: #\([0-9]*\).*/\1/p' | head -1)
-                    S7_PROOF_DETAILS="${S7_PROOF_DETAILS}, PR=MISMATCH(expected=#${EXPECTED_PR},observed=#${OBSERVED_PR:-MISSING})"
-                    S7_PASS=false
-                fi
-
-                if $S7_PASS; then
-                    record_scenario "s7-git-to-svn-sync" "pass" "$S7_PROOF_DETAILS"
-                else
-                    record_scenario "s7-git-to-svn-sync" "fail" "content OK but provenance mismatch ($S7_PROOF_DETAILS)"
+                    record_scenario "s7-git-to-svn-sync" "fail" "$S7_PROOF"
                     CYCLE_OK=false
                 fi
             fi

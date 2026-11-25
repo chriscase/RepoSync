@@ -518,6 +518,17 @@ pub(crate) struct OrdinaryStartupClaim {
     pub native: Option<(String, String)>,
 }
 
+impl OrdinaryStartupClaim {
+    pub(crate) fn into_daemon_guard(self, data_dir: &Path) -> WriterFenceGuard {
+        WriterFenceGuard {
+            host: self.fence.host,
+            epoch: self.fence.epoch,
+            pid: self.fence.pid,
+            data_dir: Some(data_dir.to_owned()),
+        }
+    }
+}
+
 pub(crate) fn claim_for_ordinary_startup(
     db: &Database,
     lock: &crate::data_dir::LockGuard,
@@ -535,6 +546,7 @@ pub(crate) fn claim_for_ordinary_startup(
             crate::db::schema::initialize_empty_startup_in_transaction(tx)?;
         }
         let epoch = claim_lease_tx(tx, &host, pid)?;
+        crate::db::schema::installed_team::upgrade_on_claim(tx)?;
         let lease = tx.query_row(
             "SELECT value FROM kv_state WHERE key=?1",
             [LEASE_KEY],

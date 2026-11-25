@@ -1,0 +1,20 @@
+{
+  "reasons": [
+    {
+      "match": "^(R21|R22)",
+      "reason": "Company-installed version is NOT ESTABLISHED. No pinned historical production binary is vendored in this lab. A current-tree migration fixture is not this proof, and an unknown installed version stays NOT_RUN."
+    },
+    {
+      "match": "^(R13|R14|69_)",
+      "reason": "Coordinated update-from-parent success is not claimed. Preview and re-anchor refusal are separate lab operations. This matrix subcase stays NOT_RUN until that production workflow is implemented and wired."
+    },
+    {
+      "match": "^(R09|R10)_",
+      "reason": "Lower-level team_mode_e2e.rs remains #189-owned and is not executed or edited here. Lab rewrite journeys are separate operations. This matrix subcase is not implied by those journeys."
+    },
+    {
+      "match": ".*",
+      "reason": "No acceptance-lab executor is mapped to this matrix subcase. It stays visible and is not a PASS. Related lab operations are listed on their own rows."
+    }
+  ]
+}
