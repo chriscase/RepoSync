@@ -225,6 +225,18 @@ reposync identity lookup jsmith              # Look up one SVN user's Git identi
 reposync audit --limit 20                    # Recent sync history
 ```
 
+### Inspect an installed Team database before upgrading
+
+Run the candidate CLI against a **consistent offline SQLite backup** from `legacy/team-install` or `legacy/team-install-hotfix`. These branches share the same database layout. Keep the original database and its sidecars together. A database file copied on its own from a live WAL-mode installation can omit committed history. Supply a checkpointed backup that includes those commits. Discarding journal files can invalidate a snapshot.
+
+```bash
+reposync upgrade-preflight --database /backups/team/reposync.db
+```
+
+The report identifies the installed v13 or v14 catalog and lists each registration by ID. It checks for retained Git/SVN checkpoints, mappings, sync records, revision-bearing audit entries and import progress. An exit status of zero means these checks found no retained or unattributed history. The command returns a failure status for missing historical identity, evidence of unknown origin or an unreadable, changed or unsupported snapshot. It reads the supplied snapshot offline, without loading configuration or connecting to either remote.
+
+For a pair with retained history, keep it paused and locate an independently attributable pre-upgrade SVN backup, its original service URL and branch creation or copy history, and the corresponding Git ref and full imported commits. A saved SVN working copy can corroborate the original URL and UUID. Assessing the live repository and authorizing recovery require a separate review. [Historical Team upgrade follow-up](https://github.com/chriscase/RepoSync/issues/316)
+
 ### Personal Mode Commands
 
 ```bash

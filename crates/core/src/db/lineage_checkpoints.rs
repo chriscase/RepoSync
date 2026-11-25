@@ -574,7 +574,10 @@ fn blocked(reason: &str, detail: impl Into<String>) -> SyncError {
     }
 }
 
-fn retained_legacy_baseline(conn: &Connection, repo_id: &str) -> Result<bool, DatabaseError> {
+pub(super) fn retained_legacy_baseline(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<bool, DatabaseError> {
     let (last_svn, last_git): (i64, String) = conn.query_row(
         "SELECT last_svn_rev, last_git_sha FROM repositories WHERE id = ?1",
         [repo_id],
