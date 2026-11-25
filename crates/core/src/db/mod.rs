@@ -6,6 +6,9 @@
 pub mod conflict_repo_attribution;
 pub mod credential_seeding;
 pub mod git_push_operations;
+pub mod historical_enrollment;
+pub mod historical_review_key;
+pub mod historical_transport;
 pub mod import_operations;
 pub mod late_pair_publish_operations;
 pub mod lineage_checkpoints;
