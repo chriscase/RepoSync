@@ -210,6 +210,10 @@ fn canonical_enrollment_is_idempotent_and_rejects_changed_retained_state() {
         .unwrap(),
         0
     );
+    conn.execute_batch("SAVEPOINT changed_audit; UPDATE audit_log SET svn_rev=99 WHERE action='historical_lineage_enrolled'").unwrap();
+    assert!(read_planned_cutover_pins(&conn, ID).is_err());
+    conn.execute_batch("ROLLBACK TO changed_audit; RELEASE changed_audit")
+        .unwrap();
     conn.execute(
         "UPDATE sync_records SET message='changed after review' WHERE repo_id=?1",
         [ID],

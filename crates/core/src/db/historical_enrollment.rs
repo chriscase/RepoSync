@@ -239,19 +239,30 @@ pub fn read_legacy_pair_pins(conn: &Connection, id: &str) -> Result<LegacyPairPi
 
 fn receipt(conn: &Connection, id: &str) -> Result<Option<Value>, DatabaseError> {
     let mut stmt = conn.prepare(
-        "SELECT details,success FROM audit_log WHERE repo_id=?1 AND action=?2 ORDER BY id LIMIT 2",
+        "SELECT details,success,svn_rev,git_sha,direction,author FROM audit_log WHERE repo_id=?1 AND action=?2 ORDER BY id LIMIT 2",
     )?;
     let mut rows = stmt.query(params![id, ACTION])?;
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
     let raw: String = row.get(0)?;
-    if row.get::<_, i64>(1)? != 1 || rows.next()?.is_some() {
+    let details: Value =
+        serde_json::from_str(&raw).map_err(|_| refused("malformed enrollment receipt"))?;
+    let rev: Option<i64> = row.get(2)?;
+    let sha: Option<String> = row.get(3)?;
+    if row.get::<_, i64>(1)? != 1
+        || rev.is_none()
+        || sha.is_none()
+        || rev != details["last_svn_rev"].as_i64()
+        || sha.as_deref() != details["canonical_lineage"]["git_baseline_sha"].as_str()
+        || row.get::<_, Option<String>>(4)?.is_some()
+        || row.get::<_, Option<String>>(5)?.is_some()
+        || details.to_string() != raw
+        || rows.next()?.is_some()
+    {
         return Err(refused("contradictory enrollment audit records"));
     }
-    Ok(Some(
-        serde_json::from_str(&raw).map_err(|_| refused("malformed enrollment receipt"))?,
-    ))
+    Ok(Some(details))
 }
 
 // Migration assigns scopes to the whole database. A single-pair cutover must first
@@ -455,6 +466,21 @@ fn persist(
     let mut canonical = checked.canonical;
     canonical.scope_uuid.clone_from(&pins.scope_uuid);
     canonical.generation = pins.generation;
+    let recorded: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kv_state WHERE key=?1",
+            [lineage_checkpoints::independently_established_svn_uuid_kv_key(&pins.repo_id)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if recorded
+        .as_ref()
+        .is_some_and(|raw| raw != &canonical.svn_uuid)
+    {
+        return Err(refused(
+            "a retained historical UUID record contradicts the verified witness",
+        ));
+    }
     if lineage_checkpoints::independently_established_svn_uuid(conn, &pins.repo_id)?
         .is_some_and(|id| id != canonical.svn_uuid)
     {
@@ -482,7 +508,7 @@ fn persist(
             ));
         }
     }
-    let audit = json!({"version":1,"scope_uuid":pins.scope_uuid,"generation":pins.generation,
+    let audit = json!({"version":1,"scope_uuid":pins.scope_uuid,"generation":pins.generation,"last_svn_rev":pins.last_svn_rev,
         "storage_sha256":pins.storage_sha256,"review_sha256":checked.digest,"history_sha256":checked.history,
         "planned_cutover":checked.planned,"canonical_lineage":canonical,"provenance":checked.provenance});
     let existing =
