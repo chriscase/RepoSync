@@ -742,7 +742,7 @@
     {
       "id": "R23",
       "title": "Post-external-write recovery without blind restore",
-      "baseline": "NOT RUN",
+      "baseline": "PARTIAL",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
       "required_case_ids": [
@@ -750,18 +750,19 @@
         "64B_FINALIZER_RECOVERY",
         "64B_ATOMIC_FAILURE",
         "64C_UNIQUE_MATCH",
-        "64C_RESUME_ONE_WRITE"
+        "64C_RESUME_ONE_WRITE",
+        "R23_SCHEDULER_RESTORED_DATABASE"
       ],
       "supporting_case_ids": [
         "64B_CURSOR_CONFLICT",
         "64C_CONFLICT_HELD"
       ],
       "open": [
-        "Restoring an old DB after remote writes and blindly replaying is not a dedicated negative case",
-        "Automatic/background SVN recovery is not implemented"
+        "Actual scheduler case is registered; execute and independently verify the exact candidate/receiving tree before claiming this subcase passes",
+        "Old-database restore after a remote Git-to-SVN write without a retained journal, expanded restored-history shapes, and automatic/background SVN recovery remain unqualified"
       ],
-      "evidence": "#64-B verifies an already-published Git SHA and finalizes without a second push. #64-C verifies one accepted Git→SVN commit by UUID/path/revision ancestry/changed paths/tree and the durable operation identity, or authorizes resume when the effect is absent and the pre-write target is unchanged. Blind old-DB restore remains forbidden by contract, not by a dedicated fixture.",
-      "diagnostic_expected_baseline_failure": false
+      "evidence": "#64-B and #64-C separately verify remote effects under retained operation journals, not blind restores. The retained R23 hosted baseline (#305, run 45322416314 job 138203860109) observed the direct engine advance the restored bridge and create a conflict without replaying either remote; no full scheduler baseline ran. #306 qualified the narrow direct-engine pre-replay hold for a restored r2 snapshot with a genuine r3 SVN-to-Git publication. R23_SCHEDULER_RESTORED_DATABASE registers the actual daemon interval and worker case: an independent SVN working copy writes r3, Git publishes it once, a successful live repeat is a no-op, then two cold scheduler instances reopen the same restored r2 state and check the scoped hold and exact checkout/ledger/remote preservation. New scheduler case execution is not recorded by this source change. Uses a scrubbed Unix test child with exact local remote fencing and disposable filesystem remotes, not a deployed database or a lost-receipt Git-to-SVN publication.",
+      "diagnostic_expected_baseline_failure": true
     },
     {
       "id": "R24",
