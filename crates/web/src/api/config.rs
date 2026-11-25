@@ -8,7 +8,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::api::auth::validate_session;
+use crate::api::auth::require_admin;
 use crate::api::status::AppError;
 use crate::AppState;
 
@@ -104,11 +104,7 @@ async fn get_config(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<ConfigResponse>, AppError> {
-    validate_session(
-        &state,
-        headers.get("authorization").and_then(|v| v.to_str().ok()),
-    )
-    .await?;
+    require_admin(&state, &headers).await?;
 
     let cfg = &state.config;
 
@@ -146,11 +142,7 @@ async fn get_identity_mappings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<AuthorMapping>>, AppError> {
-    validate_session(
-        &state,
-        headers.get("authorization").and_then(|v| v.to_str().ok()),
-    )
-    .await?;
+    require_admin(&state, &headers).await?;
 
     let db = &state.db;
 
@@ -173,11 +165,7 @@ async fn update_identity_mappings(
     headers: HeaderMap,
     Json(body): Json<UpdateMappingsRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_session(
-        &state,
-        headers.get("authorization").and_then(|v| v.to_str().ok()),
-    )
-    .await?;
+    require_admin(&state, &headers).await?;
 
     let json_str = serde_json::to_string(&body.mappings)
         .map_err(|e| AppError::Internal(format!("serialize mappings: {}", e)))?;
@@ -201,11 +189,7 @@ async fn get_notification_config(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    crate::api::auth::validate_session(
-        &state,
-        headers.get("authorization").and_then(|v| v.to_str().ok()),
-    )
-    .await?;
+    require_admin(&state, &headers).await?;
 
     let db = &state.db;
     let teams_url = db
@@ -228,14 +212,7 @@ async fn save_notification_config(
     headers: axum::http::HeaderMap,
     Json(body): Json<SaveNotificationConfig>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let (_user_id, role) = crate::api::auth::validate_session_with_role(
-        &state,
-        headers.get("authorization").and_then(|v| v.to_str().ok()),
-    )
-    .await?;
-    if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
-    }
+    require_admin(&state, &headers).await?;
 
     let db = &state.db;
     let url = body.teams_webhook_url.unwrap_or_default();
@@ -256,14 +233,7 @@ async fn test_teams_notification(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let (_user_id, role) = crate::api::auth::validate_session_with_role(
-        &state,
-        headers.get("authorization").and_then(|v| v.to_str().ok()),
-    )
-    .await?;
-    if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
-    }
+    require_admin(&state, &headers).await?;
 
     let db = &state.db;
     let url = db

@@ -30,7 +30,7 @@ use reposync_core::import::{self, ImportConfig, ImportPhase, ImportProgress};
 use reposync_core::models::Repository;
 use reposync_core::svn::SvnClient;
 
-use crate::api::auth::validate_session_with_role;
+use crate::api::auth::require_admin;
 use crate::api::status::AppError;
 use crate::AppState;
 
@@ -195,11 +195,7 @@ async fn get_setup_config(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<SetupConfigResponse>, AppError> {
-    crate::api::auth::validate_session(
-        &state,
-        headers.get("authorization").and_then(|v| v.to_str().ok()),
-    )
-    .await?;
+    require_admin(&state, &headers).await?;
 
     let cfg = &state.config;
 
@@ -273,15 +269,7 @@ async fn test_svn_connection(
     headers: axum::http::HeaderMap,
     Json(body): Json<TestSvnRequest>,
 ) -> Result<Json<TestConnectionResponse>, AppError> {
-    // Require auth unless this is a fresh instance with no users/password configured
-    let has_users = state.db.count_users().unwrap_or(0) > 0;
-    if state.config.web.admin_password.is_some() || has_users {
-        crate::api::auth::validate_session(
-            &state,
-            headers.get("authorization").and_then(|v| v.to_str().ok()),
-        )
-        .await?;
-    }
+    setup_auth(&state, &headers).await?;
     let url = body.url.trim().to_string();
     let username = body.username.trim().to_string();
 
@@ -343,14 +331,7 @@ async fn test_git_connection(
     headers: axum::http::HeaderMap,
     Json(body): Json<TestGitRequest>,
 ) -> Result<Json<TestConnectionResponse>, AppError> {
-    let has_users = state.db.count_users().unwrap_or(0) > 0;
-    if state.config.web.admin_password.is_some() || has_users {
-        crate::api::auth::validate_session(
-            &state,
-            headers.get("authorization").and_then(|v| v.to_str().ok()),
-        )
-        .await?;
-    }
+    setup_auth(&state, &headers).await?;
     let api_url = body.api_url.trim().trim_end_matches('/').to_string();
     let repo = body.repo.trim().to_string();
 
@@ -442,14 +423,7 @@ async fn apply_config(
     headers: axum::http::HeaderMap,
     Json(body): Json<ApplyConfigRequest>,
 ) -> Result<Json<ApplyConfigResponse>, AppError> {
-    let has_users = state.db.count_users().unwrap_or(0) > 0;
-    if state.config.web.admin_password.is_some() || has_users {
-        crate::api::auth::validate_session(
-            &state,
-            headers.get("authorization").and_then(|v| v.to_str().ok()),
-        )
-        .await?;
-    }
+    setup_auth(&state, &headers).await?;
     let mut warnings = Vec::new();
 
     // Write identity mapping file if mappings are provided
@@ -811,20 +785,18 @@ fn overlay_setup_import_status(
     value
 }
 
-async fn setup_auth(
-    state: &Arc<AppState>,
-    headers: &HeaderMap,
-) -> Result<(String, String), AppError> {
-    let has_users = state.db.count_users().unwrap_or(0) > 0;
-    if state.config.web.admin_password.is_some() || has_users {
-        validate_session_with_role(
-            state,
-            headers.get("authorization").and_then(|v| v.to_str().ok()),
-        )
-        .await
-    } else {
-        Ok(("setup-wizard".into(), "admin".into()))
+/// Only bootstrap-capable setup actions admit a verified empty installation.
+async fn setup_auth(state: &Arc<AppState>, headers: &HeaderMap) -> Result<String, AppError> {
+    if state.config.web.admin_password.is_none()
+        && state
+            .db
+            .count_users()
+            .map_err(|error| AppError::Internal(error.to_string()))?
+            == 0
+    {
+        return Ok("setup-wizard".into());
     }
+    require_admin(state, headers).await
 }
 
 enum SetupAdmission {
@@ -991,7 +963,7 @@ async fn start_import(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<ImportActionResponse>, AppError> {
-    let (user_id, _role) = setup_auth(&state, &headers).await?;
+    let user_id = setup_auth(&state, &headers).await?;
     match admit_setup_import(&state, &headers, &user_id).await? {
         SetupAdmission::AlreadyRecorded(operation) => Ok(Json(ImportActionResponse {
             ok: true,
@@ -1407,15 +1379,7 @@ async fn reset_and_reimport(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<ImportActionResponse>, AppError> {
-    // Admin only
-    let (user_id, role) = validate_session_with_role(
-        &state,
-        headers.get("authorization").and_then(|v| v.to_str().ok()),
-    )
-    .await?;
-    if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
-    }
+    let user_id = require_admin(&state, &headers).await?;
 
     let repo = setup_repository(&state.db)?;
     if let Some(active) = state
