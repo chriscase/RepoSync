@@ -534,15 +534,30 @@ pub(crate) fn claim_for_ordinary_startup(
     lock: &crate::data_dir::LockGuard,
     data_dir: &Path,
 ) -> Result<OrdinaryStartupClaim, DatabaseError> {
+    claim_for_ordinary_startup_with(db, lock, data_dir, |_| Ok(()), |_, ()| Ok(()))
+        .map(|(claim, ())| claim)
+}
+
+/// Run reviewed cutover checks and bind the resulting canonical scope inside the same
+/// writer reservation that migrates the installed Team catalog.
+pub(crate) fn claim_for_ordinary_startup_with<P, T>(
+    db: &Database,
+    lock: &crate::data_dir::LockGuard,
+    data_dir: &Path,
+    before: impl FnOnce(&Connection) -> Result<P, DatabaseError>,
+    after: impl FnOnce(&Connection, P) -> Result<T, DatabaseError>,
+) -> Result<(OrdinaryStartupClaim, T), DatabaseError> {
     let host = ordinary_host_id()?;
     let pid = std::process::id();
-    let (epoch, lease, native) = db.immediate_transaction(|tx| {
+    let (epoch, lease, native, result) = db.immediate_transaction(|tx| {
         lock.require_current(data_dir)?;
         let saved = db.opened_file()?;
         saved.require_unaliased_owner(tx)?;
         #[cfg(test)]
         crate::db::startup::reservation_tests::observe(&saved.path, "claim");
-        if !crate::db::startup::require_quiet(tx)? {
+        let initialized = crate::db::startup::require_quiet(tx)?;
+        let checked = before(tx)?;
+        if !initialized {
             crate::db::schema::initialize_empty_startup_in_transaction(tx)?;
         }
         let epoch = claim_lease_tx(tx, &host, pid)?;
@@ -559,14 +574,20 @@ pub(crate) fn claim_for_ordinary_startup(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        Ok((epoch, lease, native))
+        let result = after(tx, checked)?;
+        lock.require_current(data_dir)?;
+        saved.require_unaliased_owner(tx)?;
+        Ok((epoch, lease, native, result))
     })?;
     set_process_identity(&host, pid, epoch);
-    Ok(OrdinaryStartupClaim {
-        fence: RecoveryWriterFence { epoch, host, pid },
-        lease,
-        native,
-    })
+    Ok((
+        OrdinaryStartupClaim {
+            fence: RecoveryWriterFence { epoch, host, pid },
+            lease,
+            native,
+        },
+        result,
+    ))
 }
 
 /// Claim or renew with an explicit holder identity (used by tests).
