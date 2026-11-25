@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
-# The offline suite exercises the same matcher used by the live scenario.
+# The offline suite exercises the same preflight and matcher as the live scenario.
 set -euo pipefail
-exec python3 "$(dirname "$0")/test_s7_provenance.py" "$@"
+script_dir=$(cd "$(dirname "$0")" && pwd)
+bash "$script_dir/test_s7_prepare_canary_pr.sh"
+exec python3 "$script_dir/test_s7_provenance.py" "$@"

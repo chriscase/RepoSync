@@ -104,7 +104,9 @@ Each cycle executes these scenarios in order:
 > a PR, then run sync and verify the file content lands in SVN.
 >
 > **S7 provenance matching.** S5 records the SVN revision before opening the PR and the
-> single Git commit created on its branch. S6 records the PR number and its squash-merge SHA.
+> single Git commit created on its branch. A missing or malformed SVN baseline stops S5 before
+> any GitHub request. S6 uses only the commit confirmed in the current cycle, including when
+> the artifact directory is reused. It records the PR number and its squash-merge SHA.
 > Personal Mode replays the PR member commit. Its default commit-message trailer block records
 > the member as `Git-SHA:` and the PR as `PR-Number:`. The durable `RepoSync-Git-SHA:` also
 > records the member. The squash-merge SHA is recorded separately in the proof.
