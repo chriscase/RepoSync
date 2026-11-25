@@ -1,0 +1,12 @@
+# Publishes the lab UI on the runner loopback. The app network is internal, so
+# Docker does not accept host connections to the daemon's own published port.
+# Run 38195547031: reposync was healthy and 127.0.0.1:35371 returned
+# ECONNREFUSED. This process only forwards TCP to reposync:8080.
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+FROM ${DEBIAN_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl socat \
+    && rm -rf /var/lib/apt/lists/*
+USER 65534:65534
+ENTRYPOINT ["socat"]
+CMD ["TCP-LISTEN:8080,bind=0.0.0.0,fork,reuseaddr", "TCP:reposync:8080"]
