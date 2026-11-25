@@ -575,8 +575,6 @@ pub(crate) fn claim_for_ordinary_startup_with<P, T>(
             )
             .optional()?;
         let result = after(tx, checked)?;
-        lock.require_current(data_dir)?;
-        saved.require_unaliased_owner(tx)?;
         Ok((epoch, lease, native, result))
     })?;
     set_process_identity(&host, pid, epoch);

@@ -125,7 +125,16 @@ impl Database {
             .ok_or_else(|| DatabaseError::Other("existing Team database required".into()))?;
         let mut db = Self::open_reserved_startup(&path, Some(prior))?;
         let (claim, result) = crate::writer_fence::claim_for_ordinary_startup_with(
-            &db, &lock, &data_dir, before, after,
+            &db,
+            &lock,
+            &data_dir,
+            before,
+            |tx, checked| {
+                let result = after(tx, checked)?;
+                lock.require_current(&data_dir)?;
+                db.opened_file()?.require_unaliased_owner(tx)?;
+                Ok(result)
+            },
         )?;
         db.startup_owner = Some(StartupOwner {
             _lock: lock,

@@ -230,3 +230,51 @@ fn canonical_enrollment_is_idempotent_and_rejects_changed_retained_state() {
         ""
     );
 }
+
+#[test]
+fn refused_retrospective_proof_does_not_retire_a_previous_writer_lease() {
+    let _guard = crate::writer_fence::tests::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reposync.db");
+    let conn = fixture(&path);
+    let owner = Database::open_cli_writer(dir.path()).unwrap();
+    let key = "writer_fence_v1:lease";
+    let raw: String = conn
+        .query_row("SELECT value FROM kv_state WHERE key=?1", [key], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    drop(owner);
+    // This is a lease of a previous, definitively dead local worker, eligible to be
+    // claimed via ordinary startup. A failed retrospective check must not retire it.
+    let mut previous: Value = serde_json::from_str(&raw).unwrap();
+    previous["holder_pid"] = json!(i32::MAX);
+    let previous = previous.to_string();
+    conn.execute(
+        "INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,'original')",
+        params![key, previous],
+    )
+    .unwrap();
+    let error = enroll_verified_lineage(dir.path(), ID, &"1".repeat(64), |_, _| {
+        Err(refused("synthetic changed witness"))
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("synthetic changed witness"));
+    let after: (String, String) = conn
+        .query_row(
+            "SELECT value,updated_at FROM kv_state WHERE key=?1",
+            [key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after, (previous, "original".to_string()));
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM canonical_lineage", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(receipt(&conn, ID).unwrap().is_none());
+}
