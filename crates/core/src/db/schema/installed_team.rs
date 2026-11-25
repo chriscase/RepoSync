@@ -1,6 +1,6 @@
 //! Both installed team branches used 13/14 for different migrations than Reliability.
 //! Match their SQLite catalog before using the existing operational migrations.
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use rusqlite::Connection;
@@ -9,81 +9,142 @@ use super::{apply_migration_body, get_schema_version, MIGRATIONS};
 use crate::errors::DatabaseError;
 
 // These statements match the two deployed schema registries (blob 7feb27af).
-const INSTALLED_ADDITIONS: &str = "
+const INSTALLED_V13: &str = "
         CREATE INDEX IF NOT EXISTS idx_sync_records_repo_dir_status_rev
-            ON sync_records (repo_id, direction, status, svn_rev);
+            ON sync_records (repo_id, direction, status, svn_rev);";
+const INSTALLED_V14: &str = "
         ALTER TABLE repositories ADD COLUMN cloned_from_id TEXT;
         CREATE INDEX IF NOT EXISTS idx_repositories_cloned_from
             ON repositories(cloned_from_id);";
 
-type Catalog = BTreeMap<String, String>;
+// SQLite internal statistics and autoindexes are SQLite's responsibility.
+type Catalog = BTreeSet<(String, String, String, String)>;
 
 fn catalog(conn: &Connection) -> Result<Catalog, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name",
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
     )?;
-    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    })?;
     rows.collect()
 }
 
-fn build_reference_catalogs() -> Result<(Catalog, Catalog), DatabaseError> {
-    let reference = Connection::open_in_memory()?;
-    for &(_, _, sql) in MIGRATIONS.iter().take_while(|entry| entry.0 <= 12) {
-        reference.execute_batch(sql)?;
-    }
-    reference.execute_batch(INSTALLED_ADDITIONS)?;
-    let installed = catalog(&reference)?;
-    apply_scope_and_lineage(&reference)?;
-    Ok((installed, catalog(&reference)?))
+struct Catalogs {
+    installed_13: Catalog,
+    installed_14: Catalog,
+    operational_13: Catalog,
+    operational_14: Catalog,
+    converted_14: Catalog,
 }
 
-fn reference_catalogs() -> Result<&'static (Catalog, Catalog), DatabaseError> {
-    static CATALOGS: OnceLock<Result<(Catalog, Catalog), String>> = OnceLock::new();
+fn shared_schema() -> Result<Connection, DatabaseError> {
+    let conn = Connection::open_in_memory()?;
+    for &(_, _, sql) in MIGRATIONS.iter().take_while(|entry| entry.0 <= 12) {
+        conn.execute_batch(sql)?;
+    }
+    conn.pragma_update(None, "user_version", 12)?;
+    Ok(conn)
+}
+
+fn build_reference_catalogs() -> Result<Catalogs, DatabaseError> {
+    let installed = shared_schema()?;
+    installed.execute_batch(INSTALLED_V13)?;
+    let installed_13 = catalog(&installed)?;
+    installed.execute_batch(INSTALLED_V14)?;
+    let installed_14 = catalog(&installed)?;
+    apply_scope_and_lineage(&installed)?;
+    let operational = shared_schema()?;
+    super::run_migrations_up_to(&operational, 13)?;
+    let operational_13 = catalog(&operational)?;
+    // Apply the two registry entries directly when building references. Startup
+    // admission itself uses these references and must never recurse.
+    for &(version, _, sql) in MIGRATIONS.iter().filter(|entry| entry.0 == 14) {
+        apply_migration_body(&operational, version, sql)?;
+    }
+    Ok(Catalogs {
+        installed_13,
+        installed_14,
+        operational_13,
+        operational_14: catalog(&operational)?,
+        converted_14: catalog(&installed)?,
+    })
+}
+
+fn reference_catalogs() -> Result<&'static Catalogs, DatabaseError> {
+    static CATALOGS: OnceLock<Result<Catalogs, String>> = OnceLock::new();
     CATALOGS
         .get_or_init(|| build_reference_catalogs().map_err(|error| error.to_string()))
         .as_ref()
         .map_err(|error| DatabaseError::Other(error.clone()))
 }
 
-/// Identify an original team installation, a previously converted one or ordinary Reliability.
-/// Incomplete and copy-only layouts with colliding version numbers must never be migrated.
+fn is_copy_artifact(name: &str) -> bool {
+    matches!(
+        name,
+        "commit_map_v13"
+            | "repo_migration_state"
+            | "pair_lineages"
+            | "pair_frontiers"
+            | "pair_outcomes"
+            | "legacy_evidence_links"
+    )
+}
+
+/// True only for the complete installed schema. Converted and native operational
+/// layouts must contain all registered objects. Runtime additions are permitted.
 pub(crate) fn pending(conn: &Connection, version: u32) -> Result<bool, DatabaseError> {
-    if !(13..=14).contains(&version) {
+    if version < 13 {
+        // The legacy runner committed its DDL before setting user_version. A
+        // crash between those writes can leave the deployed v13 index on v12.
+        let partial: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name IN
+             ('idx_sync_records_repo_dir_status_rev','idx_repositories_cloned_from',
+              'idx_repositories_scope_uuid','repo_migration_state','pair_lineages','pair_frontiers','pair_outcomes','commit_map_v13'))
+             OR EXISTS(SELECT 1 FROM pragma_table_info('repositories') WHERE name IN ('cloned_from_id','scope_uuid'))",
+            [], |row| row.get(0))?;
+        if partial {
+            return Err(DatabaseError::Other(
+                "partial schema ahead of its registry version; upgrade refused".into(),
+            ));
+        }
         return Ok(false);
     }
-    let (scope, installed_markers, canonical_tables): (bool, bool, u32) = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('repositories') WHERE name='scope_uuid'),
-                EXISTS(SELECT 1 FROM sqlite_schema WHERE name IN
-                     ('idx_sync_records_repo_dir_status_rev','idx_repositories_cloned_from'))
-                 OR EXISTS(SELECT 1 FROM pragma_table_info('repositories') WHERE name='cloned_from_id'),
-                (SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN
-                  ('canonical_lineage','canonical_checkpoints','canonical_mapping_outcomes'))",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    if scope
-        && !installed_markers
-        && ((version == 13 && canonical_tables == 0) || (version == 14 && canonical_tables == 3))
+    if version > 14 {
+        return Ok(false);
+    }
+    let known = reference_catalogs()?;
+    let actual = catalog(conn)?;
+    if (version == 13 && actual == known.installed_13)
+        || (version == 14 && actual == known.installed_14)
     {
-        return Ok(false);
+        return Ok(true);
     }
-    if version == 14 && installed_markers {
-        let (installed, upgraded) = reference_catalogs()?;
-        let mut actual = catalog(conn)?;
-        if &actual == installed {
-            return Ok(true);
+    let has_mixed_objects = actual.iter().any(|(_, name, _, _)| {
+        is_copy_artifact(name) || (version == 13 && name.starts_with("canonical_"))
+    });
+    if !has_mixed_objects {
+        // Converted storage retains both legacy indexes and the clone column.
+        if version == 14 && known.converted_14.is_subset(&actual) {
+            return Ok(false);
         }
-        // The optional authenticated refresh key is created on first use.
-        use super::super::pair_refresh_authenticated::{KEY_SCHEMA, KEY_TABLE};
-        if actual.get(KEY_TABLE).map(String::as_str) == Some(KEY_SCHEMA) {
-            actual.remove(KEY_TABLE);
-        }
-        if scope && &actual == upgraded {
+        let operational = if version == 13 {
+            &known.operational_13
+        } else {
+            &known.operational_14
+        };
+        let has_installed_index = actual.iter().any(|(_, name, _, _)| {
+            matches!(
+                name.as_str(),
+                "idx_sync_records_repo_dir_status_rev" | "idx_repositories_cloned_from"
+            )
+        });
+        if !has_installed_index && operational.is_subset(&actual) {
             return Ok(false);
         }
     }
     Err(DatabaseError::Other(format!(
-        "unrecognized team-install or partial physical layout at schema version {version}; upgrade refused"
+        "unrecognized physical layout at schema version {version}; upgrade refused"
     )))
 }
 
@@ -111,6 +172,9 @@ pub(crate) fn upgrade_on_claim(tx: &Connection) -> Result<(), DatabaseError> {
                 "installed schema already contains operational scope migration evidence".into(),
             ));
         }
+        if get_schema_version(tx)? == 13 {
+            tx.execute_batch(INSTALLED_V14)?;
+        }
         apply_scope_and_lineage(tx)?;
         let missing_scope: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM repositories WHERE scope_uuid IS NULL OR length(scope_uuid) != 36)",
@@ -135,7 +199,8 @@ mod tests {
             "../../../../daemon/tests/fixtures/schema-v12.sql"
         ))
         .unwrap();
-        conn.execute_batch(INSTALLED_ADDITIONS).unwrap();
+        conn.execute_batch(INSTALLED_V13).unwrap();
+        conn.execute_batch(INSTALLED_V14).unwrap();
         conn.execute_batch("PRAGMA user_version=14;
             INSERT INTO repositories(id,name,svn_url,created_at,updated_at,last_svn_rev,last_git_sha,cloned_from_id)
               VALUES('team','Deployment','file:///fixture','t','t',42,'abc','historical-source');
@@ -214,6 +279,35 @@ mod tests {
         drop(conn);
         let db = Database::open_cli_writer(dir.path()).unwrap();
         assert!(!pending(&db.conn(), 14).unwrap());
+    }
+
+    #[test]
+    fn complete_installed_v13_upgrades_and_mixed_operational_layouts_are_refused() {
+        let conn = shared_schema().unwrap();
+        conn.execute_batch(INSTALLED_V13).unwrap();
+        assert!(pending(&conn, 12).is_err());
+        conn.execute_batch("PRAGMA user_version=13; BEGIN IMMEDIATE")
+            .unwrap();
+        assert!(pending(&conn, 13).unwrap());
+        upgrade_on_claim(&conn).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        assert!(!pending(&conn, 14).unwrap());
+        let native = Connection::open_in_memory().unwrap();
+        super::super::run_migrations(&native).unwrap();
+        native
+            .execute_batch("CREATE TABLE extension_notes(note TEXT)")
+            .unwrap();
+        assert!(!pending(&native, 14).unwrap());
+        native
+            .execute_batch("CREATE TABLE pair_lineages(id TEXT)")
+            .unwrap();
+        assert!(pending(&native, 14).is_err());
+        native
+            .execute_batch(
+                "DROP TABLE pair_lineages; DROP INDEX idx_canonical_mapping_outcomes_scope",
+            )
+            .unwrap();
+        assert!(pending(&native, 14).is_err());
     }
 
     #[test]
