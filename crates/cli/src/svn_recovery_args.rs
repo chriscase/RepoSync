@@ -13,7 +13,7 @@ pub(crate) enum RecoveryAction {
         /// Digest from the matching preview, as 64 lowercase hexadecimal digits.
         #[arg(long, value_parser = RecoveryText::Digest)]
         reviewed_digest: String,
-        /// Confirm the old daemon and other database and repository writers are stopped.
+        /// Confirm the old service and other writers acting for this bridge are stopped.
         #[arg(long, required = true)]
         confirm_stopped_writers: bool,
         /// Attest that this is the known-good old installation before replacement.
