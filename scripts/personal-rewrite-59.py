@@ -131,6 +131,15 @@ def exercise(root, cli, personal):
         run("svnadmin", "create", svn)
         run("svn", "checkout", svn.as_uri(), wc)
         excluded_message = "EXCLUDED-ONLY-HISTORICAL-SECRET"
+        historical_subject = "PRIVATE-MIXED-FULL-SUBJECT"
+        historical_body = "PRIVATE-MIXED-FULL-BODY"
+        incremental_subject = "PRIVATE-MIXED-INCREMENTAL-SUBJECT"
+        incremental_body = "PRIVATE-MIXED-INCREMENTAL-BODY"
+        private_author = "private-source-mixed-actor"
+        mapped_name = "PRIVATE-SVN-MAPPED-NAME"
+        mapped_email = "private-svn-mapped-email@example.test"
+        mapping = root/"authors.toml"
+        mapping.write_text(f'[authors]\n{private_author} = {{ name = "{mapped_name}", email = "{mapped_email}" }}\n')
         (wc/"team/bravo").mkdir(parents=True)
         (wc/"team/bravo/other.txt").write_text("never mirror")
         run("svn", "add", "team", cwd=wc)
@@ -143,7 +152,9 @@ def exercise(root, cli, personal):
         (wc/"team/bravo/other.txt").write_text("r3 excluded")
         run("svn", "commit", "-m", excluded_message + "-3", "--username", "excluded-actor", cwd=wc)
         (wc/"team/alpha/selected/note.txt").write_text("r4")
-        run("svn", "commit", "-m", "selected edit", "--username", "fixture", cwd=wc)
+        (wc/"team/bravo/other.txt").write_text("full mixed excluded bytes")
+        run("svn", "commit", "-m", historical_subject + "\n\n" + historical_body,
+            "--username", private_author, cwd=wc)
         (wc/"team/bravo/other.txt").write_text("r5 excluded")
         run("svn", "commit", "-m", excluded_message + "-5", "--username", "excluded-actor", cwd=wc)
         run("git", "init", "--bare", "--initial-branch=main", remote)
@@ -164,6 +175,10 @@ auto_create = false
 name = "Fixture"
 email = "fixture@example.test"
 svn_username = "fixture"
+[identity]
+mapping_file = {json.dumps(str(mapping))}
+[commit_format]
+svn_to_git = "{{original_message}}\\n\\nSVN-Revision: r{{svn_rev}}\\nSVN-Author: {{svn_author}}\\nSVN-Date: {{svn_date}}\\nSync-Marker: [reposync]"
 [options]
 """
         scope = """
@@ -207,8 +222,16 @@ path_rewrite_rules = [{ strip_prefix = "team/alpha/" }]
         revision_shas = git("rev-list", "--reverse", "main").splitlines()
         assert len(revision_shas) == 2, revision_shas
         assert excluded_message not in git("log", "--format=%B", "main")
-        metadata = git("log", "--format=%an %ae %B", "main")
-        assert "excluded-actor" not in metadata, metadata
+        def assert_scoped_metadata(sha, revision, secrets):
+            metadata = git("show", "-s", "--format=%an%n%ae%n%cn%n%ce%n%s%n%b", sha)
+            assert metadata.splitlines()[:5] == [
+                "Fixture", "fixture@example.test", "Fixture", "fixture@example.test",
+                f"Mirror selected SVN changes at r{revision}",
+            ], metadata
+            for secret in [*secrets, private_author, mapped_name, mapped_email, "SVN-Author:", "SVN-Date:"]:
+                assert secret not in metadata, (secret, metadata)
+            assert f"SVN-Revision: r{revision}" in metadata and "Sync-Marker: [reposync]" in metadata
+        assert_scoped_metadata(revision_shas[1], 4, [historical_subject, historical_body, "excluded-actor"])
         assert sql("SELECT value FROM watermarks WHERE source='svn_rev'") == [("5",)]
         assert sql("SELECT svn_rev FROM commit_map WHERE git_sha IS NULL ORDER BY svn_rev") == [(1,), (3,), (5,)]
         for rev, content in zip(revision_shas, ["r2", "r4"]):
@@ -218,9 +241,13 @@ path_rewrite_rules = [{ strip_prefix = "team/alpha/" }]
         (wc/"team/bravo/other.txt").write_text("r6 excluded")
         run("svn", "commit", "-m", "excluded only", cwd=wc)
         (wc/"team/alpha/selected/note.txt").write_text("r7 selected")
-        run("svn", "commit", "-m", "selected", "--username", "fixture", cwd=wc)
+        (wc/"team/bravo/other.txt").write_text("incremental mixed excluded bytes")
+        run("svn", "commit", "-m", incremental_subject + "\n\n" + incremental_body,
+            "--username", private_author, cwd=wc)
         ps("sync")
         assert git("show", "main:selected/note.txt") == "r7 selected"
+        assert git("ls-tree", "-r", "--name-only", "main") == "selected/note.txt"
+        assert_scoped_metadata("main", 7, [incremental_subject, incremental_body])
         local = root/"git-wc"
         run("git", "clone", remote, local)
         parent = run("git", "rev-parse", "HEAD", cwd=local).strip()
@@ -237,7 +264,7 @@ path_rewrite_rules = [{ strip_prefix = "team/alpha/" }]
         ps("sync")
         assert run("svnlook", "youngest", svn).strip() == "8"
         assert run("svnlook", "cat", svn, "team/alpha/selected/note.txt").strip() == "Git PR edit"
-        assert run("svnlook", "cat", svn, "team/bravo/other.txt").strip() == "r6 excluded"
+        assert run("svnlook", "cat", svn, "team/bravo/other.txt").strip() == "incremental mixed excluded bytes"
         assert "team/alpha/selected/note.txt" in run("svnlook", "changed", "-r", "8", svn)
         ps("sync")
         assert run("svnlook", "youngest", svn).strip() == "8"
@@ -301,6 +328,10 @@ path_rewrite_rules = [{ strip_prefix = "team/alpha/" }]
         tree = run("git", "--git-dir", legacy_remote, "ls-tree", "-r", "--name-only", "main")
         assert "team/bravo/other.txt" in tree
         assert "team/alpha/selected/blocked.txt" in tree
+        legacy_history = run("git", "--git-dir", legacy_remote, "log", "--format=%an %ae %B", "main")
+        for value in [historical_subject, historical_body, incremental_subject, incremental_body,
+                      f"SVN-Author: {private_author}", mapped_name, mapped_email]:
+            assert value in legacy_history, (value, legacy_history)
         assert "unrestricted legacy mode" in op("status")
         assert git("rev-parse", "main") == foreign_sha
         # Prove an actual interrupted publication cannot activate the policy:
@@ -397,7 +428,7 @@ path_rewrite_rules = [{ strip_prefix = "team/alpha/" }]
             "wizard_scoped_and_default": True, "projected_history": revision_shas,
             "svn_forward": [6, 7], "reverse_linear": {"git": sha, "svn": 8},
             "reverse_merge": {"git": merge_sha, "svn": 9},
-            "historical_no_target": [1, 3, 5], "copied_branch_initial_r2_and_increment_r3": True,
+            "historical_no_target": [1, 3, 5], "mixed_metadata_redacted_at": [4, 7], "copied_branch_initial_r2_and_increment_r3": True,
             "simultaneous_selected_changes_held_before_mutation": True,
             "legacy_full_import": True, "no_repeat_writes": True,
             "changed_or_removed_policy_held": True, "remote_path_divergence_held": True,

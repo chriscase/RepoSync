@@ -337,9 +337,12 @@ impl SvnToGitSync {
                 entry.context("missing SVN metadata for a positive Personal publication")?;
 
             // 7. Format the commit message with metadata trailers.
-            let commit_message =
+            let commit_message = if self.config.options.projected_history {
+                CommitFormatter::format_projected_svn_to_git(rev)
+            } else {
                 self.formatter
-                    .format_svn_to_git(&entry.message, rev, &entry.author, &entry.date);
+                    .format_svn_to_git(&entry.message, rev, &entry.author, &entry.date)
+            };
 
             // 8. Read the remote tip, then stage and commit locally.
             let branch = self.config.github.default_branch.clone();

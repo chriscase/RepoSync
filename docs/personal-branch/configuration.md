@@ -536,3 +536,10 @@ If a poll finds a selected SVN change while Git also has unhandled work,
 RepoSync holds before updating the bridge checkout or publishing in either
 direction. It does not pick a side, reset a checkout, or attempt an automatic
 cross-side merge; reconcile the competing history before resuming the mirror.
+
+Each projected SVN-to-Git commit uses a fixed revision-only subject and
+provenance and the configured Git mirror identity. The SVN revision log,
+source author and source date are never copied to a projected Git commit,
+including when one revision changed both selected and excluded paths. A
+custom SVN-to-Git template and SVN-to-Git identity mapping still apply
+where they did before in legacy modes, but not to projected Git commits.

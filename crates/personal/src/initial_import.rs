@@ -357,7 +357,7 @@ impl<'a> InitialImport<'a> {
         };
 
         // Build identity mapper if configured — allows preserving original SVN authors.
-        let identity_mapper = match &self.config.identity {
+        let identity_mapper = match self.config.identity.as_ref().filter(|_| !scoped) {
             Some(identity_config) => match IdentityMapper::new(identity_config) {
                 Ok(mapper) => {
                     info!("identity mapper enabled — original SVN authors will be preserved");
@@ -519,9 +519,12 @@ impl<'a> InitialImport<'a> {
                     )
                 })?;
 
-            let message =
+            let message = if scoped {
+                CommitFormatter::format_projected_svn_to_git(rev)
+            } else {
                 self.formatter
-                    .format_svn_to_git(&entry.message, rev, &entry.author, &entry.date);
+                    .format_svn_to_git(&entry.message, rev, &entry.author, &entry.date)
+            };
 
             // Resolve the Git identity for this commit's author.
             let (author_name, author_email) = match &identity_mapper {
