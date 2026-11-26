@@ -119,19 +119,10 @@ fn double_migrate_v13_must_not_reopen_latched_legacy_reads() {
         "empty v13 migration must latch legacy reads off"
     );
 
-    // Simulate v12 → v13 upgrade with legacy human-id KV present at migration time.
+    // Exercise genuine v12 SQL, rather than rewinding a current schema marker.
+    let db = Database::in_memory().unwrap();
     db.conn()
-        .execute_batch(
-            "DROP INDEX IF EXISTS idx_repositories_scope_uuid;
-         ALTER TABLE repositories DROP COLUMN scope_uuid;
-         PRAGMA user_version = 12;",
-        )
-        .unwrap();
-    db.conn()
-        .execute(
-            "DELETE FROM kv_state WHERE key IN (?1, ?2)",
-            params![LEGACY_READS_FLAG, V13_MIGRATION_DONE],
-        )
+        .execute_batch(include_str!("../../daemon/tests/fixtures/schema-v12.sql"))
         .unwrap();
     db.conn().execute(
         "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,last_svn_rev,last_git_sha)

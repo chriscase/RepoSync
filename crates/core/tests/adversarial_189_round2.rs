@@ -8,6 +8,24 @@ fn database() -> Database {
     db
 }
 
+fn genuine_v12_database() -> Database {
+    let db = Database::in_memory().unwrap();
+    db.conn()
+        .execute_batch(include_str!("../../daemon/tests/fixtures/schema-v12.sql"))
+        .unwrap();
+    db
+}
+
+fn insert_v12(db: &Database, id: &str) {
+    db.conn()
+        .execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,last_svn_rev,last_git_sha)
+             VALUES (?1,?1,'file:///fixture','trunk','','','','main',1,'t','t',0,'')",
+            [id],
+        )
+        .unwrap();
+}
+
 fn insert(db: &Database, id: &str, scope: &str) {
     db.conn().execute(
         "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,last_svn_rev,last_git_sha,scope_uuid) VALUES (?1,?1,'file:///fixture','trunk','','','','main',1,'t','t',0,'',?2)",
@@ -23,13 +41,11 @@ fn legacy_receipt(db: &Database, id: &str, sha: &str) {
 
 #[test]
 fn v12_upgrade_preserves_receipts_for_ids_with_common_prefix() {
-    let db = database();
-    insert(&db, "pair", &new_scope_uuid());
-    insert(&db, "pair2", &new_scope_uuid());
+    let db = genuine_v12_database();
+    insert_v12(&db, "pair");
+    insert_v12(&db, "pair2");
     let sha = "b".repeat(40);
     legacy_receipt(&db, "pair2", &sha);
-    // Restore the actual pre-v13 schema shape, then exercise ordinary startup migration.
-    db.conn().execute_batch("DROP INDEX idx_repositories_scope_uuid; ALTER TABLE repositories DROP COLUMN scope_uuid; PRAGMA user_version = 12;").unwrap();
     db.initialize().unwrap();
     let scope = repository_scope_uuid(&db.conn(), "pair2").unwrap();
     assert!(
@@ -42,12 +58,11 @@ fn v12_upgrade_preserves_receipts_for_ids_with_common_prefix() {
 
 #[test]
 fn v12_upgrade_preserves_receipts_for_ids_with_underscore_prefix() {
-    let db = database();
-    insert(&db, "pair", &new_scope_uuid());
-    insert(&db, "pair_child", &new_scope_uuid());
+    let db = genuine_v12_database();
+    insert_v12(&db, "pair");
+    insert_v12(&db, "pair_child");
     let sha = "c".repeat(40);
     legacy_receipt(&db, "pair_child", &sha);
-    db.conn().execute_batch("DROP INDEX idx_repositories_scope_uuid; ALTER TABLE repositories DROP COLUMN scope_uuid; PRAGMA user_version = 12;").unwrap();
     db.initialize().unwrap();
     let scope = repository_scope_uuid(&db.conn(), "pair_child").unwrap();
     assert!(

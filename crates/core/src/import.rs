@@ -2933,6 +2933,20 @@ async fn prepare_import_lfs(
     }
 }
 
+fn import_team_path_rewrite(
+    db: &Database,
+    repo_id: Option<&str>,
+) -> Result<Option<crate::db::team_path_rewrite::TeamRewritePolicy>, DatabaseError> {
+    use crate::db::personal_scope::PERSONAL_SCOPE_KEY;
+    match repo_id {
+        // Config/setup import can have a durable Personal journal without a
+        // managed repository row. Only the canonical reserved scope is exempt:
+        // a real Team repository may still be named "personal".
+        None | Some(PERSONAL_SCOPE_KEY) => Ok(None),
+        Some(repo) => db.team_path_rewrite(repo),
+    }
+}
+
 /// Materialize one pinned SVN snapshot, verify projected bytes, publish, and
 /// record the verified baseline. The pin must already be stored; this never
 /// re-resolves live HEAD.
@@ -2960,10 +2974,7 @@ pub async fn run_snapshot_import(
             None
         })
         .context("snapshot import writer admission refused")?;
-    let team_rewrite = match repo_id.as_deref() {
-        Some(repo) => db.team_path_rewrite(repo)?,
-        None => None,
-    };
+    let team_rewrite = import_team_path_rewrite(db, repo_id.as_deref())?;
 
     if stop_requested(&progress, cancel_signal.as_ref()).await {
         let mut p = progress.write().await;
@@ -3252,11 +3263,6 @@ pub async fn run_full_import(
         cancel_signal,
     } = run_state;
 
-    if let Some(repo) = repo_id.as_deref() {
-        if db.team_path_rewrite(repo)?.is_some() {
-            anyhow::bail!("Team path rewriting requires a fresh projected snapshot import");
-        }
-    }
     let writer_window = db
         .begin_ordinary_writer_window(if operation_id.is_some() {
             repo_id.as_deref()
@@ -3264,6 +3270,9 @@ pub async fn run_full_import(
             None
         })
         .context("full import writer admission refused")?;
+    if import_team_path_rewrite(db, repo_id.as_deref())?.is_some() {
+        anyhow::bail!("Team path rewriting requires a fresh projected snapshot import");
+    }
     if operation_id.is_none() {
         db.require_legacy_import_watermarks_available()?;
     }
