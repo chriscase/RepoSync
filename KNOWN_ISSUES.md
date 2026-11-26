@@ -76,11 +76,33 @@
 
 ## Documented States
 
-### Team path policy on partial-52
+### SVN monorepo subset sync
 
-The team scheduler applies `allowed_paths` and `blocked_patterns` during scheduled Git→SVN and incremental SVN→Git sync. Allowed paths are literal, case-sensitive directory or file prefixes. If Git renames a file out of scope, only its old path is deleted in SVN. Moving it into scope adds only its new path. A policy edit neither removes files already published nor backfills previously skipped commits.
-
-Initial imports can expose sibling paths to Git readers, and filtering later revisions does not remove that history. Included paths keep their branch-relative names. Path rewriting (including for LFS files) and personal-mode subset rules are unavailable. For example inputs, audit events and local tests, see the [monorepo subset guide](docs/monorepo-subset-sync.md).
+- Allowed paths are literal, case-sensitive component prefixes, not globs or
+  regex. Blocked patterns have limited exact/prefix/suffix matching. Git as
+  the source monorepo, multiple rewrites, and retroactive history filtering
+  are unsupported.
+- Filter-only Team policies constrain **scheduled** changes. Full or snapshot
+  imports without a rewrite can expose sibling paths and history. Changing
+  rules does not purge old Git data or replay skipped SVN revisions. Use a
+  new destination and import to establish a different projected baseline.
+- Team with a single strip prefix requires a fresh projected snapshot for
+  a direct root pair, no automatic conflict merge and LFS threshold 0.
+  Team path filtering does not redact SVN log text or mapped author identity
+  from an included revision.
+  Selected or cross-boundary SVN copy/move provenance can hold a revision
+  without publication. In the opposite direction Git rename endpoints are
+  filtered independently, so moving out can remove the formerly selected
+  path in SVN; moving in can add the newly selected path. This does not
+  describe deletion of excluded material in SVN→Git.
+- Personal projected mode requires explicit opt-in, an empty destination
+  and fresh data directory. It uses full import of the current SVN branch
+  incarnation, not a snapshot. Reverse sync is for eligible merged PRs, not
+  direct pushes. Ambiguous Git transitions, divergence or concurrent
+  selected work can hold the mirror.
+- LFS is not supported in these projected workflows. The
+  [subset guide](docs/monorepo-subset-sync.md) gives verification commands
+  and distinguishes qualified setup from unsupported cases.
 
 ### NULL `commit_map.git_sha` (#54)
 - Since operational schema v15, `commit_map.git_sha` may be NULL. NULL means

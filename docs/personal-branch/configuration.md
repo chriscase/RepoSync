@@ -491,7 +491,7 @@ put the following under `[options]`:
 ```toml
 projected_history = true
 allowed_paths = ["team/alpha/selected/"]
-blocked_patterns = ["team/alpha/selected/private/**"]
+blocked_patterns = ["team/alpha/selected/private"]
 path_rewrite_rules = [{ strip_prefix = "team/alpha/" }]
 ```
 
