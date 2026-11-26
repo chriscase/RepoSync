@@ -4,6 +4,44 @@ use rusqlite::OptionalExtension;
 
 use crate::{errors::DatabaseError, path_projection::TeamPrefixRewrite};
 
+pub(super) const TEAM_REWRITE_SCHEMA_VERSION: u32 = 16;
+
+/// Read one version-aware repository projection in the caller's transaction
+/// or a short deferred read transaction. The schema stamp and the selected
+/// policy must come from the same snapshot; observation never runs migrations.
+pub(crate) fn with_rewrite_column<T>(
+    conn: &rusqlite::Connection,
+    read: impl FnOnce(&rusqlite::Connection, &'static str) -> Result<T, DatabaseError>,
+) -> Result<T, DatabaseError> {
+    let transaction = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let snapshot = transaction.as_deref().unwrap_or(conn);
+    let version: u32 = snapshot.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    super::schema::refuse_future_schema(version)?;
+    let column = if (12..TEAM_REWRITE_SCHEMA_VERSION).contains(&version) {
+        let has_rewrite_column: bool = snapshot.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo('repositories') WHERE name = 'path_rewrite_rules' COLLATE NOCASE)",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_rewrite_column {
+            return Err(DatabaseError::Other(
+                "legacy repository schema unexpectedly contains path_rewrite_rules".into(),
+            ));
+        }
+        // No repository at these known versions can have an admitted rewrite.
+        "NULL"
+    } else {
+        // Use the literal qualified column. A purported v16 database missing
+        // it must get a schema error, not a silent default to full paths.
+        "repositories.path_rewrite_rules"
+    };
+    read(snapshot, column)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TeamRewritePolicy {
     pub rule: TeamPrefixRewrite,
@@ -98,11 +136,16 @@ impl super::Database {
         &self,
         repo: &str,
     ) -> Result<Option<TeamRewritePolicy>, DatabaseError> {
-        let raw: Option<(Option<String>, Option<String>, Option<String>)> = self.conn().query_row(
-            "SELECT path_rewrite_rules, allowed_paths, blocked_patterns FROM repositories WHERE id=?1",
-            [repo],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).optional()?;
+        let raw: Option<(Option<String>, Option<String>, Option<String>)> = with_rewrite_column(
+            &self.conn(),
+            |conn, column| {
+                Ok(conn.query_row(
+                    &format!("SELECT {column}, allowed_paths, blocked_patterns FROM repositories WHERE id=?1"),
+                    [repo],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).optional()?)
+            },
+        )?;
         let Some((rules, allowed, blocked)) = raw else {
             return Err(DatabaseError::Other(
                 "rewrite policy registration not found".into(),

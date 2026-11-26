@@ -402,7 +402,7 @@ static MIGRATIONS: &[(u32, &str, &str)] = &[
         "-- commit_map rebuild: nullable_commit_map::migrate_v15",
     ),
     (
-        16,
+        super::team_path_rewrite::TEAM_REWRITE_SCHEMA_VERSION,
         "managed Team branch path rewriting (#57)",
         "ALTER TABLE repositories ADD COLUMN path_rewrite_rules TEXT DEFAULT '[]';",
     ),
@@ -411,7 +411,7 @@ static MIGRATIONS: &[(u32, &str, &str)] = &[
 /// Operational schema version for ordinary startup. Candidate CopySession
 /// `pair_lineages` / `pair_frontiers` / `pair_outcomes` SQL is not registered
 /// here and must not be applied by [`run_migrations`].
-pub const CURRENT_SCHEMA_VERSION: u32 = 16;
+pub const CURRENT_SCHEMA_VERSION: u32 = super::team_path_rewrite::TEAM_REWRITE_SCHEMA_VERSION;
 
 /// Bootstrap verified empty storage inside the startup owner's transaction.
 pub(crate) fn initialize_empty_startup_in_transaction(

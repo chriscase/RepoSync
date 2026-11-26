@@ -1128,13 +1128,14 @@ fn read_scope_snapshot(
 /// is the authority both capture and revalidation compare against; no second
 /// policy store exists.
 fn read_admitted_policy_tx(tx: &Connection, repo_id: &str) -> Result<String, DatabaseError> {
-    let row: Option<(Option<String>, Option<String>, Option<String>)> = tx
-        .query_row(
-            "SELECT allowed_paths, blocked_patterns, path_rewrite_rules FROM repositories WHERE id = ?1",
-            [repo_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
+    let row: Option<(Option<String>, Option<String>, Option<String>)> =
+        crate::db::team_path_rewrite::with_rewrite_column(tx, |tx, column| {
+            Ok(tx.query_row(
+                &format!("SELECT allowed_paths, blocked_patterns, {column} FROM repositories WHERE id = ?1"),
+                [repo_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional()?)
+        })?;
     let Some((allowed, blocked, rewrite)) = row else {
         return Err(refused("repository registration is missing"));
     };

@@ -173,8 +173,9 @@ fn transaction_target_fingerprint(
     repo_id: &str,
     workdir: &Path,
 ) -> Result<Option<(String, String)>, DatabaseError> {
-    let settings = tx.query_row(
-        "SELECT svn_url,svn_branch,git_api_url,git_repo,git_branch,allowed_paths,blocked_patterns,lfs_threshold_mb,sync_mode,auto_merge,path_rewrite_rules FROM repositories WHERE id=?1",
+    let settings = super::team_path_rewrite::with_rewrite_column(tx, |tx, column| {
+        Ok(tx.query_row(
+        &format!("SELECT svn_url,svn_branch,git_api_url,git_repo,git_branch,allowed_paths,blocked_patterns,lfs_threshold_mb,sync_mode,auto_merge,{column} FROM repositories WHERE id=?1"),
         [repo_id],
         |row| Ok(ImportTargetSettings {
             svn_url: row.get(0)?, svn_branch: row.get(1)?,
@@ -184,7 +185,8 @@ fn transaction_target_fingerprint(
             auto_merge: row.get::<_, i64>(9)? != 0,
             path_rewrite_rules: row.get(10)?,
         }),
-    ).optional()?;
+    ).optional()?)
+    })?;
     Ok(settings.map(|settings| {
         let reference = format!("refs/heads/{}", settings.git_branch);
         (settings.fingerprint(workdir), reference)
