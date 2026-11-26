@@ -118,6 +118,7 @@ struct ImportTargetSettings {
     git_branch: String,
     allowed_paths: Option<String>,
     blocked_patterns: Option<String>,
+    path_rewrite_rules: Option<String>,
     lfs_threshold_mb: i64,
     sync_mode: String,
     auto_merge: bool,
@@ -133,6 +134,7 @@ impl ImportTargetSettings {
             git_branch: repo.git_branch.clone(),
             allowed_paths: repo.allowed_paths.clone(),
             blocked_patterns: repo.blocked_patterns.clone(),
+            path_rewrite_rules: repo.path_rewrite_rules.clone(),
             lfs_threshold_mb: repo.lfs_threshold_mb,
             sync_mode: repo.sync_mode.clone(),
             auto_merge: repo.auto_merge,
@@ -140,7 +142,7 @@ impl ImportTargetSettings {
     }
 
     fn fingerprint(&self, workdir: &Path) -> String {
-        let source = serde_json::json!({
+        let mut source = serde_json::json!({
             "svn_url":self.svn_url, "svn_branch":self.svn_branch,
             "git_api_url":self.git_api_url, "git_repo":self.git_repo,
             "git_branch":self.git_branch,
@@ -149,9 +151,16 @@ impl ImportTargetSettings {
             "blocked_patterns":self.blocked_patterns,
             "lfs_threshold_mb":self.lfs_threshold_mb,
             "sync_mode":self.sync_mode, "auto_merge":self.auto_merge,
-        })
-        .to_string();
-        hex::encode(Sha256::digest(source.as_bytes()))
+        });
+        if let Some(raw) = self.path_rewrite_rules.as_deref() {
+            if !matches!(
+                crate::path_projection::TeamPrefixRewrite::from_json(Some(raw)),
+                Ok(None)
+            ) {
+                source["path_rewrite_rules"] = serde_json::Value::String(raw.into());
+            }
+        }
+        hex::encode(Sha256::digest(source.to_string().as_bytes()))
     }
 }
 
@@ -164,8 +173,9 @@ fn transaction_target_fingerprint(
     repo_id: &str,
     workdir: &Path,
 ) -> Result<Option<(String, String)>, DatabaseError> {
-    let settings = tx.query_row(
-        "SELECT svn_url,svn_branch,git_api_url,git_repo,git_branch,allowed_paths,blocked_patterns,lfs_threshold_mb,sync_mode,auto_merge FROM repositories WHERE id=?1",
+    let settings = super::team_path_rewrite::with_rewrite_column(tx, |tx, column| {
+        Ok(tx.query_row(
+        &format!("SELECT svn_url,svn_branch,git_api_url,git_repo,git_branch,allowed_paths,blocked_patterns,lfs_threshold_mb,sync_mode,auto_merge,{column} FROM repositories WHERE id=?1"),
         [repo_id],
         |row| Ok(ImportTargetSettings {
             svn_url: row.get(0)?, svn_branch: row.get(1)?,
@@ -173,8 +183,10 @@ fn transaction_target_fingerprint(
             allowed_paths: row.get(5)?, blocked_patterns: row.get(6)?,
             lfs_threshold_mb: row.get(7)?, sync_mode: row.get(8)?,
             auto_merge: row.get::<_, i64>(9)? != 0,
+            path_rewrite_rules: row.get(10)?,
         }),
-    ).optional()?;
+    ).optional()?)
+    })?;
     Ok(settings.map(|settings| {
         let reference = format!("refs/heads/{}", settings.git_branch);
         (settings.fingerprint(workdir), reference)

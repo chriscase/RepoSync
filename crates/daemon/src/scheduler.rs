@@ -1191,9 +1191,23 @@ impl Scheduler {
                     }
                 },
             };
-            if !allowed_paths.is_empty() || !blocked_patterns.is_empty() {
-                engine.set_path_rules(allowed_paths, blocked_patterns);
-                debug!(repo_name = %repo.name, "path validation rules configured");
+            match self.db.team_path_rewrite(&repo.id) {
+                Ok(Some(policy)) => {
+                    if let Err(error) = self.db.require_team_rewrite_baseline(&repo.id, &policy) {
+                        warn!(repo_id = %repo.id, %error, "Team path rewrite baseline not verified; refusing cycle");
+                        continue;
+                    }
+                    engine.set_team_path_rewrite(policy);
+                }
+                Ok(None) if !allowed_paths.is_empty() || !blocked_patterns.is_empty() => {
+                    engine.set_path_rules(allowed_paths, blocked_patterns);
+                    debug!(repo_name = %repo.name, "path validation rules configured");
+                }
+                Ok(None) => (),
+                Err(error) => {
+                    warn!(repo_id = %repo.id, %error, "invalid Team path rewrite policy; refusing cycle");
+                    continue;
+                }
             }
 
             let ws = self.ws_broadcast.clone();
@@ -1368,6 +1382,7 @@ mod cancellation_tests {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -1449,6 +1464,7 @@ mod cancellation_tests {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -1603,6 +1619,7 @@ mod cancellation_tests {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })

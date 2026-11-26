@@ -186,6 +186,8 @@ struct UpdateRepoRequest {
         deserialize_with = "present_nullable_string"
     )]
     blocked_patterns: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path_rewrite_rules: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -242,14 +244,29 @@ struct RepoDetail {
     snapshot_pin: Option<SnapshotPin>,
     /// #56 typed policy read. The raw columns remain write-only PUT fields.
     path_policy: repo_path_policy_56::RepoPathPolicyRead,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_rewrite_prefix: Option<String>,
 }
 
 impl From<reposync_core::models::Repository> for RepoDetail {
     fn from(r: reposync_core::models::Repository) -> Self {
-        let path_policy = repo_path_policy_56::read_policy(
+        let mut path_policy = repo_path_policy_56::read_policy(
             r.allowed_paths.as_deref(),
             r.blocked_patterns.as_deref(),
         );
+        let path_rewrite_prefix = match reposync_core::path_projection::TeamPrefixRewrite::from_json(
+            r.path_rewrite_rules.as_deref(),
+        ) {
+            Ok(Some(rule)) => {
+                path_policy.path_rewriting = "single_prefix_projected_snapshot";
+                Some(rule.prefix().to_owned())
+            }
+            Ok(None) => None,
+            Err(_) => {
+                path_policy.path_rewriting = "malformed";
+                None
+            }
+        };
         Self {
             save_receipt: None,
             id: r.id,
@@ -281,6 +298,7 @@ impl From<reposync_core::models::Repository> for RepoDetail {
             history_boundary: None,
             snapshot_pin: None,
             path_policy,
+            path_rewrite_prefix,
         }
     }
 }
@@ -530,6 +548,7 @@ async fn create_repo(
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     };
@@ -636,6 +655,83 @@ async fn update_repo(
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
 
+    let proposed_rules = body
+        .path_rewrite_rules
+        .as_deref()
+        .or(existing.path_rewrite_rules.as_deref())
+        .unwrap_or("[]");
+    let current_rewrite = reposync_core::db::team_path_rewrite::TeamRewritePolicy::parse(
+        existing.path_rewrite_rules.as_deref().unwrap_or("[]"),
+        existing.allowed_paths.as_deref(),
+        existing.blocked_patterns.as_deref(),
+    )
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let proposed_rewrite = reposync_core::db::team_path_rewrite::TeamRewritePolicy::parse(
+        proposed_rules,
+        body.allowed_paths
+            .as_ref()
+            .unwrap_or(&existing.allowed_paths)
+            .as_deref(),
+        body.blocked_patterns
+            .as_ref()
+            .unwrap_or(&existing.blocked_patterns)
+            .as_deref(),
+    )
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if current_rewrite != proposed_rewrite
+        && (existing.enabled
+            || existing.last_svn_rev != 0
+            || !existing.last_git_sha.is_empty()
+            || body.enabled == Some(true))
+    {
+        return Err(AppError::BadRequest(
+            "set path rewriting before import on a new paused registration and empty Git destination"
+                .into(),
+        ));
+    }
+    if proposed_rewrite.is_some()
+        && (body.sync_mode.as_deref().unwrap_or(&existing.sync_mode) != "direct"
+            || existing.parent_id.is_some()
+            || body.auto_merge.unwrap_or(existing.auto_merge)
+            || body.lfs_threshold_mb.unwrap_or(existing.lfs_threshold_mb) != 0)
+    {
+        return Err(AppError::BadRequest(
+            "Team path rewrite currently supports direct root pairs without automatic conflict merges or LFS rewriting".into(),
+        ));
+    }
+    if current_rewrite.is_some()
+        && (existing.last_svn_rev != 0 || !existing.last_git_sha.is_empty())
+        && (body
+            .svn_url
+            .as_ref()
+            .is_some_and(|v| v != &existing.svn_url)
+            || body
+                .svn_branch
+                .as_ref()
+                .is_some_and(|v| v != &existing.svn_branch)
+            || body
+                .git_api_url
+                .as_ref()
+                .is_some_and(|v| v != &existing.git_api_url)
+            || body
+                .git_repo
+                .as_ref()
+                .is_some_and(|v| v != &existing.git_repo)
+            || body
+                .git_branch
+                .as_ref()
+                .is_some_and(|v| v != &existing.git_branch))
+    {
+        return Err(AppError::BadRequest(
+            "a projected snapshot pins the repository endpoints; use a new registration".into(),
+        ));
+    }
+    if body.enabled == Some(true) {
+        if let Some(policy) = &proposed_rewrite {
+            db.require_team_rewrite_baseline(&id, policy)
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        }
+    }
     let now = Utc::now().to_rfc3339();
     let updated = reposync_core::models::Repository {
         id: id.clone(),
@@ -666,6 +762,7 @@ async fn update_repo(
         total_errors: existing.total_errors,
         allowed_paths: body.allowed_paths.unwrap_or(existing.allowed_paths),
         blocked_patterns: body.blocked_patterns.unwrap_or(existing.blocked_patterns),
+        path_rewrite_rules: body.path_rewrite_rules.or(existing.path_rewrite_rules),
         consecutive_errors: existing.consecutive_errors,
         teams_webhook_url: existing.teams_webhook_url,
     };
@@ -1568,6 +1665,16 @@ async fn start_repo_import(
             .as_deref()
             .or(import_query.import_mode.as_deref()),
     )?;
+    if import_mode != TeamImportMode::Snapshot
+        && db
+            .team_path_rewrite(&id)
+            .map_err(|e| AppError::BadRequest(e.to_string()))?
+            .is_some()
+    {
+        return Err(AppError::BadRequest(
+            "Team path rewriting requires a fresh projected snapshot import".into(),
+        ));
+    }
     let requested_revision = body
         .svn_revision
         .as_deref()

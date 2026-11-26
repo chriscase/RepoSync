@@ -651,6 +651,7 @@ async fn predecessor_partial_full_import_holds_same_url_replacement_uuid() {
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     };
@@ -899,6 +900,7 @@ async fn predecessor_partial_full_import_holds_same_url_replacement_uuid() {
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     };
@@ -1061,6 +1063,7 @@ async fn independently_proved_same_identity_resume_continues() {
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     };

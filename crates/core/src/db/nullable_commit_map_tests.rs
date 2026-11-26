@@ -49,6 +49,10 @@ fn commit_map_sequence(conn: &Connection) -> Option<i64> {
 /// Every non-commit_map schema object and every row of every other table, so
 /// a migration that touches anything else is detected.
 fn everything_else(conn: &Connection) -> Vec<String> {
+    non_commit_map_snapshot(conn, false)
+}
+
+fn non_commit_map_snapshot(conn: &Connection, project_v16_to_v15: bool) -> Vec<String> {
     let mut out = Vec::new();
     let mut stmt = conn
         .prepare(
@@ -64,9 +68,38 @@ fn everything_else(conn: &Connection) -> Vec<String> {
         .collect::<Result<_, _>>()
         .unwrap();
     for (kind, name, table, sql) in &schema {
+        let mut projection = "*".to_owned();
+        let sql = if project_v16_to_v15 && kind == "table" && name == "repositories" {
+            // The sole permitted v16 schema delta. Read the old columns in
+            // their original order, removing exactly this one definition.
+            let mut cols = conn
+                .prepare("SELECT name FROM pragma_table_info('repositories') ORDER BY cid")
+                .unwrap();
+            // Column names are fixed SQLite identifiers in this fixture.
+            projection = cols
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .into_iter()
+                .filter(|column| column != "path_rewrite_rules")
+                .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (before, after) = sql
+                .as_deref()
+                .unwrap()
+                .split_once(", path_rewrite_rules TEXT DEFAULT '[]'")
+                .expect("v16 may add only the expected path rewrite column definition");
+            Some(format!("{before}{after}"))
+        } else {
+            sql.clone()
+        };
         out.push(format!("schema {kind} {name} {table} {sql:?}"));
         if kind == "table" {
-            let mut rows = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+            let mut rows = conn
+                .prepare(&format!("SELECT {projection} FROM \"{name}\""))
+                .unwrap();
             let width = rows.column_count();
             let mut values: Vec<String> = rows
                 .query_map([], |row| {
@@ -154,11 +187,10 @@ fn v15_ddl_is_byte_identical_to_candidate_v13_rebuild() {
 }
 
 #[test]
-fn fresh_database_reaches_v15_with_nullable_git_sha() {
+fn fresh_database_reaches_current_schema_with_nullable_git_sha() {
     let conn = Connection::open_in_memory().unwrap();
     schema::run_migrations(&conn).unwrap();
-    assert_eq!(CURRENT_SCHEMA_VERSION, NULLABLE_COMMIT_MAP_VERSION);
-    assert_eq!(user_version(&conn), 15);
+    assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
     assert_eq!(git_sha_not_null(&conn), 0);
     assert_eq!(classify_shape(&conn).unwrap(), Shape::NullableV15);
     assert_eq!(staging_tables(&conn), 0);
@@ -184,7 +216,7 @@ fn v14_upgrade_preserves_rows_ids_sequence_and_every_other_table_across_restart(
     assert_eq!(digest.rows, 5);
     {
         let db = Database::new(&path).unwrap();
-        db.initialize().unwrap();
+        schema::run_migrations_up_to(&db.conn(), NULLABLE_COMMIT_MAP_VERSION).unwrap();
         let conn = db.conn();
         assert_eq!(user_version(&conn), 15);
         assert_eq!(git_sha_not_null(&conn), 0);
@@ -200,7 +232,7 @@ fn v14_upgrade_preserves_rows_ids_sequence_and_every_other_table_across_restart(
     // Restart: a new handle sees the same v15 state and initialize is a no-op.
     let db = Database::new(&path).unwrap();
     let schema_before = stored_registry_schema(&db.conn()).unwrap();
-    db.initialize().unwrap();
+    schema::run_migrations_up_to(&db.conn(), NULLABLE_COMMIT_MAP_VERSION).unwrap();
     let conn = db.conn();
     assert_eq!(user_version(&conn), 15);
     assert_eq!(commit_map_row_digest(&conn).unwrap(), digest);
@@ -220,6 +252,64 @@ fn v14_upgrade_preserves_rows_ids_sequence_and_every_other_table_across_restart(
 }
 
 #[test]
+fn v15_upgrades_to_v16_preserving_rows_and_rewrite_default_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = v14_file(dir.path());
+    let (commit_map, other_tables, registry, sequence) = {
+        let db = Database::new(&path).unwrap();
+        let conn = db.conn();
+        schema::run_migrations_up_to(&conn, NULLABLE_COMMIT_MAP_VERSION).unwrap();
+        assert_eq!(user_version(&conn), 15);
+        assert_eq!(classify_shape(&conn).unwrap(), Shape::NullableV15);
+        conn.execute_batch(
+            "INSERT INTO commit_map (id, svn_rev, git_sha, direction, synced_at, repo_id)
+             VALUES (9, 9, NULL, 'svn_to_git', '2026-01-06T00:00:00Z', 'pair');",
+        )
+        .unwrap();
+        (
+            commit_map_row_digest(&conn).unwrap(),
+            everything_else(&conn),
+            stored_registry_schema(&conn).unwrap(),
+            commit_map_sequence(&conn),
+        )
+    };
+    let verify = |conn: &Connection| {
+        assert_eq!(user_version(conn), 16);
+        assert_eq!(classify_shape(conn).unwrap(), Shape::NullableV15);
+        assert_eq!(commit_map_row_digest(conn).unwrap(), commit_map);
+        assert_eq!(commit_map_sequence(conn), sequence);
+        assert_eq!(stored_registry_schema(conn).unwrap(), registry);
+        assert_eq!(non_commit_map_snapshot(conn, true), other_tables);
+        let mut stmt = conn
+            .prepare("SELECT id, path_rewrite_rules FROM repositories ORDER BY id")
+            .unwrap();
+        let rules = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rules,
+            [("other".into(), "[]".into()), ("pair".into(), "[]".into())]
+        );
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    };
+    {
+        let db = Database::new(&path).unwrap();
+        db.initialize().unwrap();
+        verify(&db.conn());
+    }
+    let db = Database::new(&path).unwrap();
+    db.initialize().unwrap();
+    verify(&db.conn());
+}
+
+#[test]
 fn absent_sequence_stays_absent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("reposync.db");
@@ -230,7 +320,7 @@ fn absent_sequence_stays_absent() {
     }
     let db = Database::new(&path).unwrap();
     db.initialize().unwrap();
-    assert_eq!(user_version(&db.conn()), 15);
+    assert_eq!(user_version(&db.conn()), CURRENT_SCHEMA_VERSION);
     assert_eq!(commit_map_sequence(&db.conn()), None);
 }
 
@@ -253,7 +343,7 @@ fn additional_indexes_and_triggers_on_commit_map_are_recreated_exactly() {
     assert_eq!(extra_before.len(), 2);
     let db = Database::new(&path).unwrap();
     db.initialize().unwrap();
-    assert_eq!(user_version(&db.conn()), 15);
+    assert_eq!(user_version(&db.conn()), CURRENT_SCHEMA_VERSION);
     assert_eq!(extra_objects(&db.conn()).unwrap(), extra_before);
     db.insert_commit_map(10, &"1".repeat(40), "svn_to_git", "a", "A")
         .unwrap();
@@ -341,7 +431,7 @@ fn views_and_foreign_triggers_that_query_commit_map_survive_and_still_work() {
     let db = Database::new(&path).unwrap();
     db.initialize().unwrap();
     let conn = db.conn();
-    assert_eq!(user_version(&conn), 15);
+    assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
     assert_eq!(external_dependents(&conn).unwrap(), before);
     let legacy_alter: i64 = conn
         .pragma_query_value(None, "legacy_alter_table", |row| row.get(0))
@@ -440,7 +530,7 @@ fn fixture_v12_file(dir: &Path, edit: Option<(&str, &str)>) -> PathBuf {
 }
 
 #[test]
-fn genuine_v12_fixture_and_formatting_only_variants_upgrade_to_v15() {
+fn genuine_v12_fixture_and_formatting_only_variants_upgrade_to_current_schema() {
     for edit in [
         None,
         Some((
@@ -453,7 +543,7 @@ fn genuine_v12_fixture_and_formatting_only_variants_upgrade_to_v15() {
         let digest = commit_map_row_digest(&Connection::open(&path).unwrap()).unwrap();
         let db = Database::new(&path).unwrap();
         db.initialize().unwrap();
-        assert_eq!(user_version(&db.conn()), 15, "{edit:?}");
+        assert_eq!(user_version(&db.conn()), CURRENT_SCHEMA_VERSION, "{edit:?}");
         assert_eq!(git_sha_not_null(&db.conn()), 0);
         assert_eq!(commit_map_row_digest(&db.conn()).unwrap(), digest);
     }
@@ -634,7 +724,7 @@ fn injected_failure_at_every_stage_rolls_back_then_retry_succeeds() {
         assert_untouched_v14(&path, &digest, &others);
         let db = Database::new(&path).unwrap();
         db.initialize().unwrap();
-        assert_eq!(user_version(&db.conn()), 15);
+        assert_eq!(user_version(&db.conn()), CURRENT_SCHEMA_VERSION);
         assert_eq!(commit_map_row_digest(&db.conn()).unwrap(), digest);
     }
 }
@@ -710,14 +800,15 @@ fn process_abort_mid_rebuild_leaves_v14_then_upgrade_succeeds() {
     assert_untouched_v14(&path, &digest, &others);
     let db = Database::new(&path).unwrap();
     db.initialize().unwrap();
-    assert_eq!(user_version(&db.conn()), 15);
+    assert_eq!(user_version(&db.conn()), CURRENT_SCHEMA_VERSION);
     assert_eq!(commit_map_row_digest(&db.conn()).unwrap(), digest);
 }
 
 #[test]
 fn body_is_a_no_op_on_v15_and_refused_outside_a_transaction() {
     let conn = Connection::open_in_memory().unwrap();
-    schema::run_migrations(&conn).unwrap();
+    schema::run_migrations_up_to(&conn, NULLABLE_COMMIT_MAP_VERSION).unwrap();
+    assert_eq!(user_version(&conn), 15);
     let before = stored_registry_schema(&conn).unwrap();
     conn.execute_batch("BEGIN").unwrap();
     migrate_v15(&conn).unwrap();
@@ -730,27 +821,28 @@ fn body_is_a_no_op_on_v15_and_refused_outside_a_transaction() {
 fn future_schema_is_refused_without_changes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("reposync.db");
+    let future = CURRENT_SCHEMA_VERSION + 1;
     {
         let db = Database::new(&path).unwrap();
         db.initialize().unwrap();
         db.conn()
-            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+            .pragma_update(None, "user_version", future)
             .unwrap();
     }
     match Database::new(&path) {
         Err(DatabaseError::UnsupportedSchema { found, supported }) => {
-            assert_eq!(found, 16);
-            assert_eq!(supported, 15);
+            assert_eq!(found, future);
+            assert_eq!(supported, CURRENT_SCHEMA_VERSION);
         }
         Err(other) => panic!("expected UnsupportedSchema, got {other:?}"),
         Ok(_) => panic!("expected UnsupportedSchema"),
     }
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(user_version(&conn), 16);
+    assert_eq!(user_version(&conn), future);
 }
 
 #[test]
-fn multi_repository_v12_upgrades_straight_through_v15_preserving_rows() {
+fn multi_repository_v12_upgrades_to_current_schema_preserving_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("reposync.db");
     let digest = {
@@ -769,7 +861,7 @@ fn multi_repository_v12_upgrades_straight_through_v15_preserving_rows() {
     };
     let db = Database::new(&path).unwrap();
     db.initialize().unwrap();
-    assert_eq!(user_version(&db.conn()), 15);
+    assert_eq!(user_version(&db.conn()), CURRENT_SCHEMA_VERSION);
     assert_eq!(commit_map_row_digest(&db.conn()).unwrap(), digest);
 }
 

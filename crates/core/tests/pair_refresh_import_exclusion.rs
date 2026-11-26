@@ -165,6 +165,57 @@ async fn snapshot_import_refuses_held_scopes_before_materialization_or_lfs() {
 }
 
 #[tokio::test]
+async fn reserved_personal_import_scope_needs_no_team_registration() {
+    use reposync_core::db::personal_scope::PERSONAL_SCOPE_KEY;
+
+    let f = job::Fixture::new();
+    let git = client(&f);
+    // Starting an admitted writer may renew its lease, including a run
+    // cancelled before materialization. Nothing else should persist.
+    let state_without_lease_renewal = || {
+        rows(&f.db)
+            .into_iter()
+            .filter(|(key, _)| key != "writer_fence_v1:lease")
+            .collect::<Vec<_>>()
+    };
+    let before = state_without_lease_renewal();
+    let config_bytes = std::fs::read(f.dir.path().join("git/.git/config")).unwrap();
+    let svn = SvnClient::new("file:///nonexistent", "", "");
+    let run = || {
+        let mut state = state(Some(PERSONAL_SCOPE_KEY));
+        state.cancel_signal = Some(Arc::new(AtomicBool::new(true)));
+        state
+    };
+    assert!(f.db.get_repository(PERSONAL_SCOPE_KEY).unwrap().is_none());
+    let result = reposync_core::import::run_full_import(
+        &svn,
+        &git,
+        &IdentityMapper::new(&IdentityConfig::default()).unwrap(),
+        &f.db,
+        &FilePolicy::new(0, Vec::new()),
+        &config(),
+        run(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, ImportOutcome::Cancelled { commits: 0 }));
+    let result = reposync_core::import::run_snapshot_import(
+        &svn,
+        &git,
+        &f.db,
+        &FilePolicy::new(0, Vec::new()),
+        &config(),
+        &pin(),
+        run(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, ImportOutcome::Cancelled { commits: 0 }));
+    assert_eq!(state_without_lease_renewal(), before);
+    pristine(&f, &config_bytes);
+}
+
+#[tokio::test]
 async fn ordinary_preparation_and_uncertain_global_publication_exclude_direct_imports() {
     for uncertain in [false, true] {
         let f = job::Fixture::new();

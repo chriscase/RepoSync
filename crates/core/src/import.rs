@@ -465,7 +465,7 @@ fn copy_tree_policy_inner(src: &Path, dst: &Path, ctx: &mut CopyTreePolicyCtx<'_
     Ok(())
 }
 
-fn copy_regular_file_no_follow(
+pub(crate) fn copy_regular_file_no_follow(
     src: &Path,
     dst_root: &Path,
     dst: &Path,
@@ -2933,6 +2933,20 @@ async fn prepare_import_lfs(
     }
 }
 
+fn import_team_path_rewrite(
+    db: &Database,
+    repo_id: Option<&str>,
+) -> Result<Option<crate::db::team_path_rewrite::TeamRewritePolicy>, DatabaseError> {
+    use crate::db::personal_scope::PERSONAL_SCOPE_KEY;
+    match repo_id {
+        // Config/setup import can have a durable Personal journal without a
+        // managed repository row. Only the canonical reserved scope is exempt:
+        // a real Team repository may still be named "personal".
+        None | Some(PERSONAL_SCOPE_KEY) => Ok(None),
+        Some(repo) => db.team_path_rewrite(repo),
+    }
+}
+
 /// Materialize one pinned SVN snapshot, verify projected bytes, publish, and
 /// record the verified baseline. The pin must already be stored; this never
 /// re-resolves live HEAD.
@@ -2960,6 +2974,7 @@ pub async fn run_snapshot_import(
             None
         })
         .context("snapshot import writer admission refused")?;
+    let team_rewrite = import_team_path_rewrite(db, repo_id.as_deref())?;
 
     if stop_requested(&progress, cancel_signal.as_ref()).await {
         let mut p = progress.write().await;
@@ -3042,8 +3057,12 @@ pub async fn run_snapshot_import(
         return Ok(ImportOutcome::Cancelled { commits: 0 });
     }
 
-    let stats =
-        crate::snapshot::materialize_snapshot(svn_client, &repo_path, file_policy, db, pin).await?;
+    let stats = if let Some(rewrite) = &team_rewrite {
+        let export = crate::snapshot::export_team_rewrite_pin(svn_client, pin, rewrite).await?;
+        copy_tree_with_policy(export.path(), &repo_path, file_policy, db)?
+    } else {
+        crate::snapshot::materialize_snapshot(svn_client, &repo_path, file_policy, db, pin).await?
+    };
     {
         let mut p = progress.write().await;
         p.current_file_count = stats.copied as u64;
@@ -3054,9 +3073,13 @@ pub async fn run_snapshot_import(
         ));
     }
 
-    let workdir_verify =
+    let workdir_verify = if let Some(rewrite) = &team_rewrite {
+        let export = crate::snapshot::export_team_rewrite_pin(svn_client, pin, rewrite).await?;
+        verify_export_projection(export.path(), &repo_path, file_policy)?
+    } else {
         crate::snapshot::verify_projected_snapshot(svn_client, &repo_path, file_policy, db, pin)
-            .await?;
+            .await?
+    };
     progress.write().await.verification = Some(workdir_verify.clone());
 
     if stop_requested(&progress, cancel_signal.as_ref()).await {
@@ -3078,8 +3101,11 @@ pub async fn run_snapshot_import(
     .context("failed to create snapshot baseline Git commit")?
     .to_string();
 
-    let projected =
-        crate::snapshot::project_snapshot_tree(svn_client, file_policy, db, pin).await?;
+    let projected = if let Some(rewrite) = &team_rewrite {
+        crate::snapshot::export_team_rewrite_pin(svn_client, pin, rewrite).await?
+    } else {
+        crate::snapshot::project_snapshot_tree(svn_client, file_policy, db, pin).await?
+    };
     let commit_verify = crate::snapshot::verify_commit_matches_projection(
         projected.path(),
         &repo_path,
@@ -3096,6 +3122,13 @@ pub async fn run_snapshot_import(
             &sha[..8.min(sha.len())],
             pin.operative_rev
         ));
+    }
+
+    if let Some(policy) = &team_rewrite {
+        let (Some(repo), Some(_)) = (repo_id.as_deref(), operation_id.as_deref()) else {
+            anyhow::bail!("Team rewrite snapshots require a managed import journal");
+        };
+        db.stage_verified_team_rewrite_snapshot(repo, policy, pin.operative_rev, &sha)?;
     }
 
     if let (Some(repo), Some(op)) = (&repo_id, &operation_id) {
@@ -3237,6 +3270,9 @@ pub async fn run_full_import(
             None
         })
         .context("full import writer admission refused")?;
+    if import_team_path_rewrite(db, repo_id.as_deref())?.is_some() {
+        anyhow::bail!("Team path rewriting requires a fresh projected snapshot import");
+    }
     if operation_id.is_none() {
         db.require_legacy_import_watermarks_available()?;
     }

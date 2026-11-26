@@ -1,13 +1,13 @@
-//! Ordinary startup used by daemon callers: current operational schema (v15),
+//! Ordinary startup used by daemon callers: current operational schema,
 //! no candidate registry.
 //!
 //! The case id `STARTUP_V14` and the test name `ordinary_startup_stays_v14`
 //! are pinned in `docs/reliability/required-cases.json` and are kept as
-//! identities. Since #54 the current operational schema is v15, which keeps
-//! every v14 canonical table and makes `commit_map.git_sha` nullable.
+//! identities. Startup must still retain every v14 canonical table and
+//! the #54 nullable `commit_map.git_sha` through later migrations.
 //! `Database::new`/`initialize` stays valid without the data-dir lock; exclusive
 //! owner is `Database::open_with_exclusive_owner` (daemon ordinary startup).
-use reposync_core::db::Database;
+use reposync_core::db::{schema::CURRENT_SCHEMA_VERSION, Database};
 use reposync_core::errors::DatabaseError;
 
 #[test]
@@ -20,9 +20,9 @@ fn ordinary_startup_stays_v14() {
         db.initialize().unwrap();
         assert_eq!(
             db.conn()
-                .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                .pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            15
+            CURRENT_SCHEMA_VERSION
         );
         assert_eq!(
             db.conn()
@@ -59,13 +59,13 @@ fn ordinary_startup_stays_v14() {
     db.initialize().unwrap();
     assert_eq!(
         db.conn()
-            .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+            .pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        15
+        CURRENT_SCHEMA_VERSION
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
-        serde_json::json!({"case":"STARTUP_V14","user_version":15,"candidate_tables":0,"git_sha_notnull":0,"repeat_initialize_and_restart":true})
+        serde_json::json!({"case":"STARTUP_V14","user_version":CURRENT_SCHEMA_VERSION,"candidate_tables":0,"git_sha_notnull":0,"repeat_initialize_and_restart":true})
     );
 }
 
@@ -85,7 +85,7 @@ fn future_user_version_is_refused_on_ordinary_open() {
     match err {
         DatabaseError::UnsupportedSchema { found, supported } => {
             assert_eq!(found, 99);
-            assert_eq!(supported, 15);
+            assert_eq!(supported, CURRENT_SCHEMA_VERSION);
         }
         other => panic!("expected UnsupportedSchema, got {other:?}"),
     }
@@ -96,7 +96,7 @@ fn future_user_version_is_refused_on_ordinary_open() {
     assert_eq!(version, 99);
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
-        serde_json::json!({"case":"STARTUP_FUTURE_REFUSED","found":99,"supported":15,"user_version_unchanged":true})
+        serde_json::json!({"case":"STARTUP_FUTURE_REFUSED","found":99,"supported":CURRENT_SCHEMA_VERSION,"user_version_unchanged":true})
     );
 }
 
@@ -106,9 +106,9 @@ fn exclusive_data_dir_owner_blocks_second_startup() {
     let (db, owner) = Database::open_with_exclusive_owner(t.path()).unwrap();
     assert_eq!(
         db.conn()
-            .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+            .pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        15
+        CURRENT_SCHEMA_VERSION
     );
     let err = match Database::open_with_exclusive_owner(t.path()) {
         Ok(_) => panic!("expected second exclusive owner to be refused"),
@@ -125,9 +125,9 @@ fn exclusive_data_dir_owner_blocks_second_startup() {
     assert_eq!(
         reopen
             .conn()
-            .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+            .pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        15
+        CURRENT_SCHEMA_VERSION
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",

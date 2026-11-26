@@ -1093,3 +1093,154 @@ mod tests {
         assert_eq!(err.path, "new.txt");
     }
 }
+
+/// A reversible one-prefix namespace. Paths outside the prefix have no
+/// implicit identity mapping, which forbids projected/unprojected collisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamPrefixRewrite(String);
+
+impl TeamPrefixRewrite {
+    pub fn new(prefix: &str) -> Result<Self, &'static str> {
+        let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+        Self::validate(prefix)?;
+        Ok(Self(prefix.to_owned()))
+    }
+
+    pub fn prefix(&self) -> &str {
+        &self.0
+    }
+
+    /// At most one rule, parsed the same way by config readers and validators.
+    pub fn from_json(raw: Option<&str>) -> Result<Option<Self>, &'static str> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Rule {
+            strip_prefix: String,
+        }
+        let Some(raw) = raw else { return Ok(None) };
+        let rules: Vec<Rule> =
+            serde_json::from_str(raw).map_err(|_| "invalid JSON rewrite rule list")?;
+        match rules.as_slice() {
+            [] => Ok(None),
+            [rule] => Self::new(&rule.strip_prefix).map(Some),
+            _ => Err("only one strip-prefix rule is supported"),
+        }
+    }
+
+    /// A configured rewrite must fully contain every allowed namespace.
+    /// Otherwise an admitted SVN path could be silently dropped by the rewrite.
+    pub fn validate_scope(&self, allowed: &[String]) -> Result<(), &'static str> {
+        if allowed.is_empty() {
+            return Err("rewrite requires an explicit allowed scope");
+        }
+        for p in allowed {
+            let p = Self::new(p)?;
+            if p != *self && self.to_git(&p.0)?.is_none() {
+                return Err("allowed scope extends outside the rewrite prefix");
+            }
+        }
+        Ok(())
+    }
+
+    fn validate(path: &str) -> Result<(), &'static str> {
+        if path.is_empty()
+            || path.contains(['\\', ':', '\0', '\r', '\n', '\t'])
+            || path
+                .split('/')
+                .any(|p| p.is_empty() || p == "." || p == ".." || p.eq_ignore_ascii_case(".git"))
+        {
+            return Err("rewrite requires canonical relative paths");
+        }
+        Ok(())
+    }
+
+    pub fn to_git<'a>(&self, svn: &'a str) -> Result<Option<&'a str>, &'static str> {
+        Self::validate(svn)?;
+        Ok(svn
+            .strip_prefix(&self.0)
+            .and_then(|suffix| suffix.strip_prefix('/')))
+    }
+
+    /// Map both endpoints before the existing branch-relative SVN policy
+    /// runs. Contents are still read from the Git-side source path.
+    pub fn map_git_input(
+        &self,
+        mut change: GitToSvnInputChange,
+    ) -> Result<GitToSvnInputChange, &'static str> {
+        change.path = self.to_svn(&change.path)?;
+        change.rename_from = change
+            .rename_from
+            .as_deref()
+            .map(|path| self.to_svn(path))
+            .transpose()?;
+        Ok(change)
+    }
+
+    pub fn to_svn(&self, git: &str) -> Result<String, &'static str> {
+        Self::validate(git)?;
+        Ok(format!("{}/{git}", self.0))
+    }
+}
+
+#[cfg(test)]
+mod team_prefix_rewrite_tests {
+    use super::TeamPrefixRewrite;
+    #[test]
+    fn rewrite_git_rename_endpoints_before_svn_selection() {
+        use super::{project_git_to_svn_changeset, GitToSvnInputChange};
+        let rule = TeamPrefixRewrite::new("src/teams/foo").unwrap();
+        let change = rule
+            .map_git_input(GitToSvnInputChange {
+                action: "R".into(),
+                path: "next.c".into(),
+                content: Some(b"payload".to_vec()),
+                rename_from: Some("last.c".into()),
+            })
+            .unwrap();
+        let result = project_git_to_svn_changeset(
+            vec![change],
+            &["src/teams/foo/".into()],
+            &["src/teams/foo/last.c".into()],
+        )
+        .unwrap();
+        assert_eq!(result.included.len(), 1);
+        assert_eq!(result.included[0].path, "src/teams/foo/next.c");
+        assert_eq!(
+            result.included[0].content.as_deref(),
+            Some(b"payload".as_slice())
+        );
+        assert_eq!(
+            result.excluded,
+            vec![(
+                "R".into(),
+                "src/teams/foo/last.c -> src/teams/foo/next.c".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn team_prefix_rewrite_round_trip_without_identity_fallback() {
+        let rule = TeamPrefixRewrite::new("src/teams/foo/").unwrap();
+        assert_eq!(rule.to_git("src/teams/foo/bar.c"), Ok(Some("bar.c")));
+        assert_eq!(rule.to_svn("bar.c").unwrap(), "src/teams/foo/bar.c");
+        assert_eq!(rule.to_git("bar.c"), Ok(None));
+        assert_eq!(rule.to_git("src/teams/foobar/bar.c"), Ok(None));
+        assert_eq!(rule.to_git("src/teams/foo"), Ok(None));
+        assert!(rule.to_svn("../bar.c").is_err());
+        assert!(TeamPrefixRewrite::new("/root").is_err());
+        assert!(TeamPrefixRewrite::new("foo//").is_err());
+        assert!(rule.validate_scope(&["src/teams/foo/".into()]).is_ok());
+        assert!(rule.validate_scope(&["src/teams/foo/deep".into()]).is_ok());
+        assert!(rule.validate_scope(&["src/teams/".into()]).is_err());
+        assert!(rule.validate_scope(&[]).is_err());
+        assert_eq!(TeamPrefixRewrite::from_json(Some("[]")), Ok(None));
+        assert_eq!(
+            TeamPrefixRewrite::from_json(Some(r#"[{"strip_prefix":"src/teams/foo/"}]"#)),
+            Ok(Some(rule))
+        );
+        assert!(TeamPrefixRewrite::from_json(Some(
+            r#"[{"strip_prefix":"x"},{"strip_prefix":"y"}]"#
+        ))
+        .is_err());
+    }
+}

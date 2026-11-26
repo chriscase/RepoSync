@@ -103,6 +103,125 @@ fn split_svn_diff(raw: &str) -> Result<Vec<DiffSection>, String> {
     Ok(sections)
 }
 
+/// Paths here are literal repository-relative paths from SVN XML, not URLs.
+fn copy_endpoint_disjoint_57(path: &str, selected: &str) -> Result<bool, String> {
+    if path == "/" {
+        return Ok(false);
+    }
+    let relative = path
+        .strip_prefix('/')
+        .ok_or_else(|| "copy endpoint lacks an absolute repository path".to_owned())?;
+    if relative.contains(['\\', '\0', '\r', '\n'])
+        || relative
+            .split('/')
+            .any(|part| matches!(part, "" | "." | ".."))
+    {
+        return Err("cannot prove copy endpoint is outside the selected namespace".into());
+    }
+    let strictly_below = |candidate: &str, parent: &str| {
+        candidate
+            .strip_prefix(parent)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    Ok(path != selected && !strictly_below(path, selected) && !strictly_below(selected, path))
+}
+
+/// Re-map only validated SVN node/patch headers. Original section evidence
+/// remains in the SVN namespace; Git sees the stripped destination name.
+fn rewrite_selected_sections_57(
+    raw: &str,
+    rule: &crate::path_projection::TeamPrefixRewrite,
+) -> Result<String, String> {
+    let mut projected = String::new();
+    for section in split_svn_diff(raw)? {
+        let dst = rule
+            .to_git(&section.path)
+            .map_err(str::to_owned)?
+            .ok_or_else(|| "selected diff section is outside the rewrite prefix".to_owned())?;
+        if section.kind == SectionKind::Content {
+            content_facts(&section)?;
+        }
+        let mut before_hunks = section.kind == SectionKind::Content;
+        for (i, line) in section.text.split_inclusive('\n').enumerate() {
+            if line.starts_with("@@") {
+                before_hunks = false;
+            }
+            let eol = if line.ends_with("\r\n") {
+                "\r\n"
+            } else if line.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            if i == 0 {
+                let kind = match section.kind {
+                    SectionKind::Content => "Index: ",
+                    SectionKind::Property => "Property changes on: ",
+                };
+                projected.push_str(&format!("{kind}{dst}{eol}"));
+            } else {
+                // SVN content facts check exactly two header slots, before the
+                // first hunk. Do not rewrite marker-like text inside payloads.
+                let prefix = ["--- ", "+++ "]
+                    .into_iter()
+                    .find(|sig| line.starts_with(&format!("{sig}{}\t(", section.path)));
+                if let Some(sig) = prefix.filter(|_| before_hunks) {
+                    projected.push_str(sig);
+                    projected.push_str(dst);
+                    projected.push_str(&line[sig.len() + section.path.len()..]);
+                } else {
+                    projected.push_str(line);
+                }
+            }
+        }
+    }
+    Ok(projected)
+}
+
+#[cfg(test)]
+mod rewrite_57_patch_tests {
+    use super::*;
+    use crate::path_projection::TeamPrefixRewrite;
+
+    #[test]
+    fn rewrite_copy_endpoint_overlap_checks_both_component_directions() {
+        let selected = "/trunk/src/teams/foo";
+        for path in ["/", "/trunk/src", selected, "/trunk/src/teams/foo/x"] {
+            assert_eq!(copy_endpoint_disjoint_57(path, selected), Ok(false));
+        }
+        for path in ["/branches/other", "/trunk/src/teams/foobar"] {
+            assert_eq!(copy_endpoint_disjoint_57(path, selected), Ok(true));
+        }
+        assert!(copy_endpoint_disjoint_57("/trunk/src/../other", selected).is_err());
+        assert!(copy_endpoint_disjoint_57("trunk/src/teams/foobar", selected).is_err());
+    }
+
+    #[test]
+    fn rewrite_patch_preserves_hunk_text_and_refuses_foreign_headers() {
+        let rule = TeamPrefixRewrite::new("src/team").unwrap();
+        let raw = concat!(
+            "Index: src/team/a.c\n",
+            "=======================================\n",
+            "--- src/team/a.c\t(revision 1)\n",
+            "+++ src/team/a.c\t(revision 2)\n",
+            "@@ -1 +1 @@\n",
+            "--- src/team/a.c\t(revision 0)\n",
+            "+new source\n",
+        );
+        let rewritten = rewrite_selected_sections_57(raw, &rule).unwrap();
+        assert!(rewritten.starts_with("Index: a.c\n"));
+        assert!(rewritten.contains("--- a.c\t(revision 1)\n+++ a.c\t(revision 2)\n"));
+        assert!(rewritten.contains("@@ -1 +1 @@\n--- src/team/a.c\t(revision 0)\n"));
+        assert!(
+            rewrite_selected_sections_57(&raw.replace("src/team/", "src/other/"), &rule).is_err()
+        );
+        assert!(
+            rewrite_selected_sections_57(&raw.replace("+++ src/team", "+++ src/other"), &rule)
+                .is_err()
+        );
+    }
+}
+
 /// Header facts of one content section, checked against its own path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ContentFacts {
@@ -631,6 +750,67 @@ impl SyncEngine {
         svn: &SvnClient,
         change: &SvnChangeSet,
     ) -> Result<PlanState, String> {
+        if self.team_prefix_rewrite.is_some() {
+            let log = svn
+                .log(change.revision, change.revision)
+                .await
+                .map_err(|e| format!("cannot verify copy/rename provenance for rewrite: {e}"))?;
+            if log.len() != 1 || log[0].revision != change.revision {
+                return Err(
+                    "cannot prove exact revision copy/rename provenance for rewrite".into(),
+                );
+            }
+            let copied = log[0]
+                .changed_paths
+                .iter()
+                .filter(|p| p.copy_from_path.is_some() || p.copy_from_rev.is_some())
+                .collect::<Vec<_>>();
+            if !copied.is_empty() {
+                let observed = svn
+                    .info()
+                    .await
+                    .map_err(|e| format!("cannot verify branch identity for rewrite: {e}"))?;
+                let identity = crate::path_projection::checked_svn_path_identity(
+                    &observed.root_url,
+                    &observed.url,
+                )
+                .ok_or_else(|| "cannot verify branch identity for rewrite".to_owned())?;
+                let selected: Vec<String> = self
+                    .allowed_paths
+                    .iter()
+                    .map(|allow| {
+                        let allow = allow.trim_end_matches('/');
+                        if identity.branch_path.is_empty() {
+                            format!("/{allow}")
+                        } else {
+                            format!("/{}/{allow}", identity.branch_path)
+                        }
+                    })
+                    .collect();
+                for entry in copied {
+                    let a = entry
+                        .copy_from_path
+                        .as_deref()
+                        .ok_or_else(|| "copy has incomplete source provenance".to_owned())?;
+                    if selected.is_empty()
+                        || !entry
+                            .copy_from_rev
+                            .is_some_and(|r| r > 0 && r < change.revision)
+                    {
+                        return Err(
+                            "copy has incomplete source provenance or no admitted namespace".into(),
+                        );
+                    }
+                    for allow in &selected {
+                        if !copy_endpoint_disjoint_57(a, allow)?
+                            || !copy_endpoint_disjoint_57(&entry.path, allow)?
+                        {
+                            return Err("Team path rewriting holds SVN copies/renames touching the selected namespace for operator review".into());
+                        }
+                    }
+                }
+            }
+        }
         let raw = svn
             .diff_full(change.revision)
             .await
@@ -808,7 +988,15 @@ impl SyncEngine {
                     policy = %policy,
                     "SVN revision projected; applying selected content only"
                 );
-                Ok(Some(selected_patch.clone()))
+                let patch = match &self.team_prefix_rewrite {
+                    Some(rule) => {
+                        rewrite_selected_sections_57(selected_patch, rule).map_err(|e| {
+                            SyncError::GitError(crate::errors::GitError::ApplyFailed(e))
+                        })?
+                    }
+                    None => selected_patch.clone(),
+                };
+                Ok(Some(patch))
             }
             PlanState::Ready {
                 effect: SelectedEffect::Zero,
@@ -940,14 +1128,15 @@ fn read_scope_snapshot(
 /// is the authority both capture and revalidation compare against; no second
 /// policy store exists.
 fn read_admitted_policy_tx(tx: &Connection, repo_id: &str) -> Result<String, DatabaseError> {
-    let row: Option<(Option<String>, Option<String>)> = tx
-        .query_row(
-            "SELECT allowed_paths, blocked_patterns FROM repositories WHERE id = ?1",
-            [repo_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((allowed, blocked)) = row else {
+    let row: Option<(Option<String>, Option<String>, Option<String>)> =
+        crate::db::team_path_rewrite::with_rewrite_column(tx, |tx, column| {
+            Ok(tx.query_row(
+                &format!("SELECT allowed_paths, blocked_patterns, {column} FROM repositories WHERE id = ?1"),
+                [repo_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional()?)
+        })?;
+    let Some((allowed, blocked, rewrite)) = row else {
         return Err(refused("repository registration is missing"));
     };
     let parse = |raw: Option<String>, setting: &str| -> Result<Vec<String>, DatabaseError> {
@@ -962,7 +1151,13 @@ fn read_admitted_policy_tx(tx: &Connection, repo_id: &str) -> Result<String, Dat
     };
     let allowed = parse(allowed, "allowed_paths")?;
     let blocked = parse(blocked, "blocked_patterns")?;
-    Ok(serde_json::json!({"allowed_paths": allowed, "blocked_patterns": blocked}).to_string())
+    let rewrite = crate::path_projection::TeamPrefixRewrite::from_json(rewrite.as_deref())
+        .map_err(refused)?;
+    Ok(crate::db::team_path_rewrite::policy_snapshot(
+        &allowed,
+        &blocked,
+        rewrite.as_ref().map(|rule| rule.prefix()),
+    ))
 }
 
 impl CapturedIdentity {
@@ -1179,6 +1374,7 @@ struct WitnessRecords {
     writer_epoch: Option<u64>,
     admitted_policy: String,
     svn_url: String,
+    svn_branch: String,
     git_branch: String,
     origin: crate::db::import_operations::SnapshotOriginRecord,
     lineage: crate::db::lineage_checkpoints::CanonicalLineage,
@@ -1192,14 +1388,14 @@ fn witness_records_tx(
     repo_id: &str,
 ) -> Result<Option<WitnessRecords>, DatabaseError> {
     use crate::db::import_operations::{snapshot_origin_evidence, SnapshotOriginEvidence};
-    let row: Option<(Option<String>, String, String, String)> = tx
+    let row: Option<(Option<String>, String, String, String, String)> = tx
         .query_row(
-            "SELECT scope_uuid, last_git_sha, svn_url, git_branch FROM repositories WHERE id = ?1",
+            "SELECT scope_uuid, last_git_sha, svn_url, git_branch, svn_branch FROM repositories WHERE id = ?1",
             [repo_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
-    let Some((Some(stored_scope), column, svn_url, git_branch)) = row else {
+    let Some((Some(stored_scope), column, svn_url, git_branch, svn_branch)) = row else {
         return Ok(None);
     };
     if stored_scope.is_empty() || column.is_empty() {
@@ -1239,6 +1435,7 @@ fn witness_records_tx(
         writer_epoch,
         admitted_policy,
         svn_url,
+        svn_branch,
         git_branch,
         origin: *origin,
         lineage,
@@ -1421,7 +1618,18 @@ impl SyncEngine {
             );
             return Ok(None);
         }
-        if configured_svn_url.trim_end_matches('/') != records.svn_url.trim_end_matches('/') {
+        let registered = if self.team_prefix_rewrite.is_some() {
+            let root = records.svn_url.trim_end_matches('/');
+            let branch = records.svn_branch.trim_matches('/');
+            if branch.is_empty() {
+                root.to_owned()
+            } else {
+                format!("{root}/{branch}")
+            }
+        } else {
+            records.svn_url.clone()
+        };
+        if configured_svn_url.trim_end_matches('/') != registered.trim_end_matches('/') {
             return Ok(None);
         }
         let identity = CapturedIdentity::capture(

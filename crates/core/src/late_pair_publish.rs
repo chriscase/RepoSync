@@ -1949,6 +1949,7 @@ pub async fn publish_admitted_late_pair(
             total_errors: 0,
             allowed_paths: parent.allowed_paths.clone(),
             blocked_patterns: parent.blocked_patterns.clone(),
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: parent.teams_webhook_url.clone(),
         };
@@ -2179,6 +2180,7 @@ mod tests {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         });

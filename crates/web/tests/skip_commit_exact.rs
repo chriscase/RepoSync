@@ -121,6 +121,7 @@ fn fixture_repo(id: &str, last_git_sha: &str) -> Repository {
         total_errors: 5,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 3,
         teams_webhook_url: None,
     }

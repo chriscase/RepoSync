@@ -23,6 +23,7 @@ pub(crate) mod startup;
 mod startup_rollback;
 pub mod svn_commit_operations;
 pub mod team_cycle_mapping_operations;
+pub mod team_path_rewrite;
 pub mod watermark_recovery;
 
 pub(crate) mod opened_file;

@@ -397,6 +397,9 @@ pub struct Repository {
     /// NULL means no blocked patterns.
     #[serde(default)]
     pub blocked_patterns: Option<String>,
+    /// Team rewrite rule JSON. Missing/empty preserves the original namespace.
+    #[serde(default)]
+    pub path_rewrite_rules: Option<String>,
     /// Consecutive permanent error count for circuit breaker.
     #[serde(default)]
     pub consecutive_errors: i64,

@@ -2955,8 +2955,8 @@ impl Database {
         }
         let scope_uuid = crate::db::repo_scope_identity::new_scope_uuid();
         conn.execute(
-            "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url, scope_uuid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+            "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url, scope_uuid, path_rewrite_rules)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
             params![
                 repo.id,
                 repo.name,
@@ -2987,6 +2987,7 @@ impl Database {
                 repo.consecutive_errors,
                 repo.teams_webhook_url,
                 scope_uuid,
+                repo.path_rewrite_rules,
             ],
         )?;
         let repo_count: i64 =
@@ -3006,91 +3007,64 @@ impl Database {
         conn: &rusqlite::Connection,
         id: &str,
     ) -> Result<Option<models::Repository>, DatabaseError> {
-        let mut stmt = conn.prepare(
-            "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url
-             FROM repositories WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query_map(params![id], |row| {
-            Ok(models::Repository {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                svn_url: row.get(2)?,
-                svn_branch: row.get(3)?,
-                svn_username: row.get(4)?,
-                git_provider: row.get(5)?,
-                git_api_url: row.get(6)?,
-                git_repo: row.get(7)?,
-                git_branch: row.get(8)?,
-                sync_mode: row.get(9)?,
-                poll_interval_secs: row.get(10)?,
-                lfs_threshold_mb: row.get(11)?,
-                auto_merge: row.get::<_, i32>(12)? != 0,
-                enabled: row.get::<_, i32>(13)? != 0,
-                created_by: row.get(14)?,
-                parent_id: row.get(23)?,
-                allowed_paths: row.get(24)?,
-                blocked_patterns: row.get(25)?,
-                consecutive_errors: row.get(26)?,
-                teams_webhook_url: row.get(27)?,
-                created_at: row.get(15)?,
-                updated_at: row.get(16)?,
-                last_svn_rev: row.get(17)?,
-                last_git_sha: row.get(18)?,
-                last_sync_at: row.get(19)?,
-                sync_status: row.get(20)?,
-                total_syncs: row.get(21)?,
-                total_errors: row.get(22)?,
-            })
-        })?;
-        match rows.next() {
-            Some(Ok(repo)) => Ok(Some(repo)),
-            Some(Err(e)) => Err(e.into()),
-            None => Ok(None),
-        }
+        super::team_path_rewrite::with_rewrite_column(conn, |conn, column| {
+            Ok(conn
+                .query_row(
+                    &Self::repository_select(column, "WHERE id = ?1"),
+                    [id],
+                    Self::repository_from_row,
+                )
+                .optional()?)
+        })
+    }
+
+    fn repository_select(column: &str, clause: &str) -> String {
+        format!("SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url, {column} FROM repositories {clause}")
+    }
+
+    fn repository_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<models::Repository> {
+        Ok(models::Repository {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            svn_url: row.get(2)?,
+            svn_branch: row.get(3)?,
+            svn_username: row.get(4)?,
+            git_provider: row.get(5)?,
+            git_api_url: row.get(6)?,
+            git_repo: row.get(7)?,
+            git_branch: row.get(8)?,
+            sync_mode: row.get(9)?,
+            poll_interval_secs: row.get(10)?,
+            lfs_threshold_mb: row.get(11)?,
+            auto_merge: row.get::<_, i32>(12)? != 0,
+            enabled: row.get::<_, i32>(13)? != 0,
+            created_by: row.get(14)?,
+            parent_id: row.get(23)?,
+            allowed_paths: row.get(24)?,
+            blocked_patterns: row.get(25)?,
+            path_rewrite_rules: row.get(28)?,
+            consecutive_errors: row.get(26)?,
+            teams_webhook_url: row.get(27)?,
+            created_at: row.get(15)?,
+            updated_at: row.get(16)?,
+            last_svn_rev: row.get(17)?,
+            last_git_sha: row.get(18)?,
+            last_sync_at: row.get(19)?,
+            sync_status: row.get(20)?,
+            total_syncs: row.get(21)?,
+            total_errors: row.get(22)?,
+        })
     }
 
     /// List all repositories ordered by name.
     pub fn list_repositories(&self) -> Result<Vec<models::Repository>, DatabaseError> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url
-             FROM repositories ORDER BY name",
-        )?;
-        let entries = stmt
-            .query_map([], |row| {
-                Ok(models::Repository {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    svn_url: row.get(2)?,
-                    svn_branch: row.get(3)?,
-                    svn_username: row.get(4)?,
-                    git_provider: row.get(5)?,
-                    git_api_url: row.get(6)?,
-                    git_repo: row.get(7)?,
-                    git_branch: row.get(8)?,
-                    sync_mode: row.get(9)?,
-                    poll_interval_secs: row.get(10)?,
-                    lfs_threshold_mb: row.get(11)?,
-                    auto_merge: row.get::<_, i32>(12)? != 0,
-                    enabled: row.get::<_, i32>(13)? != 0,
-                    created_by: row.get(14)?,
-                    parent_id: row.get(23)?,
-                    allowed_paths: row.get(24)?,
-                    blocked_patterns: row.get(25)?,
-                    consecutive_errors: row.get(26)?,
-                    teams_webhook_url: row.get(27)?,
-                    created_at: row.get(15)?,
-                    updated_at: row.get(16)?,
-                    last_svn_rev: row.get(17)?,
-                    last_git_sha: row.get(18)?,
-                    last_sync_at: row.get(19)?,
-                    sync_status: row.get(20)?,
-                    total_syncs: row.get(21)?,
-                    total_errors: row.get(22)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(entries)
+        super::team_path_rewrite::with_rewrite_column(&self.conn(), |conn, column| {
+            let mut stmt = conn.prepare(&Self::repository_select(column, "ORDER BY name"))?;
+            let entries = stmt
+                .query_map([], Self::repository_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(entries)
+        })
     }
 
     /// List child repositories (branch pairs) for a given parent.
@@ -3098,46 +3072,16 @@ impl Database {
         &self,
         parent_id: &str,
     ) -> Result<Vec<models::Repository>, DatabaseError> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url
-             FROM repositories WHERE parent_id = ?1 ORDER BY name",
-        )?;
-        let entries = stmt
-            .query_map(params![parent_id], |row| {
-                Ok(models::Repository {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    svn_url: row.get(2)?,
-                    svn_branch: row.get(3)?,
-                    svn_username: row.get(4)?,
-                    git_provider: row.get(5)?,
-                    git_api_url: row.get(6)?,
-                    git_repo: row.get(7)?,
-                    git_branch: row.get(8)?,
-                    sync_mode: row.get(9)?,
-                    poll_interval_secs: row.get(10)?,
-                    lfs_threshold_mb: row.get(11)?,
-                    auto_merge: row.get::<_, i32>(12)? != 0,
-                    enabled: row.get::<_, i32>(13)? != 0,
-                    created_by: row.get(14)?,
-                    parent_id: row.get(23)?,
-                    allowed_paths: row.get(24)?,
-                    blocked_patterns: row.get(25)?,
-                    consecutive_errors: row.get(26)?,
-                    teams_webhook_url: row.get(27)?,
-                    created_at: row.get(15)?,
-                    updated_at: row.get(16)?,
-                    last_svn_rev: row.get(17)?,
-                    last_git_sha: row.get(18)?,
-                    last_sync_at: row.get(19)?,
-                    sync_status: row.get(20)?,
-                    total_syncs: row.get(21)?,
-                    total_errors: row.get(22)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(entries)
+        super::team_path_rewrite::with_rewrite_column(&self.conn(), |conn, column| {
+            let mut stmt = conn.prepare(&Self::repository_select(
+                column,
+                "WHERE parent_id = ?1 ORDER BY name",
+            ))?;
+            let entries = stmt
+                .query_map([parent_id], Self::repository_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(entries)
+        })
     }
 
     /// Update a repository's configuration.
@@ -3164,8 +3108,8 @@ impl Database {
             ));
         }
         let changed = tx.execute(
-            "UPDATE repositories SET name = ?1, svn_url = ?2, svn_branch = ?3, svn_username = ?4, git_provider = ?5, git_api_url = ?6, git_repo = ?7, git_branch = ?8, sync_mode = ?9, poll_interval_secs = ?10, lfs_threshold_mb = ?11, auto_merge = ?12, enabled = ?13, updated_at = ?14, last_svn_rev = ?15, last_git_sha = ?16, last_sync_at = ?17, sync_status = ?18, total_syncs = ?19, total_errors = ?20, parent_id = ?21, allowed_paths = ?22, blocked_patterns = ?23, consecutive_errors = ?24, teams_webhook_url = ?25
-             WHERE id = ?26",
+            "UPDATE repositories SET name = ?1, svn_url = ?2, svn_branch = ?3, svn_username = ?4, git_provider = ?5, git_api_url = ?6, git_repo = ?7, git_branch = ?8, sync_mode = ?9, poll_interval_secs = ?10, lfs_threshold_mb = ?11, auto_merge = ?12, enabled = ?13, updated_at = ?14, last_svn_rev = ?15, last_git_sha = ?16, last_sync_at = ?17, sync_status = ?18, total_syncs = ?19, total_errors = ?20, parent_id = ?21, allowed_paths = ?22, blocked_patterns = ?23, consecutive_errors = ?24, teams_webhook_url = ?25, path_rewrite_rules = ?26
+             WHERE id = ?27",
             params![
                 repo.name,
                 repo.svn_url,
@@ -3192,6 +3136,7 @@ impl Database {
                 repo.blocked_patterns,
                 repo.consecutive_errors,
                 repo.teams_webhook_url,
+                repo.path_rewrite_rules,
                 repo.id,
             ],
         )?;
@@ -4174,6 +4119,7 @@ mod tests {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -4392,6 +4338,7 @@ mod tests {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -4721,6 +4668,7 @@ mod tests {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         };

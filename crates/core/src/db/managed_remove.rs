@@ -774,6 +774,7 @@ fn load_repo(conn: &Connection, repo_id: &str) -> Result<Option<Repository>, Dat
                 parent_id: row.get(23)?,
                 allowed_paths: row.get(24)?,
                 blocked_patterns: row.get(25)?,
+                path_rewrite_rules: None,
                 consecutive_errors: row.get(26)?,
                 teams_webhook_url: row.get(27)?,
                 created_at: row.get(15)?,
@@ -2434,6 +2435,7 @@ impl Database {
                 total_errors: tombstone.total_errors,
                 allowed_paths: tombstone.allowed_paths.clone(),
                 blocked_patterns: tombstone.blocked_patterns.clone(),
+                path_rewrite_rules: None,
                 consecutive_errors: tombstone.consecutive_errors,
                 teams_webhook_url: tombstone.teams_webhook_url.clone(),
             };
@@ -2621,6 +2623,7 @@ mod tests {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         }

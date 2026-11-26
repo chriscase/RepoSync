@@ -112,6 +112,7 @@ fn due_scheduler(repos: &[DueRepo]) -> (tempfile::TempDir, Scheduler) {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: repo.blocked_patterns.map(str::to_string),
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })

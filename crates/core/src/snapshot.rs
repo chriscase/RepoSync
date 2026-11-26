@@ -368,6 +368,118 @@ pub async fn project_snapshot_tree(
     Ok(export_dir)
 }
 
+pub(crate) async fn export_team_rewrite_pin(
+    svn: &SvnClient,
+    pin: &SnapshotPin,
+    rewrite: &crate::db::team_path_rewrite::TeamRewritePolicy,
+) -> Result<tempfile::TempDir> {
+    let live = svn
+        .info()
+        .await
+        .context("failed to re-read rewrite SVN identity")?;
+    if live.uuid != pin.svn_uuid || live.url != pin.canonical_url {
+        bail!("SVN identity changed after pin; projected snapshot refuses to continue");
+    }
+    let raw = tempfile::tempdir().context("failed to create rewrite snapshot export directory")?;
+    svn.export("", pin.operative_rev, raw.path())
+        .await
+        .with_context(|| format!("failed to export pinned SVN r{}", pin.operative_rev))?;
+    rewrite_snapshot_source_57(
+        raw.path(),
+        &rewrite.rule,
+        &rewrite.allowed,
+        &rewrite.blocked,
+    )
+}
+
+/// Prepare a path-rewritten import source from an already pinned, private
+/// SVN export. The raw export is never materialized in a Git worktree.
+pub(crate) fn rewrite_snapshot_source_57(
+    raw: &Path,
+    rule: &crate::path_projection::TeamPrefixRewrite,
+    allowed: &[String],
+    blocked: &[String],
+) -> Result<tempfile::TempDir> {
+    use crate::import::ManifestEntry;
+    rule.validate_scope(allowed).map_err(anyhow::Error::msg)?;
+    let manifest = crate::import::require_supported_export(raw)?;
+    let projected = tempfile::tempdir().context("failed to allocate rewrite staging tree")?;
+    for (name, entry) in &manifest.entries {
+        if !matches!(entry, ManifestEntry::File { .. })
+            || !crate::path_projection::path_is_projected(name, allowed, blocked)
+        {
+            continue;
+        }
+        let path = rule
+            .to_git(name)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("admitted file outside rewrite namespace"))?;
+        let target = projected.path().join(path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let source = raw.join(name);
+        let metadata = std::fs::symlink_metadata(&source)?;
+        crate::import::copy_regular_file_no_follow(&source, projected.path(), &target, &metadata)?;
+    }
+    let actual = crate::import::require_supported_export(projected.path())?;
+    let mut expected = std::collections::BTreeMap::new();
+    for (name, entry) in manifest.entries {
+        if matches!(entry, ManifestEntry::File { .. })
+            && crate::path_projection::path_is_projected(&name, allowed, blocked)
+        {
+            let path = rule
+                .to_git(&name)
+                .map_err(anyhow::Error::msg)?
+                .ok_or_else(|| anyhow::anyhow!("admitted file outside rewrite namespace"))?;
+            if expected.insert(path.to_owned(), entry).is_some() {
+                bail!("two selected SVN paths map to the same Git destination");
+            }
+        }
+    }
+    let observed = actual
+        .entries
+        .into_iter()
+        .filter(|(_, e)| matches!(e, ManifestEntry::File { .. }))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if observed != expected {
+        bail!("rewritten staging tree differs from the independently observed pinned source");
+    }
+    Ok(projected)
+}
+
+#[cfg(test)]
+mod rewrite_57_snapshot_tests {
+    use super::*;
+    #[test]
+    fn rewrite_snapshot_stages_only_selected_svn_bytes_at_git_paths() {
+        let raw = tempfile::tempdir().unwrap();
+        for (p, bytes) in [
+            ("src/teams/foo/keep.c", "kept"),
+            ("src/teams/foo/ignored.tmp", "blocked"),
+            ("src/teams/foobar/keep.c", "other team"),
+        ] {
+            let path = raw.path().join(p);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let rule = crate::path_projection::TeamPrefixRewrite::new("src/teams/foo").unwrap();
+        let staged = rewrite_snapshot_source_57(
+            raw.path(),
+            &rule,
+            &["src/teams/foo".into()],
+            &["*.tmp".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(staged.path().join("keep.c")).unwrap(),
+            b"kept"
+        );
+        assert!(!staged.path().join("src").exists());
+        assert!(!staged.path().join("ignored.tmp").exists());
+    }
+}
+
 pub fn relative_paths(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(content_index(root)?
         .into_keys()
