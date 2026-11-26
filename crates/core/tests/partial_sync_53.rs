@@ -1207,21 +1207,30 @@ const BASELINE: &[(&str, &str)] = &[
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sc01_only_admitted_paths_and_bytes_enter_git_and_excluded_work_is_accounted() {
     let _serial = serial().lock().await;
-    let fx = Fixture::new(BASELINE).await;
+    // An unprojected initial import doesn't erase excluded files. Start with
+    // only known selected baseline files; introduce the sibling afterwards.
+    let fx = Fixture::new(&[
+        ("team-a/a.txt", "team-a baseline\n"),
+        ("docs/readme.txt", "docs baseline\n"),
+    ])
+    .await;
     let commits_before = fx.git_commits();
     fx.write("team-a/a.txt", "team-a changed\n");
     fx.write("team-a/new.txt", "team-a new\n");
-    let r2 = fx.commit("r2 admitted");
-    fx.write("team-b/b.txt", "team-b changed\n");
+    fx.write("team-b/b.txt", "excluded from mixed revision\n");
     fx.write("docs/readme.txt", "docs changed\n");
+    let r2 = fx.commit("r2 team and shared docs selected");
+    fx.write("team-b/b.txt", "excluded-only revision\n");
     let r3 = fx.commit("r3 excluded only");
-    let engine = fx.engine(&["team-a/"], &[]);
+    let engine = fx.engine(&["team-a/", "docs/"], &[]);
+    let git_cursor = inbound_git_cursor(&engine);
     let stats = engine.run_sync_cycle().await.unwrap();
-    assert_eq!(
-        stats.svn_to_git_count, 1,
-        "only the admitted revision commits"
-    );
+    assert_eq!(stats.svn_to_git_count, 1);
     assert_eq!(fx.git_commits(), commits_before + 1);
+    assert_eq!(
+        fx.git_paths(),
+        ["docs/readme.txt", "team-a/a.txt", "team-a/new.txt"]
+    );
     assert_eq!(
         fx.git_file("team-a/a.txt").as_deref(),
         Some("team-a changed\n")
@@ -1231,13 +1240,14 @@ async fn sc01_only_admitted_paths_and_bytes_enter_git_and_excluded_work_is_accou
         Some("team-a new\n")
     );
     assert_eq!(
-        fx.git_file("team-b/b.txt").as_deref(),
-        Some("team-b baseline\n")
+        fx.git_file("docs/readme.txt").as_deref(),
+        Some("docs changed\n")
     );
     assert_eq!(
-        fx.git_file("docs/readme.txt").as_deref(),
-        Some("docs baseline\n")
+        fx.svn_file("team-b/b.txt").as_deref(),
+        Some("excluded-only revision\n")
     );
+    assert_eq!(inbound_git_cursor(&engine), git_cursor);
     assert!(fx
         .git(&["log", "-1", "--format=%B", "main"])
         .contains(&format!("synced from SVN r{r2}")));
@@ -1275,6 +1285,7 @@ async fn sc02_fully_excluded_revision_has_no_git_effect_and_reopen_repeat_is_qui
         "inbound Git cursor unchanged"
     );
     assert_filtered_once(&engine, r2);
+    assert_svn_checkpoint_filtered(&engine, r2);
     assert_eq!(audit_count(&engine, "svn_to_git_filtered"), 1);
     let rows_before = rows(&engine);
     assert!(
@@ -1356,7 +1367,7 @@ async fn sc04_git_mixed_commit_reaches_svn_with_outside_paths_untouched() {
     let engine = fx.engine(&["team-a/"], &[]);
     engine.run_sync_cycle().await.unwrap();
     let head = fx.svn_head();
-    fx.git_push(
+    let sha = fx.git_push(
         &[
             ("team-a/from-git.txt", "from git admitted\n"),
             ("team-b/from-git.txt", "from git outside\n"),
@@ -1364,6 +1375,20 @@ async fn sc04_git_mixed_commit_reaches_svn_with_outside_paths_untouched() {
         "Git mixed commit",
     );
     let stats = engine.run_sync_cycle().await.unwrap();
+    let audit: Vec<String> = {
+        let conn = engine.db().conn();
+        let mut query = conn.prepare(
+            "SELECT details FROM audit_log WHERE repo_id=?1 AND git_sha=?2 AND action='path_violation_filtered' AND success=1"
+        ).unwrap();
+        query
+            .query_map([REPO, &sha], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(audit.len(), 1);
+    assert!(audit[0].contains("team-b/from-git.txt"), "{audit:?}");
+    assert!(!audit[0].contains("team-a/from-git.txt"), "{audit:?}");
     assert_eq!(stats.git_to_svn_count, 1);
     assert_eq!(fx.svn_head(), head + 1);
     assert_eq!(
@@ -1401,6 +1426,7 @@ async fn sc05_git_excluded_only_commit_produces_no_svn_revision_and_repeats_quie
             .is_some(),
         "existing Git no-target receipt"
     );
+    assert_eq!(inbound_git_cursor(&engine).as_deref(), Some(sha.as_str()));
     let quiet = engine.run_sync_cycle().await.unwrap();
     assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
     assert_eq!(fx.svn_head(), head);
@@ -1448,6 +1474,69 @@ async fn sc06_svn_git_edit_svn_round_trip_keeps_exact_bytes_without_duplication(
         mapped,
         "no duplicated mapping after reopen"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc08_svn_rename_within_scope_moves_exact_bytes_and_keeps_other_paths() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    let count = fx.git_commits();
+    fx.svn(&["move", &op("team-a/old.txt"), "team-a/new.txt"]);
+    let rev = fx.commit("rename within scope");
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(fx.git_commits(), count + 1);
+    assert_eq!(
+        fx.git_paths(),
+        [
+            "docs/readme.txt",
+            "team-a/a.txt",
+            "team-a/new.txt",
+            "team-b/b.txt",
+            "team-b/c.txt"
+        ]
+    );
+    assert_eq!(
+        fx.git_file("team-a/new.txt").as_deref(),
+        Some("team-a old\n")
+    );
+    assert_eq!(fx.svn_file("team-a/old.txt"), None);
+    assert_eq!(fx.git_file("team-a/old.txt"), None);
+    assert_team_applied(&engine, &fx, rev, &fx.git_tip());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sc10_two_idle_cycles_after_real_publication_do_not_write() {
+    let _serial = serial().lock().await;
+    let fx = Fixture::new(BASELINE).await;
+    let engine = fx.engine(&["team-a/"], &[]);
+    fx.write("team-a/a.txt", "one change\n");
+    let rev = fx.commit("first publication");
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let observed = (
+        fx.git(&["for-each-ref"]),
+        fx.git_commits(),
+        fx.svn_head(),
+        rows(&engine),
+        svn_watermark(&engine),
+        inbound_git_cursor(&engine),
+    );
+    assert_team_applied(&engine, &fx, rev, &fx.git_tip());
+    for _ in 0..2 {
+        let quiet = engine.run_sync_cycle().await.unwrap();
+        assert_eq!((quiet.svn_to_git_count, quiet.git_to_svn_count), (0, 0));
+        assert_eq!(
+            (
+                fx.git(&["for-each-ref"]),
+                fx.git_commits(),
+                fx.svn_head(),
+                rows(&engine),
+                svn_watermark(&engine),
+                inbound_git_cursor(&engine)
+            ),
+            observed,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

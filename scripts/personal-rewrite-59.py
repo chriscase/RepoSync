@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Use the actual CLI and Personal worker against disposable SVN, Git and loopback API."""
 import argparse
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -78,7 +79,7 @@ def wizard(cli, output, env, source, api, scoped):
             pass
 
 
-def exercise(root, cli, personal):
+def exercise(root, cli, personal, poll_for_rs60=False):
     prs = []
     commits = {}
     events = []
@@ -107,6 +108,10 @@ def exercise(root, cli, personal):
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
+
+        def do_POST(self):
+            events.append((self.command, urlsplit(self.path).path))
+            self.send_error(405)
 
         def log_message(self, *_):
             pass
@@ -196,6 +201,13 @@ path_rewrite_rules = [{ strip_prefix = "team/alpha/" }]
         legacy = wizard(cli, root/"wizard-legacy.toml", env, svn.as_uri(), api, False)
         assert "allowed_paths" not in legacy["options"]
         assert "projected_history" not in legacy["options"]
+        if poll_for_rs60:
+            # Two disjoint selected namespaces under one rewrite prefix.
+            scope = scope.replace(
+                'allowed_paths = ["team/alpha/selected/"]',
+                'allowed_paths = ["team/alpha/selected/", "team/alpha/docs/"]',
+            )
+            base = base.replace('[personal]\n', '[personal]\npoll_interval_secs = 1\n')
         cfg.write_text(base+scope)
 
         def op(*args, **kw):
@@ -238,15 +250,86 @@ path_rewrite_rules = [{ strip_prefix = "team/alpha/" }]
             assert git("ls-tree", "-r", "--name-only", rev) == "selected/note.txt"
             assert git("show", f"{rev}:selected/note.txt") == content
 
+        @contextmanager
+        def poll(label):
+            log = root / f"poll-{label}.log"
+            with log.open("wb") as out:
+                process = subprocess.Popen(
+                    [str(cli), "personal", "--personal-config", str(cfg), "start", "--foreground"],
+                    cwd=root, env=env, stdout=out, stderr=subprocess.STDOUT,
+                )
+                try:
+                    def wait(predicate):
+                        deadline = time.monotonic() + 25
+                        while time.monotonic() < deadline:
+                            assert process.poll() is None, log.read_text()
+                            if predicate():
+                                return
+                            time.sleep(0.10)
+                        raise AssertionError(f"{label} poll timed out: {log.read_text()}")
+                    wait(lambda: "Daemon started" in log.read_text())
+                    yield wait
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=12)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                            raise
+                    assert process.returncode == 0, log.read_text()
+
+        def commit_selected_r7():
+            (wc/"team/alpha/selected/note.txt").write_text("r7 selected")
+            (wc/"team/bravo/other.txt").write_text("incremental mixed excluded bytes")
+            if poll_for_rs60:
+                (wc/"team/alpha/docs").mkdir()
+                (wc/"team/alpha/docs/guide.txt").write_text("selected shared doc")
+                run("svn", "add", "team/alpha/docs", cwd=wc)
+            run("svn", "commit", "-m", incremental_subject + "\n\n" + incremental_body,
+                "--username", private_author, cwd=wc)
+
         (wc/"team/bravo/other.txt").write_text("r6 excluded")
         run("svn", "commit", "-m", "excluded only", cwd=wc)
-        (wc/"team/alpha/selected/note.txt").write_text("r7 selected")
-        (wc/"team/bravo/other.txt").write_text("incremental mixed excluded bytes")
-        run("svn", "commit", "-m", incremental_subject + "\n\n" + incremental_body,
-            "--username", private_author, cwd=wc)
-        ps("sync")
+        if poll_for_rs60:
+            refs = git("for-each-ref")
+            marks = sql("SELECT source,value FROM watermarks WHERE source != 'svn_rev' ORDER BY source")
+            def durable():
+                return (
+                    sql("SELECT svn_rev,git_sha FROM commit_map ORDER BY svn_rev,git_sha"),
+                    sql("SELECT count(*) FROM audit_log WHERE action='svn_to_git_filtered'"),
+                    sql("SELECT source,value FROM watermarks ORDER BY source"),
+                    sql("""SELECT outcome,target_git_sha,target_svn_rev
+                           FROM canonical_mapping_outcomes
+                           WHERE direction='svn_to_git' AND source_key='svn:6'"""),
+                )
+            with poll("excluded") as wait:
+                wait(lambda: sql("SELECT value FROM watermarks WHERE source='svn_rev'") == [("6",)])
+                filtered = durable()
+                assert [(rev, sha) for rev, sha in filtered[0] if rev == 6] == [(6, None)]
+                assert filtered[3] == [("intentionally_filtered_no_target", None, None)]
+                assert sql("""SELECT count(*) FROM audit_log
+                              WHERE action='svn_to_git_filtered' AND svn_rev=6""") == [(1,)]
+                assert sql("SELECT source,value FROM watermarks WHERE source != 'svn_rev' ORDER BY source") == marks
+                assert git("for-each-ref") == refs
+            with poll("reopen") as wait:
+                # The merged-PR GET occurs downstream of a completed SVN phase.
+                before = events.count(("GET", "/repos/test/mirror/pulls"))
+                wait(lambda: events.count(("GET", "/repos/test/mirror/pulls")) >= before + 2)
+                assert durable() == filtered and git("for-each-ref") == refs
+                commit_selected_r7()
+                wait(lambda: sql("SELECT value FROM watermarks WHERE source='svn_rev'") == [("7",)])
+                assert git("rev-list", "--count", "main") == "3"
+                assert git("show", "main:docs/guide.txt") == "selected shared doc"
+                assert not any(method == "POST" for method, _ in events), events
+            print("PASS RS60-SC11: personal start polled r6 no-target, reopened quietly, and selected both prefixes at r7", flush=True)
+        else:
+            commit_selected_r7()
+            ps("sync")
         assert git("show", "main:selected/note.txt") == "r7 selected"
-        assert git("ls-tree", "-r", "--name-only", "main") == "selected/note.txt"
+        expected_tree = "docs/guide.txt\nselected/note.txt" if poll_for_rs60 else "selected/note.txt"
+        assert git("ls-tree", "-r", "--name-only", "main") == expected_tree
         assert_scoped_metadata("main", 7, [incremental_subject, incremental_body])
         local = root/"git-wc"
         run("git", "clone", remote, local)
@@ -440,6 +523,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--cli", type=Path, required=True)
     parser.add_argument("--personal", type=Path, required=True)
+    parser.add_argument("--poll-for-rs60", action="store_true", help="also qualify real Personal daemon start/restart for #60")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="reposync-personal-rewrite-59-") as root:
-        exercise(Path(root), args.cli.resolve(), args.personal.resolve())
+        exercise(Path(root), args.cli.resolve(), args.personal.resolve(), args.poll_for_rs60)
