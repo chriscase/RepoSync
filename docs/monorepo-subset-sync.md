@@ -234,4 +234,6 @@ checkpoint evidence on disposable fixtures.
   an unavailable editor to mean the policy is empty.
 
 These examples qualify the stated paths, not every transport, copy/rename
-pattern, migration, or broad end-to-end scenario in the parent epic.
+pattern, migration, or broad end-to-end scenario in the parent epic. See the
+[twelve-scenario evidence map](reliability/contracts/60-monorepo-subset-qualification.md)
+for the native qualification suite and remaining limitations.
