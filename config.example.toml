@@ -92,10 +92,23 @@ admin_password_env = "REPOSYNC_ADMIN_PASSWORD"
 # email_recipients = ["team-lead@company.com", "dev-team@company.com"]
 
 [sync]
-# Set team path rules in the registered repository's Path policy editor or API.
-# The Team scheduler applies them to Git-to-SVN and incremental SVN-to-Git sync.
-# Initial imports and the standalone `reposync sync now` command do not load these rules.
-# See docs/monorepo-subset-sync.md for a worked example and verification.
+# Monorepo subset (one repository pair; see docs/monorepo-subset-sync.md).
+# TEAM: set each registered repository's policy in the web editor or API.
+# Example settings PUT body fields (JSON strings, NOT service TOML keys):
+#   "allowed_paths": "[\"src/teams/foo/\"]",
+#   "blocked_patterns": "[\"*.tmp\"]",
+#   "path_rewrite_rules": "[{\"strip_prefix\":\"src/teams/foo/\"}]"
+# The Team strip-prefix workflow requires a fresh paused direct root pair, a
+# verified projected snapshot, LFS threshold 0 and no auto-merge. A Team
+# filter-only policy does not project initial imports. Do not use standalone
+# `reposync sync now` for a policy-controlled Team pair.
+#
+# PERSONAL: add these keys to [options] in a separate personal.toml, not here:
+# projected_history = true
+# allowed_paths = ["team/alpha/selected/"]
+# blocked_patterns = ["team/alpha/selected/blocked.txt"]
+# path_rewrite_rules = [{ strip_prefix = "team/alpha/" }]
+# Use a fresh data directory and an empty Git destination, then import --full.
 
 # Sync mode: "direct" = auto-sync immediately, "pr" = create GitHub PR for review
 mode = "direct"
