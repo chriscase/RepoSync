@@ -297,6 +297,21 @@ fn cmd_status(config_path: &str) -> Result<()> {
         PersonalConfig::load_and_resolve(config_path).context("failed to load personal config")?;
     let data_dir = &config.personal.data_dir;
 
+    println!(
+        "{}",
+        reposync_core::personal_projection::policy_description(&config.options)
+    );
+    let path = data_dir.join("personal.db");
+    if path.try_exists()? {
+        let db = Database::open_existing_read_only(&path)?;
+        if let Err(error) =
+            reposync_core::personal_projection::require_matching_projected_history(&db, &config)
+        {
+            println!("Path policy HELD: {error}");
+        } else if config.options.projected_history {
+            println!("Path policy ACTIVE (verified projected history)");
+        }
+    }
     match daemon::inspect_pid_file(data_dir)? {
         Some((pid, true)) => println!("● Running (PID {})", pid),
         Some((pid, false)) => println!("○ Not running (stale PID {})", pid),
@@ -325,8 +340,8 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
         PersonalConfig::load_and_resolve(config_path).context("failed to load personal config")?;
     config.validate().context("invalid personal config")?;
     anyhow::ensure!(
-        config.options.allowed_paths.is_empty(),
-        "scoped Personal import is not supported; unrestricted import refused"
+        config.options.allowed_paths.is_empty() || config.options.projected_history,
+        "scoped Personal import is not supported; unrestricted import refused; use a fresh projected_history opt-in"
     );
 
     let data_dir = &config.personal.data_dir;
@@ -336,7 +351,11 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
     // Initialize database.
     let db = Database::open_personal_writer(data_dir)
         .context("Personal import startup writer admission refused")?;
-    reposync_core::personal_projection::require_unrestricted(&db)?;
+    reposync_core::personal_projection::require_import_mode(
+        &db,
+        &config,
+        mode == ImportMode::Full,
+    )?;
     let writer_window = db
         .begin_personal_startup_writer_window()
         .context("Personal import startup writer admission refused")?;
@@ -383,6 +402,18 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
             }
         }
     };
+    if config.options.projected_history && git_client.repo().find_remote("origin").is_err() {
+        git_client
+            .repo()
+            .remote("origin", &config.github.clone_url())?;
+        reposync_core::git::sync_git_http_auth_from_resolution(
+            &git_client,
+            &git_repo_path,
+            &db,
+            reposync_core::db::personal_scope::personal_scope_key(),
+            config.github.token.as_deref(),
+        )?;
+    }
     if git_client.repo().is_empty()? {
         git_client
             .ensure_head_on_branch(&config.github.default_branch)

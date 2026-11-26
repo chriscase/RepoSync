@@ -1,6 +1,6 @@
 //! Health check for personal branch mode.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use reposync_core::db::Database;
 use reposync_core::personal_config::PersonalConfig;
@@ -8,13 +8,14 @@ use reposync_core::personal_config::PersonalConfig;
 use super::style;
 
 /// Run a health check on the personal branch setup.
-pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
+pub async fn run_doctor(config: &PersonalConfig) -> Result<()> {
     println!();
     println!("{}", style::header("RepoSync Doctor"));
     println!("{}", "═".repeat(17));
     println!();
 
     let mut issues = Vec::new();
+    let mut verify_remote = false;
 
     // 1. Configuration
     match config.validate() {
@@ -25,11 +26,13 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
         }
     }
 
-    if !config.options.allowed_paths.is_empty() {
-        println!("  {}", style::warn(&format!(
-            "SVN→Git scope    {:?}. Scoped import and Git→SVN PR replay are unavailable; use a clean scoped checkout. Network directory profile: {:?}. Qualified stock Apache profiles use complete pinned WC31 checkouts. HTTPS requires an explicitly provisioned CA; unsupported transports and incomplete visibility hold.",
-            config.options.allowed_paths, config.options.network_directory_profile
-        )));
+    println!(
+        "  {}",
+        reposync_core::personal_projection::policy_description(&config.options)
+    );
+
+    if !config.options.projected_history && !config.options.allowed_paths.is_empty() {
+        println!("  Scoped import and Git→SVN PR replay are unavailable in this existing inbound-only mode.");
     }
 
     // 2. Data directory
@@ -58,7 +61,19 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
     if db_path.exists() {
         match Database::open_existing_read_only(&db_path) {
             Ok(db) => match db.get_watermark("svn_rev") {
-                Ok(_) => println!("  {}", style::success("Database          OK")),
+                Ok(_) => {
+                    println!("  {}", style::success("Database          OK"));
+                    match reposync_core::personal_projection::require_matching_projected_history(
+                        &db, config,
+                    ) {
+                        Err(error) => issues.push(format!("Path policy HELD: {error}")),
+                        Ok(()) if config.options.projected_history => {
+                            verify_remote = true;
+                            println!("  Path policy ACTIVE (verified projected history)");
+                        }
+                        _ => {}
+                    }
+                }
                 Err(error) => {
                     println!(
                         "  {}",
@@ -88,12 +103,29 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
             "  {}",
             style::success(&format!("Git Repository    {}", git_path.display()))
         );
+        match reposync_core::personal_projection::git_path_divergence(&git_path, config) {
+            Ok(paths) if !paths.is_empty() => issues.push(format!(
+                "Git tree diverges from the selected SVN scope: {:?}. Preserve this mirror; re-import into a fresh destination and data directory.",
+                paths.iter().take(10).collect::<Vec<_>>())),
+            Err(error) => issues.push(format!("Cannot verify local Git path scope: {error}")),
+            _ => {}
+        }
     } else if git_path.exists() {
         println!("  {}", style::error("Git Repository    Not a git repo"));
         issues.push("Git repo directory exists but is not initialized".to_string());
     } else {
         println!("  {}", style::warn("Git Repository    Not cloned"));
         issues.push("Run 'reposync personal import' to set up".to_string());
+    }
+
+    if verify_remote {
+        match remote_scope_divergence(config).await {
+            Ok(paths) if !paths.is_empty() => issues.push(format!(
+                "Git remote tree diverges from the selected SVN scope: {:?}. Preserve this mirror; re-import into a fresh destination and data directory.",
+                paths.iter().take(10).collect::<Vec<_>>())),
+            Ok(_) => println!("  Git remote path scope verified"),
+            Err(error) => issues.push(format!("Git remote path scope not verified: {error}")),
+        }
     }
 
     // 5. SVN working copy
@@ -192,4 +224,63 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
     println!();
 
     Ok(())
+}
+
+/// Inspect the exact remote branch in temporary storage. Never fetch into
+/// the live checkout or apply anything to the remote.
+async fn remote_scope_divergence(config: &PersonalConfig) -> Result<Vec<String>> {
+    use std::time::Duration;
+    use tokio::process::Command;
+    let tmp = tempfile::tempdir()?;
+    let mut init = Command::new("git");
+    init.args(["init", "--bare", "--quiet"])
+        .current_dir(tmp.path());
+    let initialized = reposync_core::process::run(init, Duration::from_secs(10), None).await?;
+    anyhow::ensure!(
+        initialized.status.success(),
+        "could not prepare a temporary Git view"
+    );
+    let refspec = format!(
+        "refs/heads/{}:refs/reposync/doctor",
+        config.github.default_branch
+    );
+    let mut fetch = Command::new("git");
+    fetch
+        .args([
+            "fetch",
+            "--quiet",
+            "--depth=1",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--",
+        ])
+        .arg(config.github.clone_url())
+        .arg(refspec)
+        .current_dir(tmp.path())
+        .env("GIT_TERMINAL_PROMPT", "0");
+    reposync_core::git::subprocess_auth::apply_git_http_auth_tokio_optional(
+        &mut fetch,
+        config.github.token.as_deref(),
+    );
+    let fetched = reposync_core::process::run(fetch, Duration::from_secs(30), None)
+        .await
+        .context("temporary Git scope observation unavailable")?;
+    anyhow::ensure!(
+        fetched.status.success(),
+        "configured remote branch could not be read"
+    );
+    let mut rev_parse = Command::new("git");
+    rev_parse
+        .args(["rev-parse", "--verify", "refs/reposync/doctor"])
+        .current_dir(tmp.path());
+    let id = reposync_core::process::run(rev_parse, Duration::from_secs(10), None).await?;
+    anyhow::ensure!(
+        id.status.success(),
+        "could not identify the observed Git tree"
+    );
+    reposync_core::personal_projection::git_path_divergence_at(
+        tmp.path(),
+        std::str::from_utf8(&id.stdout)?.trim(),
+        config,
+    )
 }

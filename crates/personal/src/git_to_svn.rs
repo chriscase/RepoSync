@@ -76,6 +76,7 @@ pub struct GitToSvnSync {
     svn_author: String,
     svn_url: String,
     http_auth_token: Option<String>,
+    config: PersonalConfig,
 }
 
 impl GitToSvnSync {
@@ -113,6 +114,15 @@ impl GitToSvnSync {
             svn_author: config.developer.svn_username.clone(),
             svn_url: config.svn.url.clone(),
             http_auth_token: config.github.token.clone(),
+            config: config.clone(),
+        }
+    }
+
+    fn policy_snapshot(&self) -> String {
+        if self.config.options.projected_history {
+            reposync_core::personal_projection::policy_snapshot(&self.config.options)
+        } else {
+            PERSONAL_NO_TARGET_PROJECTION.into()
         }
     }
 
@@ -186,7 +196,9 @@ impl GitToSvnSync {
     /// 5. Record results in `pr_sync_log` and `commit_map`.
     ///
     /// Returns a summary of what was synced.
-    fn ensure_personal_history_admitted(&self) -> Result<()> {
+    fn ensure_personal_history_admitted(
+        &self,
+    ) -> Result<Option<reposync_core::history_inspect::HistoryInspectAdmission>> {
         let http_auth_token = self.personal_history_http_auth();
         inspect_personal_history_with_http_auth(
             &self.db,
@@ -196,13 +208,12 @@ impl GitToSvnSync {
             http_auth_token.as_deref(),
             self.http_auth_token.as_deref(),
         )
-        .map(|_| ())
         .map_err(|e| anyhow::anyhow!(e))
     }
 
     #[instrument(skip(self), fields(repo = %self.github_repo))]
     pub async fn sync(&self) -> Result<GitToSvnResult> {
-        reposync_core::personal_projection::require_unrestricted(&self.db)?;
+        reposync_core::personal_projection::admit_reverse(&self.db, &self.config)?;
         if let Some(op) = self
             .db
             .active_personal_svn_commit_operation()
@@ -311,6 +322,9 @@ impl GitToSvnSync {
                 Err(e) => {
                     error!(pr_number = pr.number, error = %e, "failed to sync PR to SVN");
                     result.prs_failed += 1;
+                    if self.config.options.projected_history {
+                        return Err(e);
+                    }
                     // Ordering matters: once a PR aborts mid-apply, later PRs in this
                     // pass must not run until the held SHA retries successfully.
                     warn!(
@@ -347,20 +361,45 @@ impl GitToSvnSync {
     async fn sync_pr(&self, pr: &PullRequest, merge_sha: &str) -> Result<u64> {
         let pr_branch = &pr.head.ref_name;
 
-        // Fetch the commits belonging to this PR.
-        let commits = self
-            .github
-            .get_pr_commits(&self.github_repo, pr.number)
-            .await
-            .context("failed to fetch PR commits")?;
-
-        if commits.is_empty() {
-            warn!(pr_number = pr.number, "PR has no commits, skipping");
-            return Ok(0);
-        }
-
-        // Detect merge strategy for metadata.
-        let merge_strategy = self.detect_merge_strategy(pr, &commits).await;
+        let (commits, merge_strategy) = if self.config.options.projected_history {
+            // The GitHub PR list may contain pre-squash or pre-rebase IDs.
+            // Replay only the actual accepted Git object, whose first-parent
+            // delta is checked against the previously handled Git checkpoint.
+            let detail = self
+                .github
+                .get_commit(&self.github_repo, merge_sha)
+                .await
+                .context("failed to fetch the merged Git commit")?;
+            anyhow::ensure!(
+                detail.sha == merge_sha,
+                "GitHub returned a different commit than the merged PR target"
+            );
+            let strategy = if detail.parents.len() > 1 {
+                "projected-merge"
+            } else {
+                "projected-linear"
+            };
+            (
+                vec![GitHubCommit {
+                    sha: detail.sha,
+                    commit: detail.commit,
+                    author: detail.author,
+                }],
+                strategy.to_owned(),
+            )
+        } else {
+            let commits = self
+                .github
+                .get_pr_commits(&self.github_repo, pr.number)
+                .await
+                .context("failed to fetch PR commits")?;
+            if commits.is_empty() {
+                warn!(pr_number = pr.number, "PR has no commits, skipping");
+                return Ok(0);
+            }
+            let strategy = self.detect_merge_strategy(pr, &commits).await;
+            (commits, strategy)
+        };
 
         // Record PR sync as pending.
         let sync_id = self
@@ -375,10 +414,11 @@ impl GitToSvnSync {
             )
             .context("failed to insert pr_sync_log entry")?;
 
+        let policy_snapshot = self.policy_snapshot();
         let echo_ctx = TeamEchoContext {
             db: self.db.as_ref(),
             repo_id: PERSONAL_REPO_ID,
-            no_target_projection: PERSONAL_NO_TARGET_PROJECTION,
+            no_target_projection: &policy_snapshot,
         };
 
         let mut synced_count: u64 = 0;
@@ -525,6 +565,11 @@ impl GitToSvnSync {
         pr_number: u64,
         pr_branch: &str,
     ) -> Result<i64> {
+        reposync_core::personal_projection::admit_reverse(&self.db, &self.config)?;
+        if self.config.options.projected_history {
+            reposync_core::personal_projection::require_projected_source(&self.db, &self.svn)
+                .await?;
+        }
         if let Some(op) = self
             .db
             .active_personal_svn_commit_operation()
@@ -563,8 +608,24 @@ impl GitToSvnSync {
             }
         }
 
-        self.ensure_personal_history_admitted()
+        let admission = self
+            .ensure_personal_history_admitted()
             .context("personal Git history inspection blocked git-to-svn replay")?;
+        if self.config.options.projected_history {
+            let git = GitClient::new(&self.git_repo_path)?;
+            // Validate policy before aligning the checkout or updating SVN.
+            self.projected_changes_for_commit(&git, &commit.sha)?;
+            let admission =
+                admission.context("no verified Git history for projected Personal PR")?;
+            let (parent, _) = git.commit_parent_and_tree(&commit.sha)?;
+            anyhow::ensure!(parent.as_deref() == Some(admission.checkpoint.as_str()),
+                "merged PR first parent is not the handled Personal checkpoint; refusing ambiguous or skipped Git history");
+            git.align_managed_branch_to_admitted_commit(
+                &self.default_branch,
+                &commit.sha,
+                &admission.remote_tip,
+            )?;
+        }
 
         // 1. Update SVN working copy to latest.
         self.svn
@@ -658,12 +719,13 @@ impl GitToSvnSync {
             let intended_changed_paths = intended_paths_from_contents(&file_contents);
             let intended_svn_tree = hash_regular_file_tree(&self.svn_wc_path)
                 .context("failed to hash intended SVN working copy")?;
+            let policy_snapshot = self.policy_snapshot();
             let fingerprint = svn_commit_target_fingerprint(
                 PERSONAL_REPO_ID,
                 &info.uuid,
                 self.svn.url(),
                 &info.url,
-                "{}",
+                &policy_snapshot,
             );
             let identity = svn_path_identity(&info.root_url, &info.url).context("invalid SVN target namespace")?;
             let request_id = format!("git-{}", commit.sha);
@@ -684,7 +746,7 @@ impl GitToSvnSync {
                     target_svn_branch_path: &identity.branch_path,
                     pre_write_svn_rev: info.latest_rev,
                     pre_write_svn_tree: &pre_write_svn_tree,
-                    projection: "{}",
+                    projection: &policy_snapshot,
                     intended_changed_paths,
                     intended_svn_tree: &intended_svn_tree,
                     author: &self.svn_author,
@@ -1165,8 +1227,7 @@ impl GitToSvnSync {
 
     /// Build the projected Git→SVN changeset for one commit.
     ///
-    /// Personal mode has no allow/block path rules (#59); empty rules mean the
-    /// whole tree is in scope. Renames are split to per-endpoint D/A before apply.
+    /// Read bytes in Git coordinates, then select and write in SVN coordinates.
     fn projected_changes_for_commit(
         &self,
         git_client: &GitClient,
@@ -1177,6 +1238,15 @@ impl GitToSvnSync {
             .context("failed to get changed files for commit")?;
         let mut inputs = Vec::new();
         for change in &changed_files {
+            if self.config.options.projected_history {
+                let (_, mode) = git_client.changed_entry_modes(commit_sha, &change.path)?;
+                let before_path = change.rename_from.as_deref().unwrap_or(&change.path);
+                let (before_mode, _) = git_client.changed_entry_modes(commit_sha, before_path)?;
+                anyhow::ensure!(
+                    before_mode.into_iter().chain(mode).all(|mode| mode == 0o100644),
+                    "projected Personal PR replay currently supports regular non-executable files only"
+                );
+            }
             let content = if change.action != "D" {
                 git_client
                     .get_file_content_at_commit(commit_sha, &change.path)
@@ -1193,8 +1263,36 @@ impl GitToSvnSync {
                 rename_from: change.rename_from.clone(),
             });
         }
-        const NO_RULES: &[String] = &[];
-        project_git_to_svn_changeset(inputs, NO_RULES, NO_RULES).map_err(|err| anyhow::anyhow!(err))
+        let options = &self.config.options;
+        if !options.projected_history {
+            return project_git_to_svn_changeset(inputs, &[], &[]).map_err(anyhow::Error::msg);
+        }
+        let rewrite = options.rewrite_rule().map_err(anyhow::Error::msg)?;
+        let inputs = inputs
+            .into_iter()
+            .map(|change| match &rewrite {
+                Some(rule) => rule.map_git_input(change).map_err(anyhow::Error::msg),
+                None => Ok(change),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let project =
+            project_git_to_svn_changeset(inputs, &options.allowed_paths, &options.blocked_patterns)
+                .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(project.excluded.is_empty() && !project.is_empty(),
+            "Git commit diverges from the admitted Personal path projection; preserve the mirror and re-import into a fresh destination");
+        for item in &project.included {
+            anyhow::ensure!(
+                self.policy
+                    .evaluate(
+                        &item.path,
+                        item.content.as_ref().map_or(0, |bytes| bytes.len()) as u64
+                    )
+                    .should_sync(),
+                "Git commit diverges from the Personal file policy at {:?}",
+                item.path
+            );
+        }
+        Ok(project)
     }
 
     /// Detect the merge strategy used for a PR by inspecting the merge commit.
@@ -1291,6 +1389,10 @@ impl GitToSvnSync {
         if op.state != SvnCommitOperationState::ReconciliationRequired {
             return Ok(None);
         }
+        anyhow::ensure!(
+            op.projection == self.policy_snapshot(),
+            "held Personal SVN write belongs to a different path policy"
+        );
         let inspect = inspect_git_to_svn_commit(&self.svn, op).await;
         match inspect {
             SvnCommitInspect::UniqueMatch {

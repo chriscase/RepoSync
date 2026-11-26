@@ -175,17 +175,98 @@ pub async fn run_init(output_path: &str) -> Result<()> {
         "full      — import all SVN history as individual commits (slow, complete history)",
     ];
 
-    let import_choice = Select::new()
-        .with_prompt("Initial import mode")
-        .items(import_mode_options)
-        .default(0)
-        .interact()
-        .context("failed to read import mode selection")?;
-
-    let import_mode = match import_choice {
-        0 => "snapshot",
-        1 => "full",
-        _ => "snapshot",
+    let requested_scope: String = Input::new()
+        .with_prompt("SVN-relative allowed paths, comma-separated (blank keeps the existing whole-tree mode)")
+        .allow_empty(true)
+        .interact_text()?;
+    let allowed_paths = requested_scope
+        .split(',')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for prefix in &allowed_paths {
+        reposync_core::svn::operand::validate_relative_path(prefix.trim_end_matches('/'))?;
+    }
+    let (rewrite, blocked_patterns) = if allowed_paths.is_empty() {
+        (String::new(), Vec::new())
+    } else {
+        let rewrite: String = Input::new()
+            .with_prompt("Optional SVN prefix to strip from Git paths (blank keeps the SVN paths)")
+            .allow_empty(true)
+            .interact_text()?;
+        let rewrite = rewrite.trim().to_owned();
+        if !rewrite.is_empty() {
+            let rule = reposync_core::path_projection::TeamPrefixRewrite::new(&rewrite)
+                .map_err(anyhow::Error::msg)?;
+            rule.validate_scope(&allowed_paths)
+                .map_err(anyhow::Error::msg)?;
+        }
+        let blocked: String = Input::new()
+            .with_prompt("Optional blocked SVN path globs, comma-separated")
+            .allow_empty(true)
+            .interact_text()?;
+        (
+            rewrite,
+            blocked
+                .split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )
+    };
+    let projected_history = !allowed_paths.is_empty();
+    let transport_lines = if projected_history {
+        match reposync_core::svn::operand::checked_url(&svn_url)?.scheme() {
+            "file" => String::new(),
+            "svn" => "network_directory_profile = \"apache_svnserve_wc31\"\n".into(),
+            "https" => {
+                let ca: String = Input::new()
+                    .with_prompt("Absolute path to the provisioned SVN TLS CA bundle")
+                    .interact_text()?;
+                anyhow::ensure!(Path::new(&ca).is_absolute(), "SVN TLS CA bundle path must be absolute");
+                format!("network_directory_profile = \"apache_mod_dav_svn_https_wc31\"\nsvn_tls_ca_file = \"{}\"\n",
+                    escape_toml_string(&ca))
+            }
+            _ => anyhow::bail!("projected Personal history requires file:// or a qualified svn:// or https:// server"),
+        }
+    } else {
+        String::new()
+    };
+    let import_mode = if projected_history {
+        println!("Scoped mode requires full-history import into a fresh empty Git destination.");
+        "full"
+    } else {
+        match Select::new()
+            .with_prompt("Initial import mode")
+            .items(import_mode_options)
+            .default(0)
+            .interact()?
+        {
+            1 => "full",
+            _ => "snapshot",
+        }
+    };
+    let render_array = |v: &[String]| {
+        v.iter()
+            .map(|p| format!("\"{}\"", escape_toml_string(p)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let path_options = if projected_history {
+        let rules = if rewrite.is_empty() {
+            "[]".into()
+        } else {
+            format!(
+                "[{{ strip_prefix = \"{}\" }}]",
+                escape_toml_string(&rewrite)
+            )
+        };
+        format!("projected_history = true\nallowed_paths = [{}]\nblocked_patterns = [{}]\npath_rewrite_rules = {}\n{}",
+            render_array(&allowed_paths), render_array(&blocked_patterns), rules, transport_lines)
+    } else {
+        String::new()
     };
 
     println!();
@@ -327,7 +408,7 @@ svn_username = "{dev_svn_username}"
 # git_to_svn = "{{original_message}}\n\n[reposync] Git-SHA: {{git_sha}}"
 
 [options]
-# Normalize CRLF to LF during sync.
+{path_options}# Normalize CRLF to LF during sync.
 normalize_line_endings = true
 
 # Preserve the executable bit from SVN svn:executable.
@@ -364,6 +445,7 @@ auto_merge = true
         dev_email = escape_toml_string(&dev_email),
         dev_svn_username = escape_toml_string(&dev_svn_username),
         import_mode = import_mode,
+        path_options = path_options,
     );
 
     // Ensure parent directories exist.

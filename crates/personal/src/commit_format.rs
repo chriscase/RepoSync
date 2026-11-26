@@ -33,6 +33,15 @@ impl CommitFormatter {
             .replace("{svn_date}", svn_date)
     }
 
+    /// Projected mirrors publish revision provenance, not the source SVN log.
+    /// An SVN revision can touch paths elsewhere and its message/date/author
+    /// cover the whole revision, so this format takes only its revision number.
+    pub fn format_projected_svn_to_git(svn_rev: i64) -> String {
+        format!(
+            "Mirror selected SVN changes at r{svn_rev}\n\nSynced-From: svn\nSVN-Revision: r{svn_rev}\nSync-Marker: [reposync]"
+        )
+    }
+
     /// Format a commit message for Git→SVN direction.
     pub fn format_git_to_svn(
         &self,
@@ -120,6 +129,17 @@ mod tests {
         assert!(result.contains("SVN-Revision: r42"));
         assert!(result.contains("SVN-Author: alice"));
         assert!(result.contains("[reposync]"));
+    }
+
+    #[test]
+    fn projected_svn_message_is_fixed_revision_provenance() {
+        let message = CommitFormatter::format_projected_svn_to_git(42);
+        assert_eq!(
+            message,
+            "Mirror selected SVN changes at r42\n\nSynced-From: svn\nSVN-Revision: r42\nSync-Marker: [reposync]"
+        );
+        assert_eq!(CommitFormatter::extract_svn_rev(&message), Some(42));
+        assert!(CommitFormatter::is_sync_marker(&message));
     }
 
     #[test]

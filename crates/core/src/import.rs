@@ -2769,6 +2769,40 @@ pub async fn confirm_personal_full_import_publication(
         .context("verified Personal full-import checkpoint refused; writer window retained")
 }
 
+/// Complete an explicitly scoped Personal import. The policy binding and
+/// watermarks become active atomically only after matching the remote tip.
+pub async fn confirm_personal_projected_import_publication(
+    window: &crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
+    publication: LegacyImportRef<'_>,
+    svn_revision: i64,
+    config: &crate::personal_config::PersonalConfig,
+    source: &crate::db::lineage_checkpoints::LiveSvnIdentity,
+    no_targets: &[crate::personal_projection::ProjectedHistoryNoTarget],
+) -> Result<()> {
+    verify_legacy_import_publication_tip(
+        publication.workdir,
+        publication.remote,
+        publication.branch,
+        publication.token,
+        publication.sha,
+    )
+    .await?;
+    window
+        .confirm_unjournalled_import_checkpoint(|tx| {
+            crate::personal_projection::persist_projected_history_no_targets_tx(
+                tx,
+                svn_revision,
+                config,
+                no_targets,
+            )?;
+            persist_legacy_personal_import_watermarks_tx(tx, svn_revision, publication.sha)?;
+            crate::personal_projection::bind_projected_history_tx(tx, config, source)
+        })
+        .context(
+            "verified projected Personal full-import checkpoint refused; writer window retained",
+        )
+}
+
 /// Independent exact-ref proof shared with the Personal initial importer.
 pub async fn verify_legacy_import_publication_tip(
     workdir: &Path,

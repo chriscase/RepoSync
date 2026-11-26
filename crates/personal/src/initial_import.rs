@@ -59,11 +59,11 @@ impl<'a> InitialImport<'a> {
         mode: ImportMode,
         window: OrdinaryWriterWindow<'_>,
     ) -> Result<u64> {
-        anyhow::ensure!(
-            self.config.options.allowed_paths.is_empty(),
-            "scoped Personal import is not supported; unrestricted import refused"
-        );
-        reposync_core::personal_projection::require_unrestricted(self.db)?;
+        reposync_core::personal_projection::require_import_mode(
+            self.db,
+            self.config,
+            mode == ImportMode::Full,
+        )?;
         window
             .require_engine_scope(self.db, None)
             .context("Personal initial import writer handoff refused")?;
@@ -327,8 +327,37 @@ impl<'a> InitialImport<'a> {
     ) -> Result<u64> {
         info!("starting full history import");
 
+        let scoped = self.config.options.projected_history;
+        let source = if scoped {
+            let git = self.git_client.lock().unwrap();
+            let unborn = git.is_unborn()?;
+            let tree = reposync_core::import::require_supported_export(git.repo_path())?;
+            anyhow::ensure!(
+                unborn
+                    && tree.entries.iter().all(|(name, kind)| name == ".git"
+                        && matches!(kind, reposync_core::import::ManifestEntry::Reserved { .. })),
+                "projected Personal full import requires a fresh local Git checkout"
+            );
+            let expected = self.config.github.clone_url();
+            let origin = git.repo().find_remote("origin")?;
+            anyhow::ensure!(
+                origin.url() == Some(expected.as_str()),
+                "projected Personal import origin does not match the configured destination"
+            );
+            anyhow::ensure!(
+                git.ls_remote_ref("origin", &self.config.github.default_branch)?.is_none(),
+                "projected Personal full import requires an empty destination branch; preserve it and re-import into a fresh mirror"
+            );
+            reposync_core::personal_projection::scoped_source(
+                self.svn_client,
+                &self.config.options,
+            )?
+        } else {
+            self.svn_client.clone()
+        };
+
         // Build identity mapper if configured — allows preserving original SVN authors.
-        let identity_mapper = match &self.config.identity {
+        let identity_mapper = match self.config.identity.as_ref().filter(|_| !scoped) {
             Some(identity_config) => match IdentityMapper::new(identity_config) {
                 Ok(mapper) => {
                     info!("identity mapper enabled — original SVN authors will be preserved");
@@ -346,7 +375,11 @@ impl<'a> InitialImport<'a> {
         };
 
         // Build file policy from config.
-        let policy = FilePolicy::from(&self.config.options);
+        let policy = if scoped {
+            FilePolicy::new(0, Vec::new())
+        } else {
+            FilePolicy::from(&self.config.options)
+        };
         if policy.has_constraints() {
             info!(
                 max_file_size = policy.max_file_size(),
@@ -357,29 +390,51 @@ impl<'a> InitialImport<'a> {
             );
         }
 
-        // Get SVN HEAD info
-        let svn_info = self
-            .svn_client
-            .info()
-            .await
-            .context("failed to get SVN info")?;
+        // An existing admitted HTTPS trust fingerprint must be checked
+        // before making any SVN call under this configuration.
+        if scoped {
+            reposync_core::personal_projection::require_https_trust(self.db, &source)?;
+        }
+        let svn_info = source.info().await.context("failed to get SVN info")?;
         let head_rev = svn_info.latest_rev;
         info!(head_rev, "SVN HEAD revision — will import all revisions");
 
+        let pinned = if scoped {
+            reposync_core::personal_projection::bind_https_source(self.db, &source, &svn_info)?;
+            Some(
+                reposync_core::db::lineage_checkpoints::observe_live_svn_identity(
+                    &source, &svn_info,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let mut count = 0u64;
 
         // Iterate through all revisions
-        let log_entries = self
-            .svn_client
-            .log(1, head_rev)
-            .await
-            .context("failed to get SVN log")?;
+        let log_entries = if let Some(pinned) = &pinned {
+            reposync_core::personal_projection::projected_history_entries(
+                &source,
+                pinned.incarnation_created_rev,
+                head_rev,
+            )
+            .await?
+        } else {
+            source
+                .log(1, head_rev)
+                .await
+                .context("failed to get SVN log")?
+        };
 
         let repo_path = {
             let git_client_guard = self.git_client.lock().unwrap();
             git_client_guard.repo_path().to_path_buf()
         };
 
+        let mut verified_trees =
+            reposync_core::personal_projection::ProjectedHistoryTrees::default();
+        let mut no_targets = Vec::new();
         for entry in &log_entries {
             let rev = entry.revision;
 
@@ -396,13 +451,32 @@ impl<'a> InitialImport<'a> {
             }
 
             // Export this revision to a temp directory, then copy with policy.
-            let export_dir = tempfile::tempdir()
-                .with_context(|| format!("failed to create temp dir for SVN revision r{}", rev))?;
-
-            self.svn_client
-                .export("", rev, export_dir.path())
+            let export_dir = if let Some(pinned) = &pinned {
+                reposync_core::personal_projection::export_projected_history_revision(
+                    &source,
+                    &self.config.options,
+                    rev,
+                    pinned,
+                )
                 .await
-                .with_context(|| format!("failed to export SVN revision r{}", rev))?;
+                .with_context(|| format!("failed to project full-history SVN r{rev}"))?
+            } else {
+                let export_dir = tempfile::tempdir().with_context(|| {
+                    format!("failed to create temp dir for SVN revision r{rev}")
+                })?;
+                source
+                    .export("", rev, export_dir.path())
+                    .await
+                    .with_context(|| format!("failed to export SVN revision r{rev}"))?;
+                export_dir
+            };
+
+            if scoped {
+                if let Some(proof) = verified_trees.observe(rev, export_dir.path())? {
+                    no_targets.push(proof);
+                    continue;
+                }
+            }
 
             // Copy with policy enforcement — propagate hard I/O errors
             // instead of silently swallowing them.
@@ -445,9 +519,12 @@ impl<'a> InitialImport<'a> {
                     )
                 })?;
 
-            let message =
+            let message = if scoped {
+                CommitFormatter::format_projected_svn_to_git(rev)
+            } else {
                 self.formatter
-                    .format_svn_to_git(&entry.message, rev, &entry.author, &entry.date);
+                    .format_svn_to_git(&entry.message, rev, &entry.author, &entry.date)
+            };
 
             // Resolve the Git identity for this commit's author.
             let (author_name, author_email) = match &identity_mapper {
@@ -480,6 +557,17 @@ impl<'a> InitialImport<'a> {
             ) {
                 Ok(oid) => {
                     let sha = oid.to_string();
+                    if scoped {
+                        reposync_core::snapshot::verify_commit_matches_projection(
+                            export_dir.path(),
+                            &repo_path,
+                            &sha,
+                            &policy,
+                        )
+                        .with_context(|| {
+                            format!("committed Personal projection differs at SVN r{rev}")
+                        })?;
+                    }
                     debug!(rev, sha = %sha, author = %author_name, "committed revision");
 
                     self.db
@@ -498,12 +586,24 @@ impl<'a> InitialImport<'a> {
 
                     count += 1;
                 }
+                Err(e) if scoped => {
+                    return Err(e).context("projected history commit failed; not published")
+                }
                 Err(e) => {
                     // Empty commits (no file changes) are expected for property-only revisions
                     debug!(rev, error = %e, "commit failed (possibly empty revision)");
                 }
             }
             drop(git_client);
+        }
+
+        if let Some(pinned) = &pinned {
+            anyhow::ensure!(
+                count > 0,
+                "projected import produced no verified baseline; Git was not changed"
+            );
+            reposync_core::personal_projection::require_projected_source_unchanged(&source, pinned)
+                .await?;
         }
 
         // Push all at once (credentials via remote URL)
@@ -526,18 +626,31 @@ impl<'a> InitialImport<'a> {
                     .context("failed to read Git HEAD")?
             };
             if count > 0 {
-                reposync_core::import::confirm_personal_full_import_publication(
-                    window,
-                    reposync_core::import::LegacyImportRef {
-                        workdir: &repo_path,
-                        remote: "origin",
-                        branch: &self.config.github.default_branch,
-                        token: self.config.github.token.as_deref(),
-                        sha: &head_sha,
-                    },
-                    last.revision,
-                )
-                .await?;
+                let publication = reposync_core::import::LegacyImportRef {
+                    workdir: &repo_path,
+                    remote: "origin",
+                    branch: &self.config.github.default_branch,
+                    token: self.config.github.token.as_deref(),
+                    sha: &head_sha,
+                };
+                if scoped {
+                    reposync_core::import::confirm_personal_projected_import_publication(
+                        window,
+                        publication,
+                        last.revision,
+                        self.config,
+                        pinned.as_ref().context("missing projected SVN source")?,
+                        &no_targets,
+                    )
+                    .await?;
+                } else {
+                    reposync_core::import::confirm_personal_full_import_publication(
+                        window,
+                        publication,
+                        last.revision,
+                    )
+                    .await?;
+                }
             } else {
                 self.db
                     .finalize_personal_full_import_watermarks(last.revision, &head_sha)

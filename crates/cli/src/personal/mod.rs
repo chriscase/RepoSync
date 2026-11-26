@@ -128,7 +128,7 @@ pub async fn run_personal(cmd: PersonalCommands, config_path: &str) -> Result<()
 
         PersonalCommands::Doctor => {
             let config = load_config(config_path)?;
-            doctor::run_doctor(&config)
+            doctor::run_doctor(&config).await
         }
 
         PersonalCommands::Conflicts { action } => {

@@ -15,8 +15,8 @@ use super::style;
 /// Run the import command.
 pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
     anyhow::ensure!(
-        config.options.allowed_paths.is_empty(),
-        "scoped Personal import is not supported; unrestricted import refused"
+        config.options.allowed_paths.is_empty() || config.options.projected_history,
+        "scoped Personal import is not supported; unrestricted import refused; use a fresh projected_history opt-in"
     );
     let data_dir = &config.personal.data_dir;
 
@@ -30,7 +30,7 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
     // Initialize database
     let db = Database::open_personal_writer(data_dir)
         .context("Personal import startup writer admission refused")?;
-    reposync_core::personal_projection::require_unrestricted(&db)?;
+    reposync_core::personal_projection::require_import_mode(&db, config, mode != "snapshot")?;
     let writer_window = db
         .begin_personal_startup_writer_window()
         .context("Personal import startup writer admission refused")?;
@@ -76,6 +76,18 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
         }
     };
 
+    if config.options.projected_history && git_client.repo().find_remote("origin").is_err() {
+        git_client
+            .repo()
+            .remote("origin", &config.github.clone_url())?;
+        reposync_core::git::sync_git_http_auth_from_resolution(
+            &git_client,
+            &git_repo_path,
+            &db,
+            reposync_core::db::personal_scope::personal_scope_key(),
+            config.github.token.as_deref(),
+        )?;
+    }
     if git_client.repo().is_empty()? {
         git_client
             .ensure_head_on_branch(&config.github.default_branch)

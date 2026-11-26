@@ -27,11 +27,23 @@ pub fn run_status(config: &PersonalConfig) -> Result<()> {
     };
     println!("  Status     {}", daemon_status);
 
+    println!(
+        "  {}",
+        reposync_core::personal_projection::policy_description(&config.options)
+    );
+
     // Try to open DB for watermarks
     let db_path = data_dir.join("personal.db");
     if db_path.try_exists()? {
         let db = Database::open_existing_read_only(&db_path)
             .context("failed to inspect existing Personal database; preserve storage")?;
+        if let Err(error) =
+            reposync_core::personal_projection::require_matching_projected_history(&db, config)
+        {
+            println!("  Path policy HELD: {error}");
+        } else if config.options.projected_history {
+            println!("  Path policy ACTIVE (verified projected history)");
+        }
         let svn_rev = db
             .get_watermark("svn_rev")
             .context("failed to read Personal SVN checkpoint")?
