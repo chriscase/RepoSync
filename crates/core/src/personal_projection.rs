@@ -31,15 +31,225 @@ use crate::svn::{SvnClient, SvnLogEntry};
 
 const MODE_LATCH: &str = "personal_incremental_scope_mode_v1";
 
+const PROJECTED_BASELINE: &str = "personal_projected_history_v1";
+const PROJECTED_SOURCE: &str = "personal_projected_history_source_v1";
+
+fn projected_binding(config: &crate::personal_config::PersonalConfig) -> String {
+    let target = serde_json::json!({
+        "policy": policy_snapshot(&config.options),
+        "svn": config.svn.url,
+        "git": config.github.clone_url(),
+        "branch": config.github.default_branch,
+    });
+    hex::encode(Sha256::digest(target.to_string().as_bytes()))
+}
+
+/// Checks before clone, SVN read, or per-revision mappings. An existing
+/// checkout must never be automatically rewritten to fit a newly edited scope.
+pub fn require_import_mode(
+    db: &Database,
+    config: &crate::personal_config::PersonalConfig,
+    full: bool,
+) -> Result<()> {
+    if !config.options.projected_history {
+        ensure!(config.options.allowed_paths.is_empty(),
+            "scoped Personal import is not supported without explicit projected_history; unrestricted import refused");
+        return require_unrestricted(db);
+    }
+    ensure!(
+        full,
+        "scoped Personal snapshot refused; use a fresh projected full import"
+    );
+    let has_partial_history: bool = db.conn().query_row(
+        "SELECT EXISTS(SELECT 1 FROM sync_records WHERE repo_id IN (?1,?2))
+                OR EXISTS(SELECT 1 FROM commit_map WHERE repo_id IN (?1,?2))",
+        params![SCOPE, crate::db::personal_scope::LEGACY_PERSONAL_REPO_ID],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        !has_partial_history
+            && db.get_state(MODE_LATCH)?.is_none()
+            && db.get_state(PROJECTED_BASELINE)?.is_none()
+            && db.get_state(PROJECTED_SOURCE)?.is_none()
+            && db.get_watermark("git_sha")?.is_none()
+            && db.get_watermark("svn_rev")?.is_none(),
+        "projected Personal history requires a fresh mirror and data directory; preserve the existing checkout and re-import"
+    );
+    Ok(())
+}
+
+/// Called only after exact remote full-import publication and watermarks were
+/// verified. An interruption before this marker cannot enable reverse writes.
+pub(crate) fn bind_projected_history_tx(
+    tx: &rusqlite::Connection,
+    config: &crate::personal_config::PersonalConfig,
+    source: &LiveSvnIdentity,
+) -> Result<(), DatabaseError> {
+    if !config.options.projected_history {
+        return Err(DatabaseError::Other(
+            "projected import was not requested".into(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO kv_state (key,value,updated_at) VALUES (?1,?2,?3)",
+        params![
+            PROJECTED_BASELINE,
+            projected_binding(config),
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO kv_state (key,value,updated_at) VALUES (?1,?2,?3)",
+        params![
+            PROJECTED_SOURCE,
+            projected_source_stamp(source),
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+fn projected_source_stamp(source: &LiveSvnIdentity) -> String {
+    serde_json::json!({
+        "uuid": source.uuid, "root": source.root_url, "url": source.url,
+        "branch": source.branch_path, "created_rev": source.incarnation_created_rev,
+        "copy_from_path": source.copy_from_path, "copy_from_rev": source.copy_from_rev,
+    })
+    .to_string()
+}
+
+pub async fn require_projected_source(db: &Database, svn: &SvnClient) -> Result<()> {
+    let prior = db
+        .get_state(PROJECTED_SOURCE)?
+        .context("Personal projected SVN source has not been verified")?;
+    let now = observe_live_svn_identity(svn, &svn.info().await?).await?;
+    ensure!(
+        prior == projected_source_stamp(&now),
+        "Personal projected SVN origin or branch incarnation changed; preserve the mirror"
+    );
+    Ok(())
+}
+
+pub fn require_matching_projected_history(
+    db: &Database,
+    config: &crate::personal_config::PersonalConfig,
+) -> Result<()> {
+    let prior = db.get_state(PROJECTED_BASELINE)?;
+    if config.options.projected_history || prior.is_some() {
+        ensure!(
+            config.options.projected_history
+                && prior.as_deref() == Some(projected_binding(config).as_str())
+                && db.get_state(PROJECTED_SOURCE)?.is_some(),
+            "Personal projection is unverified or changed; preserve this mirror and re-import into a fresh mirror and data directory"
+        );
+    }
+    Ok(())
+}
+
+pub fn admit_reverse(db: &Database, config: &crate::personal_config::PersonalConfig) -> Result<()> {
+    if config.options.projected_history {
+        admit_sync(db, config)
+    } else {
+        ensure!(
+            config.options.allowed_paths.is_empty(),
+            "older scoped Personal mode is SVN-to-Git only"
+        );
+        require_unrestricted(db)
+    }
+}
+
+pub fn policy_description(options: &PersonalOptionsConfig) -> String {
+    let mode = if options.projected_history {
+        "projected history (verified baseline required; merged PRs only)"
+    } else if options.allowed_paths.is_empty() {
+        "unrestricted legacy mode"
+    } else {
+        "existing scoped incremental SVN→Git only"
+    };
+    format!(
+        "Personal path policy: {mode}; SVN allow {:?}; SVN block {:?}; rewrite {:?}",
+        options.allowed_paths,
+        options.blocked_patterns,
+        options
+            .path_rewrite_rules
+            .iter()
+            .map(|r| &r.strip_prefix)
+            .collect::<Vec<_>>()
+    )
+}
+
+/// Inspect the local checkout and its fetched mirror tip without fetching,
+/// modifying refs, or resetting the checkout.
+pub fn git_path_divergence(
+    workdir: &Path,
+    config: &crate::personal_config::PersonalConfig,
+) -> Result<Vec<String>> {
+    if config.options.allowed_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let repo = git2::Repository::open(workdir)?;
+    let head = match repo.head() {
+        Ok(head) => head.peel_to_tree()?,
+        Err(e) if e.code() == git2::ErrorCode::UnbornBranch => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let cached_ref = format!("refs/remotes/origin/{}", config.github.default_branch);
+    let mut trees = vec![head];
+    match repo.find_reference(&cached_ref) {
+        Ok(reference) => trees.push(reference.peel_to_tree()?),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    projected_git_divergence(trees, config)
+}
+
+pub fn git_path_divergence_at(
+    git_path: &Path,
+    sha: &str,
+    config: &crate::personal_config::PersonalConfig,
+) -> Result<Vec<String>> {
+    let repo = git2::Repository::open(git_path)?;
+    let tree = repo.find_commit(git2::Oid::from_str(sha)?)?.tree()?;
+    projected_git_divergence(vec![tree], config)
+}
+
+fn projected_git_divergence(
+    trees: Vec<git2::Tree<'_>>,
+    config: &crate::personal_config::PersonalConfig,
+) -> Result<Vec<String>> {
+    use git2::{ObjectType, TreeWalkMode, TreeWalkResult};
+    let rule = config.options.rewrite_rule().map_err(anyhow::Error::msg)?;
+    let mut divergent = std::collections::BTreeSet::new();
+    for tree in trees {
+        tree.walk(TreeWalkMode::PreOrder, |root, entry| {
+            if entry.kind() == Some(ObjectType::Tree) {
+                return TreeWalkResult::Ok;
+            }
+            if let Some(name) = entry.name() {
+                let git = format!("{root}{name}");
+                let svn = rule.as_ref().map_or_else(|| Ok(git.clone()), |r| r.to_svn(&git));
+                if !matches!(svn, Ok(ref path) if path_is_projected(path, &config.options.allowed_paths, &config.options.blocked_patterns)) {
+                    divergent.insert(git);
+                }
+            } else {
+                divergent.insert(format!("{root}<non-UTF-8 path>"));
+            }
+            TreeWalkResult::Ok
+        })?;
+    }
+    Ok(divergent.into_iter().collect())
+}
+
 /// No implicit downgrade: TOML omission is not an instruction to republish the
 /// full tree or replay previously held PRs. Keep unrestricted installs unchanged.
 pub fn require_unrestricted(db: &Database) -> Result<()> {
-    ensure!(db.get_state(MODE_LATCH)?.is_none(),
+    ensure!(db.get_state(MODE_LATCH)?.is_none() && db.get_state(PROJECTED_BASELINE)?.is_none(),
         "this mirror was opened in scoped Personal mode; restore allowed_paths. An unrestricted transition requires a separately prepared mirror");
     Ok(())
 }
 
 pub fn admit_sync(db: &Database, config: &crate::personal_config::PersonalConfig) -> Result<()> {
+    require_matching_projected_history(db, config)?;
     if config.options.allowed_paths.is_empty() {
         return require_unrestricted(db);
     }
@@ -78,16 +288,21 @@ pub fn admit_sync(db: &Database, config: &crate::personal_config::PersonalConfig
 }
 
 pub fn policy_snapshot(options: &PersonalOptionsConfig) -> String {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "allowed_paths": options.allowed_paths,
-        "blocked_patterns": [],
+        "blocked_patterns": options.blocked_patterns,
         "network_directory_profile": options.network_directory_profile,
         "ignore_patterns": options.ignore_patterns,
         "max_file_size": options.max_file_size,
         "lfs_patterns": options.lfs_patterns,
         "lfs_threshold": options.lfs_threshold,
-    })
-    .to_string()
+    });
+    // Preserve existing #55 receipt serialization byte-for-byte.
+    if options.projected_history {
+        value["projected_history"] = true.into();
+        value["path_rewrite_rules"] = serde_json::json!(options.path_rewrite_rules);
+    }
+    value.to_string()
 }
 
 // Git records file bytes and owner execute, not empty directories, mtimes,
@@ -99,7 +314,7 @@ fn selected_files(root: &Path, options: &PersonalOptionsConfig) -> Result<Files>
     let mut files = Files::new();
     for (path, entry) in require_supported_export(root)?.entries {
         if let ManifestEntry::File { size, mode, sha256 } = entry {
-            if path_is_projected(&path, &options.allowed_paths, &[])
+            if path_is_projected(&path, &options.allowed_paths, &options.blocked_patterns)
                 && policy.evaluate(&path, size).should_sync()
             {
                 files.insert(path, (sha256, mode & 0o100 != 0));
@@ -323,6 +538,176 @@ async fn export_scope(
     Ok(())
 }
 
+/// Materialize an already verified selected SVN tree into Git coordinates.
+fn projected_export(raw: &Path, options: &PersonalOptionsConfig) -> Result<TempDir> {
+    let selected = selected_files(raw, options)?;
+    let rewrite = options.rewrite_rule().map_err(anyhow::Error::msg)?;
+    let stage = tempfile::tempdir()?;
+    let mut expected = Files::new();
+    for (name, bytes) in selected {
+        let destination = match &rewrite {
+            Some(rule) => rule
+                .to_git(&name)
+                .map_err(anyhow::Error::msg)?
+                .context("selected SVN file falls outside the rewrite namespace")?,
+            None => &name,
+        };
+        ensure!(
+            expected.insert(destination.to_owned(), bytes).is_none(),
+            "two selected SVN paths map to the same Git destination"
+        );
+        let target = stage.path().join(destination);
+        std::fs::create_dir_all(target.parent().context("missing Git path parent")?)?;
+        let source = raw.join(&name);
+        let metadata = std::fs::symlink_metadata(&source)?;
+        crate::import::copy_regular_file_no_follow(&source, stage.path(), &target, &metadata)?;
+    }
+    let observed: Files = content_entries(require_supported_export(stage.path())?)
+        .into_iter()
+        .filter_map(|(name, bytes)| bytes.map(|bytes| (name, bytes)))
+        .collect();
+    ensure!(
+        observed == expected,
+        "materialized Git tree differs from pinned SVN projection"
+    );
+    Ok(stage)
+}
+
+pub async fn projected_history_entries(
+    svn: &SvnClient,
+    first_rev: i64,
+    head_rev: i64,
+) -> Result<Vec<SvnLogEntry>> {
+    let exact = svn.strict_log_range(first_rev, head_rev).await?;
+    let entries = svn.log(first_rev, head_rev).await?;
+    ensure!(
+        exact
+            .iter()
+            .map(|e| e.revision)
+            .eq(entries.iter().map(|e| e.revision)),
+        "scoped full-history SVN log differs from strict numbered evidence"
+    );
+    ensure!(
+        entries
+            .first()
+            .is_some_and(|entry| entry.revision == first_rev)
+            && entries.windows(2).all(|w| w[0].revision < w[1].revision),
+        "scoped full-history log does not begin at the proved SVN incarnation"
+    );
+    Ok(entries)
+}
+
+pub async fn require_projected_source_unchanged(
+    svn: &SvnClient,
+    prior: &LiveSvnIdentity,
+) -> Result<()> {
+    let live = observe_live_svn_identity(svn, &svn.info().await?).await?;
+    ensure!(
+        svn_identity_difference(prior, &live).is_none(),
+        "SVN source changed during projected import"
+    );
+    Ok(())
+}
+
+/// Equality witness for a historical revision that changes no projected
+/// file bytes or Git mode. Neither SVN author nor log text belongs here.
+pub struct ProjectedHistoryNoTarget {
+    rev: i64,
+    digest: String,
+}
+
+/// Track the last independently projected Git tree, beginning at the unborn
+/// empty tree. Only a change may enter the Git history.
+#[derive(Default)]
+pub struct ProjectedHistoryTrees(Files);
+
+impl ProjectedHistoryTrees {
+    pub fn observe(
+        &mut self,
+        rev: i64,
+        verified: &Path,
+    ) -> Result<Option<ProjectedHistoryNoTarget>> {
+        let files: Files = content_entries(require_supported_export(verified)?)
+            .into_iter()
+            .filter_map(|(name, bytes)| bytes.map(|bytes| (name, bytes)))
+            .collect();
+        if self.0 == files {
+            let digest = hex::encode(Sha256::digest(serde_json::to_vec(&files)?));
+            Ok(Some(ProjectedHistoryNoTarget { rev, digest }))
+        } else {
+            self.0 = files;
+            Ok(None)
+        }
+    }
+}
+
+pub(crate) fn persist_projected_history_no_targets_tx(
+    tx: &rusqlite::Connection,
+    frontier: i64,
+    config: &crate::personal_config::PersonalConfig,
+    proofs: &[ProjectedHistoryNoTarget],
+) -> Result<(), DatabaseError> {
+    let generation = current_generation_read_only(tx, SCOPE, SCOPE)?;
+    let projection = policy_snapshot(&config.options);
+    let mut previous = 0;
+    for proof in proofs {
+        if proof.rev <= previous || proof.rev > frontier {
+            return Err(DatabaseError::Other(
+                "invalid historical Personal no-target evidence order".into(),
+            ));
+        }
+        let key = svn_source_key(proof.rev);
+        let reason = format!(
+            "equal verified historical Personal Git projection (SHA-256 {})",
+            proof.digest
+        );
+        record_mapping_outcome(
+            tx,
+            SCOPE,
+            generation,
+            MappingWrite {
+                direction: CheckpointDirection::SvnToGit,
+                source_key: &key,
+                outcome: MappingOutcome::IntentionallyFilteredNoTarget,
+                target_git_sha: None,
+                target_svn_rev: None,
+                reason: Some(&reason),
+                policy_snapshot: Some(&projection),
+            },
+        )?;
+        insert_proven_no_target_row_tx(tx, proof.rev, "svn_to_git", "", "", SCOPE)?;
+        previous = proof.rev;
+    }
+    Ok(())
+}
+
+/// Full historical import and ordinary incremental sync share the same
+/// selected-endpoint visibility, SVN-coordinate filtering and Git mapping.
+pub async fn export_projected_history_revision(
+    svn: &SvnClient,
+    options: &PersonalOptionsConfig,
+    rev: i64,
+    live: &LiveSvnIdentity,
+) -> Result<TempDir> {
+    let network = options.network_directory_profile.is_some();
+    let historical = if network {
+        observe_numbered_network_identity(svn, rev).await?
+    } else {
+        observe_historical_svn_identity_at(svn, rev).await?
+    };
+    ensure!(
+        svn_identity_difference(&historical, live).is_none(),
+        "SVN historical revision belongs to another branch incarnation"
+    );
+    let source = svn.visibility_tempdir("history-")?;
+    export_scope(svn, rev, source.path(), options, &historical).await?;
+    if network {
+        require_network_live_endpoint(svn, &historical).await?;
+    }
+    svn.require_visibility_budget()?;
+    projected_export(source.path(), options)
+}
+
 pub struct SelectedSnapshot {
     directory: TempDir,
     before: TempDir,
@@ -498,6 +883,13 @@ pub async fn prepare(
             strict.is_some(),
             "SVN log omitted a revision with a selected Git effect; holding the revision"
         );
+        if options.projected_history {
+            let directory = projected_export(new_dir.path(), options)?;
+            let before = projected_export(old_dir.path(), options)?;
+            svn.require_visibility_budget()?;
+            window.finish_preparation()?;
+            return Ok(Some(SelectedSnapshot { directory, before }));
+        }
         // Move only admitted files between our private temporary directories.
         // No untrusted entry is followed, and renaming preserves execute bits.
         let projection = svn.visibility_tempdir("projected-")?;

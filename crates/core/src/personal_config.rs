@@ -249,6 +249,18 @@ pub struct PersonalOptionsConfig {
     #[serde(default)]
     pub allowed_paths: Vec<String>,
 
+    /// Explicit opt-in to a fresh scoped full-history import and PR round trip.
+    #[serde(default)]
+    pub projected_history: bool,
+
+    /// Block globs, evaluated in the original SVN path namespace.
+    #[serde(default)]
+    pub blocked_patterns: Vec<String>,
+
+    /// At most one reversible rule, in the same shape as a Team rule.
+    #[serde(default)]
+    pub path_rewrite_rules: Vec<PersonalPathRewriteRule>,
+
     /// Explicit opt-in to a qualified stock Subversion checkout proof.
     #[serde(default)]
     pub network_directory_profile: Option<NetworkDirectoryProfile>,
@@ -298,6 +310,29 @@ pub struct PersonalOptionsConfig {
     pub lfs_patterns: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PersonalPathRewriteRule {
+    pub strip_prefix: String,
+}
+
+impl PersonalOptionsConfig {
+    pub fn rewrite_rule(
+        &self,
+    ) -> Result<Option<crate::path_projection::TeamPrefixRewrite>, &'static str> {
+        use crate::path_projection::TeamPrefixRewrite;
+        match self.path_rewrite_rules.as_slice() {
+            [] => Ok(None),
+            [rule] => {
+                let rewrite = TeamPrefixRewrite::new(&rule.strip_prefix)?;
+                rewrite.validate_scope(&self.allowed_paths)?;
+                Ok(Some(rewrite))
+            }
+            _ => Err("only one strip-prefix rule is supported"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkDirectoryProfile {
@@ -325,6 +360,9 @@ impl Default for PersonalOptionsConfig {
     fn default() -> Self {
         Self {
             allowed_paths: Vec::new(),
+            projected_history: false,
+            blocked_patterns: Vec::new(),
+            path_rewrite_rules: Vec::new(),
             network_directory_profile: None,
             svn_tls_ca_file: None,
             normalize_line_endings: true,
@@ -459,6 +497,31 @@ impl PersonalConfig {
             )?;
         }
 
+        if self.options.projected_history {
+            if self.options.allowed_paths.is_empty()
+                || self.options.lfs_threshold != 0
+                || !self.options.lfs_patterns.is_empty()
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "options.projected_history".into(),
+                    detail: "projected history requires an explicit allowed scope and does not yet support Git LFS".into(),
+                });
+            }
+        } else if !self.options.blocked_patterns.is_empty()
+            || !self.options.path_rewrite_rules.is_empty()
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "options.projected_history".into(),
+                detail: "blocked paths or rewrite rules require an explicit fresh projected history opt-in".into(),
+            });
+        }
+        self.options
+            .rewrite_rule()
+            .map_err(|e| ConfigError::InvalidValue {
+                field: "options.path_rewrite_rules".into(),
+                detail: e.into(),
+            })?;
+
         // Fail-fast: sync_direct_pushes is not yet implemented in personal mode.
         if self.options.sync_direct_pushes {
             return Err(ConfigError::InvalidValue {
@@ -518,7 +581,10 @@ normalize_line_endings = true
 sync_executable_bit = true
 # max_file_size = 0         # 0 = no limit
 # ignore_patterns = []
-# allowed_paths = []        # incremental SVN→Git only when scoped
+# allowed_paths = []        # branch-relative original SVN path prefixes
+# projected_history = false # true requires a fresh projected full import
+# blocked_patterns = []     # globs in SVN path coordinates
+# path_rewrite_rules = [{ strip_prefix = "team/example/" }]
 # network_directory_profile = "apache_svnserve_wc31"  # qualified stock svn://
 # network_directory_profile = "apache_mod_dav_svn_https_wc31"  # qualified Apache DAV pilot
 # svn_tls_ca_file = "/absolute/path/to/trusted-ca.pem"

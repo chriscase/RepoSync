@@ -25,5 +25,4 @@ indicatif = { workspace = true }
 console = { workspace = true }
 comfy-table = { workspace = true }
 
-[dev-dependencies]
 tempfile = { workspace = true }

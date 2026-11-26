@@ -207,6 +207,70 @@ impl GitClient {
         self.http_auth_token.borrow().clone()
     }
 
+    /// True only for a valid symbolic branch that has no commits yet.
+    pub fn is_unborn(&self) -> Result<bool, GitError> {
+        match self.repo.head() {
+            Ok(_) => Ok(false),
+            Err(error) if error.code() == git2::ErrorCode::UnbornBranch => Ok(true),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Move only a clean managed branch forward to an admitted commit. Verify
+    /// the source and current checkout are on the observed remote history;
+    /// never reset, discard local content, or consult a movable branch name.
+    pub fn align_managed_branch_to_admitted_commit(
+        &self,
+        branch: &str,
+        source_sha: &str,
+        admitted_tip: &str,
+    ) -> Result<(), GitError> {
+        let dry_error = |detail: &str| GitError::ApplyFailed(detail.to_owned());
+        let head = self.repo.head()?;
+        let branch_ref = format!("refs/heads/{branch}");
+        if head.name() != Some(branch_ref.as_str()) || !self.repo.statuses(None)?.is_empty() {
+            return Err(dry_error(
+                "Personal bridge checkout is not the clean managed branch",
+            ));
+        }
+        let source = Oid::from_str(source_sha)?;
+        let remote = Oid::from_str(admitted_tip)?;
+        let local = head.peel_to_commit()?.id();
+        let descends = |tip, base| -> Result<bool, GitError> {
+            Ok(tip == base || self.repo.graph_descendant_of(tip, base)?)
+        };
+        if !descends(remote, source)? || !descends(remote, local)? {
+            return Err(dry_error(
+                "Git change is outside the admitted Personal branch history",
+            ));
+        }
+        if descends(local, source)? {
+            return Ok(());
+        }
+        if !descends(source, local)? {
+            return Err(dry_error(
+                "Personal bridge cannot fast-forward to the admitted Git change",
+            ));
+        }
+        let output = std::process::Command::new("git")
+            .args([
+                "merge",
+                "--ff-only",
+                "--no-edit",
+                "--no-overwrite-ignore",
+                source_sha,
+            ])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .current_dir(&self.repo_path)
+            .output()?;
+        if !output.status.success() || self.repo.head()?.peel_to_commit()?.id() != source {
+            return Err(dry_error(
+                "Personal bridge fast-forward did not complete; local changes were not reset",
+            ));
+        }
+        Ok(())
+    }
+
     /// Get the current HEAD commit SHA.
     pub fn head_sha(&self) -> Result<String, GitError> {
         let head = self.repo.head().map_err(GitError::from)?;

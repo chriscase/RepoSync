@@ -129,6 +129,12 @@ impl SvnToGitSync {
         };
 
         let scope = &self.config.options.allowed_paths;
+        let normalized_policy = FilePolicy::new(0, Vec::new());
+        let publish_policy = if self.config.options.projected_history {
+            &normalized_policy
+        } else {
+            &self.policy
+        };
         let svn = if scope.is_empty() {
             self.svn_client.clone()
         } else {
@@ -278,7 +284,7 @@ impl SvnToGitSync {
                     git.repo().statuses(None)?.is_empty(),
                     "Personal scoped publication requires a clean Git checkout"
                 );
-                dir.into_export(git.repo_path(), &self.policy)?
+                dir.into_export(git.repo_path(), publish_policy)?
             };
 
             // 6. Copy exported files into the Git working tree (with policy).
@@ -288,9 +294,27 @@ impl SvnToGitSync {
                 git_client.repo_path().to_path_buf()
             }; // Release lock before blocking I/O.
 
-            let skipped =
-                Self::copy_tree_with_policy(export_dir.path(), &repo_path, &self.policy, &self.db)
-                    .with_context(|| format!("failed to copy exported files for r{}", rev))?;
+            if self.config.options.projected_history {
+                // The selected SVN projection has a positive effect. Check
+                // a fresh remote observation before touching the checkout
+                // or creating a commit; there is no cross-side merge policy.
+                let git = self.git_client.lock().unwrap();
+                let local = git.get_head_sha()?;
+                let handled = self.db.get_watermark("git_sha")?;
+                let observed = git.ls_remote_ref(GIT_REMOTE, &self.config.github.default_branch)?;
+                anyhow::ensure!(
+                    observed.as_deref() == Some(local.as_str()) && handled.as_deref() == Some(local.as_str()),
+                    "simultaneous selected SVN and Git changes are held; reconcile the mirror before publishing either side"
+                );
+            }
+
+            let skipped = Self::copy_tree_with_policy(
+                export_dir.path(),
+                &repo_path,
+                publish_policy,
+                &self.db,
+            )
+            .with_context(|| format!("failed to copy exported files for r{}", rev))?;
 
             if skipped > 0 {
                 info!(rev, skipped, "SVN→Git: files skipped by policy during copy");
@@ -303,7 +327,7 @@ impl SvnToGitSync {
             reposync_core::import::verify_export_projection(
                 export_dir.path(),
                 &repo_path,
-                &self.policy,
+                publish_policy,
             )
             .with_context(|| {
                 format!("independent SVN→Git projection verification failed for r{rev}")
@@ -377,7 +401,7 @@ impl SvnToGitSync {
             let sha_str = git_sha.to_string();
             if !scope.is_empty() {
                 reposync_core::snapshot::verify_commit_matches_projection(
-                    export_dir.path(), &repo_path, &sha_str, &self.policy
+                    export_dir.path(), &repo_path, &sha_str, publish_policy
                 ).context("scoped Personal Git commit differs from the verified projection; refusing publication")?;
             }
             info!(rev, sha = %sha_str, "committed SVN revision as Git commit");

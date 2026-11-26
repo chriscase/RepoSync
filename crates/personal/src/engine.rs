@@ -130,13 +130,26 @@ impl PersonalSyncEngine {
             ..Default::default()
         };
 
-        if !self.config.options.allowed_paths.is_empty()
+        if !self.config.options.projected_history
+            && !self.config.options.allowed_paths.is_empty()
             && self.db.active_personal_svn_commit_operation()?.is_some()
         {
             anyhow::bail!("pending Personal Git→SVN journal predates scoped inbound sync; reconcile it under its original configuration");
         }
 
         reposync_core::personal_projection::admit_sync(&self.db, &self.config)?;
+
+        if self.config.options.projected_history {
+            let svn = self.outbound_svn()?;
+            reposync_core::personal_projection::require_projected_source(&self.db, &svn).await?;
+            let git = self.git_client.lock().unwrap();
+            let expected = self.config.github.clone_url();
+            let origin = git.repo().find_remote("origin")?;
+            anyhow::ensure!(
+                origin.url() == Some(expected.as_str()),
+                "Personal projected Git origin changed; preserve the mirror"
+            );
+        }
 
         // Prove and finalize any held Git→SVN journal before P/O/R/L inspection.
         // Promotion uses SVN inspect-before-author (GitHub fallback only after proof).
@@ -158,21 +171,41 @@ impl PersonalSyncEngine {
         }
 
         // Same P/O/R/L inspection as team Git→SVN, before any reset/replay.
-        if let Err(e) = self.inspect_git_history() {
-            self.set_state(PersonalSyncState::Error);
-            error!(error = %e, "personal Git history inspection blocked");
-            self.db
-                .insert_audit_log(
-                    "history_blocked",
-                    Some("git_to_svn"),
-                    None,
-                    None,
-                    None,
-                    Some(&e.to_string()),
-                    false,
-                )
-                .ok();
-            return Err(e);
+        let admission = match self.inspect_git_history() {
+            Ok(admission) => admission,
+            Err(e) => {
+                self.set_state(PersonalSyncState::Error);
+                error!(error = %e, "personal Git history inspection blocked");
+                self.db
+                    .insert_audit_log(
+                        "history_blocked",
+                        Some("git_to_svn"),
+                        None,
+                        None,
+                        None,
+                        Some(&e.to_string()),
+                        false,
+                    )
+                    .ok();
+                return Err(e);
+            }
+        };
+
+        if self.config.options.projected_history {
+            let scope = &self.config;
+            let admission =
+                admission.context("missing admitted Git history for projected Personal mirror")?;
+            let divergent = reposync_core::personal_projection::git_path_divergence(
+                &self.git_repo_path,
+                scope,
+            )?;
+            let remote = reposync_core::personal_projection::git_path_divergence_at(
+                &self.git_repo_path,
+                &admission.remote_tip,
+                scope,
+            )?;
+            anyhow::ensure!(divergent.is_empty() && remote.is_empty(),
+                "Git tree diverges from the admitted Personal path projection; preserve the mirror and re-import into a fresh destination");
         }
 
         // Phase 1: SVN → Git
@@ -197,7 +230,7 @@ impl PersonalSyncEngine {
                     )
                     .ok();
                 if !self.config.options.allowed_paths.is_empty() {
-                    // Scoped mode has no outbound phase to salvage.
+                    // Never bypass a held scoped inbound revision to write SVN.
                     return Err(e);
                 }
                 // Don't abort — still try Git→SVN
@@ -231,6 +264,9 @@ impl PersonalSyncEngine {
                         false,
                     )
                     .ok();
+                if self.config.options.projected_history {
+                    return Err(e);
+                }
             }
         }
 
@@ -266,9 +302,8 @@ impl PersonalSyncEngine {
 
     /// Git → SVN sync phase (via merged PRs).
     async fn sync_git_to_svn(&self) -> Result<(u64, u64)> {
-        if !self.config.options.allowed_paths.is_empty() {
-            // Never send an unprojected change back to SVN. Scoped PR replay
-            // is #59; leave any pending PRs untouched.
+        if !self.config.options.projected_history && !self.config.options.allowed_paths.is_empty() {
+            // Older scoped configurations intentionally remain inbound-only.
             return Ok((0, 0));
         }
         let held_git_to_svn_needs_promotion = self
@@ -303,7 +338,7 @@ impl PersonalSyncEngine {
         self.set_state(PersonalSyncState::ApplyingGitToSvn);
 
         let syncer = GitToSvnSync::new(
-            self.svn_client.clone(),
+            self.outbound_svn()?,
             (*self.github_client).clone(),
             self.db.clone(),
             &self.config,
@@ -335,9 +370,22 @@ impl PersonalSyncEngine {
         *state = new_state;
     }
 
+    fn outbound_svn(&self) -> Result<SvnClient> {
+        if self.config.options.projected_history {
+            let svn = reposync_core::personal_projection::scoped_source(
+                &self.svn_client,
+                &self.config.options,
+            )?;
+            reposync_core::personal_projection::require_https_trust(&self.db, &svn)?;
+            Ok(svn)
+        } else {
+            Ok(self.svn_client.clone())
+        }
+    }
+
     async fn promote_held_git_to_svn_before_history_inspect(&self) -> Result<()> {
         let syncer = GitToSvnSync::new(
-            self.svn_client.clone(),
+            self.outbound_svn()?,
             (*self.github_client).clone(),
             self.db.clone(),
             &self.config,
@@ -352,7 +400,9 @@ impl PersonalSyncEngine {
 
     /// Inspect the configured Git branch against the last handled SHA before
     /// SVN→Git or Git→SVN writes. Webhook `forced` is not consulted here.
-    fn inspect_git_history(&self) -> Result<()> {
+    fn inspect_git_history(
+        &self,
+    ) -> Result<Option<reposync_core::history_inspect::HistoryInspectAdmission>> {
         let config_token = self.config.github.token.as_deref();
         let (git_path, http_auth_token) = {
             let git = self
@@ -383,7 +433,6 @@ impl PersonalSyncEngine {
             http_auth_token.as_deref(),
             config_token,
         )
-        .map(|_| ())
         .map_err(|e| anyhow::anyhow!(e))
     }
 }

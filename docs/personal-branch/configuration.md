@@ -482,3 +482,57 @@ Missing log metadata cannot authorize a changed Git tree. A timeout, trust
 failure or unresolved proof leaves the current revision pending, preserves
 already confirmed earlier revisions, and stops later ones. Catch-up resumes
 at the next number on a later cycle.
+
+### Scoped full history and one-prefix rewrite
+
+For a new mirror, choose an SVN-relative scope in `reposync personal init`, or
+put the following under `[options]`:
+
+```toml
+projected_history = true
+allowed_paths = ["team/alpha/selected/"]
+blocked_patterns = ["team/alpha/selected/private/**"]
+path_rewrite_rules = [{ strip_prefix = "team/alpha/" }]
+```
+
+This selection mirrors SVN `team/alpha/selected/note.txt` at Git
+`selected/note.txt`. Both allow and block rules are evaluated in the original
+SVN coordinates. Leave out the rewrite array to keep SVN-relative names in
+Git. An explicitly enabled scope needs a fresh data directory and empty Git
+destination branch. Run `reposync personal import --full`; scoped snapshots
+are refused rather than importing the whole repository. The full import pins
+the SVN origin and binds the policy only after verifying the published Git tip.
+
+The Personal worker then applies the same projection during SVN polling, and
+maps eligible merged pull-request changes back to their original SVN paths.
+Direct pushes are not replayed as Personal pull requests. Git commits that
+diverge from the projection are held. Git LFS is not supported with this opt-in;
+writing executable-mode, special-node, or non-regular changes via a projected
+PR is refused. Existing scoped-only configurations without `projected_history`
+stay inbound-only; old configurations with no scope remain unchanged.
+
+`reposync personal status` reports the active policy and its verified baseline.
+`reposync personal doctor` reports files outside the scope from the local
+checkout and current remote tip. The remote observation uses a short-lived
+private Git directory and never changes the live checkout or remote. A rule
+change, partial import, or destination change does not authorize new writes.
+Preserve the old mirror, choose a new/empty destination and fresh data directory,
+and re-import. Do not erase a preserved mirror to clear a held write.
+
+A projected PR is applied from its actual accepted Git commit, using the
+first-parent change from the last handled Git checkpoint. Merge commits and
+linear/squash commits with that parent are supported. A multi-commit rebase
+whose merged tip has a different first parent, or other ambiguous intervening
+Git history, is held instead of silently skipping commits.
+
+Projected history contains commits only when selected Git content or mode
+changes. Revisions that leave the projected tree unchanged (including a
+leading empty tree) advance the verified SVN frontier without copying their
+authors or log messages into Git. A copied SVN branch starts at the creation
+snapshot of that exact branch incarnation; import does not follow history
+into the predecessor branch.
+
+If a poll finds a selected SVN change while Git also has unhandled work,
+RepoSync holds before updating the bridge checkout or publishing in either
+direction. It does not pick a side, reset a checkout, or attempt an automatic
+cross-side merge; reconcile the competing history before resuming the mirror.
