@@ -14,6 +14,10 @@ use super::style;
 
 /// Run the import command.
 pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
+    anyhow::ensure!(
+        config.options.allowed_paths.is_empty(),
+        "scoped Personal import is not supported; unrestricted import refused"
+    );
     let data_dir = &config.personal.data_dir;
 
     println!();
@@ -26,6 +30,7 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
     // Initialize database
     let db = Database::open_personal_writer(data_dir)
         .context("Personal import startup writer admission refused")?;
+    reposync_core::personal_projection::require_unrestricted(&db)?;
     let writer_window = db
         .begin_personal_startup_writer_window()
         .context("Personal import startup writer admission refused")?;

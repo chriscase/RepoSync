@@ -176,6 +176,10 @@ async fn build_engine(config_path: &str) -> Result<(PersonalSyncEngine, Personal
         PersonalConfig::load_and_resolve(config_path).context("failed to load personal config")?;
     config.validate().context("invalid personal config")?;
 
+    if !config.options.allowed_paths.is_empty() {
+        anyhow::ensure!(config.personal.data_dir.join("personal.db").try_exists()?,
+            "scoped Personal sync requires an existing proven SVN and Git checkpoint; refusing bootstrap");
+    }
     // Ensure data directory exists.
     let data_dir = &config.personal.data_dir;
     std::fs::create_dir_all(data_dir)
@@ -184,6 +188,7 @@ async fn build_engine(config_path: &str) -> Result<(PersonalSyncEngine, Personal
     // Initialize database.
     let db = Database::open_personal_writer(data_dir)
         .context("Personal sync startup writer admission refused")?;
+    reposync_core::personal_projection::admit_sync(&db, &config)?;
     let writer_window = db
         .begin_personal_startup_writer_window()
         .context("Personal sync startup writer admission refused")?;
@@ -319,6 +324,10 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
     let config =
         PersonalConfig::load_and_resolve(config_path).context("failed to load personal config")?;
     config.validate().context("invalid personal config")?;
+    anyhow::ensure!(
+        config.options.allowed_paths.is_empty(),
+        "scoped Personal import is not supported; unrestricted import refused"
+    );
 
     let data_dir = &config.personal.data_dir;
     std::fs::create_dir_all(data_dir)
@@ -327,6 +336,7 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
     // Initialize database.
     let db = Database::open_personal_writer(data_dir)
         .context("Personal import startup writer admission refused")?;
+    reposync_core::personal_projection::require_unrestricted(&db)?;
     let writer_window = db
         .begin_personal_startup_writer_window()
         .context("Personal import startup writer admission refused")?;

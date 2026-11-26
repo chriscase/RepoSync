@@ -19,6 +19,13 @@ use crate::errors::SvnError;
 /// Default timeout for SVN commands (5 minutes).
 const SVN_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SelectedNode {
+    Directory,
+    File,
+    Missing,
+}
+
 /// Asynchronous client for interacting with an SVN repository via the CLI.
 #[derive(Clone)]
 pub struct SvnClient {
@@ -27,6 +34,7 @@ pub struct SvnClient {
     password: String,
     cancel: Option<Arc<AtomicBool>>,
     refresh_config: Option<Arc<tempfile::TempDir>>,
+    https_visibility: Option<Arc<super::https_visibility::HttpsVisibility>>,
 }
 
 // Never log unvalidated userinfo/query text, including unsupported or malformed
@@ -91,6 +99,7 @@ impl SvnClient {
             password: password.into(),
             cancel: None,
             refresh_config: None,
+            https_visibility: None,
         };
         info!(url = %diagnostic_url(&client.url), username = %client.username, "created SvnClient");
         client
@@ -156,6 +165,58 @@ impl SvnClient {
         self.refresh_config.is_some()
     }
 
+    /// Isolate read-only proof traffic to the configured Personal actor.
+    /// No fallback to cached or ambient credentials is permitted.
+    pub(crate) fn isolated_personal_visibility(&self, ca: Option<&Path>) -> Result<Self, SvnError> {
+        let password = (!self.password.is_empty()).then_some(self.password.as_str());
+        let mut isolated = Self::new_isolated_refresh(&self.url, &self.username, password)?;
+        if let Some(ca) = ca {
+            let private = isolated
+                .refresh_config
+                .as_ref()
+                .expect("isolated client has private config");
+            let digest = super::https_visibility::install_trust(ca, private.path())?;
+            isolated.https_visibility = Some(Arc::new(
+                super::https_visibility::HttpsVisibility::new(digest)?,
+            ));
+        }
+        Ok(isolated)
+    }
+
+    pub(crate) fn https_trust_fingerprint(&self) -> Option<&str> {
+        self.https_visibility
+            .as_ref()
+            .map(|pilot| pilot.trust_sha256.as_str())
+    }
+
+    pub(crate) fn visibility_tempdir(&self, prefix: &str) -> std::io::Result<tempfile::TempDir> {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(prefix);
+        match &self.https_visibility {
+            Some(pilot) => builder.tempdir_in(pilot.scratch()),
+            None => builder.tempdir(),
+        }
+    }
+
+    pub fn require_visibility_budget(&self) -> Result<(), SvnError> {
+        if let Some(pilot) = &self.https_visibility {
+            pilot.check()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn personal_visibility_operand(&self, path: &str) -> Result<Self, SvnError> {
+        if !self.has_refresh_isolation() {
+            return Err(SvnError::LineageRefused {
+                reason: "unproved_svn_subtree_visibility".into(),
+                detail: "Personal directory proof requires the same isolated source actor".into(),
+            });
+        }
+        let mut scoped = self.clone();
+        scoped.url = repository_url(&self.url, path)?;
+        Ok(scoped)
+    }
+
     pub(crate) fn refresh_ancestor_client(&self, url: &str) -> Result<Self, SvnError> {
         let refused = || SvnError::LineageRefused {
             reason: "unproved_svn_ancestor_visibility".into(),
@@ -200,6 +261,81 @@ impl SvnClient {
             &literal_url(&self.url, Some(revision))?,
         ])
         .await
+    }
+
+    /// Check for one literal descendant in pinned, complete directory listings.
+    /// A failed command or malformed listing is never interpreted as absence.
+    pub(crate) async fn selected_node_at(
+        &self,
+        path: &str,
+        rev: i64,
+    ) -> Result<SelectedNode, SvnError> {
+        super::operand::validate_relative_path(path)?;
+        let bad = || SvnError::XmlParseError("incomplete or unexpected pinned SVN listing".into());
+        let mut parent = String::new();
+        let mut components = path.split('/').peekable();
+        while let Some(name) = components.next() {
+            let url = repository_url(&self.url, &parent)?;
+            let peg = literal_url(&url, Some(rev))?;
+            let xml = self
+                .run_svn(&[
+                    "list",
+                    "--xml",
+                    "--depth",
+                    "immediates",
+                    "-r",
+                    &rev.to_string(),
+                    "--",
+                    &peg,
+                ])
+                .await?;
+            let doc = roxmltree::Document::parse(&xml).map_err(|_| bad())?;
+            let root = doc.root_element();
+            let lists: Vec<_> = root.children().filter(|n| n.is_element()).collect();
+            let [list] = lists.as_slice() else {
+                return Err(bad());
+            };
+            if !root.has_tag_name("lists")
+                || !list.has_tag_name("list")
+                || list.attribute("path") != Some(url.as_str())
+            {
+                return Err(bad());
+            }
+            let mut children = std::collections::BTreeMap::new();
+            for e in list.children().filter(|n| n.is_element()) {
+                let names: Vec<_> = e.children().filter(|n| n.has_tag_name("name")).collect();
+                let [node] = names.as_slice() else {
+                    return Err(bad());
+                };
+                let child = node
+                    .text()
+                    .filter(|t| !t.is_empty() && !t.contains('/'))
+                    .ok_or_else(bad)?;
+                let kind = e
+                    .attribute("kind")
+                    .filter(|v| matches!(*v, "file" | "dir"))
+                    .ok_or_else(bad)?;
+                if !e.has_tag_name("entry") || children.insert(child, kind).is_some() {
+                    return Err(bad());
+                }
+            }
+            match children.get(name) {
+                None => return Ok(SelectedNode::Missing),
+                Some(&"file") => {
+                    return Ok(if components.peek().is_some() {
+                        SelectedNode::Missing
+                    } else {
+                        SelectedNode::File
+                    })
+                }
+                _ => {}
+            }
+            if !parent.is_empty() {
+                parent.push('/');
+            }
+            parent.push_str(name);
+        }
+        Ok(SelectedNode::Directory)
     }
 
     /// Import-scoped cancellation; ordinary sync clients remain unchanged.
@@ -452,6 +588,66 @@ impl SvnClient {
             destination,
         ])
         .await?;
+        Ok(())
+    }
+
+    /// A pinned empty-depth parent provides a disposable anchor for a
+    /// one-child visibility probe without fetching sibling contents.
+    pub(crate) async fn checkout_empty_pinned(
+        &self,
+        path: &Path,
+        rev: i64,
+    ) -> Result<(), SvnError> {
+        let destination = local_destination(path)?;
+        self.run_svn(&[
+            "checkout",
+            "--ignore-externals",
+            "--depth",
+            "empty",
+            "-r",
+            &rev.to_string(),
+            "--",
+            &literal_url(&self.url, Some(rev))?,
+            destination,
+        ])
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn probe_named_child(
+        &self,
+        path: &Path,
+        name: &str,
+        rev: i64,
+    ) -> Result<(), SvnError> {
+        super::operand::validate_relative_path(name)?;
+        if name.contains('/') {
+            return Err(SvnError::XmlParseError(
+                "expected one literal child of the pinned parent".into(),
+            ));
+        }
+        let operand = literal_path(name)?;
+        let result = self
+            .run_svn_at(
+                &[
+                    "update",
+                    "--ignore-externals",
+                    "--depth",
+                    "empty",
+                    "-r",
+                    &rev.to_string(),
+                    "--",
+                    &operand,
+                ],
+                Some(path),
+            )
+            .await?;
+        // Successful status or partial output alone is not an acknowledgement.
+        if result.trim_end() != format!("Updating '{name}':\nAt revision {rev}.") {
+            return Err(SvnError::XmlParseError(
+                "named-child SVN update did not complete as an unchanged pinned target".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -961,7 +1157,18 @@ impl SvnClient {
     // -- Internal helpers ----------------------------------------------------
 
     async fn run_svn(&self, args: &[&str]) -> Result<String, SvnError> {
+        self.run_svn_at(args, None).await
+    }
+
+    async fn run_svn_at(
+        &self,
+        args: &[&str],
+        for_named_child: Option<&Path>,
+    ) -> Result<String, SvnError> {
         let mut cmd = self.svn_command();
+        if let Some(path) = for_named_child {
+            cmd.current_dir(path).env("LC_ALL", "C.UTF-8");
+        }
         let (verb, rest) = args
             .split_first()
             .ok_or_else(|| SvnError::XmlParseError("missing SVN command".into()))?;
@@ -978,27 +1185,50 @@ impl SvnClient {
         cmd.args(rest);
         record_svn_diag(&cmd);
 
-        debug!(cmd = ?format!("svn {}", args.join(" ")), "running svn command");
-        let output = crate::process::run(cmd, SVN_COMMAND_TIMEOUT, self.cancel.as_ref())
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    SvnError::BinaryNotFound("svn".into())
-                } else {
-                    SvnError::IoError(e)
-                }
-            })?;
+        if self.https_visibility.is_some() {
+            debug!(verb, "running scoped HTTPS SVN command");
+        } else {
+            debug!(cmd = ?format!("svn {}", args.join(" ")), "running svn command");
+        }
+        let output = if let Some(pilot) = &self.https_visibility {
+            pilot.run(cmd).await?
+        } else {
+            crate::process::run(cmd, SVN_COMMAND_TIMEOUT, self.cancel.as_ref())
+                .await
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        SvnError::BinaryNotFound("svn".into())
+                    } else {
+                        SvnError::IoError(e)
+                    }
+                })?
+        };
 
         if !output.status.success() {
-            let stderr = self.command_stderr(&output.stderr);
+            let stderr = if self.https_visibility.is_some() {
+                let diagnostic = String::from_utf8_lossy(&output.stderr);
+                if diagnostic.contains("E230001") {
+                    "HTTPS SVN certificate verification refused".to_owned()
+                } else {
+                    "scoped HTTPS SVN command failed; current revision remains pending".to_owned()
+                }
+            } else {
+                self.command_stderr(&output.stderr)
+            };
             let exit_code = output.status.code().unwrap_or(-1);
             warn!(exit_code, %stderr, "svn command failed");
             return Err(SvnError::CommandFailed { exit_code, stderr });
         }
-        let stdout = if args
-            .iter()
-            .take_while(|arg| **arg != "--")
-            .any(|arg| *arg == "--xml")
+        if for_named_child.is_some() && !output.stderr.is_empty() {
+            return Err(SvnError::XmlParseError(
+                "named-child SVN update emitted diagnostics; absence unproved".into(),
+            ));
+        }
+        let stdout = if for_named_child.is_some()
+            || args
+                .iter()
+                .take_while(|arg| **arg != "--")
+                .any(|arg| *arg == "--xml")
         {
             String::from_utf8(output.stdout)
                 .map_err(|_| SvnError::XmlParseError("SVN XML output is not UTF-8".into()))?

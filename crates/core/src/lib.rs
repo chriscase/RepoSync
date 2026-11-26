@@ -32,6 +32,7 @@ pub mod pair_refresh;
 pub mod path_projection;
 pub mod pending_frontier;
 pub mod personal_config;
+pub mod personal_projection;
 pub mod process;
 pub mod skip_commit;
 pub mod snapshot;

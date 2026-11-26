@@ -96,6 +96,7 @@ impl SvnToGitSync {
     /// or verified no-target receipts). Marker text is diagnostic only.
     /// Already-synced revisions are skipped via `commit_map` / SVN→Git receipts.
     pub async fn sync(&self) -> Result<usize> {
+        reposync_core::personal_projection::admit_sync(&self.db, &self.config)?;
         if let Some(op) = self
             .db
             .active_personal_git_push_operation()
@@ -127,15 +128,38 @@ impl SvnToGitSync {
             None => 0,
         };
 
+        let scope = &self.config.options.allowed_paths;
+        let svn = if scope.is_empty() {
+            self.svn_client.clone()
+        } else {
+            reposync_core::personal_projection::scoped_source(
+                &self.svn_client,
+                &self.config.options,
+            )?
+        };
+        let profile = self
+            .config
+            .options
+            .network_directory_profile
+            .filter(|_| !scope.is_empty());
+        let cover_numbered_revisions = profile.is_some();
+        reposync_core::personal_projection::require_https_trust(&self.db, &svn)?;
         info!(watermark, "starting SVN-to-Git sync pass");
 
         // 2. Query SVN HEAD revision.
-        let svn_info = self
-            .svn_client
+        let svn_info = svn
             .info()
             .await
             .context("failed to get SVN repository info")?;
-        let head_rev = svn_info.latest_rev;
+        // Bound network checkout work without crossing unexamined revisions.
+        reposync_core::personal_projection::bind_https_source(&self.db, &svn, &svn_info)?;
+        let head_rev = if let Some(profile) = profile {
+            svn_info
+                .latest_rev
+                .min(watermark.saturating_add(profile.revision_limit()))
+        } else {
+            svn_info.latest_rev
+        };
 
         if head_rev <= watermark {
             debug!(head_rev, watermark, "SVN is up to date, nothing to sync");
@@ -148,25 +172,60 @@ impl SvnToGitSync {
             "found new SVN revisions to sync"
         );
 
+        if cover_numbered_revisions {
+            reposync_core::personal_projection::require_live_network_checkpoint(&svn, watermark)
+                .await
+                .context("scoped Personal network checkpoint admission refused")?;
+        }
+
         // 3. Fetch the log entries for the new revision range.
-        let log_entries = self
-            .svn_client
+        let log_entries = svn
             .log(watermark + 1, head_rev)
             .await
             .context("failed to fetch SVN log entries")?;
 
         let mut synced_count: usize = 0;
+        let revisions: Vec<_> = if cover_numbered_revisions {
+            let mut indexed = std::collections::BTreeMap::new();
+            for entry in &log_entries {
+                anyhow::ensure!(
+                    (watermark + 1..=head_rev).contains(&entry.revision)
+                        && indexed.insert(entry.revision, entry).is_none(),
+                    "invalid Personal SVN log range"
+                );
+            }
+            (watermark + 1..=head_rev)
+                .map(|rev| (rev, indexed.remove(&rev)))
+                .collect()
+        } else {
+            log_entries
+                .iter()
+                .map(|entry| (entry.revision, Some(entry)))
+                .collect()
+        };
+        let projection = if scope.is_empty() {
+            PERSONAL_NO_TARGET_PROJECTION.to_owned()
+        } else {
+            reposync_core::personal_projection::policy_snapshot(&self.config.options)
+        };
+        let mut previous = watermark;
         let echo_ctx = TeamEchoContext {
             db: self.db.as_ref(),
             repo_id: PERSONAL_REPO_ID,
-            no_target_projection: PERSONAL_NO_TARGET_PROJECTION,
+            no_target_projection: &projection,
         };
 
-        for entry in &log_entries {
-            let rev = entry.revision;
+        for (rev, entry) in revisions {
+            svn.require_visibility_budget()?;
+            let predecessor = previous;
+            previous = rev;
 
-            match classify_incoming_svn_revision_personal(&echo_ctx, rev, &entry.message)
-                .map_err(|e| anyhow::anyhow!(e))?
+            match classify_incoming_svn_revision_personal(
+                &echo_ctx,
+                rev,
+                entry.map_or("", |e| e.message.as_str()),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?
             {
                 EchoDisposition::SkipEcho => {
                     debug!(rev, "skipping echo SVN revision (repo-scoped receipt)");
@@ -193,15 +252,37 @@ impl SvnToGitSync {
             }
 
             // 5. Export the SVN revision to a temporary directory.
-            let export_dir = tempfile::tempdir()
-                .context("failed to create temporary directory for SVN export")?;
-
-            self.svn_client
-                .export("", rev, export_dir.path())
+            let export_dir = if scope.is_empty() {
+                let dir = tempfile::tempdir()?;
+                self.svn_client
+                    .export("", rev, dir.path())
+                    .await
+                    .with_context(|| format!("failed to export SVN revision r{rev}"))?;
+                dir
+            } else {
+                let Some(dir) = reposync_core::personal_projection::prepare(
+                    &svn,
+                    &self.db,
+                    &self.config.options,
+                    entry,
+                    rev,
+                    predecessor,
+                )
                 .await
-                .with_context(|| format!("failed to export SVN revision r{}", rev))?;
+                .with_context(|| format!("failed to project personal SVN r{rev}"))?
+                else {
+                    continue;
+                };
+                let git = self.git_client.lock().unwrap();
+                anyhow::ensure!(
+                    git.repo().statuses(None)?.is_empty(),
+                    "Personal scoped publication requires a clean Git checkout"
+                );
+                dir.into_export(git.repo_path(), &self.policy)?
+            };
 
             // 6. Copy exported files into the Git working tree (with policy).
+            svn.require_visibility_budget()?;
             let repo_path = {
                 let git_client = self.git_client.lock().unwrap();
                 git_client.repo_path().to_path_buf()
@@ -227,6 +308,9 @@ impl SvnToGitSync {
             .with_context(|| {
                 format!("independent SVN→Git projection verification failed for r{rev}")
             })?;
+
+            let entry =
+                entry.context("missing SVN metadata for a positive Personal publication")?;
 
             // 7. Format the commit message with metadata trailers.
             let commit_message =
@@ -267,10 +351,17 @@ impl SvnToGitSync {
                 let committer_email = author_email.clone();
                 let msg = commit_message.clone();
                 let gc = self.git_client.clone();
+                let scoped_lfs = !scope.is_empty() && self.policy.lfs_enabled();
 
                 tokio::task::spawn_blocking(move || {
                     let git_client = gc.lock().unwrap();
-                    git_client.commit(
+                    let commit = if scoped_lfs {
+                        GitClient::commit_via_cli
+                    } else {
+                        GitClient::commit
+                    };
+                    commit(
+                        &git_client,
                         &msg,
                         &author_name,
                         &author_email,
@@ -284,6 +375,11 @@ impl SvnToGitSync {
             };
 
             let sha_str = git_sha.to_string();
+            if !scope.is_empty() {
+                reposync_core::snapshot::verify_commit_matches_projection(
+                    export_dir.path(), &repo_path, &sha_str, &self.policy
+                ).context("scoped Personal Git commit differs from the verified projection; refusing publication")?;
+            }
             info!(rev, sha = %sha_str, "committed SVN revision as Git commit");
 
             let (intended_parent, intended_tree) = {

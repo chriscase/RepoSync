@@ -245,6 +245,18 @@ impl Default for CommitFormatConfig {
 /// Miscellaneous sync behaviour options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonalOptionsConfig {
+    /// SVN branch-relative prefixes selected by incremental Personal SVN→Git sync.
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+
+    /// Explicit opt-in to a qualified stock Subversion checkout proof.
+    #[serde(default)]
+    pub network_directory_profile: Option<NetworkDirectoryProfile>,
+
+    /// Explicit, independently provisioned CA PEM bundle for HTTPS proof.
+    #[serde(default)]
+    pub svn_tls_ca_file: Option<PathBuf>,
+
     /// Normalize CRLF to LF during sync.
     #[serde(default = "default_true")]
     pub normalize_line_endings: bool,
@@ -286,9 +298,35 @@ pub struct PersonalOptionsConfig {
     pub lfs_patterns: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkDirectoryProfile {
+    ApacheSvnserveWc31,
+    ApacheModDavSvnHttpsWc31,
+}
+
+impl NetworkDirectoryProfile {
+    pub fn matches_scheme(self, scheme: &str) -> bool {
+        matches!(
+            (self, scheme),
+            (Self::ApacheSvnserveWc31, "svn") | (Self::ApacheModDavSvnHttpsWc31, "https")
+        )
+    }
+
+    pub fn revision_limit(self) -> i64 {
+        match self {
+            Self::ApacheSvnserveWc31 => 32,
+            Self::ApacheModDavSvnHttpsWc31 => 8,
+        }
+    }
+}
+
 impl Default for PersonalOptionsConfig {
     fn default() -> Self {
         Self {
+            allowed_paths: Vec::new(),
+            network_directory_profile: None,
+            svn_tls_ca_file: None,
             normalize_line_endings: true,
             sync_executable_bit: true,
             max_file_size: 0,
@@ -386,6 +424,41 @@ impl PersonalConfig {
             });
         }
 
+        let profile = self.options.network_directory_profile;
+        let ca = self.options.svn_tls_ca_file.as_deref();
+        if !self.options.allowed_paths.is_empty() || profile.is_some() || ca.is_some() {
+            let transport = crate::svn::operand::checked_url(&self.svn.url).map_err(|e| {
+                ConfigError::InvalidValue {
+                    field: "svn.url".into(),
+                    detail: e.to_string(),
+                }
+            })?;
+            let profile_matches = match profile {
+                None => transport.scheme() == "file",
+                Some(profile) => profile.matches_scheme(transport.scheme()),
+            };
+            let trust_matches = match profile {
+                Some(NetworkDirectoryProfile::ApacheModDavSvnHttpsWc31) => {
+                    ca.is_some_and(Path::is_absolute)
+                }
+                _ => ca.is_none(),
+            };
+            if self.options.allowed_paths.is_empty() || !profile_matches || !trust_matches {
+                return Err(ConfigError::InvalidValue {
+                    field: "options.network_directory_profile".into(),
+                    detail: "scoped Personal sync requires file://, explicit apache_svnserve_wc31 for svn://, or explicit apache_mod_dav_svn_https_wc31 plus an absolute svn_tls_ca_file for https://; unsupported configuration held".into(),
+                });
+            }
+        }
+        for prefix in &self.options.allowed_paths {
+            crate::svn::operand::validate_relative_path(prefix.trim_end_matches('/')).map_err(
+                |e| ConfigError::InvalidValue {
+                    field: "options.allowed_paths".into(),
+                    detail: e.to_string(),
+                },
+            )?;
+        }
+
         // Fail-fast: sync_direct_pushes is not yet implemented in personal mode.
         if self.options.sync_direct_pushes {
             return Err(ConfigError::InvalidValue {
@@ -445,6 +518,10 @@ normalize_line_endings = true
 sync_executable_bit = true
 # max_file_size = 0         # 0 = no limit
 # ignore_patterns = []
+# allowed_paths = []        # incremental SVN→Git only when scoped
+# network_directory_profile = "apache_svnserve_wc31"  # qualified stock svn://
+# network_directory_profile = "apache_mod_dav_svn_https_wc31"  # qualified Apache DAV pilot
+# svn_tls_ca_file = "/absolute/path/to/trusted-ca.pem"
 # sync_externals = false
 # sync_direct_pushes = false
 auto_merge = true

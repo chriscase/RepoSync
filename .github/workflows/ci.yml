@@ -48,6 +48,9 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      - name: Personal filtered revision CLI qualification (#55)
+        run: python3 scripts/personal-filter-55.py --personal target/debug/reposync-personal --cli target/debug/reposync
+
       - name: Build core release
         run: cargo build --locked -p reposync-core --release
 

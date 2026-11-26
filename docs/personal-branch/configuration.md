@@ -406,3 +406,79 @@ For quick reference, here are all fields and their defaults:
 | `options.sync_direct_pushes` | `false` (not implemented — fails if set to true) |
 | `options.lfs_threshold` | `0` (LFS disabled) |
 | `options.lfs_patterns` | `[]` |
+
+
+### Incremental SVN→Git scope
+
+In an existing Personal mirror, set `allowed_paths = ["foo/"]` in `[options]`
+to select files under that branch-relative prefix. Prefixes match complete path
+components. An absent or empty list keeps the normal bidirectional behavior on mirrors that have never enabled scope. Once enabled, the mirror is bound to scoped operation: removing the option will hold sync and import, not silently widen publication. Use a separately prepared mirror for unrestricted operation.
+The existing file-size, ignore and LFS policy applies inside the selected paths.
+
+This incremental mode is **SVN→Git only**: it does not poll or replay merged
+PRs, and refuses snapshot and full import rather than silently importing
+the entire SVN tree. Start with an existing checkpoint and a clean checkout
+matching the selected SVN files. If the trees diverge, positive updates stop
+before copying or deleting anything; preserve the checkout and reconcile.
+Do not expect a change in scope to backfill previously handled revisions.
+
+A fully filtered revision advances the Personal SVN watermark but creates no
+Git commit, push, or PR and does not move the Git cursor. Use
+`reposync personal status` or `reposync personal log` to see the revision's
+filtered outcome or the SHA for a published commit.
+
+
+**Transport proof boundary.** Local `file://` supports directory scopes. Both
+network profiles are explicit stock Apache compatibility choices, not evidence
+that an account can see every path.
+
+- Stock `svnserve` over `svn://`: set
+  `network_directory_profile = "apache_svnserve_wc31"` in `[options]`.
+- Qualified Apache `mod_dav_svn` over direct `https://`: set
+  `network_directory_profile = "apache_mod_dav_svn_https_wc31"` and
+  `svn_tls_ca_file = "/absolute/path/to/trusted-ca.pem"` in `[options]`.
+  Supply an independently trusted PEM certificate bundle. The client copies
+  it from a canonical regular-file path (no symlink) to its private per-cycle
+  configuration, performs standard TLS hostname
+  and chain validation and neither uses ambient trust nor ignores TLS failures.
+  After a valid direct SVN response, the mirror binds the repository identity
+  and CA bytes. A replaced CA bundle, mismatched origin, or malformed input
+  holds; it is not automatically admitted. Restore the admitted CA or use a
+  new separately prepared mirror after an intentional trust transition.
+  Redirected DAV, `http://`, `svn+ssh://`, unqualified servers and unknown WC
+  layouts are outside the profile. RepoSync compares the returned identity
+  to the configured direct URL before accepting evidence. It does not
+  intercept redirects in the SVN transport or promise that redirect traffic
+  cannot occur; configure a canonical endpoint that does not redirect.
+
+Full-depth checkouts are pinned independently at adjacent endpoints. Both
+must agree with complete WC31 metadata: excluded, switched, sparse or
+incomplete nodes hold the current revision. A separate export must agree
+with proved paths, bytes and modes before the Git writer can use it. A
+missing path is proved only by a pristine depth-empty parent and exact
+single-child update; no sibling contents are fetched and no parent above the
+configured SVN branch is read. An empty listing is not absence. In Apache DAV,
+a denied child can produce the same successful update message as an absent one
+but leaves a `server-excluded` WC31 row; RepoSync requires unchanged pristine
+metadata as well as the exact acknowledgment.
+
+**Fixed work limits.** Each `svn://` cycle examines at most 32 consecutive
+revision numbers and uses the existing five-minute per-command SVN deadline.
+HTTPS examines at most 8 consecutive numbers, with 30 seconds per SVN
+command and a 90-second planning budget shared across the cycle. HTTPS
+subprocesses on the qualified Unix profile have at most 64 MiB per written
+file, and command capture admits at most 16 MiB stdout and 1 MiB stderr.
+SVN subprocess temp files are directed to the same owned planning scratch.
+Owned private planning scratch is checked every 250 ms while commands run and
+at stage boundaries; 512 MiB or 25,000 entries stops planning. This is a
+sampled aggregate guard, not a filesystem quota: a write can grow between
+checks. The 90-second limit is a planning deadline, not a deadline for
+cleanup or an already journaled Git push. Each uncached revision can require
+multiple complete checkouts and exports and additional nested-lineage reads.
+
+A branch log can omit unrelated revisions. The cursor cannot jump over an
+unseen number without matched, independently proved selected endpoints.
+Missing log metadata cannot authorize a changed Git tree. A timeout, trust
+failure or unresolved proof leaves the current revision pending, preserves
+already confirmed earlier revisions, and stops later ones. Catch-up resumes
+at the next number on a later cycle.
