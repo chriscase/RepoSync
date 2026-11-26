@@ -193,6 +193,7 @@ pub struct SyncEngine {
     allowed_paths: Vec<String>,
     /// Blocked path patterns for Git-to-SVN sync. Empty means no blocked patterns.
     blocked_patterns: Vec<String>,
+    team_prefix_rewrite: Option<crate::path_projection::TeamPrefixRewrite>,
     /// Fixture-only replay batch cap override (debug builds).
     #[cfg(debug_assertions)]
     pending_commit_cap_override: std::sync::Mutex<Option<usize>>,
@@ -624,6 +625,7 @@ impl SyncEngine {
             lfs_threshold_bytes: 0,
             allowed_paths: Vec::new(),
             blocked_patterns: Vec::new(),
+            team_prefix_rewrite: None,
             #[cfg(debug_assertions)]
             pending_commit_cap_override: std::sync::Mutex::new(None),
             #[cfg(debug_assertions)]
@@ -782,6 +784,31 @@ impl SyncEngine {
     pub fn set_path_rules(&mut self, allowed: Vec<String>, blocked: Vec<String>) {
         self.allowed_paths = allowed;
         self.blocked_patterns = blocked;
+    }
+
+    pub fn set_team_path_rewrite(
+        &mut self,
+        policy: crate::db::team_path_rewrite::TeamRewritePolicy,
+    ) {
+        self.set_path_rules(policy.allowed, policy.blocked);
+        self.team_prefix_rewrite = Some(policy.rule);
+    }
+
+    fn map_git_inputs_for_svn(
+        &self,
+        inputs: Vec<GitToSvnInputChange>,
+    ) -> Result<Vec<GitToSvnInputChange>, SyncError> {
+        let Some(rule) = &self.team_prefix_rewrite else {
+            return Ok(inputs);
+        };
+        inputs
+            .into_iter()
+            .map(|input| {
+                rule.map_git_input(input).map_err(|e| {
+                    SyncError::GitError(crate::errors::GitError::ApplyFailed(e.into()))
+                })
+            })
+            .collect()
     }
 
     /// Return the kv_state key for the last SVN revision watermark.
@@ -1756,7 +1783,11 @@ impl SyncEngine {
     }
 
     fn no_target_projection(&self) -> String {
-        serde_json::json!({"allowed_paths": self.allowed_paths, "blocked_patterns": self.blocked_patterns}).to_string()
+        crate::db::team_path_rewrite::policy_snapshot(
+            &self.allowed_paths,
+            &self.blocked_patterns,
+            self.team_prefix_rewrite.as_ref().map(|rule| rule.prefix()),
+        )
     }
 
     /// Accept compact `"{}"` baselines when path rules are unfiltered (legacy fixtures).
@@ -4017,7 +4048,7 @@ impl SyncEngine {
             // verification, journal, and receipts below consume this same
             // included set.
             let mut projected = project_git_to_svn_changeset(
-                raw_inputs,
+                self.map_git_inputs_for_svn(raw_inputs)?,
                 &self.allowed_paths,
                 &self.blocked_patterns,
             )
@@ -4088,6 +4119,19 @@ impl SyncEngine {
                     if item.action == "D" {
                         continue;
                     }
+                    let git_path = if let Some(rule) = &self.team_prefix_rewrite {
+                        rule.to_git(&item.path)
+                            .map_err(|e| {
+                                SyncError::GitError(crate::errors::GitError::ApplyFailed(e.into()))
+                            })?
+                            .ok_or_else(|| {
+                                SyncError::GitError(crate::errors::GitError::ApplyFailed(
+                                    "SVN projected path has no inverse Git path".into(),
+                                ))
+                            })?
+                    } else {
+                        &item.path
+                    };
                     #[cfg(debug_assertions)]
                     let bridge = git.repo_path().display().to_string();
                     #[cfg(debug_assertions)]
@@ -4095,22 +4139,22 @@ impl SyncEngine {
                         self.git_blob_reads_recorded
                             .lock()
                             .unwrap()
-                            .push(item.path.clone());
+                            .push(git_path.to_owned());
                     }
                     #[cfg(debug_assertions)]
-                    let read = if self.git_content_read_test_fault_matches(
-                        &change.sha,
-                        &bridge,
-                        &item.path,
-                    ) {
-                        Err(crate::errors::GitError::RefNotFound(item.path.clone()))
-                    } else {
-                        git.get_file_content_at_commit(&change.sha, &item.path)
-                    };
+                    let read =
+                        if self.git_content_read_test_fault_matches(&change.sha, &bridge, git_path)
+                        {
+                            Err(crate::errors::GitError::RefNotFound(git_path.to_owned()))
+                        } else {
+                            git.get_file_content_at_commit(&change.sha, git_path)
+                        };
                     #[cfg(not(debug_assertions))]
-                    let read = git.get_file_content_at_commit(&change.sha, &item.path);
+                    let read = git.get_file_content_at_commit(&change.sha, git_path);
                     item.content = Some(read.map_err(SyncError::GitError)?.ok_or_else(|| {
-                        SyncError::GitError(crate::errors::GitError::RefNotFound(item.path.clone()))
+                        SyncError::GitError(crate::errors::GitError::RefNotFound(
+                            git_path.to_owned(),
+                        ))
                     })?);
                     if item.content.as_deref().is_some_and(|bytes| {
                         bytes.starts_with(b"version https://git-lfs.github.com/spec/v1")
@@ -4132,7 +4176,7 @@ impl SyncEngine {
                         }
                         let source = format!("--source={}", change.sha);
                         let attributes = sync_git_command_output(git.repo_path(),
-                            &["check-attr", "-z", &source, "--all", "--", &item.path],
+                            &["check-attr", "-z", &source, "--all", "--", git_path],
                             Duration::from_secs(5), None)
                             .filter(|output| output.status.success())
                             .ok_or_else(|| self.record_history_block("unsupported_git_semantics",
@@ -4147,7 +4191,7 @@ impl SyncEngine {
                                 .0
                                 .iter()
                                 .any(|record| {
-                                    record[0] != item.path.as_bytes() || record[1].is_empty()
+                                    record[0] != git_path.as_bytes() || record[1].is_empty()
                                 })
                         {
                             return Err(self.record_history_block(
@@ -4206,8 +4250,21 @@ impl SyncEngine {
             {
                 let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
                 for (_, path, _) in &file_contents {
+                    let git_path = if let Some(rule) = &self.team_prefix_rewrite {
+                        rule.to_git(path)
+                            .map_err(|e| {
+                                SyncError::GitError(crate::errors::GitError::ApplyFailed(e.into()))
+                            })?
+                            .ok_or_else(|| {
+                                SyncError::GitError(crate::errors::GitError::ApplyFailed(
+                                    "SVN projected path has no inverse Git path".into(),
+                                ))
+                            })?
+                    } else {
+                        path
+                    };
                     let (previous, current) = git
-                        .changed_entry_modes(&change.sha, path)
+                        .changed_entry_modes(&change.sha, git_path)
                         .map_err(SyncError::GitError)?;
                     if (previous.is_none() && current.is_none())
                         || previous
@@ -5556,6 +5613,7 @@ impl SyncEngine {
                     rename_from: f.rename_from.clone(),
                 })
                 .collect();
+            let raw_inputs = self.map_git_inputs_for_svn(raw_inputs)?;
             let projected = project_git_to_svn_changeset(
                 raw_inputs.clone(),
                 &self.allowed_paths,

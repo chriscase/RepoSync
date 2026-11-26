@@ -9,7 +9,7 @@ On `epic/reposync-partial-52`, a team can limit which paths its **scheduled Team
 | Limit writes back to SVN, keeping paths such as `team/readme.md` | Set the team repository policy below. |
 | Filter new SVN edits under `team/` after import | Set the same Team policy. A mixed revision publishes only selected content. A fully excluded revision advances the processing watermark without creating a Git commit. |
 | Give Git readers only `team/`, or split a Git monorepo into several repositories | Subset export and Git repository splitting are unavailable. |
-| Put SVN's `trunk/team/readme.md` at Git's root as `readme.md` | The receiver has no `path_rewrite_rules` setting. It cannot remap paths, including LFS paths, or rewrite existing history. |
+| Put SVN's `trunk/team/readme.md` at Git's root as `readme.md` | Use a new direct Team registration and [one strip-prefix rewrite](#flatten-one-subtree-on-a-fresh-team-mirror-57). Existing history and LFS paths are not rewritten. |
 | Use the same policy with `reposync personal` | Personal mode supports branch sync. Its config has no subset-policy fields and its outbound engine uses empty path rules. [Personal configuration](../crates/core/src/personal_config.rs) · [Personal Git→SVN implementation](../crates/personal/src/git_to_svn.rs) |
 
 ## Configure a team repository
@@ -80,3 +80,33 @@ The inbound fixtures cover a mixed revision, a fully filtered revision across re
 - **Why did my Git push drop files on the SVN side?** Inspect the source commit with `git show --name-status -M <sha>` in the local Git clone. In the repository's audit log, or in `reposync --config <local-config.toml> audit --limit 30` on the fixture host, look for `path_violation_filtered` (some paths excluded) or `path_violation_skipped` (all excluded). Compare the SVN revision with `svnlook changed -r <revision> <local-svn-repository>`. A filter event explains path selection. Check the resulting SVN revision or sync record to confirm publication.
 - **Why is my SVN file missing in Git?** Check the registered SVN branch, import completion, snapshot revision if applicable, and subsequent sync records. Verify the path on the destination branch with `git ls-tree -r --name-only main` in the local clone at the received revision. For subsequent scheduled changes, check the active rules and the `svn_to_git_filtered` event. A missing or ambiguous diff, or a selected executable/symlink property change, can hold the revision for inspection. Widening the policy does not replay earlier revisions.
 - **Why has this repository stopped syncing?** A malformed stored list makes the scheduler refuse that repository. Look for the field name and `refusing repository sync` in daemon logs. Use the editor's **Replace with a new list** or an intentional **Clear** and verify the reread. If the editor says the policy is unavailable, check which server build answered. If a conflict is holding the pair, inspect the source paths and revisions in **Conflicts** before resolving it. [Conflict workflow](conflict-resolution.md)
+
+### Flatten one subtree on a fresh Team mirror (#57)
+
+For a direct root Team pair with an empty Git destination, you can save one
+strip-prefix rewrite while the registration is disabled. In the authenticated
+repository settings API (`PUT /api/repos/{id}`), submit
+`path_rewrite_rules: "[{\"strip_prefix\":\"src/teams/foo/\"}]"` alongside a
+nonempty `allowed_paths` list fully contained under that directory. Each
+prefix is relative to the paired SVN branch, not the SVN server root.
+
+Use **Snapshot at pinned SVN revision** to initialize the mirror. The
+scheduler refuses to start without a completed matching projected snapshot;
+an existing nonempty or unprojected Git destination is not migrated in place.
+Use a new registration and destination instead. Automatic conflict merging, full-history import, child
+registrations, Personal mode and LFS path rewriting are not part of this
+workflow.
+
+The filter is evaluated in the original SVN path namespace before stripping.
+For example, `src/teams/foo/bar.c` appears as `bar.c` in Git. A Git update to
+`bar.c` is interpreted as `src/teams/foo/bar.c` before the same SVN-side scope
+check. Paths outside the prefix have no identity mapping into the new Git
+namespace, so an out-of-scope `bar.c` cannot collide with the selected file.
+Multiple rules, invalid relative paths and allowed prefixes extending outside
+the rewrite directory are rejected.
+
+SVN copies and moves are allowed through ordinary filtering only when both
+endpoints can be proved disjoint from the selected subtree, including its
+ancestors. Other cases, including cross-boundary renames, hold for operator review; the scheduler
+does not pick an endpoint, advance the SVN cursor, or publish half of a move.
+A copy/move on a pair without rewriting keeps the pre-existing policy.

@@ -1327,6 +1327,7 @@ impl QualifiedPair {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -6909,6 +6910,7 @@ async fn candidate_rs05_two_repos_equal_revision_import_completion_scoped() {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -6984,6 +6986,7 @@ async fn candidate_rs05_global_svn_watermark_not_adopted_without_scoped_state() 
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -7122,6 +7125,7 @@ async fn candidate_rs05_columns_only_watermark_backfill_becomes_verified() {
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -7188,6 +7192,7 @@ async fn candidate_rs05_global_recovery_columns_only_does_not_mint_scoped_state(
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -7281,6 +7286,7 @@ async fn candidate_rs05_scoped_svn_checkpoint_disagreement_stays_blocked() {
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -7361,6 +7367,7 @@ async fn candidate_rs05_fetch_svn_changes_global_watermark_fails_closed() {
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -7534,6 +7541,7 @@ async fn candidate_rs05_fetch_svn_changes_missing_scoped_one_repo_other_syncs() 
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -7819,6 +7827,7 @@ async fn candidate_rs05_fetch_git_changes_missing_scoped_one_repo_other_syncs() 
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -8044,6 +8053,7 @@ async fn candidate_rs05_get_status_scoped_git_cursor_ignores_global() {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -8158,6 +8168,7 @@ async fn candidate_rs05_get_status_scoped_svn_cursor_ignores_global() {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -8394,6 +8405,7 @@ async fn candidate_rs05_import_baseline_pending_isolated_per_repo_status() {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -8593,6 +8605,7 @@ async fn candidate_rs05_team_terminal_sync_state_isolated_per_repo() {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -8756,6 +8769,7 @@ async fn candidate_rs05_unscoped_status_aggregates_worst_repo_state() {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -13822,6 +13836,7 @@ impl TwoRepoCredentialFixture {
                 total_errors: 0,
                 allowed_paths: None,
                 blocked_patterns: None,
+                path_rewrite_rules: None,
                 consecutive_errors: 0,
                 teams_webhook_url: None,
             })
@@ -14185,6 +14200,7 @@ async fn candidate_rs11_parent_revocation_blocks_global_for_child() {
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -14216,6 +14232,7 @@ async fn candidate_rs11_parent_revocation_blocks_global_for_child() {
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -14300,6 +14317,7 @@ fn rs11_embedded_git_fixture(embedded_token: &str) -> (TempDir, PathBuf, PathBuf
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -14485,6 +14503,7 @@ async fn candidate_rs11_startup_config_remote_ignores_managed_chain() {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -14663,6 +14682,7 @@ async fn candidate_rs11_startup_child_revocation_preserved() {
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -14694,6 +14714,7 @@ async fn candidate_rs11_startup_child_revocation_preserved() {
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -15047,6 +15068,7 @@ async fn candidate_rs05_late_pair_bc_pending_isolation() {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })
@@ -16330,6 +16352,7 @@ async fn candidate_rsc02_ambiguous_null_repo_id_surfaces_row_ids() {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         })

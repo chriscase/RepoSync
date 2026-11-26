@@ -467,6 +467,7 @@ async fn repo_import_handler_persists_failure_on_the_admitted_database() {
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -711,6 +712,7 @@ async fn resume_handler_shows_unpersisted_failure_when_terminal_write_fails_once
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -933,6 +935,7 @@ async fn resume_status_ignores_previous_attempt_error_then_shows_current_failure
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -1155,6 +1158,7 @@ async fn credential_http_state(
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -1606,6 +1610,7 @@ async fn resume_preparation_failure_keeps_authorization_then_continues() {
         total_errors: 0,
         allowed_paths: None,
         blocked_patterns: None,
+        path_rewrite_rules: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
     })
@@ -2179,6 +2184,7 @@ mod pr245_original_http_acceptance {
             total_errors: 0,
             allowed_paths: None,
             blocked_patterns: None,
+            path_rewrite_rules: None,
             consecutive_errors: 0,
             teams_webhook_url: None,
         };

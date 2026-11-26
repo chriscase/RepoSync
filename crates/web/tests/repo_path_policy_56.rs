@@ -67,6 +67,7 @@ fn policy_repo(id: &str, allowed: Option<&str>, blocked: Option<&str>) -> Reposi
         total_errors: 2,
         allowed_paths: allowed.map(Into::into),
         blocked_patterns: blocked.map(Into::into),
+        path_rewrite_rules: None,
         consecutive_errors: 1,
         teams_webhook_url: Some("https://hooks.example.invalid/rs56".into()),
     }
