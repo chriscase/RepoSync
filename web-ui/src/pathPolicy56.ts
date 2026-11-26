@@ -2,7 +2,7 @@ import type { Repository } from './api';
 
 /**
  * #56 repository path policy: typed read, editor draft, PUT serialization,
- * inline validation and a Git→SVN preview.
+ * inline validation and a bidirectional preview.
  *
  * - Reads come only from `path_policy`. The raw `allowed_paths` /
  *   `blocked_patterns` fields are write-only; a missing or unrecognised read is
@@ -12,8 +12,8 @@ import type { Repository } from './api';
  * - Validation mirrors crates/web/src/api/repo_path_policy_56.rs (same codes,
  *   same order). The preview ports reposync_core::path_projection
  *   (normalize_policy_path, path_matches_prefix, path_matches_blocked,
- *   path_is_projected and the exclusion_message order). Rewriting is not
- *   modelled because the engine does not rewrite paths.
+ *   path_is_projected and the exclusion_message order). TeamPrefixRewrite
+ *   is applied before outbound filtering and after inbound filtering.
  */
 
 export type PolicyFieldKey = 'allowed_paths' | 'blocked_patterns';
@@ -46,6 +46,7 @@ export interface PathPolicyDraft {
   inboundFiltering: InboundFiltering;
   allowed_paths: PolicyFieldDraft;
   blocked_patterns: PolicyFieldDraft;
+  rewrite: { origin: 'unsupported' | 'unset' | 'configured' | 'malformed' | 'unknown'; saved: string; mode: PolicyMode; prefix: string };
   /** Visible notes, e.g. a recovered draft clear that was deliberately not restored. */
   notices: string[];
 }
@@ -80,7 +81,7 @@ export function readPolicyField(read: unknown): PolicyOrigin {
   return { kind: 'unavailable', reason: UNRECOGNISED };
 }
 
-export function readRepositoryPathPolicy(repo: Pick<Repository, 'path_policy'> | null | undefined): Record<PolicyFieldKey, PolicyOrigin> {
+export function readRepositoryPathPolicy(repo: Pick<Repository, 'path_policy' | 'path_rewrite_prefix'> | null | undefined): Record<PolicyFieldKey, PolicyOrigin> {
   const policy: unknown = repo?.path_policy;
   if (!policy || typeof policy !== 'object' || (policy as { version?: unknown }).version !== 1) {
     const origin: PolicyOrigin = { kind: 'unavailable', reason: UNAVAILABLE };
@@ -91,7 +92,7 @@ export function readRepositoryPathPolicy(repo: Pick<Repository, 'path_policy'> |
 }
 
 /** True only for known, non-empty lists (the server hook treats malformed as no rules). */
-export function pathPolicyHasRules(repo: Pick<Repository, 'path_policy'> | null | undefined): boolean {
+export function pathPolicyHasRules(repo: Pick<Repository, 'path_policy' | 'path_rewrite_prefix'> | null | undefined): boolean {
   const read = readRepositoryPathPolicy(repo);
   return POLICY_FIELDS.some(field => { const origin = read[field]; return origin.kind === 'known' && origin.entries.length > 0; });
 }
@@ -106,8 +107,8 @@ function keepDraft(origin: PolicyOrigin): PolicyFieldDraft {
  * NOT restored as a clear, because drafts written before #56 recorded `null`
  * whenever the old editor could not read the policy.
  */
-export function pathPolicyDraft(repo: Pick<Repository, 'path_policy'> | null | undefined,
-  recovered?: Partial<Record<PolicyFieldKey, string | null | undefined>>): PathPolicyDraft {
+export function pathPolicyDraft(repo: Pick<Repository, 'path_policy' | 'path_rewrite_prefix'> | null | undefined,
+  recovered?: Partial<Pick<Repository, PolicyFieldKey | 'path_rewrite_rules'>>): PathPolicyDraft {
   const read = readRepositoryPathPolicy(repo);
   const notices: string[] = [];
   const field = (key: PolicyFieldKey): PolicyFieldDraft => {
@@ -132,7 +133,31 @@ export function pathPolicyDraft(repo: Pick<Repository, 'path_policy'> | null | u
       inboundFiltering = 'not_applied';
     }
   }
-  return { allowed_paths: field('allowed_paths'), blocked_patterns: field('blocked_patterns'), inboundFiltering, notices };
+  const reportedPrefix = repo?.path_rewrite_prefix;
+  const supported = policy?.version === 1 && policy.rewrite_editor === 'single_strip_prefix_v1';
+  const rewriteOrigin = policy?.version !== 1 ? 'unknown'
+    : policy.path_rewriting === 'malformed' ? 'malformed'
+    : policy.path_rewriting === 'single_prefix_projected_snapshot'
+      ? typeof reportedPrefix === 'string' && !canonicalRewritePathProblem(reportedPrefix) ? 'configured' : 'unknown'
+      : policy.path_rewriting === 'none_read_only' ? 'unset' : 'unknown';
+  const rewrite: PathPolicyDraft['rewrite'] = {
+    origin: !supported && rewriteOrigin === 'unset' ? 'unsupported' : rewriteOrigin,
+    saved: rewriteOrigin === 'configured' ? reportedPrefix as string : '',
+    mode: 'keep', prefix: '',
+  };
+  rewrite.prefix = rewrite.saved;
+  if (supported && rewrite.origin !== 'unknown' && recovered?.path_rewrite_rules !== undefined) {
+    let entries: unknown;
+    try { entries = JSON.parse(recovered.path_rewrite_rules); } catch { entries = undefined; }
+    if (!Array.isArray(entries) || entries.length > 1
+        || (entries.length === 1 && typeof entries[0]?.strip_prefix !== 'string')) {
+      throw new Error('The recovered path rewrite draft could not be read. Review the current settings before saving.');
+    }
+    rewrite.mode = entries.length ? 'edit' : 'clear';
+    rewrite.prefix = entries[0]?.strip_prefix ?? '';
+  }
+  if (!supported && rewrite.origin !== 'unsupported') rewrite.origin = 'unknown';
+  return { rewrite, allowed_paths: field('allowed_paths'), blocked_patterns: field('blocked_patterns'), inboundFiltering, notices };
 }
 
 function sameEntries(left: string[], right: string[]): boolean {
@@ -148,13 +173,51 @@ export function submittedPolicyValue(draft: PolicyFieldDraft): string | null | u
 }
 
 /** The policy part of a repository PUT body. Only explicitly changed fields appear. */
-export function pathPolicyConfiguration(draft: PathPolicyDraft): Partial<Record<PolicyFieldKey, string | null>> {
-  const output: Partial<Record<PolicyFieldKey, string | null>> = {};
+export function pathPolicyConfiguration(draft: PathPolicyDraft): Partial<Pick<Repository, PolicyFieldKey | 'path_rewrite_rules'>> {
+  const output: Partial<Pick<Repository, PolicyFieldKey | 'path_rewrite_rules'>> = {};
+  const rule = submittedRewrite(draft);
+  if (rule !== undefined) output.path_rewrite_rules = rule;
   for (const field of POLICY_FIELDS) {
     const value = submittedPolicyValue(draft[field]);
     if (value !== undefined) output[field] = value;
   }
   return output;
+}
+
+
+/** Match TeamPrefixRewrite: one trailing delimiter is permitted in a rule, not in a file path. */
+export function canonicalRewritePathProblem(value: string): boolean {
+  return ['\\', ':', '\0', '\r', '\n', '\t'].some(character => value.includes(character))
+    || value.split('/').some(part => !part || part === '.' || part === '..' || /^\.[gG][iI][tT]$/.test(part));
+}
+export function submittedRewrite(draft: PathPolicyDraft): string | undefined {
+  const {origin, saved, mode, prefix} = draft.rewrite;
+  if (origin === 'unknown' || origin === 'unsupported' || mode === 'keep') return undefined;
+  if (mode === 'clear') return '[]';
+  const normalized = prefix.replace(/\/$/, '');
+  return origin === 'configured' && normalized === saved ? undefined : JSON.stringify([{ strip_prefix: prefix }]);
+}
+
+export function effectiveRewrite(draft: PathPolicyDraft, allowed: string[]): {prefix: string | null; problem?: string} {
+  const { mode, saved, prefix, origin } = draft.rewrite;
+  if (mode === 'clear' || (mode === 'keep' && (origin === 'unset' || origin === 'unsupported'))) return {prefix: null};
+  if (mode === 'keep' && (origin === 'unknown' || origin === 'malformed')) return {prefix: null, problem: 'The effective rewrite policy is not available. The preview cannot safely predict the target path.'};
+  const effective = (mode === 'keep' ? saved : prefix).replace(/\/$/, '');
+  if (canonicalRewritePathProblem(effective)) return {prefix: null, problem: 'Use a canonical relative SVN directory, for example teams/alpha.'};
+  if (!allowed.length || allowed.some(entry => {
+    const allowedPrefix = entry.replace(/\/$/, '');
+    return canonicalRewritePathProblem(allowedPrefix) || !(allowedPrefix === effective || allowedPrefix.startsWith(effective + '/'));
+  })) return {prefix: null, problem: 'Add an explicit allowed scope. Every allowed prefix must be a canonical path inside the strip prefix.'};
+  return {prefix: effective};
+}
+
+export function previewMappedPath(path: string, allowed: string[], blocked: string[], prefix: string | null, inbound: boolean) {
+  if (!prefix) return {...previewPath(path, allowed, blocked), target: path};
+  if (canonicalRewritePathProblem(path)) return {path, included: false, reason: null, target: '', invalid: true};
+  const svn = inbound ? path : `${prefix}/${path}`;
+  const selected = previewPath(svn, allowed, blocked);
+  const target = inbound ? (svn.startsWith(prefix + '/') ? svn.slice(prefix.length + 1) : '') : svn;
+  return {...selected, path, included: selected.included && !!target, target, invalid: false};
 }
 
 export function normalizePolicyPath(path: string): string {

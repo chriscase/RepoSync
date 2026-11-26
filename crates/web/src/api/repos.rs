@@ -664,8 +664,7 @@ async fn update_repo(
         existing.path_rewrite_rules.as_deref().unwrap_or("[]"),
         existing.allowed_paths.as_deref(),
         existing.blocked_patterns.as_deref(),
-    )
-    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    );
     let proposed_rewrite = reposync_core::db::team_path_rewrite::TeamRewritePolicy::parse(
         proposed_rules,
         body.allowed_paths
@@ -678,7 +677,10 @@ async fn update_repo(
             .as_deref(),
     )
     .map_err(|e| AppError::BadRequest(e.to_string()))?;
-    if current_rewrite != proposed_rewrite
+    if current_rewrite
+        .as_ref()
+        .ok()
+        .is_none_or(|current| current != &proposed_rewrite)
         && (existing.enabled
             || existing.last_svn_rev != 0
             || !existing.last_git_sha.is_empty()
@@ -699,7 +701,7 @@ async fn update_repo(
             "Team path rewrite currently supports direct root pairs without automatic conflict merges or LFS rewriting".into(),
         ));
     }
-    if current_rewrite.is_some()
+    if current_rewrite.as_ref().is_ok_and(Option::is_some)
         && (existing.last_svn_rev != 0 || !existing.last_git_sha.is_empty())
         && (body
             .svn_url

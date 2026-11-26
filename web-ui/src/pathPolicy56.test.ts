@@ -6,7 +6,7 @@ import {
   addPolicyEntry, beginPolicyEdit, clearPolicyField, effectivePathPolicy, hasSurroundingWhitespace, parsePreviewPaths, pathPolicyConfiguration,
   pathPolicyDraft, pathPolicyHasRules, pathPolicyIssues, pathPolicyIssueSummary, policyEntryIssue, policyFieldIssues,
   policyFieldSummary, policyFieldWarnings, previewPath, readRepositoryPathPolicy, removePolicyEntry, undoPolicyField,
-  updatePolicyEntry,
+  updatePolicyEntry, effectiveRewrite, previewMappedPath,
 } from './pathPolicy56';
 
 const LIMITS = { enforced_direction: 'git_to_svn', svn_to_git_filtering: 'not_applied', path_rewriting: 'none_read_only' } as const;
@@ -252,5 +252,44 @@ describe('#56 preview matches the engine projection', () => {
     expect(pathPolicyHasRules(lists([], []))).toBe(false);
     expect(pathPolicyHasRules(repo({ version: 1, ...LIMITS, allowed_paths: malformed, blocked_patterns: { state: 'unset' } }))).toBe(false);
     expect(pathPolicyHasRules(repo(undefined))).toBe(false);
+  });
+});
+
+
+describe('single strip-prefix policy', () => {
+  const shape = { version: 1, ...LIMITS,
+    allowed_paths: {state: 'list', entries:['teams/alpha']}, blocked_patterns: {state: 'list', entries:['*.exe']},
+    rewrite_editor: 'single_strip_prefix_v1',
+  };
+  it('keeps, replaces, recovers, and explicitly clears through the save allowlist', () => {
+    const read = repo({...shape, path_rewriting: 'single_prefix_projected_snapshot'}, {path_rewrite_prefix: 'teams/alpha'});
+    const draft = pathPolicyDraft(read);
+    expect(pathPolicyConfiguration(draft)).toEqual({});
+    const clear = pathPolicyDraft(read, { path_rewrite_rules: '[]' });
+    expect(publicConfiguration(pathPolicyConfiguration(clear))).toEqual({path_rewrite_rules:'[]'});
+    const replace = pathPolicyDraft(read, { path_rewrite_rules: '[{"strip_prefix":"teams/beta"}]' });
+    expect(pathPolicyConfiguration(replace)).toEqual({path_rewrite_rules:'[{"strip_prefix":"teams/beta"}]'});
+    expect(effectiveRewrite(replace, ['teams/alpha']).problem).toContain('inside the strip prefix');
+    expect(effectiveRewrite(replace, ['teams/beta/']).prefix).toBe('teams/beta');
+    const old = pathPolicyDraft(repo({...shape, rewrite_editor: undefined}), {path_rewrite_rules:'[]'});
+    expect(pathPolicyConfiguration(old)).toEqual({});
+  });
+  it('uses the same SVN coordinates for allow/block and reports the mapped filename', () => {
+    const allowed = ['teams/alpha'];
+    const blocked = ['*.exe', 'teams/alpha/private'];
+    const prefix = 'teams/alpha';
+    for (const [path, inbound, target] of [
+      ['src/a.rs', false, 'teams/alpha/src/a.rs'],
+      ['teams/alpha/src/a.rs', true, 'src/a.rs'],
+      ['tools/bad.exe', false, ''],
+      ['teams/alpha/private/a.rs', true, ''],
+      ['teams/alpha-other/a.rs', true, ''],
+      ['../a.rs', false, ''],
+      ['teams/alpha', true, ''],
+    ] as const) {
+      const result = previewMappedPath(path, allowed, blocked, prefix, inbound);
+      expect(result.included, path).toBe(!!target);
+      if (target) expect(result.target).toBe(target);
+    }
   });
 });

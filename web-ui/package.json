@@ -10,6 +10,7 @@
     "lint": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "test:path-policy:e2e": "node --test --test-concurrency=1 tests/path-policy-56.e2e.mjs",
     "test:a11y": "node --test --test-concurrency=1 a11y/flows.test.mjs",
     "test:a11y:serve": "node a11y/serve.mjs"
   },

@@ -65,8 +65,9 @@ pub(crate) struct RepoPathPolicyRead {
     pub enforced_direction: &'static str,
     /// Scope of inbound filtering. Imports and existing Git history are outside this capability.
     pub svn_to_git_filtering: &'static str,
-    /// Included paths keep their branch-relative path; rewriting is not editable.
+    /// Effective rewrite state; older readers can ignore the additional capability.
     pub path_rewriting: &'static str,
+    pub rewrite_editor: &'static str,
 }
 
 pub(crate) fn read_field(stored: Option<&str>) -> PolicyFieldRead {
@@ -91,6 +92,7 @@ pub(crate) fn read_policy(allowed: Option<&str>, blocked: Option<&str>) -> RepoP
         enforced_direction: "bidirectional",
         svn_to_git_filtering: "managed_incremental",
         path_rewriting: "none_read_only",
+        rewrite_editor: "single_strip_prefix_v1",
     }
 }
 

@@ -49,7 +49,7 @@ export class RepositoryEditorOwnership {
 const PUBLIC_FIELDS = [
   'name', 'svn_url', 'svn_branch', 'svn_username', 'git_provider', 'git_api_url',
   'git_repo', 'git_branch', 'sync_mode', 'poll_interval_secs', 'lfs_threshold_mb',
-  'auto_merge', 'enabled', 'allowed_paths', 'blocked_patterns',
+  'auto_merge', 'enabled', 'allowed_paths', 'blocked_patterns', 'path_rewrite_rules',
 ] as const;
 
 /** Explicit allowlist: credential inputs, tokens, receipts and runtime counters never enter a journal. */

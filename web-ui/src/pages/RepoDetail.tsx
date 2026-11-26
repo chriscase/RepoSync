@@ -54,7 +54,7 @@ import {
 import ServerMonitor from '../components/ServerMonitor';
 import PathPolicyEditor56 from '../components/PathPolicyEditor56';
 import {
-  pathPolicyConfiguration, pathPolicyDraft, pathPolicyHasRules, pathPolicyIssues, pathPolicyIssueSummary,
+  pathPolicyConfiguration, pathPolicyDraft, pathPolicyHasRules, pathPolicyIssues, pathPolicyIssueSummary, effectivePathPolicy, effectiveRewrite, submittedRewrite,
   type PathPolicyDraft,
 } from '../pathPolicy56';
 import {
@@ -901,6 +901,11 @@ function RepositoryDetailEditor() {
     const submitted={...currentForm.current};setSaveError(null);setSaveMessage(null);
     const policyIssues=pathPolicyIssues(submitted.path_policy);
     if(policyIssues.length){setSaveError(pathPolicyIssueSummary(policyIssues));return;}
+    const effective = effectivePathPolicy(submitted.path_policy);
+    if (submittedRewrite(submitted.path_policy) !== undefined && effective.ok) {
+      const {problem} = effectiveRewrite(submitted.path_policy, effective.allowed);
+      if (problem) {setSaveError(problem); return;}
+    }
     try {
       const result=await saveFlow.save(editConfiguration(submitted),{svn_password:submitted.svn_password || undefined,git_token:submitted.git_token || undefined},repo.updated_at);
       if(!result.viewActive || editVersion.current!==generation)return;
@@ -1382,7 +1387,7 @@ function RepositoryDetailEditor() {
             <FieldNumber label={t('repo.field.lfsThreshold')} value={form.lfs_threshold_mb} onChange={(v) => setField('lfs_threshold_mb', v)} min={0} />
             <FieldToggle label={t('field.autoMerge')} checked={form.auto_merge} onChange={(v) => setField('auto_merge', v)} />
             <div className="col-span-full" {...region('policy', 'settings')}>
-              <PathPolicyEditor56 draft={form.path_policy} onChange={(next) => setField('path_policy', next)} />
+              <PathPolicyEditor56 draft={form.path_policy} serverError={saveError && /(?:path.rewrit|strip.prefix|rewrite|allowed_paths|blocked_patterns)/i.test(saveError) ? saveError : undefined} onChange={(next) => {setSaveError(null); setField('path_policy', next);}} />
             </div>
           </div>
         ) : (
