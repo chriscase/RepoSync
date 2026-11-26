@@ -213,7 +213,7 @@ async fn rs56_get_reports_unset_lists_empty_and_malformed_without_raw_columns() 
     assert_eq!(
         unset["path_policy"],
         json!({"version":1,"allowed_paths":{"state":"unset"},"blocked_patterns":{"state":"unset"},
-            "enforced_direction":"bidirectional","svn_to_git_filtering":"managed_incremental","path_rewriting":"none_read_only"})
+            "enforced_direction":"bidirectional","svn_to_git_filtering":"managed_incremental","path_rewriting":"none_read_only","rewrite_editor":"single_strip_prefix_v1"})
     );
     let lists = get_repo(&client, addr, "lists").await;
     assert_eq!(
@@ -860,5 +860,135 @@ fn rs56_preview_vectors_match_the_engine_projection() {
                 );
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn rs56_rewrite_replaces_keeps_and_clears_without_bypassing_pinned_scope() {
+    let mut paused = policy_repo("paused", Some(r#"["teams/alpha"]"#), Some(r#"["*.exe"]"#));
+    paused.enabled = false;
+    paused.last_svn_rev = 0;
+    paused.last_git_sha.clear();
+    paused.lfs_threshold_mb = 0;
+    let mut pinned = policy_repo("pinned", Some(r#"["teams/alpha"]"#), None);
+    pinned.path_rewrite_rules = Some(r#"[{"strip_prefix":"teams/alpha"}]"#.into());
+    pinned.lfs_threshold_mb = 0;
+    let (addr, state, _task, _tmp) = policy_fixture(vec![paused, pinned]).await;
+    let client = authed_client();
+    let read = get_repo(&client, addr, "paused").await;
+    assert_eq!(
+        read["path_policy"]["rewrite_editor"],
+        "single_strip_prefix_v1"
+    );
+    let (status, result) = put_repo(
+        &client,
+        addr,
+        "paused",
+        &edit(
+            &read,
+            json!({
+                "path_rewrite_rules": r#"[{"strip_prefix":"teams/alpha"}]"#
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(
+        result["path_policy"]["path_rewriting"],
+        "single_prefix_projected_snapshot"
+    );
+    let read = get_repo(&client, addr, "paused").await;
+    assert_eq!(read["path_rewrite_prefix"], "teams/alpha");
+    let (status, result) = put_repo(
+        &client,
+        addr,
+        "paused",
+        &edit(&read, json!({"name":"Kept"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["path_rewrite_prefix"], "teams/alpha");
+    let (status, result) = put_repo(
+        &client,
+        addr,
+        "paused",
+        &edit(
+            &result,
+            json!({
+                "name": "Do not persist",
+                "allowed_paths": r#"["teams/beta"]"#,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{result}");
+    assert!(result["error"]
+        .as_str()
+        .unwrap()
+        .contains("outside the rewrite prefix"));
+    let read = get_repo(&client, addr, "paused").await;
+    assert_eq!(read["name"], "Kept");
+    let (status, result) = put_repo(
+        &client,
+        addr,
+        "paused",
+        &edit(&read, json!({"path_rewrite_rules":"[]"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{result}");
+    assert!(get_repo(&client, addr, "paused").await["path_rewrite_prefix"].is_null());
+    assert_eq!(
+        state
+            .db
+            .get_repository("paused")
+            .unwrap()
+            .unwrap()
+            .path_rewrite_rules
+            .as_deref(),
+        Some("[]")
+    );
+    let read = get_repo(&client, addr, "pinned").await;
+    let (status, result) = put_repo(
+        &client,
+        addr,
+        "pinned",
+        &edit(&read, json!({"path_rewrite_rules":"[]"})),
+    )
+    .await;
+    assert_eq!(status, 400, "{result}");
+    assert_eq!(
+        get_repo(&client, addr, "pinned").await["path_rewrite_prefix"],
+        "teams/alpha"
+    );
+}
+
+#[test]
+fn rs56_rewrite_preview_vectors_match_core_projection() {
+    use reposync_core::path_projection::TeamPrefixRewrite;
+    let rule = TeamPrefixRewrite::new("teams/alpha").unwrap();
+    let allowed = vec!["teams/alpha".to_owned()];
+    let blocked = vec!["*.exe".to_owned(), "teams/alpha/private".to_owned()];
+    // Mirrored by the real UI's preview unit suite.
+    for (path, inbound, target) in [
+        ("src/a.rs", false, Some("teams/alpha/src/a.rs")),
+        ("teams/alpha/src/a.rs", true, Some("src/a.rs")),
+        ("tools/bad.exe", false, None),
+        ("teams/alpha/private/a.rs", true, None),
+        ("teams/alpha-other/a.rs", true, None),
+        ("../a.rs", false, None),
+        ("teams/alpha", true, None),
+    ] {
+        let result = if inbound {
+            if path_is_projected(path, &allowed, &blocked) {
+                rule.to_git(path).ok().flatten().map(str::to_owned)
+            } else {
+                None
+            }
+        } else {
+            rule.to_svn(path)
+                .ok()
+                .filter(|svn| path_is_projected(svn, &allowed, &blocked))
+        };
+        assert_eq!(result.as_deref(), target, "{path}");
     }
 }

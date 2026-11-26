@@ -105,10 +105,31 @@ Stored lists are not revalidated on read. An unchanged legacy list is reported a
   allowlist already carries both fields as `string | null`.
 - **Hook link.** The "Git Hook" link appears only for a known, non-empty list.
 
+## Team strip prefix
+
+The whole policy section starts collapsed. A v1 receiver advertising
+`rewrite_editor: "single_strip_prefix_v1"` lets the operator edit the optional
+branch-relative SVN strip prefix. The existing `path_rewrite_prefix` read value
+and `path_rewriting` state describe the stored rule without returning its raw JSON.
+An older receiver never receives a rewrite from this editor.
+
+The same settings PUT omits the field when unchanged; replacement sends
+`[{"strip_prefix":"teams/alpha"}]` as JSON text, and explicit Clear sends the
+existing empty-rule-list text `[]`. Undo discards the proposed edit. Existing
+CAS, save receipts and scope validation apply. Rewriting requires a new paused
+direct root registration, a fresh projected snapshot, an empty Git destination,
+and no automatic conflict merge or LFS. A saved baseline is not silently
+rewritten. Server rejections remain visible in the editor.
+
 ## Preview semantics
 
 The browser preview is a local port of `path_projection` and is never sent to the server.
-It uses the lists as they will be after saving.
+It uses the proposed lists and rule. For SVN→Git, filter in branch-relative SVN
+coordinates and then strip the directory prefix. For Git→SVN, prepend the
+directory prefix before filtering. An included row shows the mapped target;
+invalid, blocked and out-of-scope inputs are not advertised as target paths.
+This is a sample-file preview, not a commit, rename, snapshot or collision
+simulation. Nothing is written or sent while previewing.
 
 - **Normalization:** `\` becomes `/`, and leading `/` characters are removed.
 - **Allowed prefix:** the trailing `/` is ignored. `team` matches `team` and `team/…`,
@@ -131,18 +152,18 @@ It uses the lists as they will be after saving.
 
 `PREVIEW_VECTORS` is kept identical in `crates/web/tests/repo_path_policy_56.rs` and
 `web-ui/src/pathPolicy56.test.ts`. The Rust side evaluates the table with
-`path_is_projected` and `exclusion_message`, and the UI side with the port. Equal tables
-with both sides passing would be the parity evidence; neither side has been run.
+`path_is_projected` and `exclusion_message`, and the UI side with the port. The matching tables are parity evidence when both suites pass. Rewrite mapping has a
+second mirrored set of vectors for both directions, including excluded paths.
 
 ## Disclosed limitations
 
 1. **SVN→Git scope.** With [#53](53-svn-to-git-filtering.md), scheduled Team sync
    projects new SVN revisions under the registration’s active rules. Initial imports can
    include the entire branch, and existing Git history remains visible. The sample-path
-   preview covers outbound selection. The editor reads the server capability, shows the
+   preview covers single-file selection and mapping, not scheduler readiness. The editor reads the server capability, shows the
    outbound-only limitation on older receivers and treats an unknown capability conservatively.
-2. **Rewriting is read-only.** Included paths keep their branch-relative path. No rewrite
-   mapping is offered.
+2. **One optional strip rule.** No arbitrary maps or multiple rewrite targets. Existing
+   registrations cannot change an admitted projected baseline in place.
 3. **Other readers are unchanged.** `GET /hooks/pre-commit` and SVN-commit reconciliation
    still treat a malformed stored value as empty. They are outside this allocation, and
    new malformed values can no longer be written through the API.
@@ -152,10 +173,10 @@ with both sides passing would be the parity evidence; neither side has been run.
    accepted on both sides.
 6. **Harness wiring.** The component test is `PathPolicyEditor56.test.ts` (no JSX), so
    the existing vitest `include` (`src/**/*.test.ts`) collects it without any
-   `vite.config.ts` change. `tests/path-policy-56.e2e.mjs` is not wired into
-   `package.json` scripts. The `contracts/README.md` index is not updated.
+   `vite.config.ts` change. Run the isolated browser suite with `npm run test:path-policy:e2e`
+   and `REPOSYNC_A11Y_BROWSER` pointing to an admitted Chromium binary.
 
-## Evidence (authored, NOT RUN)
+## Qualification suites
 
 | Source | What it would prove |
 | --- | --- |
@@ -165,16 +186,16 @@ with both sides passing would be the parity evidence; neither side has been run.
 | `web-ui/src/components/PathPolicyEditor56.test.ts` (static render, collected by the existing vitest include) | Collapsed disclosure wiring; read-only mode; error/label/describedby binding with a disabled hide button while invalid; explicit actions for malformed; no controls when unavailable; preview table and status; notices; whitespace-preserving preview cells |
 | `web-ui/tests/path-policy-56.e2e.mjs` (Vite plus an existing admitted Chromium, loopback fixtures only) | Exact PUT bodies: unrelated save omits both fields; an inline invalid entry sends no PUT; replacement; explicit clear; malformed kept, then cleared; no `path_policy` means no controls and fields omitted. Keyboard Remove moves focus to the previous entry (or to Add for the last one), Undo restores keep, and Save sends only that field, with unrelated form fields unchanged and an actual API reread that preserves them. Keyboard disclosure and a preview that keeps typed whitespace. Axe (WCAG 2.x A/AA) on the policy section |
 
-Commands a later admitted executor would run:
+Commands to reproduce with admitted local tooling:
 
 - `cargo test -p reposync-web repo_path_policy_56`
 - `cargo test -p reposync-web --test repo_path_policy_56`
 - `cd web-ui && npm run typecheck && npm run lint && npx vitest run src/pathPolicy56.test.ts src/components/PathPolicyEditor56.test.ts`
 - `REPOSYNC_A11Y_BROWSER=<admitted chromium> node --test --test-concurrency=1 tests/path-policy-56.e2e.mjs`
 
-## Scope
+## Historical scope of #261
 
-Existing files are changed only in these regions:
+The original editor proposal changed existing files are changed only in these regions:
 
 - `crates/web/src/api/repos.rs`: helper registration, the `path_policy` DTO field and its
   initializer, and present-field validation in `update_repo`.

@@ -940,7 +940,8 @@ export interface RepositoryPathPolicyRead {
   blocked_patterns: RepositoryPolicyFieldRead;
   enforced_direction: 'git_to_svn' | 'bidirectional';
   svn_to_git_filtering: 'not_applied' | 'managed_incremental';
-  path_rewriting: 'none_read_only';
+  path_rewriting: 'none_read_only' | 'single_prefix_projected_snapshot' | 'malformed';
+  rewrite_editor?: 'single_strip_prefix_v1';
 }
 
 export interface Repository {
@@ -969,6 +970,9 @@ export interface Repository {
   blocked_patterns?: string | null;
   /** #56 typed policy read; absent from servers without #56. */
   path_policy?: RepositoryPathPolicyRead;
+  path_rewrite_prefix?: string | null;
+  /** Existing PUT wire format: JSON rule list, or [] to clear. */
+  path_rewrite_rules?: string;
   consecutive_errors: number;
   sync_status: string;
   initializing?: boolean;

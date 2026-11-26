@@ -22,7 +22,7 @@ describe('#56 PathPolicyEditor56 static rendering', () => {
   it('starts collapsed with controlled disclosure buttons and a visible limitation note', () => {
     const html = renderToStaticMarkup(createElement(PathPolicyEditor56, { draft: stored, onChange: noop }));
     const toggles = [...html.matchAll(/<button[^>]*aria-expanded="(true|false)"[^>]*>/g)];
-    expect(toggles.map(match => match[1])).toEqual(['false', 'false']);
+    expect(toggles.map(match => match[1])).toEqual(['false', 'false', 'false']);
     for (const [tag] of toggles) {
       const panel = attribute(tag, 'aria-controls');
       expect(panel).toBeTruthy();
@@ -30,7 +30,7 @@ describe('#56 PathPolicyEditor56 static rendering', () => {
     }
     expect(html).toContain('role="note"');
     expect(html).toContain('Initial imports can include all branch paths, and files already published remain in Git history.');
-    expect(html).toContain('Rewriting is read-only and cannot be configured here.');
+    expect(html).toContain('Rewrite editing not available from this server');
     expect(html).toContain('2 allowed path prefixes');
     expect(html).toContain('1 blocked pattern');
   });
@@ -53,7 +53,7 @@ describe('#56 PathPolicyEditor56 static rendering', () => {
     expect(html).not.toMatch(/<input/);
     expect(html).not.toContain('>Edit<');
     expect(html).not.toContain('>Clear<');
-    expect((html.match(/aria-expanded="true"/g) || [])).toHaveLength(2);
+    expect((html.match(/aria-expanded="true"/g) || [])).toHaveLength(3);
   });
 
   it('binds an inline error to its labelled input and keeps the invalid list open', () => {
@@ -90,7 +90,7 @@ describe('#56 PathPolicyEditor56 static rendering', () => {
 
   it('disables every policy control when the server did not report the policy', () => {
     const html = renderToStaticMarkup(createElement(PathPolicyEditor56, { draft: draftFor(undefined), onChange: noop }));
-    expect(html).not.toMatch(/aria-expanded=/);
+    expect(html.match(/aria-expanded=/g)).toHaveLength(1); // section only; no field controls
     expect(html).not.toMatch(/>(Edit|Clear|Add|Undo)</);
     expect((html.match(/Not available from this server — unchanged on save/g) || [])).toHaveLength(2);
     expect(html).toContain('The path policy was not reported by this server, so no preview is possible.');

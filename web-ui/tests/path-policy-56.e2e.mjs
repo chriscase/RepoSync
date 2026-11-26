@@ -15,7 +15,7 @@
 // Cleanup qualification only: REPOSYNC_E2E_FAULT=case-timeout, =teardown-failure or
 // =setup-timeout registers one extra "rs56 fault:" case. Select it with
 // --test-name-pattern="^rs56 fault:". With the variable unset, the file registers exactly the
-// six cases below.
+// cases below.
 import test, { before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, request as httpRequest } from 'node:http';
@@ -47,11 +47,12 @@ async function startPolicyApi(fixtureOrigin) {
     const base = repository('C');
     delete base.allowed_paths; delete base.blocked_patterns;
     api.settings = { ...base, id: 'P', name: 'Policy fixture', updated_at: '2026-11-13T00:00:00.000Z' };
-    api.raw = { allowed, blocked }; api.hidePolicy = hidePolicy; api.requests.length = 0; api.receipts.clear();
+    api.raw = { allowed, blocked }; api.rewrite = null; api.rejectRewrite = false; api.hidePolicy = hidePolicy; api.requests.length = 0; api.receipts.clear();
   };
   api.detail = () => ({ ...api.settings, ...(api.hidePolicy ? {} : { path_policy: { version: 1,
     allowed_paths: readField(api.raw.allowed), blocked_patterns: readField(api.raw.blocked),
-    enforced_direction: 'bidirectional', svn_to_git_filtering: 'managed_incremental', path_rewriting: 'none_read_only' } }) });
+    enforced_direction: 'bidirectional', svn_to_git_filtering: 'managed_incremental', rewrite_editor: 'single_strip_prefix_v1',
+      path_rewriting: api.rewrite ? 'single_prefix_projected_snapshot' : 'none_read_only' }, path_rewrite_prefix: api.rewrite }) });
   api.puts = () => api.requests.filter(request => request.method === 'PUT' && request.path === '/api/repos/P');
   const server = createServer(async (req, res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
@@ -83,6 +84,11 @@ async function startPolicyApi(fixtureOrigin) {
       if (column in body && body[column] !== null && (typeof body[column] !== 'string' || readField(body[column]).state !== 'list')) {
         return reply(400, { error: `${column} not_array: must be a JSON array of strings; nothing was saved` });
       }
+    }
+    if ('path_rewrite_rules' in body) {
+      if (api.rejectRewrite) return reply(400, {error: 'set path rewriting before import on a new paused registration and empty Git destination'});
+      const rules = JSON.parse(body.path_rewrite_rules);
+      api.rewrite = rules[0]?.strip_prefix ?? null;
     }
     for (const [column, key] of columns) if (column in body) api.raw[key] = body[column];
     for (const setting of ['name', 'svn_url', 'svn_branch', 'svn_username', 'git_provider', 'git_api_url', 'git_repo', 'git_branch', 'sync_mode', 'poll_interval_secs', 'lfs_threshold_mb', 'auto_merge', 'enabled']) {
@@ -173,8 +179,18 @@ async function audit(page, label) {
   assert.deepEqual(result.violations.map(v => ({ id: v.id, nodes: v.nodes.map(n => n.target) })), [], label + ' axe violations');
 }
 const section = page => page.getByTestId('path-policy-56');
+async function showPolicy(page) {
+  const toggle = section(page).getByRole('button', { name: 'Path policy', exact: true });
+  if (await toggle.getAttribute('aria-expanded') === 'false') await press(page, toggle);
+}
 const field = (page, key) => page.getByTestId(`path-policy-${key}`);
-async function startEditing(page) { await press(page, page.getByRole('button', { name: 'Edit', exact: true })); await page.getByRole('button', { name: 'Save', exact: true }).waitFor(); }
+async function startEditing(page) {
+  await press(page, page.getByRole('button', { name: 'Edit', exact: true }));
+  await page.getByRole('button', { name: 'Save', exact: true }).waitFor();
+  const toggle = section(page).getByRole('button', { name: 'Path policy', exact: true });
+  assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
+  await press(page, toggle);
+}
 async function save(page, expectedPuts) {
   await press(page, page.getByRole('button', { name: 'Save', exact: true }));
   for (let i = 0; i < 80 && policy.puts().length < expectedPuts; i++) await new Promise(resolve => setTimeout(resolve, 50));
@@ -184,6 +200,7 @@ async function save(page, expectedPuts) {
 
 test('rs56 unrelated settings save omits both policy fields and the reread policy is preserved', { timeout: 45000 }, async () => {
   const { page, close } = await open(); try {
+    await showPolicy(page);
     await field(page, 'allowed_paths').getByText('2 allowed path prefixes', { exact: true }).waitFor();
     // With rules stored, the hook control is shown: by its test id and as the one 'Git Hook' button.
     // The old-server case below asserts its absence the same two ways.
@@ -200,6 +217,7 @@ test('rs56 unrelated settings save omits both policy fields and the reread polic
     assert.equal(body.name, 'Policy fixture renamed');
     assert.equal('allowed_paths' in body, false); assert.equal('blocked_patterns' in body, false);
     assert.deepEqual(policy.raw, { allowed: '["src/","config/"]', blocked: '["*.exe"]' });
+    await showPolicy(page);
     await field(page, 'allowed_paths').getByText('2 allowed path prefixes', { exact: true }).waitFor();
     await field(page, 'blocked_patterns').getByText('1 blocked pattern', { exact: true }).waitFor();
   } finally { await close(); }
@@ -228,6 +246,7 @@ test('rs56 keyboard edit: invalid entry blocks save inline, valid replacement th
     await save(page, 1);
     assert.equal(policy.puts()[0].body.allowed_paths, '["src/","config/","team/docs"]');
     assert.equal('blocked_patterns' in policy.puts()[0].body, false);
+    await showPolicy(page);
     await allowed.getByText('3 allowed path prefixes', { exact: true }).waitFor();
 
     await startEditing(page);
@@ -238,6 +257,7 @@ test('rs56 keyboard edit: invalid entry blocks save inline, valid replacement th
     assert.deepEqual(Object.keys(policy.puts()[1].body).filter(key => key.endsWith('_paths') || key.endsWith('_patterns')), ['blocked_patterns']);
     assert.equal(policy.puts()[1].body.blocked_patterns, null);
     assert.deepEqual(policy.raw, { allowed: '["src/","config/","team/docs"]', blocked: null });
+    await showPolicy(page);
     await blocked.getByText('No blocked patterns', { exact: true }).waitFor();
   } finally { await close(); }
 });
@@ -246,6 +266,7 @@ test('rs56 malformed stored value is kept by unrelated saves and changes only by
   policy.reset('src/', '["*.exe"]');
   const { page, close } = await open(); try {
     const allowed = field(page, 'allowed_paths');
+    await showPolicy(page);
     await allowed.getByText('Stored value is malformed — unchanged on save', { exact: true }).waitFor();
     await section(page).getByText(/The stored allowed path prefixes value is malformed/).waitFor();
     await startEditing(page);
@@ -259,6 +280,7 @@ test('rs56 malformed stored value is kept by unrelated saves and changes only by
     await save(page, 2);
     assert.equal(policy.puts()[1].body.allowed_paths, null);
     assert.equal('blocked_patterns' in policy.puts()[1].body, false);
+    await showPolicy(page);
     await allowed.getByText('No allowed-path restriction', { exact: true }).waitFor();
   } finally { await close(); }
 });
@@ -268,7 +290,7 @@ test('rs56 server without path_policy: policy controls are unavailable and saves
   const { page, close } = await open(); try {
     await startEditing(page);
     assert.equal(await section(page).getByText('Not available from this server — unchanged on save', { exact: true }).count(), 2);
-    assert.equal(await section(page).getByRole('button').count(), 0);
+    assert.deepEqual(await section(page).getByRole('button').allTextContents(), ['Path policy']);
     assert.equal(await page.getByTestId('download-pre-commit-hook').count(), 0);
     assert.equal(await page.getByRole('button', { name: 'Git Hook' }).count(), 0);
     await page.getByLabel('Name', { exact: true }).fill('Old server rename');
@@ -317,6 +339,7 @@ test('rs56 keyboard Remove moves focus, saves only that change, and the actual r
     assert.deepEqual(reread.path_policy.blocked_patterns, { state: 'list', entries: ['*.exe'] });
     for (const key of [...formFields, 'enabled', 'parent_id', 'created_at']) assert.deepEqual(reread[key], before[key], `reread ${key} preserved`);
     assert.notEqual(reread.updated_at, before.updated_at);
+    await showPolicy(page);
     await allowed.getByText('1 allowed path prefix', { exact: true }).waitFor();
     await blocked.getByText('1 blocked pattern', { exact: true }).waitFor();
   } finally { await close(); }
@@ -324,6 +347,7 @@ test('rs56 keyboard Remove moves focus, saves only that change, and the actual r
 
 test('rs56 collapsed lists and Git→SVN preview are keyboard operable and match engine semantics', { timeout: 45000 }, async () => {
   const { page, close } = await open(); try {
+    await showPolicy(page);
     const toggle = field(page, 'allowed_paths').getByRole('button', { name: 'Show allowed path prefixes', exact: true });
     assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
     await press(page, toggle);
@@ -376,3 +400,52 @@ if (FAULT === 'setup-timeout') {
     assert.fail('unreachable: the before hook times out first');
   });
 }
+
+
+test('rs56 changes a strip prefix, previews both directions, reopens and explicitly clears', { timeout: 45000 }, async () => {
+  policy.reset('["teams/alpha"]', '["*.exe"]');
+  const { page, close } = await open(); try {
+    await startEditing(page);
+    const editor = section(page);
+    await press(page, editor.getByRole('button', { name: 'Edit strip prefix' }));
+    const input = editor.getByRole('textbox', { name: 'SVN directory prefix' });
+    await input.fill('teams/beta');
+    assert.equal(await input.getAttribute('aria-invalid'), 'true');
+    await input.fill('teams/alpha');
+    await editor.getByLabel('Sample Git paths (one per line)').fill('src/readme.md\nsrc/bad.exe');
+    const preview = editor.getByTestId('path-policy-preview');
+    await preview.getByText('teams/alpha/src/readme.md', {exact:true}).waitFor();
+    await preview.getByText('Excluded: matches blocked pattern *.exe', {exact:true}).waitFor();
+    await editor.getByLabel('Preview direction').selectOption('inbound');
+    await editor.getByLabel('Sample SVN paths (one per line)').fill('teams/alpha/src/readme.md\nteams/beta/private.md');
+    await preview.getByText('src/readme.md', {exact:true}).waitFor();
+    await preview.getByText('Excluded: not under an allowed path prefix', {exact:true}).waitFor();
+    await save(page, 1);
+    assert.equal(policy.puts()[0].body.path_rewrite_rules, '[{"strip_prefix":"teams/alpha"}]');
+    await showPolicy(page);
+    await editor.getByRole('group', {name:'Strip SVN prefix'}).getByText('teams/alpha', {exact:true}).waitFor();
+    await startEditing(page);
+    await press(page, editor.getByRole('button', {name: 'Clear strip prefix'}));
+    await save(page, 2);
+    assert.equal(policy.puts()[1].body.path_rewrite_rules, '[]');
+    assert.equal(policy.rewrite, null);
+  } finally { await close(); }
+});
+
+
+test('rs56 shows server-side rewrite refusal inline and keeps the proposal unsaved', { timeout: 45000 }, async () => {
+  policy.reset('["teams/alpha"]', null);
+  policy.rejectRewrite = true;
+  const { page, close } = await open(); try {
+    await startEditing(page);
+    const editor = section(page);
+    await press(page, editor.getByRole('button', { name: 'Edit strip prefix' }));
+    const input = editor.getByRole('textbox', { name: 'SVN directory prefix' });
+    await input.fill('teams/alpha');
+    await press(page, page.getByRole('button', { name: 'Save', exact: true }));
+    await editor.getByRole('alert').filter({hasText: 'set path rewriting before import'}).waitFor();
+    assert.equal(await input.inputValue(), 'teams/alpha');
+    assert.equal(await input.getAttribute('aria-invalid'), 'true');
+    assert.equal(policy.rewrite, null);
+  } finally { await close(); }
+});
