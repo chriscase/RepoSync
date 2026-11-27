@@ -75,7 +75,17 @@ Base (last synced version)
      └── Git changes (theirs)
 ```
 
-If the changes don't overlap (different lines), they're merged automatically. If they do overlap, a conflict is created for manual resolution.
+In Team mode every detected conflict is currently held for manual resolution, including changes to different lines of the same file. Automatic three-way merging is not applied there yet.
+
+## What a Team Conflict Records
+
+When a Team sync cycle holds a conflict, the conflict row records:
+
+- the newest pending SVN revision and the newest pending Git commit that touch the file;
+- the base text: the file at the SVN revision and Git commit both sides last agreed on, stored only when the SVN and Git copies there are identical;
+- the SVN text at the newest pending SVN revision and the Git text at the pending Git tip. A side where the file no longer exists has no text.
+
+Text is stored only when it is valid UTF-8, contains no NUL byte and is at most 1 MiB. Binary files, other encodings, larger files, Git LFS pointers and anything that could not be read leave that text empty. SVN text is read with keywords expanded, the same way RepoSync exports it to Git. The revision and commit are still recorded. Neither repository is changed while the conflict is held, and the recorded text is never used to merge automatically.
 
 ## Conflict Lifecycle
 

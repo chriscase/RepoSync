@@ -806,6 +806,12 @@ async fn rs73_overlapping_shared_file_edits_surface_persisted_conflict_without_a
     assert_eq!(rows[0].file_path, "shared.txt");
     assert_eq!(rows[0].conflict_type, "content");
     assert_eq!(rows[0].status, "detected");
+    // Exact inputs: which revision and commit diverged, and each side's bytes.
+    assert_eq!(rows[0].svn_rev, Some(svn_edit_rev));
+    assert_eq!(rows[0].git_sha.as_deref(), Some(git_edit_sha.as_str()));
+    assert_eq!(rows[0].base_content.as_deref(), Some(BASE));
+    assert_eq!(rows[0].svn_content.as_deref(), Some(SVN_EDIT));
+    assert_eq!(rows[0].git_content.as_deref(), Some(GIT_EDIT));
     // Identity of the first-cycle row; retries and fresh handles must see
     // this exact row (same id, scope, status), not a replacement.
     let first_row = (*rows[0]).clone();
