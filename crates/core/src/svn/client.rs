@@ -986,7 +986,14 @@ impl SvnClient {
         let [entry] = entries.as_slice() else {
             return Ok(None);
         };
-        if entry.attribute("kind") != Some("file") {
+        // A directory with one child lists that child; require the entry to
+        // be the requested file itself.
+        let requested = file_path.trim_end_matches('/').rsplit('/').next();
+        let name = entry
+            .children()
+            .find(|n| n.has_tag_name("name"))
+            .and_then(|n| n.text());
+        if entry.attribute("kind") != Some("file") || name != requested {
             return Ok(None);
         }
         Ok(entry

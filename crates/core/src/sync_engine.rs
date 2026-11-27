@@ -5833,8 +5833,9 @@ impl SyncEngine {
     /// watermark revision, holds identical text.
     ///
     /// Text stays `None` when it is binary, not valid UTF-8, larger than
-    /// [`CONFLICT_EVIDENCE_MAX_BYTES`] (checked before reading), not a
-    /// regular file in Git, a Git LFS pointer or unreadable. It is
+    /// [`CONFLICT_EVIDENCE_MAX_BYTES`] (checked before reading), a symbolic
+    /// link (not a regular Git file, or an SVN `svn:special` file), a Git
+    /// LFS pointer or unreadable. It is
     /// never stored lossily. Reads are best-effort and never change whether
     /// a conflict is held.
     async fn attach_conflict_evidence(
@@ -5861,7 +5862,8 @@ impl SyncEngine {
                     .conn()
                     .query_row(
                         "SELECT MAX(svn_rev) FROM sync_records
-                         WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'git_to_svn'",
+                         WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'git_to_svn'
+                           AND status = 'applied'",
                         rusqlite::params![rid, sha],
                         |row| row.get(0),
                     )
@@ -5928,6 +5930,15 @@ impl SyncEngine {
         match svn.file_size_at_rev(path, revision).await {
             Ok(Some(size)) if size <= CONFLICT_EVIDENCE_MAX_BYTES as u64 => {}
             Ok(_) => return None,
+            Err(error) => {
+                report(path, revision, &error);
+                return None;
+            }
+        }
+        // A special file (symbolic link) is stored as link text, not content.
+        match svn.file_properties_at_rev(path, revision).await {
+            Ok(props) if props.contains("name=\"svn:special\"") => return None,
+            Ok(_) => {}
             Err(error) => {
                 report(path, revision, &error);
                 return None;
