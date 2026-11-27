@@ -9460,11 +9460,7 @@ async fn test_team_mode_marker_without_receipt_applies_once() {
 /// `SyncEngine::last_cycle_stats`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_team_mode_conflict_detection() {
-    if !svn_available() {
-        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
-        return;
-    }
-
+    // Active coverage: the constructor fails loudly when SVN tools are missing.
     let pair = QualifiedPair::new_with_svn_branch("conflict-detection", "trunk").await;
     let (baseline_rev, baseline_sha) = pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap();
     assert_eq!(baseline_sha, pair.imported_base);

@@ -203,8 +203,9 @@ pub struct SyncEngine {
     allowed_paths: Vec<String>,
     /// Blocked path patterns for Git-to-SVN sync. Empty means no blocked patterns.
     blocked_patterns: Vec<String>,
-    /// Counters of the most recent cycle that started sync work, kept even
-    /// when that cycle returned an error (for example an unresolved conflict).
+    /// Counters of the most recent finished cycle that started sync work,
+    /// kept even when it returned an error (for example an unresolved
+    /// conflict). Cleared when each cycle starts; see `last_cycle_stats`.
     last_cycle_stats: std::sync::Mutex<Option<SyncStats>>,
     /// Fixture-only replay batch cap override (debug builds).
     #[cfg(debug_assertions)]
@@ -676,9 +677,10 @@ impl SyncEngine {
     /// `run_sync_cycle` returns its [`SyncStats`] only on success. When a
     /// cycle stops on an error, such as unresolved conflicts, this still
     /// reports what it detected, including `conflicts_detected`. Returns
-    /// `None` before the first cycle, or when the latest cycle stopped during
-    /// writer admission, credential reload or the scope schema upgrade,
-    /// before any sync work began.
+    /// `None` before the first cycle, while a cycle is in progress, when the
+    /// latest cycle stopped during writer admission, credential reload or the
+    /// scope schema upgrade, and when it panicked or was cancelled before
+    /// finishing.
     pub fn last_cycle_stats(&self) -> Option<SyncStats> {
         self.last_cycle_stats
             .lock()
