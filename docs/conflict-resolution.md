@@ -77,6 +77,16 @@ Base (last synced version)
 
 If the changes don't overlap (different lines), they're merged automatically. If they do overlap, a conflict is created for manual resolution.
 
+## What a Team Conflict Records
+
+When a Team sync cycle holds a conflict, the conflict row records:
+
+- the newest pending SVN revision and the newest pending Git commit that touch the file;
+- the base text, taken from the last synced Git commit the pending changes start from;
+- the SVN text at that revision and the Git text at the pending Git tip.
+
+Text is stored only when it is valid UTF-8, contains no NUL byte and is at most 1 MiB. Binary files, other encodings, larger files, Git LFS pointers, a side that deleted the file, or a side that could not be read leave that text empty, so the dashboard never shows altered bytes. The revision and commit are still recorded. Neither repository is changed while the conflict is held.
+
 ## Conflict Lifecycle
 
 ```

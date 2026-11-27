@@ -168,6 +168,10 @@ struct GitFetchResult {
     replay_batch: Vec<GitChangeSet>,
     conflict_coverage: Vec<GitChangeSet>,
     conflict_coverage_skipped: usize,
+    /// Commit the conflict coverage starts from (the shared base).
+    coverage_origin: String,
+    /// Commit the conflict coverage ends at (the proposed Git side).
+    coverage_tip: String,
     has_more: bool,
     reset_target: String,
     pending_total: usize,
@@ -2601,9 +2605,13 @@ impl SyncEngine {
                 .saturating_sub(git_fetch.conflict_coverage_skipped),
             git_fetch.conflict_coverage.len(),
         )?;
-        let conflicts =
+        let mut conflicts =
             self.detect_conflicts_internal(&svn_changes, &git_fetch.conflict_coverage)?;
         stats.conflicts_detected = conflicts.len();
+        if !conflicts.is_empty() {
+            self.attach_conflict_evidence(&mut conflicts, &svn_changes, &git_fetch)
+                .await;
+        }
 
         if !conflicts.is_empty() {
             info!(count = conflicts.len(), "conflicts detected");
@@ -5296,6 +5304,8 @@ impl SyncEngine {
                 replay_batch: Vec::new(),
                 conflict_coverage: Vec::new(),
                 conflict_coverage_skipped: 0,
+                coverage_origin: selection_origin.to_string(),
+                coverage_tip: admission.remote_tip.clone(),
                 has_more: true,
                 reset_target: admission.checkpoint.clone(),
                 pending_total,
@@ -5351,6 +5361,8 @@ impl SyncEngine {
             replay_batch,
             conflict_coverage,
             conflict_coverage_skipped,
+            coverage_origin: selection_origin.to_string(),
+            coverage_tip: admission.remote_tip.clone(),
             has_more: selection.has_more,
             reset_target,
             pending_total,
@@ -5803,6 +5815,86 @@ impl SyncEngine {
             });
         }
         git_file_changes
+    }
+
+    /// Record which SVN revision and Git commit each conflict comes from,
+    /// and the base, SVN and Git text, so a held conflict can be reviewed.
+    ///
+    /// The base is the file at the commit the conflict coverage starts from.
+    /// Each side's text is the file at that side's pending tip: the newest
+    /// pending SVN revision touching the path, and the newest pending Git
+    /// commit. Content stays `None` when the file is absent on that side,
+    /// binary, not valid UTF-8, larger than [`CONFLICT_EVIDENCE_MAX_BYTES`],
+    /// a Git LFS pointer or unreadable. It is never stored lossily. Evidence is best-effort:
+    /// a read failure is logged and the conflict is still held.
+    async fn attach_conflict_evidence(
+        &self,
+        conflicts: &mut [Conflict],
+        svn_changes: &[SvnChangeSet],
+        git_fetch: &GitFetchResult,
+    ) {
+        fn touches(file: &ChangedFile, path: &str) -> bool {
+            file.path == path || file.rename_from.as_deref() == Some(path)
+        }
+        for conflict in conflicts.iter_mut() {
+            let path = conflict.file_path.clone();
+            if let Some((revision, file)) = svn_changes
+                .iter()
+                .flat_map(|cs| cs.changed_files.iter().map(move |f| (cs.revision, f)))
+                .filter(|(_, f)| touches(f, &path))
+                .max_by_key(|(revision, _)| *revision)
+            {
+                conflict.svn_rev = Some(revision);
+                if file.path == path && file.action != "D" && !file.is_binary {
+                    conflict.svn_content = self.svn_conflict_text(&path, revision).await;
+                }
+            }
+            conflict.git_sha = git_fetch
+                .conflict_coverage
+                .iter()
+                .rev()
+                .find(|cs| cs.changed_files.iter().any(|f| touches(f, &path)))
+                .map(|cs| cs.sha.clone());
+            if conflict.git_sha.is_some() {
+                conflict.git_content = self.git_conflict_text(&git_fetch.coverage_tip, &path);
+            }
+            conflict.base_content = self.git_conflict_text(&git_fetch.coverage_origin, &path);
+        }
+    }
+
+    async fn svn_conflict_text(&self, path: &str, revision: i64) -> Option<String> {
+        let svn = self
+            .svn_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        match svn.cat(path, revision).await {
+            // The text API decodes lossily; never store replacement bytes.
+            Ok(text) if text.contains('\u{fffd}') => None,
+            Ok(text) => conflict_text(text.into_bytes()),
+            Err(error) => {
+                warn!(path, revision, %error, "could not read SVN conflict content");
+                None
+            }
+        }
+    }
+
+    fn git_conflict_text(&self, sha: &str, path: &str) -> Option<String> {
+        if sha.is_empty() {
+            return None;
+        }
+        let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+        match git.get_file_content_at_commit(sha, path) {
+            // An LFS pointer is not the file the SVN side holds.
+            Ok(Some(bytes)) if bytes.starts_with(b"version https://git-lfs.github.com/spec/") => {
+                None
+            }
+            Ok(bytes) => bytes.and_then(conflict_text),
+            Err(error) => {
+                warn!(path, sha, %error, "could not read Git conflict content");
+                None
+            }
+        }
     }
 
     fn detect_conflicts_internal(
@@ -6297,6 +6389,17 @@ pub struct GitChangeSet {
     pub author_email: String,
     pub message: String,
     pub changed_files: Vec<ChangedFile>,
+}
+
+/// Largest file copied into a conflict row as text, per side.
+pub const CONFLICT_EVIDENCE_MAX_BYTES: usize = 1024 * 1024;
+
+/// Text suitable for a conflict row: valid UTF-8, no NUL byte, within the cap.
+fn conflict_text(bytes: Vec<u8>) -> Option<String> {
+    if bytes.len() > CONFLICT_EVIDENCE_MAX_BYTES || bytes.contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// A single file changed in a commit.
@@ -8131,6 +8234,23 @@ repo = "test/test-repo"
         assert_eq!(
             std::fs::read(git_dir.path().join("child.txt")).unwrap(),
             b"child\n",
+        );
+    }
+
+    #[test]
+    fn conflict_text_keeps_only_exact_bounded_text() {
+        assert_eq!(conflict_text(b"line\n".to_vec()).as_deref(), Some("line\n"));
+        assert_eq!(conflict_text(Vec::new()).as_deref(), Some(""));
+        assert_eq!(conflict_text(b"a\0b".to_vec()), None);
+        assert_eq!(conflict_text(vec![0xe9]), None);
+        let at_cap = vec![b'x'; CONFLICT_EVIDENCE_MAX_BYTES];
+        assert_eq!(
+            conflict_text(at_cap).map(|t| t.len()),
+            Some(CONFLICT_EVIDENCE_MAX_BYTES)
+        );
+        assert_eq!(
+            conflict_text(vec![b'x'; CONFLICT_EVIDENCE_MAX_BYTES + 1]),
+            None
         );
     }
 

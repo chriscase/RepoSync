@@ -695,6 +695,49 @@ fn svn_checkout(url: &str, wc_path: &Path) {
     assert!(status.success(), "svn checkout failed");
 }
 
+/// Run one `svn` command in a working copy and require success.
+fn svn_cli(wc_path: &Path, args: &[&str]) {
+    let output = Command::new("svn")
+        .args(args)
+        .current_dir(wc_path)
+        .output()
+        .expect("svn command");
+    assert!(
+        output.status.success(),
+        "svn {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Commit every pending change in a working copy and return the revision.
+fn svn_commit_wc(wc_path: &Path, message: &str) -> i64 {
+    let output = Command::new("svn")
+        .args([
+            "commit",
+            "-m",
+            message,
+            wc_path.to_str().unwrap(),
+            "--username",
+            "fixture",
+            "--non-interactive",
+        ])
+        .output()
+        .expect("svn commit");
+    assert!(
+        output.status.success(),
+        "svn commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("Committed revision")
+                .map(|rest| rest.trim().trim_end_matches('.').parse::<i64>().unwrap())
+        })
+        .expect("committed revision")
+}
+
 fn svn_commit_file(wc_path: &Path, filename: &str, content: &str, message: &str) -> i64 {
     let file_path = wc_path.join(filename);
 
@@ -9508,6 +9551,11 @@ async fn test_team_mode_conflict_detection() {
     assert_eq!(conflicts[0].conflict_type, "content");
     assert_eq!(conflicts[0].status, "detected");
     assert_eq!(conflicts[0].repo_id.as_deref(), Some(pair.repo_id.as_str()));
+    assert_eq!(conflicts[0].svn_rev, Some(svn_rev));
+    assert_eq!(conflicts[0].git_sha.as_deref(), Some(git_sha.as_str()));
+    assert_eq!(conflicts[0].base_content.as_deref(), Some("SVN origin\n"));
+    assert_eq!(conflicts[0].svn_content.as_deref(), Some("SVN version\n"));
+    assert_eq!(conflicts[0].git_content.as_deref(), Some("Git version\n"));
 
     // Neither history moved and no checkpoint or mapping acknowledges either edit.
     assert_eq!(pair.snapshot().await, before);
@@ -9530,6 +9578,112 @@ async fn test_team_mode_conflict_detection() {
         .db()
         .has_repo_emitted_git_commit(&pair.repo_id, &git_sha)
         .unwrap());
+}
+
+/// Conflict evidence names the newest pending revision and commit on each
+/// side, reads each side at its pending tip, and never stores bytes that are
+/// not exact text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_team_mode_conflict_evidence_uses_pending_tips_and_exact_text() {
+    let pair = QualifiedPair::new_with_svn_branch("conflict-evidence", "trunk").await;
+
+    // A binary file and a non-UTF-8 text file share the SVN-origin baseline.
+    let binary = [0u8, 159, 146, 150, 0, 1];
+    let latin1 = b"caf\xe9\n".to_vec();
+    std::fs::write(pair.wc.join("blob.bin"), binary).unwrap();
+    std::fs::write(pair.wc.join("latin1.txt"), &latin1).unwrap();
+    svn_cli(&pair.wc, &["add", "blob.bin", "latin1.txt"]);
+    svn_cli(
+        &pair.wc,
+        &[
+            "propset",
+            "svn:mime-type",
+            "application/octet-stream",
+            "blob.bin",
+        ],
+    );
+    let seeded = svn_commit_wc(&pair.wc, "Add binary and Latin-1 files");
+    let stats = pair.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 1);
+    assert_eq!(
+        pair.engine
+            .db()
+            .get_repo_watermark(&pair.repo_id)
+            .unwrap()
+            .0,
+        seeded
+    );
+    git_cli(&pair.developer, &["pull", "--ff-only"]);
+
+    // Two SVN revisions and two Git commits touch origin.txt.
+    svn_commit_file(&pair.wc, "origin.txt", "SVN first\n", "SVN first");
+    let svn_last = svn_commit_file(&pair.wc, "origin.txt", "SVN second\n", "SVN second");
+    std::fs::write(pair.wc.join("blob.bin"), [0u8, 1, 2]).unwrap();
+    std::fs::write(pair.wc.join("latin1.txt"), b"na\xefve svn\n").unwrap();
+    let svn_bytes_rev = svn_commit_wc(&pair.wc, "SVN binary and Latin-1 edits");
+    let git_first = pair.developer_commit("origin.txt", "Git first\n", "Git first");
+    let git_last = pair.developer_commit("origin.txt", "Git second\n", "Git second");
+    let git_bytes = pair.developer_commit_tree(
+        &[
+            ("blob.bin", Some("\u{0}git")),
+            ("latin1.txt", Some("caf\u{e9} git\n")),
+        ],
+        "Git binary and text edits",
+    );
+    let unrelated = pair.developer_commit("unrelated.txt", "later\n", "Later unrelated commit");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_ne!(git_first, git_last);
+
+    let before = pair.snapshot().await;
+    let result = pair.engine.run_sync_cycle().await;
+    assert!(
+        matches!(&result, Err(SyncError::UnresolvableConflict { .. })),
+        "{result:?}"
+    );
+    assert_eq!(pair.snapshot().await, before);
+    let by_path: BTreeMap<String, _> = pair
+        .engine
+        .db()
+        .list_conflicts(None, 10)
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.file_path.clone(), row))
+        .collect();
+    assert_eq!(
+        by_path.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["blob.bin", "latin1.txt", "origin.txt"]
+    );
+
+    let text = &by_path["origin.txt"];
+    assert_eq!(
+        text.svn_rev,
+        Some(svn_last),
+        "newest SVN revision on the path"
+    );
+    assert_eq!(
+        text.git_sha.as_deref(),
+        Some(git_last.as_str()),
+        "newest Git commit on the path, not a later unrelated one"
+    );
+    assert_ne!(text.git_sha.as_deref(), Some(unrelated.as_str()));
+    assert_eq!(text.base_content.as_deref(), Some("SVN origin\n"));
+    assert_eq!(text.svn_content.as_deref(), Some("SVN second\n"));
+    assert_eq!(text.git_content.as_deref(), Some("Git second\n"));
+
+    // Attribution is kept, but bytes that are not exact text are never stored.
+    let blob = &by_path["blob.bin"];
+    assert_eq!(blob.svn_rev, Some(svn_bytes_rev));
+    assert_eq!(blob.git_sha.as_deref(), Some(git_bytes.as_str()));
+    assert_eq!(
+        (&blob.base_content, &blob.svn_content, &blob.git_content),
+        (&None, &None, &None)
+    );
+    let latin = &by_path["latin1.txt"];
+    assert_eq!(latin.svn_rev, Some(svn_bytes_rev));
+    assert_eq!(latin.git_sha.as_deref(), Some(git_bytes.as_str()));
+    assert_eq!(latin.base_content, None, "Latin-1 base is not UTF-8");
+    assert_eq!(latin.svn_content, None, "lossy SVN text must not be stored");
+    assert_eq!(latin.git_content.as_deref(), Some("caf\u{e9} git\n"));
 }
 
 // ===========================================================================
