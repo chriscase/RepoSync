@@ -3659,29 +3659,46 @@ async fn scenario_r16_svnserve_svn_remote_recreation() {
     .info()
     .await
     .unwrap();
+    let bridge_before = get_head_sha(&fixture.repo.bridge);
     let result = engine.run_sync_cycle().await;
     let after = fixture.checkpoint_snapshot();
     let mappings_after = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    let bridge_after = get_head_sha(&fixture.repo.bridge);
     let uuid_changed = info_before.uuid != info_after.uuid;
     let checkpoint_stable = after == before;
     let mapping_stable = mappings_after == mappings_before;
-    let blocked = result.is_err();
-    let case_status = if uuid_changed && checkpoint_stable && mapping_stable && blocked {
-        "PASS"
-    } else {
-        "PARTIAL"
-    };
+    let bridge_stable = bridge_after == bridge_before;
+    let cycle_error = result.as_ref().err().map(|e| e.to_string());
+    // The refusal must be the SVN identity gate, not some unrelated failure.
+    let identity_refusal = cycle_error
+        .as_deref()
+        .is_some_and(|e| e.contains("svn_identity_changed"));
+    let recreated_file_absent = !fixture.repo.bridge.join("recreated.txt").exists();
+    let passed = uuid_changed
+        && checkpoint_stable
+        && mapping_stable
+        && bridge_stable
+        && identity_refusal
+        && recreated_file_absent;
     emit_evidence(
         CASE_SVN_REMOTE_RECREATION,
-        case_status,
+        if passed { "PASS" } else { "FAIL" },
         serde_json::json!({
             "uuid_before": info_before.uuid,
             "uuid_after": info_after.uuid,
             "checkpoint_before_after": [before, after],
             "mapping_count_before_after": [mappings_before, mappings_after],
-            "cycle_blocked": blocked,
-            "cycle_error": result.err().map(|e| e.to_string()),
+            "bridge_head_before_after": [bridge_before, bridge_after],
+            "cycle_blocked": result.is_err(),
+            "identity_refusal": identity_refusal,
+            "recreated_file_absent": recreated_file_absent,
+            "cycle_error": cycle_error,
         }),
+    );
+    assert!(
+        passed,
+        "a recreated SVN repository at the same URL must be refused by the identity gate \
+         without moving the checkpoint, mappings or Git bridge: {cycle_error:?}"
     );
 }
 
