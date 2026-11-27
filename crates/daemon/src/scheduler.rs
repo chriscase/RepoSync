@@ -98,6 +98,16 @@ fn busy_held_writer_blocks_replacement_open(db: &Database) -> bool {
     })
 }
 
+/// Take every webhook signal already queued, without waiting, and return how
+/// many there were. A burst of deliveries then costs one inspection.
+fn drain_queued_webhooks(rx: &mut mpsc::Receiver<()>) -> usize {
+    let mut folded = 0;
+    while rx.try_recv().is_ok() {
+        folded += 1;
+    }
+    folded
+}
+
 /// Tracks aggregate statistics across sync cycles.
 #[allow(dead_code)]
 pub struct SchedulerStats {
@@ -345,6 +355,12 @@ impl Scheduler {
                 // Webhook-triggered immediate sync. GitHub `forced` is only a
                 // hint on the webhook; this runs the same inspection as polling.
                 Some(()) = self.sync_rx.recv() => {
+                    // Signals that queued while waiting are folded into this
+                    // one inspection; one arriving while it runs queues the next.
+                    let folded = drain_queued_webhooks(&mut self.sync_rx);
+                    if folded > 0 {
+                        debug!(folded, "folded queued webhook signals into one inspection");
+                    }
                     self.handle_webhook_tick().await;
                     // Reset the interval so we don't sync again too soon
                     interval.reset();
@@ -2349,6 +2365,20 @@ mod shutdown_admission_tests {
         assert!(recorded.is_empty());
         assert_eq!(entries.load(Ordering::SeqCst), 0);
         assert!(handles.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_webhook_signals_fold_into_one_inspection() {
+        let (tx, mut rx) = mpsc::channel(16);
+        for _ in 0..16 {
+            tx.try_send(()).unwrap();
+        }
+        rx.recv().await.unwrap();
+        assert_eq!(drain_queued_webhooks(&mut rx), 15);
+        assert_eq!(drain_queued_webhooks(&mut rx), 0);
+        // A signal sent after the drain is kept for the next inspection.
+        tx.try_send(()).unwrap();
+        assert_eq!(drain_queued_webhooks(&mut rx), 1);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
