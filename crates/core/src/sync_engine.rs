@@ -5888,9 +5888,16 @@ impl SyncEngine {
             // The text API decodes lossily; never store replacement bytes.
             Ok(text) if text.contains('\u{fffd}') => None,
             Ok(text) => conflict_text(text.into_bytes()),
-            // Includes a path absent at that revision.
             Err(error) => {
-                debug!(path, revision, %error, "no SVN conflict content");
+                let absent = matches!(&error, crate::errors::SvnError::CommandFailed { stderr, .. }
+                    if ["E160013", "E200009", "W160013", "E195012"]
+                        .iter()
+                        .any(|code| stderr.contains(code)));
+                if absent {
+                    debug!(path, revision, "file absent on the SVN side");
+                } else {
+                    warn!(path, revision, %error, "could not read SVN conflict content");
+                }
                 None
             }
         }

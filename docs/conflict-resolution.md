@@ -75,7 +75,7 @@ Base (last synced version)
      └── Git changes (theirs)
 ```
 
-If the changes don't overlap (different lines), they're merged automatically. If they do overlap, a conflict is created for manual resolution.
+In Team mode every detected conflict is currently held for manual resolution, including changes to different lines of the same file. Automatic three-way merging is not applied there yet.
 
 ## What a Team Conflict Records
 
