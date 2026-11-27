@@ -412,6 +412,48 @@ async fn test_git_connection(
 // Apply configuration
 // ---------------------------------------------------------------------------
 
+/// The only file the setup wizard writes mappings to: the configured
+/// `identity.mapping_file` (the file the identity mapper reads), or
+/// `identity-mappings.toml` beside the configuration file when none is set.
+fn setup_mapping_target(state: &AppState) -> std::path::PathBuf {
+    match &state.config.identity.mapping_file {
+        Some(path) => path.clone(),
+        None => config_dir(&state.config_path).join(DEFAULT_SETUP_MAPPING_FILE),
+    }
+}
+
+const DEFAULT_SETUP_MAPPING_FILE: &str = "identity-mappings.toml";
+
+fn config_dir(config_path: &std::path::Path) -> &std::path::Path {
+    config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
+/// Whether a requested mapping path names `target`. A request may repeat the
+/// target as given or, when relative, as resolved beside the configuration
+/// file. Any `..` component is refused rather than normalized.
+fn mapping_path_matches(
+    requested: &str,
+    target: &std::path::Path,
+    config_path: &std::path::Path,
+) -> bool {
+    let requested = std::path::Path::new(requested);
+    if requested
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    if requested == target {
+        return true;
+    }
+    if requested.is_relative() && config_dir(config_path).join(requested) == target {
+        return true;
+    }
+    false
+}
+
 async fn apply_config(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -427,39 +469,53 @@ async fn apply_config(
     }
     let mut warnings = Vec::new();
 
+    // Decide where mappings may be written before anything is stored, so a
+    // refused path leaves no partial configuration behind.
+    let mapping_target = setup_mapping_target(&state);
+    if let Some(requested) = body
+        .identity_mapping_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        if !mapping_path_matches(requested, &mapping_target, &state.config_path) {
+            return Err(AppError::BadRequest(format!(
+                "identity mapping file must be the configured mapping file ({}); \
+                 the setup wizard does not write other paths",
+                mapping_target.display()
+            )));
+        }
+    }
+
     // Write identity mapping file if mappings are provided
     if let Some(ref mappings) = body.identity_mappings {
         if !mappings.is_empty() {
-            let mapping_path = body
-                .identity_mapping_file
-                .as_deref()
-                .unwrap_or("identity-mappings.toml");
-            let mut mapping_lines = Vec::new();
-            for m in mappings {
-                mapping_lines.push(format!("[mappings.\"{}\"]", m.svn_username));
-                mapping_lines.push(format!("name = \"{}\"", m.name));
-                mapping_lines.push(format!("email = \"{}\"", m.email));
-                mapping_lines.push(String::new());
-            }
-            let mapping_content = mapping_lines.join("\n");
-
-            // Resolve path relative to config file directory
-            let config_dir = state
-                .config_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."));
-            let full_mapping_path = if std::path::Path::new(mapping_path).is_absolute() {
-                std::path::PathBuf::from(mapping_path)
-            } else {
-                config_dir.join(mapping_path)
-            };
-
-            if let Err(e) = std::fs::write(&full_mapping_path, &mapping_content) {
+            // Serialize in the format the identity mapper reads, so names and
+            // emails cannot inject TOML.
+            let authors: std::collections::HashMap<
+                String,
+                reposync_core::identity::mapping_file::AuthorEntry,
+            > = mappings
+                .iter()
+                .filter(|m| !m.svn_username.trim().is_empty())
+                .map(|m| {
+                    (
+                        m.svn_username.clone(),
+                        reposync_core::identity::mapping_file::AuthorEntry {
+                            name: m.name.clone(),
+                            email: m.email.clone(),
+                        },
+                    )
+                })
+                .collect();
+            if let Err(e) =
+                reposync_core::identity::mapping_file::MappingFile::save(&mapping_target, &authors)
+            {
                 warnings.push(format!("Failed to write identity mapping file: {}", e));
             } else {
                 info!(
-                    path = %full_mapping_path.display(),
-                    count = mappings.len(),
+                    path = %mapping_target.display(),
+                    count = authors.len(),
                     "Wrote identity mappings file"
                 );
             }
