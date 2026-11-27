@@ -3659,29 +3659,89 @@ async fn scenario_r16_svnserve_svn_remote_recreation() {
     .info()
     .await
     .unwrap();
+    let bridge_before = get_head_sha(&fixture.repo.bridge);
+    let bare_before = git_main_commit_and_tree(&fixture.repo.bare);
+    let svn_youngest_before = svnlook_at(&repo_dir, "youngest", &[]).trim().to_string();
+    let durable = |db: &Database| {
+        let lineage =
+            reposync_core::db::lineage_checkpoints::load_canonical_lineage(db, &fixture.repo.id)
+                .unwrap()
+                .map(|l| l.svn_uuid);
+        let established =
+            reposync_core::db::lineage_checkpoints::independently_established_svn_uuid(
+                &db.conn(),
+                &fixture.repo.id,
+            )
+            .unwrap();
+        let svn_kv = db
+            .get_state(&format!("last_svn_rev_{}", fixture.repo.id))
+            .unwrap();
+        (lineage, established, svn_kv)
+    };
+    let durable_before = durable(&setup_db(&fixture.db_path));
     let result = engine.run_sync_cycle().await;
     let after = fixture.checkpoint_snapshot();
-    let mappings_after = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    let db_after = setup_db(&fixture.db_path);
+    let mappings_after = db_after.count_sync_records().unwrap();
+    let durable_after = durable(&db_after);
+    let status_after = db_after
+        .get_repository(&fixture.repo.id)
+        .unwrap()
+        .map(|r| r.sync_status);
+    let bridge_after = get_head_sha(&fixture.repo.bridge);
+    let bare_after = git_main_commit_and_tree(&fixture.repo.bare);
+    let svn_youngest_after = svnlook_at(&repo_dir, "youngest", &[]).trim().to_string();
+    // The pinned lineage still names the original repository, and the SVN
+    // cursor did not move onto the new repository's history.
+    let lineage_kept = durable_before == durable_after
+        && durable_after.0.as_deref() == Some(info_before.uuid.as_str());
+    let remotes_stable = bare_after == bare_before && svn_youngest_after == svn_youngest_before;
+    let held = status_after.as_deref() == Some("reconciliation_required");
     let uuid_changed = info_before.uuid != info_after.uuid;
     let checkpoint_stable = after == before;
     let mapping_stable = mappings_after == mappings_before;
-    let blocked = result.is_err();
-    let case_status = if uuid_changed && checkpoint_stable && mapping_stable && blocked {
-        "PASS"
-    } else {
-        "PARTIAL"
-    };
+    let bridge_stable = bridge_after == bridge_before;
+    let cycle_error = result.as_ref().err().map(|e| e.to_string());
+    // The refusal must be the SVN identity gate, not some unrelated failure.
+    let identity_refusal = cycle_error
+        .as_deref()
+        .is_some_and(|e| e.contains("svn_identity_changed"));
+    let recreated_file_absent = !fixture.repo.bridge.join("recreated.txt").exists();
+    let passed = uuid_changed
+        && checkpoint_stable
+        && mapping_stable
+        && bridge_stable
+        && remotes_stable
+        && lineage_kept
+        && held
+        && identity_refusal
+        && recreated_file_absent;
     emit_evidence(
         CASE_SVN_REMOTE_RECREATION,
-        case_status,
+        if passed { "PASS" } else { "FAIL" },
         serde_json::json!({
             "uuid_before": info_before.uuid,
             "uuid_after": info_after.uuid,
             "checkpoint_before_after": [before, after],
             "mapping_count_before_after": [mappings_before, mappings_after],
-            "cycle_blocked": blocked,
-            "cycle_error": result.err().map(|e| e.to_string()),
+            "bridge_head_before_after": [bridge_before, bridge_after],
+            "bare_main_before_after": [bare_before.0.to_string(), bare_after.0.to_string()],
+            "svn_youngest_before_after": [svn_youngest_before, svn_youngest_after],
+            "pinned_uuid_established_svn_kv_before_after": [
+                format!("{durable_before:?}"),
+                format!("{durable_after:?}")
+            ],
+            "sync_status_after": status_after,
+            "cycle_blocked": result.is_err(),
+            "identity_refusal": identity_refusal,
+            "recreated_file_absent": recreated_file_absent,
+            "cycle_error": cycle_error,
         }),
+    );
+    assert!(
+        passed,
+        "a recreated SVN repository at the same URL must be refused by the identity gate \
+         and held for reconciliation without moving the checkpoint, lineage, mappings or either remote: {cycle_error:?}"
     );
 }
 

@@ -21,7 +21,6 @@ FINALIZED_HISTORY_CASES = ("historical_hold", "mirror_recovery", "contradictory_
 PINNED_CI_PARTIAL_ALLOWLIST_IDS = frozenset(
     {
         POST_WRITE_RECOVERY,
-        "R16_SVNSERVE_SVN_REMOTE_RECREATION",
         "R17_SVNSERVE_NOTIFICATION_ISOLATION",
     }
 )
@@ -658,6 +657,19 @@ def run_self_test() -> None:
         code, errs = ci_gate(write_summary(tmp, surprise, "PARTIAL"), allowlist_path)
         assert code != 0 and errs, (code, errs)
         check_controlled(surprise, "PARTIAL", "3", "FAIL")
+
+        # SVN remote recreation is blocked by the identity gate and must PASS;
+        # it is no longer an allowed PARTIAL.
+        assert recreation_id not in allowed, allowed
+        regressed = full_pass_rows()
+        for row in regressed:
+            if row["id"] == recreation_id:
+                row["status"] = "PARTIAL"
+        code, errs = ci_gate(write_summary(tmp, regressed, "PARTIAL"), allowlist_path)
+        assert code == 1 and f"{recreation_id}: PARTIAL not on CI allowlist ({allowlist_path.name})" in errs, (
+            code,
+            errs,
+        )
 
         failed = full_pass_rows()
         for row in failed:
