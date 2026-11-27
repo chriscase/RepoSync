@@ -99,8 +99,9 @@ They are separate from the authenticated API above. What the handlers do today:
 | Stale or out-of-order events | The event is not replayed; it only prompts an inspection of the current remote state, so a stale event costs at most one extra inspection | Same |
 | Scheduler unreachable | `500`, and the delivery ID is forgotten so a redelivery is acted on | Same |
 
-The response's `triggered` field is `true` only when that delivery queued a new
-inspection. The delivery log is in memory, holds the last 4096 IDs and is
+The response's `triggered` field is `true` when that delivery queued a signal.
+Several queued signals still cost one inspection, so `triggered: true` does not
+mean a separate inspection ran for that delivery. The delivery log is in memory, holds the last 4096 IDs and is
 cleared by a restart; at worst a redelivery then prompts one more inspection.
 
 So a webhook is only an accelerator: the same history inspection that polling
