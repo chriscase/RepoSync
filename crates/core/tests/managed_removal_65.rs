@@ -1019,17 +1019,11 @@ async fn rs65_unrequested_svn_stays_untouched_and_failed_git_cannot_change_choic
     tokio::time::timeout(std::time::Duration::from_secs(90), async {
         use reposync_core::managed_remove::reviewed;
         let f = native_fixture().await;
-        let hook = f.bare.join("hooks/pre-receive");
-        std::fs::write(
-            &hook,
+        install_pre_receive(
+            &f.bare,
+            "r65-deny",
             "#!/bin/sh\necho 'synthetic Git deletion denied' >&2\nexit 1\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        );
         let before_refs = native_command(
             f.root.path(),
             "git",
@@ -1381,4 +1375,43 @@ fn rs199_legacy_choices_keep_identical_serialized_plan_contract() {
     assert!(serde_json::to_string(&explicit)
         .unwrap()
         .contains("\"archive_pair\":true"));
+}
+
+// The isolated qualification image mounts the writable fixture noexec, so Git
+// cannot run a hook written there. The image instead supplies a read-only copy
+// of this exact script (scripts/reliability-hooks) and names its directory in
+// REPOSYNC_FIXTURE_HOOKS. The bare repository's own config points Git at it.
+fn install_pre_receive(bare: &std::path::Path, name: &str, body: &str) {
+    match std::env::var_os("REPOSYNC_FIXTURE_HOOKS") {
+        Some(root) => {
+            let dir = std::path::Path::new(&root).join(name);
+            let image = std::fs::read(dir.join("pre-receive"))
+                .unwrap_or_else(|error| panic!("image-owned {name} hook is missing: {error}"));
+            assert_eq!(
+                image,
+                body.as_bytes(),
+                "image-owned {name} hook differs from the test's script"
+            );
+            let configured = std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(bare)
+                .args(["config", "core.hooksPath"])
+                .arg(&dir)
+                .status()
+                .unwrap();
+            assert!(
+                configured.success(),
+                "could not select the image-owned {name} hook"
+            );
+        }
+        None => {
+            let hook = bare.join("hooks").join("pre-receive");
+            std::fs::write(&hook, body).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+    }
 }

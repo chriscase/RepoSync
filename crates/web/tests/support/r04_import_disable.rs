@@ -14,6 +14,54 @@ mod settings_put;
 const MAIN: &str = "refs/heads/main";
 const DEADLINE: Duration = Duration::from_secs(60);
 
+const R04_GATE_HOOK: &str = r#"#!/bin/sh
+set -eu
+cat >> hooks/r04-offers
+: > hooks/r04-ready
+remaining=1200
+while [ ! -f hooks/r04-release ]; do
+    [ -d hooks ] && [ "$remaining" -gt 0 ] || exit 1
+    remaining=$((remaining - 1))
+    sleep 0.05
+done
+"#;
+
+// The isolated qualification image mounts the writable fixture noexec, so Git
+// cannot run a hook written there. The image instead supplies a read-only copy
+// of this exact script (scripts/reliability-hooks) and names its directory in
+// REPOSYNC_FIXTURE_HOOKS. The bare repository's own config points Git at it;
+// the hook's control files stay in the fixture's `hooks/` data directory.
+fn install_pre_receive(bare: &Path, name: &str, body: &str) {
+    match std::env::var_os("REPOSYNC_FIXTURE_HOOKS") {
+        Some(root) => {
+            let dir = Path::new(&root).join(name);
+            let image = fs::read(dir.join("pre-receive"))
+                .unwrap_or_else(|error| panic!("image-owned {name} hook is missing: {error}"));
+            assert_eq!(
+                image,
+                body.as_bytes(),
+                "image-owned {name} hook differs from the test's script"
+            );
+            let configured = std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(bare)
+                .args(["config", "core.hooksPath"])
+                .arg(&dir)
+                .status()
+                .unwrap();
+            assert!(
+                configured.success(),
+                "could not select the image-owned {name} hook"
+            );
+        }
+        None => {
+            let hook = bare.join("hooks").join("pre-receive");
+            fs::write(&hook, body).unwrap();
+            fs::set_permissions(hook, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+}
+
 // Git runs pre-receive in the bare repository. Capture its actual old/new/ref
 // lines before any ref moves. Both the test and the hook have bounded waits.
 pub(super) struct ReceiveGate(PathBuf);
@@ -24,22 +72,7 @@ impl ReceiveGate {
         fs::create_dir_all(&hooks).unwrap();
         let hook = hooks.join("pre-receive");
         assert!(!hook.exists());
-        fs::write(
-            &hook,
-            r#"#!/bin/sh
-set -eu
-cat >> hooks/r04-offers
-: > hooks/r04-ready
-remaining=1200
-while [ ! -f hooks/r04-release ]; do
-    [ -d hooks ] && [ "$remaining" -gt 0 ] || exit 1
-    remaining=$((remaining - 1))
-    sleep 0.05
-done
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(hook, fs::Permissions::from_mode(0o700)).unwrap();
+        install_pre_receive(bare, "r04-gate", R04_GATE_HOOK);
         Self(hooks)
     }
 

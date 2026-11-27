@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+cat >> hooks/r04-offers
+: > hooks/r04-ready
+remaining=1200
+while [ ! -f hooks/r04-release ]; do
+    [ -d hooks ] && [ "$remaining" -gt 0 ] || exit 1
+    remaining=$((remaining - 1))
+    sleep 0.05
+done

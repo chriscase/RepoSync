@@ -42,6 +42,7 @@ PY
   cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py \
     scripts/reliability-inventory.py scripts/reliability-inventory-probes.py \
     scripts/reliability-copy-consumer.mjs scripts/reliability-scoped-consumer.mjs "$context/scripts/" || return $?
+  cp -R scripts/reliability-hooks "$context/scripts/" || return $?
   mkdir -p "$context/docs/reliability/fixtures" || return $?
   cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$context/docs/reliability/" || return $?
 }

@@ -1,0 +1,3 @@
+#!/bin/sh
+echo 'synthetic Git deletion denied' >&2
+exit 1

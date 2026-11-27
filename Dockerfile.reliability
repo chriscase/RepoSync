@@ -77,6 +77,11 @@ ENV REPOSYNC_COPY_CONSUMER=/opt/reliability-copy-consumer.mjs
 COPY scripts/reliability-scoped-consumer.mjs /opt/reliability-scoped-consumer.mjs
 ENV REPOSYNC_SCOPED_CONSUMER=/opt/reliability-scoped-consumer.mjs
 COPY scripts/reliability_scan.py /usr/local/bin/reliability_scan.py
+# Git hooks cannot run from the noexec fixture mount. These reviewed, read-only
+# copies run instead; tests compare their bytes and keep control data in /fixture.
+COPY scripts/reliability-hooks /opt/reposync-fixture-hooks
+RUN chmod -R a-w /opt/reposync-fixture-hooks && chmod 0555 /opt/reposync-fixture-hooks/*/pre-receive
+ENV REPOSYNC_FIXTURE_HOOKS=/opt/reposync-fixture-hooks
 COPY scripts/reliability-inventory.py /usr/local/bin/reliability-inventory.py
 COPY docs/reliability/legacy-evidence-vocabulary.json /usr/local/bin/legacy-evidence-vocabulary.json
 COPY scripts/reliability-inventory-probes.py /usr/local/bin/reliability-inventory-probes.py
