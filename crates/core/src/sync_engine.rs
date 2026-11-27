@@ -203,6 +203,10 @@ pub struct SyncEngine {
     allowed_paths: Vec<String>,
     /// Blocked path patterns for Git-to-SVN sync. Empty means no blocked patterns.
     blocked_patterns: Vec<String>,
+    /// Counters of the most recent finished cycle that started sync work,
+    /// kept even when it returned an error (for example an unresolved
+    /// conflict). Cleared when each cycle starts; see `last_cycle_stats`.
+    last_cycle_stats: std::sync::Mutex<Option<SyncStats>>,
     /// Fixture-only replay batch cap override (debug builds).
     #[cfg(debug_assertions)]
     pending_commit_cap_override: std::sync::Mutex<Option<usize>>,
@@ -634,6 +638,7 @@ impl SyncEngine {
             lfs_threshold_bytes: 0,
             allowed_paths: Vec::new(),
             blocked_patterns: Vec::new(),
+            last_cycle_stats: std::sync::Mutex::new(None),
             #[cfg(debug_assertions)]
             pending_commit_cap_override: std::sync::Mutex::new(None),
             #[cfg(debug_assertions)]
@@ -665,6 +670,22 @@ impl SyncEngine {
     pub fn set_credential_reload_apply_fault(&self) {
         *self.credential_reload_fault.lock().unwrap() =
             Some(CredentialReloadTestFault::ApplyFailure);
+    }
+
+    /// Counters from this engine's most recent cycle that started sync work.
+    ///
+    /// `run_sync_cycle` returns its [`SyncStats`] only on success. When a
+    /// cycle stops on an error, such as unresolved conflicts, this still
+    /// reports what it detected, including `conflicts_detected`. Returns
+    /// `None` before the first cycle, while a cycle is in progress, when the
+    /// latest cycle stopped during writer admission, credential reload or the
+    /// scope schema upgrade, and when it panicked or was cancelled before
+    /// finishing.
+    pub fn last_cycle_stats(&self) -> Option<SyncStats> {
+        self.last_cycle_stats
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Install a per-engine replay batch cap for fixture tests.
@@ -923,6 +944,13 @@ impl SyncEngine {
         // RAII guard that clears the running flag on drop (even on panic).
         let _guard = SyncLockGuard(self.running.clone());
 
+        // A cycle that stops before sync work must not report an older
+        // cycle's counters.
+        *self
+            .last_cycle_stats
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+
         // Admit before credential reload, schema changes or working-tree work.
         // Refresh admission checks this durable window in its own transaction.
         let writer_window = match supplied_window {
@@ -982,6 +1010,10 @@ impl SyncEngine {
         let _ = self.persist_sync_state(final_state);
         let _ = self.db.set_state("last_sync_at", &Utc::now().to_rfc3339());
         stats.completed_at = Some(Utc::now().to_rfc3339());
+        *self
+            .last_cycle_stats
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(stats.clone());
 
         // Update per-repo error count
         if let Some(rid) = self.effective_repo_id() {

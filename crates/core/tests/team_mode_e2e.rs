@@ -9450,68 +9450,86 @@ async fn test_team_mode_marker_without_receipt_applies_once() {
 // Test 5: Conflict detection with overlapping files
 // ===========================================================================
 
-/// When both SVN and Git modify the same file, the engine should detect
-/// a conflict.
+/// When both SVN and Git modify the same SVN-origin file, the engine must
+/// detect, count and persist a conflict and acknowledge neither edit.
 ///
-/// NOTE: Currently fails because the diff_full path appends "/trunk" to
-/// the SVN URL, but the test repo uses flat layout. Needs SVN layout
-/// config fix or test repo restructuring.
+/// The pair uses a standard `trunk/` layout and a baseline imported SVN→Git
+/// by the real engine, so the overlap is a genuine three-way divergence
+/// rather than an unrelated history. The cycle stops with
+/// `UnresolvableConflict`; its counters are read back through
+/// `SyncEngine::last_cycle_stats`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires SVN standard layout (trunk/) — see TODO above"]
 async fn test_team_mode_conflict_detection() {
-    if !svn_available() {
-        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
-        return;
-    }
+    // Active coverage: the constructor fails loudly when SVN tools are missing.
+    let pair = QualifiedPair::new_with_svn_branch("conflict-detection", "trunk").await;
+    let (baseline_rev, baseline_sha) = pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap();
+    assert_eq!(baseline_sha, pair.imported_base);
 
-    let tmp = TempDir::new().unwrap();
-    let svn_url = create_svn_repo(tmp.path());
+    // SVN user modifies the SVN-origin file.
+    let svn_rev = svn_commit_file(&pair.wc, "origin.txt", "SVN version\n", "SVN edits shared");
+    assert_eq!(svn_rev, baseline_rev + 1);
 
-    // Seed SVN with a base file.
-    let wc_path = tmp.path().join("wc");
-    svn_checkout(&svn_url, &wc_path);
-    svn_commit_file(&wc_path, "shared.txt", "base content", "Add shared file");
+    // Git user also modifies the same file, on top of the imported baseline.
+    let git_sha = pair.developer_commit("origin.txt", "Git version\n", "Git edits shared");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        git_output(&pair.bare, &["rev-parse", "refs/heads/main~1"]),
+        pair.imported_base
+    );
 
-    let git_work_dir = tmp.path().join("git_work");
-    let bare_dir = tmp.path().join("origin.git");
-    let git_client = setup_git_with_bare_origin(&git_work_dir, &bare_dir);
+    let before = pair.snapshot().await;
+    assert_eq!(before.svn_origin, "SVN version\n");
+    let result = pair.engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &result,
+            Err(SyncError::UnresolvableConflict { file_path, .. }) if file_path == "origin.txt"
+        ),
+        "expected an unresolved conflict on origin.txt, not an apply error or success: {result:?}"
+    );
 
-    let initial_sha = get_head_sha(&git_work_dir);
-
-    // SVN user modifies the file.
-    svn_commit_file(&wc_path, "shared.txt", "SVN version", "SVN edits shared");
-
-    // Git user also modifies the same file.
-    std::fs::write(git_work_dir.join("shared.txt"), "Git version").unwrap();
-    git_client
-        .commit(
-            "Git edits shared",
-            "Git User",
-            "gituser@example.com",
-            "Git User",
-            "gituser@example.com",
-        )
-        .unwrap();
-    git_client.push("origin", "main").unwrap();
-
-    // Seed watermarks past the initial commits.
-    let db = setup_db(&tmp.path().join("sync.db"));
-    let _ = db.set_state("last_svn_rev", "1");
-    let _ = db.set_state("last_git_hash", &initial_sha);
-
-    let config = make_app_config(&svn_url, tmp.path());
-    let svn_client = SvnClient::new(&svn_url, "", "");
-    let mapper = Arc::new(make_identity_mapper());
-
-    let engine = SyncEngine::new(config, db, svn_client, git_client, mapper);
-    let stats = engine.run_sync_cycle().await.expect("sync cycle failed");
-
-    // Both sides modified "shared.txt" — should detect a conflict.
+    // Both sides modified "origin.txt" — the cycle must count the conflict.
+    let stats = pair
+        .engine
+        .last_cycle_stats()
+        .expect("the conflict cycle must keep its counters");
     assert!(
         stats.conflicts_detected > 0,
         "expected at least 1 conflict when both sides edit same file, got {}",
         stats.conflicts_detected
     );
+    assert_eq!(stats.conflicts_detected, 1);
+    assert_eq!(stats.conflicts_auto_resolved, 0);
+    assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (0, 0));
+
+    let conflicts = pair.engine.db().list_conflicts(None, 10).unwrap();
+    assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+    assert_eq!(conflicts[0].file_path, "origin.txt");
+    assert_eq!(conflicts[0].conflict_type, "content");
+    assert_eq!(conflicts[0].status, "detected");
+    assert_eq!(conflicts[0].repo_id.as_deref(), Some(pair.repo_id.as_str()));
+
+    // Neither history moved and no checkpoint or mapping acknowledges either edit.
+    assert_eq!(pair.snapshot().await, before);
+    assert_eq!(
+        pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+        (baseline_rev, baseline_sha)
+    );
+    assert_eq!(
+        git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+        git_sha
+    );
+    assert_eq!(
+        tracked_tree_at(&pair.bare, "refs/heads/main")
+            .get("origin.txt")
+            .map(Vec::as_slice),
+        Some(b"Git version\n".as_slice())
+    );
+    assert!(!pair
+        .engine
+        .db()
+        .has_repo_emitted_git_commit(&pair.repo_id, &git_sha)
+        .unwrap());
 }
 
 // ===========================================================================

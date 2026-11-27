@@ -20,13 +20,12 @@
 //!    Drop the engine, reopen its database and checkout, and exercise the
 //!    same gate on the first cycle of the replacement engine.
 //!
-//! Known limit (remaining whole-#73 gate): on the unresolved-conflict path the
-//! engine returns `Err(UnresolvableConflict { detail: "N unresolved
-//! conflict(s) recorded; ..." })` and drops `SyncStats`, so the literal
-//! `SyncStats::conflicts_detected` value is not observable from
-//! `run_sync_cycle`. This test asserts the equivalent public surfaces instead
-//! (error variant + the engine-reported count in `detail`, and the persisted
-//! conflict row count) and does not claim to assert the `SyncStats` field.
+//! `run_sync_cycle` returns `Err(UnresolvableConflict { .. })` on this path,
+//! so the cycle's `SyncStats` are read back through
+//! `SyncEngine::last_cycle_stats`. The first cycle must report
+//! `conflicts_detected == 1` with nothing applied or auto-resolved. A held
+//! retry is refused by the persisted gate before detection runs, so it must
+//! report no detection and no application at all.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -772,6 +771,21 @@ async fn rs73_overlapping_shared_file_edits_surface_persisted_conflict_without_a
             "expected UnresolvableConflict for shared.txt (not an apply error or success), got {other:?}"
         ),
     }
+    let stats = fx
+        .engine
+        .last_cycle_stats()
+        .expect("the conflict cycle reached detection and must keep its counters");
+    assert_eq!(
+        stats.conflicts_detected, 1,
+        "the engine must count the overlapping edit as a detected conflict"
+    );
+    assert_eq!(stats.conflicts_auto_resolved, 0, "auto-merge is disabled");
+    assert_eq!(
+        (stats.svn_to_git_count, stats.git_to_svn_count),
+        (0, 0),
+        "nothing may be applied in either direction"
+    );
+    assert!(stats.completed_at.is_some());
 
     // Persisted, surfaced conflict row (queried through public DB API).
     let conflicts = fx.engine.db().list_conflicts(None, 10).unwrap();
@@ -912,6 +926,20 @@ async fn assert_blocked_cycle(
             "retry must fail with the persisted-conflict UnresolvableConflict gate, got {other:?}"
         ),
     }
+    let stats = fx
+        .engine
+        .last_cycle_stats()
+        .expect("the held retry still started sync work");
+    assert_eq!(
+        (
+            stats.conflicts_detected,
+            stats.conflicts_auto_resolved,
+            stats.svn_to_git_count,
+            stats.git_to_svn_count
+        ),
+        (0, 0, 0, 0),
+        "the persisted gate refuses before detection and applies nothing"
+    );
     assert_single_blocking_row(fx.engine.db(), first_row, "after blocked retry");
     assert_eq!(
         &fx.state(),
