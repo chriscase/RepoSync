@@ -2595,14 +2595,17 @@ impl SyncEngine {
                         .map(|change| change.sha.clone())
                         .collect(),
                 });
-        // 2. Detect conflicts against the full admitted P→R path, not only the replay batch.
-        self.ensure_conflict_coverage_before_detection(
-            git_fetch.has_more,
-            git_fetch
-                .pending_total
-                .saturating_sub(git_fetch.conflict_coverage_skipped),
-            git_fetch.conflict_coverage.len(),
-        )?;
+        // 2. Detect conflicts against the full admitted P→R path, not only the
+        // replay batch. Fetch already refused partial coverage before building
+        // change sets, so this only re-states that invariant.
+        debug_assert!(
+            !git_fetch.has_more
+                || git_fetch.conflict_coverage.len()
+                    == git_fetch
+                        .pending_total
+                        .saturating_sub(git_fetch.conflict_coverage_skipped),
+            "conflict coverage was admitted short of the pending frontier"
+        );
         let conflicts =
             self.detect_conflicts_internal(&svn_changes, &git_fetch.conflict_coverage)?;
         stats.conflicts_detected = conflicts.len();
@@ -5824,12 +5827,15 @@ impl SyncEngine {
     /// commit touching the path. The SVN text is the file at the newest
     /// pending SVN revision and the Git text is the file at the pending Git
     /// tip, so a side where the file no longer exists stores none. The base
-    /// is the file at the pair's watermark, the SVN revision and Git commit
-    /// both sides last agreed on, and is stored only when the SVN and Git
-    /// copies there are identical.
+    /// is the file at the watermark Git commit, the state both sides last
+    /// agreed on. It is stored only when the SVN copy of that state, the
+    /// revision a Git→SVN replay created for that commit or else the
+    /// watermark revision, holds identical text.
     ///
     /// Text stays `None` when it is binary, not valid UTF-8, larger than
-    /// [`CONFLICT_EVIDENCE_MAX_BYTES`], a Git LFS pointer or unreadable. It is
+    /// [`CONFLICT_EVIDENCE_MAX_BYTES`] (checked before reading), a symbolic
+    /// link (not a regular Git file, or an SVN `svn:special` file), a Git
+    /// LFS pointer or unreadable. It is
     /// never stored lossily. Reads are best-effort and never change whether
     /// a conflict is held.
     async fn attach_conflict_evidence(
@@ -5846,6 +5852,31 @@ impl SyncEngine {
             .effective_repo_id()
             .and_then(|rid| self.db.get_repo_watermark(rid).ok())
             .filter(|(revision, sha)| *revision > 0 && !sha.is_empty());
+        // After a Git→SVN replay the watermark pairs the last imported SVN
+        // revision with the replayed Git commit; the SVN copy of that commit
+        // is the revision the replay created.
+        let base_svn_revisions: Vec<i64> = match (&watermark, self.effective_repo_id()) {
+            (Some((revision, sha)), Some(rid)) => {
+                let replayed: Option<i64> = self
+                    .db
+                    .conn()
+                    .query_row(
+                        "SELECT MAX(svn_rev) FROM sync_records
+                         WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'git_to_svn'
+                           AND status = 'applied'",
+                        rusqlite::params![rid, sha],
+                        |row| row.get(0),
+                    )
+                    .ok()
+                    .flatten();
+                replayed
+                    .filter(|replayed| replayed != revision)
+                    .into_iter()
+                    .chain(std::iter::once(*revision))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         for conflict in conflicts.iter_mut() {
             let path = conflict.file_path.clone();
             conflict.svn_rev = svn_changes
@@ -5863,41 +5894,62 @@ impl SyncEngine {
                 .find(|cs| cs.changed_files.iter().any(|f| touches(f, &path)))
                 .map(|cs| cs.sha.clone());
             conflict.git_content = self.git_conflict_text(&git_fetch.coverage_tip, &path);
-            conflict.base_content = match &watermark {
-                Some((revision, sha)) => {
-                    let git_base = self.git_conflict_text(sha, &path);
-                    let svn_base = self.svn_conflict_text(&path, *revision).await;
-                    if git_base.is_some() && git_base == svn_base {
-                        git_base
-                    } else {
-                        None
+            conflict.base_content = None;
+            if let Some((_, sha)) = &watermark {
+                if let Some(git_base) = self.git_conflict_text(sha, &path) {
+                    for revision in &base_svn_revisions {
+                        let svn_base = self.svn_conflict_text(&path, *revision).await;
+                        if svn_base.as_deref() == Some(git_base.as_str()) {
+                            conflict.base_content = Some(git_base);
+                            break;
+                        }
                     }
                 }
-                None => None,
-            };
+            }
         }
     }
 
     async fn svn_conflict_text(&self, path: &str, revision: i64) -> Option<String> {
+        fn report(path: &str, revision: i64, error: &crate::errors::SvnError) {
+            let absent = matches!(error, crate::errors::SvnError::CommandFailed { stderr, .. }
+                if ["E160013", "E200009", "W160013", "E195012"]
+                    .iter()
+                    .any(|code| stderr.contains(code)));
+            if absent {
+                debug!(path, revision, "file absent on the SVN side");
+            } else {
+                warn!(path, revision, %error, "could not read SVN conflict content");
+            }
+        }
         let svn = self
             .svn_client
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        // Check the size first so a large file is never read into memory.
+        match svn.file_size_at_rev(path, revision).await {
+            Ok(Some(size)) if size <= CONFLICT_EVIDENCE_MAX_BYTES as u64 => {}
+            Ok(_) => return None,
+            Err(error) => {
+                report(path, revision, &error);
+                return None;
+            }
+        }
+        // A special file (symbolic link) is stored as link text, not content.
+        match svn.file_properties_at_rev(path, revision).await {
+            Ok(props) if props.contains("name=\"svn:special\"") => return None,
+            Ok(_) => {}
+            Err(error) => {
+                report(path, revision, &error);
+                return None;
+            }
+        }
         match svn.cat(path, revision).await {
             // The text API decodes lossily; never store replacement bytes.
             Ok(text) if text.contains('\u{fffd}') => None,
             Ok(text) => conflict_text(text.into_bytes()),
             Err(error) => {
-                let absent = matches!(&error, crate::errors::SvnError::CommandFailed { stderr, .. }
-                    if ["E160013", "E200009", "W160013", "E195012"]
-                        .iter()
-                        .any(|code| stderr.contains(code)));
-                if absent {
-                    debug!(path, revision, "file absent on the SVN side");
-                } else {
-                    warn!(path, revision, %error, "could not read SVN conflict content");
-                }
+                report(path, revision, &error);
                 None
             }
         }
@@ -5908,6 +5960,14 @@ impl SyncEngine {
             return None;
         }
         let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+        match git.file_size_at_commit(sha, path) {
+            Ok(Some(size)) if size <= CONFLICT_EVIDENCE_MAX_BYTES => {}
+            Ok(_) => return None,
+            Err(error) => {
+                warn!(path, sha, %error, "could not read Git conflict file size");
+                return None;
+            }
+        }
         match git.get_file_content_at_commit(sha, path) {
             // An LFS pointer is not the file the SVN side holds.
             Ok(Some(bytes)) if bytes.starts_with(b"version https://git-lfs.github.com/spec/") => {

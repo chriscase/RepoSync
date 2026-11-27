@@ -502,3 +502,48 @@ async fn rs113_configured_branch_builders_select_literal_nodes_and_root_controls
         "node-1\n"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn file_size_at_rev_reports_regular_files_only() {
+    let (root, client) = fixture();
+    let wc = root.path().join("wc");
+    client.checkout_head(&wc).await.unwrap();
+    let confined = ConfinedWorkingCopy::open(&wc).unwrap();
+    confined.write_file("data.txt", b"12345").unwrap();
+    confined.write_file("solo/only.txt", b"x").unwrap();
+    std::os::unix::fs::symlink("data.txt", wc.join("link")).unwrap();
+    client.add(&wc, &["data.txt", "solo"]).await.unwrap();
+    // The client refuses to add special nodes; a coworker's svn can.
+    let added = std::process::Command::new("svn")
+        .args(["add", "--", "link"])
+        .current_dir(&wc)
+        .output()
+        .unwrap();
+    assert!(added.status.success(), "{added:?}");
+    let committed = std::process::Command::new("svn")
+        .args(["commit", "-m", "sizes", "--non-interactive"])
+        .current_dir(&wc)
+        .output()
+        .unwrap();
+    assert!(committed.status.success(), "{committed:?}");
+    let revision = 1;
+    assert_eq!(
+        client.file_size_at_rev("data.txt", revision).await.unwrap(),
+        Some(5)
+    );
+    assert_eq!(
+        client.file_size_at_rev("solo", revision).await.unwrap(),
+        None,
+        "a directory with one child is not that child"
+    );
+    assert!(client
+        .file_size_at_rev("missing.txt", revision)
+        .await
+        .is_err());
+    assert!(client
+        .file_properties_at_rev("link", revision)
+        .await
+        .unwrap()
+        .contains("name=\"svn:special\""));
+}
