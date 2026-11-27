@@ -740,9 +740,10 @@ def baseline_deadline(lock_source, name):
     # The candidate core catalog took 363.80s in ordinary CI with 897 cases.
     if lock_source == "candidate" and name in ("reposync-core", "reposync_core"):
         return 900
-    # The candidate server_freeze catalog took 298.83s in a complete isolated
-    # run and then exceeded 300s twice, leaving every later catalog unrun.
-    if lock_source == "candidate" and name == "server_freeze":
+    # The candidate team_mode_e2e catalog took 226s with 189 cases on one
+    # isolated runner and exceeded 300s on another whose core catalog ran about
+    # 1.35 times slower, leaving every later catalog unrun.
+    if lock_source == "candidate" and name == "team_mode_e2e":
         return 600
     return 300
 
@@ -910,10 +911,10 @@ def baseline_self_test():
         assert (evidence / "baseline-fixture.stderr.log").read_text() == stderr
         core_names = ("reposync-core", "reposync_core")
         assert all(baseline_deadline("candidate", name) == 900 for name in core_names)
-        assert baseline_deadline("candidate", "team_mode_e2e") == 300
-        assert baseline_deadline("candidate", "server_freeze") == 600
+        assert baseline_deadline("candidate", "team_mode_e2e") == 600
+        assert baseline_deadline("candidate", "server_freeze") == 300
         for role in [None, "unrecognized", *(r["source_head"] for r in NATIVE_ABSENCE_REGISTRY)]:
-            assert all(baseline_deadline(role, name) == 300 for name in (*core_names, "server_freeze"))
+            assert all(baseline_deadline(role, name) == 300 for name in (*core_names, "team_mode_e2e"))
 
         partial = (b"x" * 70000 + b"\ntest trusted::case ... ok\n"
                    b"test unlisted_private_name ... secret fixture output\n" +
