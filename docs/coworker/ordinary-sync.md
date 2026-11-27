@@ -90,18 +90,25 @@ They are separate from the authenticated API above. What the handlers do today:
 
 | Behavior | GitHub / Gitea push | SVN post-commit |
 | --- | --- | --- |
-| Authenticity check | HMAC signature header checked **only if** a webhook secret is configured; if none is configured the handler logs a warning and accepts the payload | Shared-secret header checked **only if** configured; otherwise accepted with a warning |
-| What it does on a valid event | Sends one "sync now" signal to the scheduler and broadcasts a UI notification | Same |
-| `forced` flag | Reported back as a **hint** (`forced_hint`, `inspection: polling_safety_gate`); never used to reset anything | n/a |
-| Duplicate delivery IDs | Not tracked by the handler | Not tracked |
-| Stale or out-of-order events | The event is not replayed; it only prompts a poll, so a stale event costs one extra poll | Same |
+| Authenticity check | HMAC signature header checked before the body is read, **if** a webhook secret is configured; a bad or missing signature gets `401`. With no secret configured the handler logs a warning and accepts the payload | Shared-secret header checked before the body is read, **if** configured; otherwise accepted with a warning |
+| Scope | Acts only on a push to a branch (`refs/heads/…`) of `github.repo` or of an enabled pair's Git repository. Other repositories, tags and payloads without a repository are acknowledged with `triggered: false` | No repository scope: any revision only prompts an inspection |
+| Duplicate delivery IDs | `X-GitHub-Delivery` / `X-Gitea-Delivery` already acted on are acknowledged as `duplicate delivery ignored`. Refused or out-of-scope deliveries do not reserve their ID | Same, using the optional `X-Webhook-Delivery` header |
+| Bursts | Never waits for the scheduler. When an inspection is already queued, the delivery reports `sync already pending` | Same |
+| What it does on a valid event | Queues one "inspect now" signal for the scheduler and broadcasts a UI notification | Same |
+| `forced`, `before`, `after` | `forced` is reported back as a **hint** (`forced_hint`, `inspection: polling_safety_gate`); none of them is used to reset or advance anything | n/a |
+| Stale or out-of-order events | The event is not replayed; it only prompts an inspection of the current remote state, so a stale event costs at most one extra inspection | Same |
+| Scheduler unreachable | `500`, and the delivery ID is forgotten so a redelivery is acted on | Same |
+
+The response's `triggered` field is `true` only when that delivery queued a new
+inspection. The delivery log is in memory, holds the last 4096 IDs and is
+cleared by a restart; at worst a redelivery then prompts one more inspection.
 
 So a webhook is only an accelerator: the same history inspection that polling
 performs is what decides whether to replay. A forced push is caught by polling
-even if no webhook arrives. Hardening webhook authenticity, deduplication and
-stale-event handling to the standard in issue #71 is **held**; see
-[Held and unavailable](held-and-unavailable.md). This guide does not tell you
-to create or change a webhook.
+even if no webhook arrives. Accepting payloads when no secret is configured is
+kept for existing installations; configure `github.webhook_secret_env` and
+`svn.webhook_secret_env`. This guide does not tell you to create or change a
+webhook.
 
 Sources: [`github_webhook`][gh-webhook], [`svn_webhook`][svn-webhook],
 [scheduler webhook tick][scheduler-webhook].
@@ -120,8 +127,8 @@ Sources: [`github_webhook`][gh-webhook], [`svn_webhook`][svn-webhook],
 [git-push]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/git/client.rs#L578-L580
 [import-force]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L2625-L2634
 [trigger-sync]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/repos.rs#L1178-L1226
-[gh-webhook]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/webhooks.rs#L87-L205
-[svn-webhook]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/web/src/api/webhooks.rs#L207-L257
+[gh-webhook]: ../../crates/web/src/api/webhooks.rs
+[svn-webhook]: ../../crates/web/src/api/webhooks.rs
 [import-snap]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L3121-L3135
 [import-full]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L3846-L3860
 [import-legacy]: https://github.com/chriscase/RepoSync/blob/ade6f9cb383f76d65c6610ef21eec2199f6c23b5/crates/core/src/import.rs#L3884-L3930

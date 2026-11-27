@@ -84,8 +84,15 @@ REPOS="$1"
 REV="$2"
 curl -s -X POST http://your-reposync-server:8080/webhook/svn \
   -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: $REPOSYNC_SVN_WEBHOOK_SECRET" \
+  -H "X-Webhook-Delivery: $REPOS@$REV" \
   -d "{\"repository\": \"$REPOS\", \"revision\": $REV}" || true
 ```
+
+Send `X-Webhook-Secret` when `svn.webhook_secret_env` is configured; RepoSync
+checks it before reading the body. `X-Webhook-Delivery` is optional: a repeated
+value is acknowledged without starting another inspection. The notification
+only asks for an early poll, so a lost or late one changes nothing.
 
 ## Step 3: Prepare Your GitHub Repository
 

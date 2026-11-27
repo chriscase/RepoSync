@@ -344,7 +344,9 @@ temporary working repositories, linked worktrees and local bare push targets.
 
 ## Still later
 
-- Webhook signature checks, event deduplication, and live webhook configuration
+- Refusing webhooks when no secret is configured, and live webhook configuration
+  (scope, delivery dedup and stale-event handling are in the receivers; see
+  [Ordinary sync](../coworker/ordinary-sync.md#webhooks-that-already-exist))
 - Auto-triggered refresh on push
 - Applying the branch-policy recommendation
 - Qualification of refresh outside the supported local scope of #69
