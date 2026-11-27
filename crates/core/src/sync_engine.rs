@@ -168,8 +168,6 @@ struct GitFetchResult {
     replay_batch: Vec<GitChangeSet>,
     conflict_coverage: Vec<GitChangeSet>,
     conflict_coverage_skipped: usize,
-    /// Commit the conflict coverage starts from (the shared base).
-    coverage_origin: String,
     /// Commit the conflict coverage ends at (the proposed Git side).
     coverage_tip: String,
     has_more: bool,
@@ -2605,41 +2603,44 @@ impl SyncEngine {
                 .saturating_sub(git_fetch.conflict_coverage_skipped),
             git_fetch.conflict_coverage.len(),
         )?;
-        let mut conflicts =
+        let conflicts =
             self.detect_conflicts_internal(&svn_changes, &git_fetch.conflict_coverage)?;
         stats.conflicts_detected = conflicts.len();
-        if !conflicts.is_empty() {
-            self.attach_conflict_evidence(&mut conflicts, &svn_changes, &git_fetch)
-                .await;
-        }
 
         if !conflicts.is_empty() {
             info!(count = conflicts.len(), "conflicts detected");
             let _ = self.persist_sync_state("conflict_found");
 
-            let mut unresolved = 0usize;
-            let mut first_unresolved_path: Option<String> = None;
+            // Decide auto-merge on the detected conflicts alone. Review
+            // evidence is attached only afterwards, to rows that will be
+            // held, so it can never turn a held conflict into a merge.
+            let mut held: Vec<Conflict> = Vec::new();
             for conflict in &conflicts {
                 if self.config.sync.auto_merge && self.try_auto_merge(conflict) {
                     stats.conflicts_auto_resolved += 1;
                 } else {
-                    unresolved += 1;
-                    if first_unresolved_path.is_none() {
-                        first_unresolved_path = Some(conflict.file_path.clone());
-                    }
-                    let mut db_conflict = crate::models::Conflict::new(conflict.file_path.clone());
-                    db_conflict.conflict_type = conflict.conflict_type.to_string();
-                    db_conflict.svn_content = conflict.svn_content.clone();
-                    db_conflict.git_content = conflict.git_content.clone();
-                    db_conflict.base_content = conflict.base_content.clone();
-                    db_conflict.svn_revision = conflict.svn_rev;
-                    db_conflict.git_hash = conflict.git_sha.clone();
-                    db_conflict.repo_id = self.repo_id.clone();
-                    let _ = self
-                        .db
-                        .record_detected_conflict(&db_conflict)
-                        .map_err(SyncError::DatabaseError)?;
+                    held.push(conflict.clone());
                 }
+            }
+            if !held.is_empty() {
+                self.attach_conflict_evidence(&mut held, &svn_changes, &git_fetch)
+                    .await;
+            }
+            let unresolved = held.len();
+            let first_unresolved_path = held.first().map(|c| c.file_path.clone());
+            for conflict in &held {
+                let mut db_conflict = crate::models::Conflict::new(conflict.file_path.clone());
+                db_conflict.conflict_type = conflict.conflict_type.to_string();
+                db_conflict.svn_content = conflict.svn_content.clone();
+                db_conflict.git_content = conflict.git_content.clone();
+                db_conflict.base_content = conflict.base_content.clone();
+                db_conflict.svn_revision = conflict.svn_rev;
+                db_conflict.git_hash = conflict.git_sha.clone();
+                db_conflict.repo_id = self.repo_id.clone();
+                let _ = self
+                    .db
+                    .record_detected_conflict(&db_conflict)
+                    .map_err(SyncError::DatabaseError)?;
             }
             if unresolved > 0 {
                 let file_path = first_unresolved_path.unwrap_or_else(|| "unknown".into());
@@ -5304,7 +5305,6 @@ impl SyncEngine {
                 replay_batch: Vec::new(),
                 conflict_coverage: Vec::new(),
                 conflict_coverage_skipped: 0,
-                coverage_origin: selection_origin.to_string(),
                 coverage_tip: admission.remote_tip.clone(),
                 has_more: true,
                 reset_target: admission.checkpoint.clone(),
@@ -5361,7 +5361,6 @@ impl SyncEngine {
             replay_batch,
             conflict_coverage,
             conflict_coverage_skipped,
-            coverage_origin: selection_origin.to_string(),
             coverage_tip: admission.remote_tip.clone(),
             has_more: selection.has_more,
             reset_target,
@@ -5817,16 +5816,22 @@ impl SyncEngine {
         git_file_changes
     }
 
-    /// Record which SVN revision and Git commit each conflict comes from,
-    /// and the base, SVN and Git text, so a held conflict can be reviewed.
+    /// Record which SVN revision and Git commit each held conflict comes
+    /// from, and the base, SVN and Git text, so it can be reviewed.
     ///
-    /// The base is the file at the commit the conflict coverage starts from.
-    /// Each side's text is the file at that side's pending tip: the newest
-    /// pending SVN revision touching the path, and the newest pending Git
-    /// commit. Content stays `None` when the file is absent on that side,
-    /// binary, not valid UTF-8, larger than [`CONFLICT_EVIDENCE_MAX_BYTES`],
-    /// a Git LFS pointer or unreadable. It is never stored lossily. Evidence is best-effort:
-    /// a read failure is logged and the conflict is still held.
+    /// Called only for conflicts that will be held, after the auto-merge
+    /// decision. Attribution is the newest pending SVN revision and Git
+    /// commit touching the path. The SVN text is the file at the newest
+    /// pending SVN revision and the Git text is the file at the pending Git
+    /// tip, so a side where the file no longer exists stores none. The base
+    /// is the file at the pair's watermark, the SVN revision and Git commit
+    /// both sides last agreed on, and is stored only when the SVN and Git
+    /// copies there are identical.
+    ///
+    /// Text stays `None` when it is binary, not valid UTF-8, larger than
+    /// [`CONFLICT_EVIDENCE_MAX_BYTES`], a Git LFS pointer or unreadable. It is
+    /// never stored lossily. Reads are best-effort and never change whether
+    /// a conflict is held.
     async fn attach_conflict_evidence(
         &self,
         conflicts: &mut [Conflict],
@@ -5836,18 +5841,20 @@ impl SyncEngine {
         fn touches(file: &ChangedFile, path: &str) -> bool {
             file.path == path || file.rename_from.as_deref() == Some(path)
         }
+        let svn_tip = svn_changes.iter().map(|cs| cs.revision).max();
+        let watermark = self
+            .effective_repo_id()
+            .and_then(|rid| self.db.get_repo_watermark(rid).ok())
+            .filter(|(revision, sha)| *revision > 0 && !sha.is_empty());
         for conflict in conflicts.iter_mut() {
             let path = conflict.file_path.clone();
-            if let Some((revision, file)) = svn_changes
+            conflict.svn_rev = svn_changes
                 .iter()
-                .flat_map(|cs| cs.changed_files.iter().map(move |f| (cs.revision, f)))
-                .filter(|(_, f)| touches(f, &path))
-                .max_by_key(|(revision, _)| *revision)
-            {
-                conflict.svn_rev = Some(revision);
-                if file.path == path && file.action != "D" && !file.is_binary {
-                    conflict.svn_content = self.svn_conflict_text(&path, revision).await;
-                }
+                .filter(|cs| cs.changed_files.iter().any(|f| touches(f, &path)))
+                .map(|cs| cs.revision)
+                .max();
+            if let Some(revision) = svn_tip {
+                conflict.svn_content = self.svn_conflict_text(&path, revision).await;
             }
             conflict.git_sha = git_fetch
                 .conflict_coverage
@@ -5855,10 +5862,19 @@ impl SyncEngine {
                 .rev()
                 .find(|cs| cs.changed_files.iter().any(|f| touches(f, &path)))
                 .map(|cs| cs.sha.clone());
-            if conflict.git_sha.is_some() {
-                conflict.git_content = self.git_conflict_text(&git_fetch.coverage_tip, &path);
-            }
-            conflict.base_content = self.git_conflict_text(&git_fetch.coverage_origin, &path);
+            conflict.git_content = self.git_conflict_text(&git_fetch.coverage_tip, &path);
+            conflict.base_content = match &watermark {
+                Some((revision, sha)) => {
+                    let git_base = self.git_conflict_text(sha, &path);
+                    let svn_base = self.svn_conflict_text(&path, *revision).await;
+                    if git_base.is_some() && git_base == svn_base {
+                        git_base
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
         }
     }
 
@@ -5872,8 +5888,9 @@ impl SyncEngine {
             // The text API decodes lossily; never store replacement bytes.
             Ok(text) if text.contains('\u{fffd}') => None,
             Ok(text) => conflict_text(text.into_bytes()),
+            // Includes a path absent at that revision.
             Err(error) => {
-                warn!(path, revision, %error, "could not read SVN conflict content");
+                debug!(path, revision, %error, "no SVN conflict content");
                 None
             }
         }

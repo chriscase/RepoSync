@@ -9681,9 +9681,76 @@ async fn test_team_mode_conflict_evidence_uses_pending_tips_and_exact_text() {
     let latin = &by_path["latin1.txt"];
     assert_eq!(latin.svn_rev, Some(svn_bytes_rev));
     assert_eq!(latin.git_sha.as_deref(), Some(git_bytes.as_str()));
-    assert_eq!(latin.base_content, None, "Latin-1 base is not UTF-8");
+    assert_eq!(
+        latin.base_content, None,
+        "the Latin-1 base exists on both sides but is not UTF-8"
+    );
     assert_eq!(latin.svn_content, None, "lossy SVN text must not be stored");
     assert_eq!(latin.git_content.as_deref(), Some("caf\u{e9} git\n"));
+}
+
+/// Evidence never feeds auto-merge: non-overlapping edits to one file stay a
+/// held conflict with auto-merge enabled. The base is the last state both
+/// sides agreed on, including an SVN import after the Git checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_team_mode_conflict_evidence_keeps_holds_and_uses_agreed_base() {
+    let pair = QualifiedPair::new_with_svn_branch("conflict-agreed-base", "trunk").await;
+    let lines = |first: &str, last: &str| format!("{first}\nb\nc\nd\ne\nf\ng\n{last}\n");
+
+    // SVN changes the file and the change is imported, so the agreed base
+    // moves past the original SVN origin.
+    let imported = lines("a", "h");
+    let imported_rev = svn_commit_file(&pair.wc, "origin.txt", &imported, "SVN imported v2");
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().svn_to_git_count,
+        1
+    );
+    let watermark = pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap();
+    assert_eq!(watermark.0, imported_rev);
+    git_cli(&pair.developer, &["pull", "--ff-only"]);
+
+    // Non-overlapping edits: SVN line 1, Git line 8.
+    let svn_text = lines("A-svn", "h");
+    let git_text = lines("a", "H-git");
+    let svn_rev = svn_commit_file(&pair.wc, "origin.txt", &svn_text, "SVN edits line 1");
+    let git_sha = pair.developer_commit("origin.txt", &git_text, "Git edits line 8");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+
+    assert!(
+        pair.engine.config().sync.auto_merge,
+        "this engine must have auto-merge enabled"
+    );
+    let before = pair.snapshot().await;
+    let result = pair.engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &result,
+            Err(SyncError::UnresolvableConflict { file_path, .. }) if file_path == "origin.txt"
+        ),
+        "evidence must not let auto-merge mutate either side: {result:?}"
+    );
+    let stats = pair.engine.last_cycle_stats().unwrap();
+    assert_eq!(
+        (stats.conflicts_detected, stats.conflicts_auto_resolved),
+        (1, 0)
+    );
+    assert_eq!(pair.snapshot().await, before, "both sides unchanged");
+    assert_eq!(
+        pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+        watermark
+    );
+
+    let rows = pair.engine.db().list_conflicts(None, 10).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].svn_rev, Some(svn_rev));
+    assert_eq!(rows[0].git_sha.as_deref(), Some(git_sha.as_str()));
+    assert_eq!(
+        rows[0].base_content.as_deref(),
+        Some(imported.as_str()),
+        "base is the agreed imported text, not the older checkpoint text"
+    );
+    assert_eq!(rows[0].svn_content.as_deref(), Some(svn_text.as_str()));
+    assert_eq!(rows[0].git_content.as_deref(), Some(git_text.as_str()));
 }
 
 // ===========================================================================
