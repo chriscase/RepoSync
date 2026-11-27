@@ -8,8 +8,36 @@ permissions:
   contents: write
 
 jobs:
+  channel:
+    name: Classify release tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      channel: ${{ steps.classify.outputs.channel }}
+      prerelease: ${{ steps.classify.outputs.prerelease }}
+      make_latest: ${{ steps.classify.outputs.make_latest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # An unrecognized tag stops here, before anything is built or published.
+      - name: Classify tag
+        id: classify
+        env:
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test_release_channel.sh
+          # Capture first: a pipe would hide the classifier's refusal.
+          outputs="$(bash scripts/release_channel.sh "$TAG")"
+          printf '%s\n' "$outputs" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$outputs"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: channel
+    if: needs.channel.outputs.channel == 'stable' || needs.channel.outputs.channel == 'prerelease'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -62,7 +90,8 @@ jobs:
 
   release:
     name: Create Release
-    needs: build
+    needs: [channel, build]
+    if: needs.channel.outputs.channel == 'stable' || needs.channel.outputs.channel == 'prerelease'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -82,6 +111,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          # A prerelease never becomes the latest release.
+          prerelease: ${{ needs.channel.outputs.prerelease }}
+          make_latest: ${{ needs.channel.outputs.make_latest }}
           files: |
             reposync-*.tar.gz
             reposync-*.tar.gz.sha256
@@ -89,7 +121,8 @@ jobs:
 
   docker:
     name: Docker Image
-    needs: [build, release]
+    needs: [channel, build, release]
+    if: needs.channel.outputs.channel == 'stable' || needs.channel.outputs.channel == 'prerelease'
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -103,16 +136,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Only a stable tag moves `latest`; a prerelease publishes its exact version.
+      - name: Select image tags
+        id: tags
+        env:
+          CHANNEL: ${{ needs.channel.outputs.channel }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          tags="ghcr.io/chriscase/reposync:${TAG}"
+          if [ "$CHANNEL" = "stable" ]; then
+            tags="${tags},ghcr.io/chriscase/reposync:latest"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/chriscase/reposync:latest
-            ghcr.io/chriscase/reposync:${{ github.ref_name }}
+          tags: ${{ steps.tags.outputs.tags }}
 
       - name: Verify Docker image
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          docker pull ghcr.io/chriscase/reposync:${{ github.ref_name }}
-          docker run --rm ghcr.io/chriscase/reposync:${{ github.ref_name }} --version
+          docker pull "ghcr.io/chriscase/reposync:${TAG}"
+          docker run --rm "ghcr.io/chriscase/reposync:${TAG}" --version
