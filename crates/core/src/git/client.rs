@@ -1157,6 +1157,27 @@ impl GitClient {
         Ok((previous, current))
     }
 
+    /// Size in bytes of a regular file at a specific commit, read from the
+    /// object header without loading the blob.
+    ///
+    /// Returns `None` if the path is absent or is not a regular file.
+    pub fn file_size_at_commit(
+        &self,
+        sha: &str,
+        file_path: &str,
+    ) -> Result<Option<usize>, GitError> {
+        let commit = self.repo.find_commit(Oid::from_str(sha)?)?;
+        let tree = commit.tree()?;
+        let Ok(entry) = tree.get_path(std::path::Path::new(file_path)) else {
+            return Ok(None);
+        };
+        if !matches!(entry.filemode(), 0o100644 | 0o100755) {
+            return Ok(None);
+        }
+        let (size, _) = self.repo.odb()?.read_header(entry.id())?;
+        Ok(Some(size))
+    }
+
     /// Get the content of a file at a specific commit.
     ///
     /// Returns `None` if the file does not exist in that commit's tree.
@@ -1504,6 +1525,29 @@ mod tests {
             .get_file_content_at_commit(&oid1.to_string(), "nonexistent.txt")
             .unwrap();
         assert!(missing.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_size_at_commit_reads_regular_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        Repository::init(dir.path()).unwrap();
+        let client = GitClient::new(dir.path()).unwrap();
+        std::fs::write(dir.path().join("data.txt"), "12345").unwrap();
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        std::fs::write(dir.path().join("dir/inner.txt"), "x").unwrap();
+        std::os::unix::fs::symlink("data.txt", dir.path().join("link")).unwrap();
+        let sha = client
+            .commit("files", "T", "t@t.com", "T", "t@t.com")
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            client.file_size_at_commit(&sha, "data.txt").unwrap(),
+            Some(5)
+        );
+        assert_eq!(client.file_size_at_commit(&sha, "link").unwrap(), None);
+        assert_eq!(client.file_size_at_commit(&sha, "dir").unwrap(), None);
+        assert_eq!(client.file_size_at_commit(&sha, "missing").unwrap(), None);
     }
 
     #[test]

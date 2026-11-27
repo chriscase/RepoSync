@@ -9753,6 +9753,84 @@ async fn test_team_mode_conflict_evidence_keeps_holds_and_uses_agreed_base() {
     assert_eq!(rows[0].git_content.as_deref(), Some(git_text.as_str()));
 }
 
+/// The base is found after a Git→SVN replay, and files over the evidence cap
+/// keep attribution without being read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_team_mode_conflict_evidence_base_after_replay_and_size_cap() {
+    let pair = QualifiedPair::new_with_svn_branch("conflict-replayed-base", "trunk").await;
+    let cap = reposync_core::sync_engine::CONFLICT_EVIDENCE_MAX_BYTES;
+
+    // A file over the cap enters through SVN.
+    let big = "x".repeat(cap) + "\n";
+    svn_commit_file(&pair.wc, "big.txt", &big, "Add a file over the cap");
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().svn_to_git_count,
+        1
+    );
+    git_cli(&pair.developer, &["pull", "--ff-only"]);
+
+    // A Git edit is replayed to SVN; it becomes the agreed text.
+    pair.developer_commit("origin.txt", "Git replayed\n", "Git edit replayed to SVN");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    svn_cli(&pair.wc, &["update"]);
+    assert_eq!(
+        std::fs::read_to_string(pair.wc.join("origin.txt")).unwrap(),
+        "Git replayed\n"
+    );
+
+    let svn_rev = {
+        svn_commit_file(
+            &pair.wc,
+            "big.txt",
+            &("y".repeat(cap) + "\n"),
+            "SVN big edit",
+        );
+        svn_commit_file(&pair.wc, "origin.txt", "SVN after replay\n", "SVN edit")
+    };
+    pair.developer_commit("big.txt", &("z".repeat(cap) + "\n"), "Git big edit");
+    let git_sha = pair.developer_commit("origin.txt", "Git after replay\n", "Git edit");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+
+    let before = pair.snapshot().await;
+    let result = pair.engine.run_sync_cycle().await;
+    assert!(
+        matches!(&result, Err(SyncError::UnresolvableConflict { .. })),
+        "{result:?}"
+    );
+    assert_eq!(pair.snapshot().await, before);
+    let by_path: BTreeMap<String, _> = pair
+        .engine
+        .db()
+        .list_conflicts(None, 10)
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.file_path.clone(), row))
+        .collect();
+
+    let text = &by_path["origin.txt"];
+    assert_eq!(text.svn_rev, Some(svn_rev));
+    assert_eq!(text.git_sha.as_deref(), Some(git_sha.as_str()));
+    assert_eq!(
+        text.base_content.as_deref(),
+        Some("Git replayed\n"),
+        "the replayed text is the agreed base"
+    );
+    assert_eq!(text.svn_content.as_deref(), Some("SVN after replay\n"));
+    assert_eq!(text.git_content.as_deref(), Some("Git after replay\n"));
+
+    let large = &by_path["big.txt"];
+    assert!(large.svn_rev.is_some() && large.git_sha.is_some());
+    assert_eq!(
+        (&large.base_content, &large.svn_content, &large.git_content),
+        (&None, &None, &None),
+        "files over the cap are not stored"
+    );
+}
+
 // ===========================================================================
 // Test 6: Commit mapping integrity
 // ===========================================================================

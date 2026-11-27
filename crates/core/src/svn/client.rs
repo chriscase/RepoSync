@@ -964,6 +964,38 @@ impl SvnClient {
             .await
     }
 
+    /// Size in bytes of a regular file at revision `rev`, from `svn list`.
+    ///
+    /// Returns `None` when the path is a directory or reports no size, and an
+    /// error when it does not exist at that revision.
+    pub async fn file_size_at_rev(
+        &self,
+        file_path: &str,
+        rev: i64,
+    ) -> Result<Option<u64>, SvnError> {
+        let url = literal_url(&repository_url(&self.url, file_path)?, Some(rev))?;
+        let output = self
+            .run_svn(&["list", "--xml", "-r", &rev.to_string(), "--", &url])
+            .await?;
+        let document = roxmltree::Document::parse(&output)
+            .map_err(|e| SvnError::XmlParseError(e.to_string()))?;
+        let entries: Vec<_> = document
+            .descendants()
+            .filter(|n| n.has_tag_name("entry"))
+            .collect();
+        let [entry] = entries.as_slice() else {
+            return Ok(None);
+        };
+        if entry.attribute("kind") != Some("file") {
+            return Ok(None);
+        }
+        Ok(entry
+            .children()
+            .find(|n| n.has_tag_name("size"))
+            .and_then(|n| n.text())
+            .and_then(|text| text.trim().parse().ok()))
+    }
+
     // -- Internal helpers ----------------------------------------------------
 
     async fn run_svn(&self, args: &[&str]) -> Result<String, SvnError> {

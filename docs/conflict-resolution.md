@@ -82,10 +82,10 @@ In Team mode every detected conflict is currently held for manual resolution, in
 When a Team sync cycle holds a conflict, the conflict row records:
 
 - the newest pending SVN revision and the newest pending Git commit that touch the file;
-- the base text: the file at the SVN revision and Git commit both sides last agreed on, stored only when the SVN and Git copies there are identical;
+- the base text: the file at the Git commit both sides last agreed on, stored only when the SVN copy of that state is identical. After a Git→SVN replay, the SVN copy is the revision the replay created;
 - the SVN text at the newest pending SVN revision and the Git text at the pending Git tip. A side where the file no longer exists has no text.
 
-Text is stored only when it is valid UTF-8, contains no NUL byte and is at most 1 MiB. Binary files, other encodings, larger files, Git LFS pointers and anything that could not be read leave that text empty. SVN text is read with keywords expanded, the same way RepoSync exports it to Git. The revision and commit are still recorded. Neither repository is changed while the conflict is held, and the recorded text is never used to merge automatically.
+Text is stored only when it is valid UTF-8, contains no NUL byte and is at most 1 MiB. Binary files, other encodings, larger files (checked before reading), symbolic links, Git LFS pointers and anything that could not be read leave that text empty. SVN text is read with keywords expanded, the same way RepoSync exports it to Git. The revision and commit are still recorded. Neither repository is changed while the conflict is held, and the recorded text is never used to merge automatically.
 
 ## Conflict Lifecycle
 
