@@ -1,7 +1,8 @@
 //! #268 follow-up: what `POST /api/setup/apply` may write for identity
 //! mappings. It writes only the configured mapping file (or the default file
 //! beside the configuration), in the format the identity mapper reads, and a
-//! refused path leaves no configuration behind.
+//! requested path never chooses where it writes; naming another file only
+//! produces a warning.
 use axum::Router;
 use reposync_core::{
     config::{AppConfig, IdentityConfig},
@@ -136,7 +137,15 @@ async fn default_target_is_written_in_the_mapper_format_without_injection() {
     let f = fixture(None).await;
     let (status, json) = apply(&f, apply_body(None, hostile())).await;
     assert_eq!(status, 200, "{json}");
-    assert_eq!(json["warnings"], json!([]), "{json}");
+    let warnings = json["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{json}");
+    assert!(
+        warnings[0]
+            .as_str()
+            .unwrap()
+            .contains("take effect only once"),
+        "the default file is not read until configured: {json}"
+    );
 
     let written = f.tmp.path().join("identity-mappings.toml");
     let authors = MappingFile::load(&written).unwrap();
@@ -156,13 +165,21 @@ async fn default_target_is_written_in_the_mapper_format_without_injection() {
 async fn configured_mapping_file_is_the_one_the_mapper_reads() {
     let f = fixture(Some("authors.toml")).await;
     let configured = f.tmp.path().join("authors.toml");
+    // The same file spelled through a symlinked directory is the same file.
+    let link = f.tmp.path().join("link");
+    std::os::unix::fs::symlink(f.tmp.path(), &link).unwrap();
+    let via_link = link.join("authors.toml");
     for requested in [
         None,
         Some(configured.to_str().unwrap()),
         Some("authors.toml"),
+        Some("sub/../authors.toml"),
+        Some(via_link.to_str().unwrap()),
     ] {
+        std::fs::create_dir_all(f.tmp.path().join("sub")).unwrap();
         let (status, json) = apply(&f, apply_body(requested, hostile())).await;
         assert_eq!(status, 200, "{requested:?}: {json}");
+        assert_eq!(json["warnings"], json!([]), "{requested:?}: {json}");
     }
     let mapper = IdentityMapper::new(&f.state.config.identity).unwrap();
     let identity = mapper.svn_to_git("jdoe").unwrap();
@@ -171,32 +188,43 @@ async fn configured_mapping_file_is_the_one_the_mapper_reads() {
 }
 
 #[tokio::test]
-async fn other_paths_are_refused_before_anything_is_stored() {
-    let f = fixture(None).await;
+async fn other_paths_are_never_written_and_are_reported() {
+    let f = fixture(Some("authors.toml")).await;
+    let configured = f.tmp.path().join("authors.toml");
     let outside = f.tmp.path().join("elsewhere.toml");
-    let nested = f.tmp.path().join("sub");
-    std::fs::create_dir(&nested).unwrap();
+    std::fs::create_dir(f.tmp.path().join("sub")).unwrap();
     let candidates: Vec<PathBuf> = vec![
         outside.clone(),
-        PathBuf::from("../identity-mappings.toml"),
-        PathBuf::from("sub/../identity-mappings.toml"),
+        PathBuf::from("../authors.toml"),
+        PathBuf::from("sub/../../authors.toml"),
         PathBuf::from("config.toml"),
         PathBuf::from("/etc/reposync/authors.toml"),
     ];
     for requested in &candidates {
+        std::fs::remove_file(&configured).ok();
         let (status, json) =
             apply(&f, apply_body(Some(requested.to_str().unwrap()), hostile())).await;
-        assert_eq!(status, 400, "{}: {json}", requested.display());
+        assert_eq!(status, 200, "{}: {json}", requested.display());
+        let warnings = json["warnings"].as_array().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("was not used")),
+            "{}: {json}",
+            requested.display()
+        );
+        // Only the configured file was written.
+        assert!(MappingFile::load(&configured).unwrap().contains_key("jdoe"));
     }
     assert!(!outside.exists());
     assert!(!f.tmp.path().join("config.toml").exists());
+    assert!(!f.tmp.path().parent().unwrap().join("authors.toml").exists());
     assert!(!f.tmp.path().join("identity-mappings.toml").exists());
-    assert!(f.state.db.list_repositories().unwrap().is_empty());
-    assert!(f
-        .state
-        .db
-        .get_state("secret_admin_password_hash")
-        .unwrap()
-        .is_none());
-    assert!(f.state.db.get_state("identity_mappings").unwrap().is_none());
+
+    // Naming a path without sending mappings warns nothing and writes nothing.
+    std::fs::remove_file(&configured).unwrap();
+    let (status, json) = apply(&f, apply_body(Some("elsewhere.toml"), json!([]))).await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["warnings"], json!([]), "{json}");
+    assert!(!configured.exists());
 }

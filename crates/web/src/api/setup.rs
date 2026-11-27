@@ -430,28 +430,32 @@ fn config_dir(config_path: &std::path::Path) -> &std::path::Path {
         .unwrap_or_else(|| std::path::Path::new("."))
 }
 
-/// Whether a requested mapping path names `target`. A request may repeat the
-/// target as given or, when relative, as resolved beside the configuration
-/// file. Any `..` component is refused rather than normalized.
+/// Whether a requested mapping path names `target`: the same text, the same
+/// path resolved beside the configuration file, or the same file once both
+/// parent directories are canonicalized. Used only to decide whether to warn.
 fn mapping_path_matches(
     requested: &str,
     target: &std::path::Path,
     config_path: &std::path::Path,
 ) -> bool {
     let requested = std::path::Path::new(requested);
-    if requested
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return false;
-    }
-    if requested == target {
+    let resolved = if requested.is_relative() {
+        config_dir(config_path).join(requested)
+    } else {
+        requested.to_path_buf()
+    };
+    if requested == target || resolved == target {
         return true;
     }
-    if requested.is_relative() && config_dir(config_path).join(requested) == target {
-        return true;
-    }
-    false
+    let canonical = |p: &std::path::Path| {
+        let name = p.file_name()?.to_owned();
+        let parent = match p.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => std::path::PathBuf::from("."),
+        };
+        Some(parent.canonicalize().ok()?.join(name))
+    };
+    matches!((canonical(&resolved), canonical(target)), (Some(a), Some(b)) if a == b)
 }
 
 async fn apply_config(
@@ -469,22 +473,36 @@ async fn apply_config(
     }
     let mut warnings = Vec::new();
 
-    // Decide where mappings may be written before anything is stored, so a
-    // refused path leaves no partial configuration behind.
+    // The wizard writes mappings only to `mapping_target`. A requested path
+    // never chooses the write location; one that names another file is
+    // reported so the caller is not misled.
     let mapping_target = setup_mapping_target(&state);
+    let writes_mappings = body
+        .identity_mappings
+        .as_ref()
+        .is_some_and(|m| !m.is_empty());
     if let Some(requested) = body
         .identity_mapping_file
         .as_deref()
         .map(str::trim)
         .filter(|p| !p.is_empty())
     {
-        if !mapping_path_matches(requested, &mapping_target, &state.config_path) {
-            return Err(AppError::BadRequest(format!(
-                "identity mapping file must be the configured mapping file ({}); \
-                 the setup wizard does not write other paths",
+        if writes_mappings && !mapping_path_matches(requested, &mapping_target, &state.config_path)
+        {
+            warnings.push(format!(
+                "Identity mapping file '{}' was not used: the setup wizard writes only the \
+                 configured mapping file ({}).",
+                requested,
                 mapping_target.display()
-            )));
+            ));
         }
+    }
+    if writes_mappings && state.config.identity.mapping_file.is_none() {
+        warnings.push(format!(
+            "Identity mappings were saved to {}, but they take effect only once \
+             identity.mapping_file in the server configuration points to that file.",
+            mapping_target.display()
+        ));
     }
 
     // Write identity mapping file if mappings are provided
