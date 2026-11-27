@@ -39,6 +39,9 @@ jobs:
       - name: Git operation request client
         run: python3 scripts/test_git_operation_request.py
 
+      - name: Release channel classifier and publisher guard
+        run: bash scripts/test_release_channel.sh
+
       - name: Paired branch hooks in disposable Git repositories
         run: python3 scripts/test_paired_branch_hooks.py -v NativeHookTests
 
