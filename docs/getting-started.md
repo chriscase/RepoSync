@@ -90,8 +90,9 @@ curl -s -X POST http://your-reposync-server:8080/webhook/svn \
 ```
 
 Send `X-Webhook-Secret` when `svn.webhook_secret_env` is configured; RepoSync
-checks it before reading the body. `X-Webhook-Delivery` is optional: a repeated
-value is acknowledged without starting another inspection. The notification
+checks it before reading the body. `X-Webhook-Delivery` is optional and is only
+used when a secret is configured: a repeated value is then acknowledged without
+starting another inspection. The notification
 only asks for an early poll, so a lost or late one changes nothing.
 
 ## Step 3: Prepare Your GitHub Repository

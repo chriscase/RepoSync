@@ -100,7 +100,8 @@ pub fn routes() -> Router<Arc<AppState>> {
 /// forgotten ID that is redelivered costs one extra inspection, nothing more.
 const DELIVERY_LOG_CAPACITY: usize = 4096;
 
-/// Delivery IDs that already led to an inspection, in arrival order.
+/// Delivery IDs, from authenticated senders, that already queued an
+/// inspection, in arrival order.
 ///
 /// The log is process-wide and in memory only: a restart forgets it, which at
 /// worst lets one redelivery prompt one more inspection. It is never used to
@@ -343,7 +344,14 @@ async fn github_webhook(
     }
 
     let commit_count = payload.commits.as_ref().map(|c| c.len()).unwrap_or(0);
-    let delivery = delivery_id(&headers, &["x-github-delivery", "x-gitea-delivery"])
+    // Delivery IDs are only trusted from authenticated senders; otherwise
+    // anyone could pre-record a predictable ID and suppress the real delivery.
+    let delivery = state
+        .config
+        .github
+        .webhook_secret
+        .as_ref()
+        .and_then(|_| delivery_id(&headers, &["x-github-delivery", "x-gitea-delivery"]))
         .map(|id| format!("git:{}", id));
 
     // Same ordinary inspection as an unforced push. Do not reset from `forced`,
@@ -435,7 +443,14 @@ async fn svn_webhook(
         .map_err(|e| AppError::BadRequest(format!("invalid JSON payload: {}", e)))?;
 
     // The revision is only a hint; the inspection reads SVN itself.
-    let delivery = delivery_id(&headers, &["x-webhook-delivery"]).map(|id| format!("svn:{}", id));
+    // As for Git, only an authenticated sender's delivery ID is recorded.
+    let delivery = state
+        .config
+        .svn
+        .webhook_secret
+        .as_ref()
+        .and_then(|_| delivery_id(&headers, &["x-webhook-delivery"]))
+        .map(|id| format!("svn:{}", id));
     let Some(outcome) = dedup_and_inspect(&state, delivery.as_deref())? else {
         info!(
             revision = payload.revision,

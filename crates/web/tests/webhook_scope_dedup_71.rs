@@ -230,7 +230,7 @@ async fn webhook_71_signature_is_checked_before_scope_or_dedup() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn webhook_71_only_synced_repositories_and_branches_trigger() {
-    let mut h = harness(false, 8).await;
+    let mut h = harness(true, 8).await;
     h.state
         .db
         .insert_repository(&paired_repo(
@@ -249,9 +249,8 @@ async fn webhook_71_only_synced_repositories_and_branches_trigger() {
         ("team/disabled", "refs/heads/main", "scope-2"),
         ("test/repo", "refs/tags/v1.0.0", "scope-3"),
     ] {
-        let (status, json) = h
-            .github(push(repo, git_ref, "1", "2"), Some(id), None)
-            .await;
+        let body = push(repo, git_ref, "1", "2");
+        let (status, json) = h.github(body.clone(), Some(id), Some(sign(&body))).await;
         assert_eq!(status, reqwest::StatusCode::OK, "{json}");
         assert_eq!(json["ok"], true, "{json}");
         assert_eq!(json["triggered"], false, "{repo} {git_ref}: {json}");
@@ -261,37 +260,30 @@ async fn webhook_71_only_synced_repositories_and_branches_trigger() {
         );
     }
     let no_repo = serde_json::to_vec(&serde_json::json!({"ref": "refs/heads/main"})).unwrap();
-    let (_, json) = h.github(no_repo, Some("scope-4"), None).await;
+    let (_, json) = h
+        .github(no_repo.clone(), Some("scope-4"), Some(sign(&no_repo)))
+        .await;
     assert_eq!(json["triggered"], false, "{json}");
     assert_eq!(h.drain(), 0, "out-of-scope pushes must not trigger");
 
     // The configured repository and an enabled pair's repository both trigger,
     // matched without regard to case or URL form.
+    let body = push("TEST/Repo", "refs/heads/main", "1", "2");
     let (_, json) = h
-        .github(
-            push("TEST/Repo", "refs/heads/main", "1", "2"),
-            Some("scope-5"),
-            None,
-        )
+        .github(body.clone(), Some("scope-5"), Some(sign(&body)))
         .await;
     assert_eq!(json["triggered"], true, "{json}");
+    let body = push("team/paired", "refs/heads/feature", "1", "2");
     let (_, json) = h
-        .github(
-            push("team/paired", "refs/heads/feature", "1", "2"),
-            Some("scope-6"),
-            None,
-        )
+        .github(body.clone(), Some("scope-6"), Some(sign(&body)))
         .await;
     assert_eq!(json["triggered"], true, "{json}");
     assert_eq!(h.drain(), 2);
 
     // An out-of-scope delivery does not reserve its ID either.
+    let body = push("test/repo", "refs/heads/main", "1", "2");
     let (_, json) = h
-        .github(
-            push("test/repo", "refs/heads/main", "1", "2"),
-            Some("scope-1"),
-            None,
-        )
+        .github(body.clone(), Some("scope-1"), Some(sign(&body)))
         .await;
     assert_eq!(json["triggered"], true, "{json}");
     assert_eq!(h.drain(), 1);
@@ -385,15 +377,19 @@ async fn webhook_71_bursts_fold_into_a_pending_inspection() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn webhook_71_unreachable_scheduler_fails_visibly_and_allows_redelivery() {
-    let mut h = harness(false, 4).await;
+    let mut h = harness(true, 4).await;
     drop(h.rx.take());
     let body = push("test/repo", "refs/heads/main", "1", "2");
-    let (status, _) = h.github(body.clone(), Some("closed-1"), None).await;
+    let (status, _) = h
+        .github(body.clone(), Some("closed-1"), Some(sign(&body)))
+        .await;
     assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
 
     // The failed delivery was forgotten, so its redelivery is acted on.
-    let mut live = harness(false, 4).await;
-    let (_, json) = live.github(body, Some("closed-1"), None).await;
+    let mut live = harness(true, 4).await;
+    let (_, json) = live
+        .github(body.clone(), Some("closed-1"), Some(sign(&body)))
+        .await;
     assert_eq!(json["triggered"], true, "{json}");
     assert_eq!(live.drain(), 1);
 }
@@ -436,4 +432,21 @@ async fn webhook_71_documented_svn_hook_payload_is_accepted() {
     assert_eq!(status, reqwest::StatusCode::OK, "{json}");
     assert_eq!(json["triggered"], true, "{json}");
     assert_eq!(h.drain(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_71_unauthenticated_delivery_ids_are_not_recorded() {
+    // Without a secret anyone can send any ID, so IDs are not trusted: a
+    // pre-recorded ID must not suppress the real delivery.
+    let mut h = harness(false, 8).await;
+    let body = push("test/repo", "refs/heads/main", "1", "2");
+    let (_, json) = h.github(body.clone(), Some("unauth-1"), None).await;
+    assert_eq!(json["triggered"], true, "{json}");
+    assert_eq!(h.drain(), 1);
+    let (_, json) = h.github(body, Some("unauth-1"), None).await;
+    assert_eq!(json["triggered"], true, "{json}");
+    let svn = r#"{"revision": 44}"#;
+    let (_, json) = h.svn(svn, Some("/srv/svn/repo@44"), None).await;
+    assert_eq!(json["triggered"], true, "{json}");
+    assert_eq!(h.drain(), 2, "neither repeat was dropped as a duplicate");
 }

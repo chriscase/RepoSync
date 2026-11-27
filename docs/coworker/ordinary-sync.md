@@ -90,10 +90,10 @@ They are separate from the authenticated API above. What the handlers do today:
 
 | Behavior | GitHub / Gitea push | SVN post-commit |
 | --- | --- | --- |
-| Authenticity check | HMAC signature header checked before the body is read, **if** a webhook secret is configured; a bad or missing signature gets `401`. With no secret configured the handler logs a warning and accepts the payload | Shared-secret header checked before the body is read, **if** configured; otherwise accepted with a warning |
+| Authenticity check | HMAC signature header checked before the body is parsed, **if** a webhook secret is configured; a bad or missing signature gets `401`. With no secret configured the handler logs a warning and accepts the payload | Shared-secret header checked before the body is parsed, **if** configured; otherwise accepted with a warning |
 | Scope | Acts only on a push to a branch (`refs/heads/…`) of `github.repo` or of an enabled pair's Git repository. Other repositories, tags and payloads without a repository are acknowledged with `triggered: false` | No repository scope: any revision only prompts an inspection |
-| Duplicate delivery IDs | `X-GitHub-Delivery` / `X-Gitea-Delivery` already acted on are acknowledged as `duplicate delivery ignored`. Refused or out-of-scope deliveries do not reserve their ID | Same, using the optional `X-Webhook-Delivery` header |
-| Bursts | Never waits for the scheduler. When an inspection is already queued, the delivery reports `sync already pending` | Same |
+| Duplicate delivery IDs | When a secret is configured, an `X-GitHub-Delivery` / `X-Gitea-Delivery` that already queued an inspection is acknowledged as `duplicate delivery ignored`. Refused or out-of-scope deliveries do not reserve their ID. Without a secret, IDs are not trusted and not recorded | Same, using the optional `X-Webhook-Delivery` header |
+| Bursts | Never waits for the scheduler. The scheduler folds every signal queued before an inspection starts into that one inspection; a signal arriving while it runs queues one more. When the queue is full, the delivery reports `sync already pending` | Same |
 | What it does on a valid event | Queues one "inspect now" signal for the scheduler and broadcasts a UI notification | Same |
 | `forced`, `before`, `after` | `forced` is reported back as a **hint** (`forced_hint`, `inspection: polling_safety_gate`); none of them is used to reset or advance anything | n/a |
 | Stale or out-of-order events | The event is not replayed; it only prompts an inspection of the current remote state, so a stale event costs at most one extra inspection | Same |
