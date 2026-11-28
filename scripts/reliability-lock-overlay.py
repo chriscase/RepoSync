@@ -50,13 +50,19 @@ def load_pins(fixtures=FIXTURES):
 
 def load_retired(fixtures=FIXTURES):
     """Reviewed old identities that are intentionally absent from the candidate."""
-    data = json.loads((fixtures / "retired-test-identities.json").read_text())
-    require(data["schema"] == 1, "unknown retired-identity schema")
-    retired = data["retired"]
+    def unique(pairs):
+        # A repeated key would silently replace a reviewed entry.
+        keys = [key for key, _ in pairs]
+        require(len(set(keys)) == len(keys), "duplicate key in retired-identity registry")
+        return dict(pairs)
+    data = json.loads((fixtures / "retired-test-identities.json").read_text(), object_pairs_hook=unique)
+    require(isinstance(data, dict) and data.get("schema") == 1, "unknown retired-identity schema")
+    retired = data.get("retired")
+    require(isinstance(retired, dict), "retired-identity registry is not an object")
     for name, entry in retired.items():
-        require(set(entry) == {"disposition", "successors", "reason"},
+        require(isinstance(entry, dict) and set(entry) == {"disposition", "successors", "reason"},
                 f"malformed retired identity: {name}")
-        require(entry["disposition"] in ("moved", "renamed", "superseded"),
+        require(entry["disposition"] in ("moved", "renamed", "superseded", "duplicate_dropped"),
                 f"unknown retired disposition: {name}")
         successors = entry["successors"]
         require(isinstance(successors, list) and successors
@@ -237,9 +243,16 @@ def self_test():
                 ("retired identity with duplicate successors", {"ordinary::positive": entry("renamed::positive", "renamed::positive")}),
                 ("retired identity without a reason", {"ordinary::positive": entry("renamed::positive", reason=" ")}),
                 ("retired identity with an unknown disposition", {"ordinary::positive": entry("renamed::positive", disposition="waived")}),
-                ("retired identity with an extra field", {"ordinary::positive": {**entry("renamed::positive"), "waive": True}})):
+                ("retired identity with an extra field", {"ordinary::positive": {**entry("renamed::positive"), "waive": True}}),
+                ("retired identity with non-list successors", {"ordinary::positive": {**entry(), "successors": "renamed::positive"}}),
+                ("retired identity that is not an object", {"ordinary::positive": ["renamed::positive"]})):
             retire(entries)
             rejected(lambda: load_retired(fixtures), description)
+        registry.write_text(json.dumps({"schema": 1, "retired": []}))
+        rejected(lambda: load_retired(fixtures), "retired-identity registry that is not an object")
+        one = json.dumps(entry("renamed::positive"))
+        registry.write_text('{"schema": 1, "retired": {"ordinary::positive": %s, "ordinary::positive": %s}}' % (one, one))
+        rejected(lambda: load_retired(fixtures), "duplicate retired identity")
         registry.write_text(json.dumps({"schema": 2, "retired": {}}))
         rejected(lambda: load_retired(fixtures), "unknown retired-identity schema")
         registry.unlink()

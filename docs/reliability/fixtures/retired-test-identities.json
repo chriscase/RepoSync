@@ -3,11 +3,12 @@
   "description": "Old test identities that passed on a historical baseline and are intentionally absent from the candidate catalog. The comparison accepts an absence only when it is listed here and every successor passed in the same candidate run. A listed identity that still exists in the candidate, or that exists and fails, is never excused.",
   "retired": {
     "integration::test_svn_to_git_echo_suppression": {
-      "disposition": "renamed",
+      "disposition": "superseded",
       "successors": [
+        "integration::test_svn_to_git_marker_without_receipt_is_applied",
         "integration::test_svn_to_git_receipt_backed_echo_suppression"
       ],
-      "reason": "Same Personal SVN-to-Git echo scenario in crates/personal/tests/integration.rs, renamed when echo suppression became receipt-backed."
+      "reason": "The old test expected an SVN revision to be skipped because its log message carried the sync marker. Marker-only suppression was dropped: the same marker-only revision is now applied, and a revision is skipped only when a sync receipt backs it. The two successors assert each half."
     },
     "reposync-core::sync_engine::tests::test_delete_always_passes": {
       "disposition": "superseded",
@@ -46,25 +47,25 @@
       "reason": "The data-directory lock moved from the daemon's lockfile module to reposync_core::data_dir, and the test moved with it under the same name."
     },
     "reposync-personal::pr_monitor::tests::test_merge_strategy_display": {
-      "disposition": "moved",
+      "disposition": "duplicate_dropped",
       "successors": [
         "reposync_personal::pr_monitor::tests::test_merge_strategy_display"
       ],
-      "reason": "pr_monitor is now compiled only in the reposync_personal library, so the same test runs under the library's identity and no longer under the binary's."
+      "reason": "pr_monitor used to be compiled into both the reposync_personal library and the reposync-personal binary, so this test ran twice. The binary no longer declares the module; the same test still runs under the library's identity, as it did in the old sources."
     },
     "reposync-personal::pr_monitor::tests::test_merged_pr_struct": {
-      "disposition": "moved",
+      "disposition": "duplicate_dropped",
       "successors": [
         "reposync_personal::pr_monitor::tests::test_merged_pr_struct"
       ],
-      "reason": "pr_monitor is now compiled only in the reposync_personal library, so the same test runs under the library's identity and no longer under the binary's."
+      "reason": "pr_monitor used to be compiled into both the reposync_personal library and the reposync-personal binary, so this test ran twice. The binary no longer declares the module; the same test still runs under the library's identity, as it did in the old sources."
     },
     "reposync-personal::svn_to_git::tests::test_copy_tree_skips_dotfiles_at_root": {
       "disposition": "superseded",
       "successors": [
         "reposync-personal::svn_to_git::tests::test_copy_tree_skips_reserved_vcs_and_preserves_ordinary_dotfiles"
       ],
-      "reason": "The old test required every root-level dot entry to be skipped. copy_tree now skips only reserved version-control directories and preserves ordinary dotfiles; the successor asserts both."
+      "reason": "The old test asserted that a root .svn directory is not copied, that the destination .git is untouched, and that nested dotfiles are copied. The successor keeps those assertions and adds that ordinary root dotfiles such as .gitignore are now preserved."
     },
     "reposync_core::sync_engine::tests::test_delete_always_passes": {
       "disposition": "superseded",
@@ -86,7 +87,7 @@
       "successors": [
         "reposync_personal::svn_to_git::tests::test_copy_tree_skips_reserved_vcs_and_preserves_ordinary_dotfiles"
       ],
-      "reason": "The old test required every root-level dot entry to be skipped. copy_tree now skips only reserved version-control directories and preserves ordinary dotfiles; the successor asserts both."
+      "reason": "The old test asserted that a root .svn directory is not copied, that the destination .git is untouched, and that nested dotfiles are copied. The successor keeps those assertions and adds that ordinary root dotfiles such as .gitignore are now preserved."
     },
     "startup_schema::ordinary_startup_stays_v12": {
       "disposition": "renamed",

@@ -11,7 +11,7 @@ their existing owners. Deployed-version coverage is **NOT ESTABLISHED**.
 
 The historical comparison matches exact test identities. `fixtures/retired-test-identities.json`
 lists each old identity that passed on a baseline and is intentionally absent from
-the candidate, with the tests that replaced it and the reason. The comparison
+the candidate, with the tests that cover it now and the reason. The comparison
 accepts an absence only when it is listed and every listed successor passed in the
 same candidate run. It refuses a listed identity that still exists in the candidate
 catalog, and it still reports every unlisted absence and every failing test as before.
