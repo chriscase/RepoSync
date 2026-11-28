@@ -1496,6 +1496,8 @@ async fn start_repo_import(
         .get_repository(&id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+    // A pair saved before branch names were checked must not reach Git.
+    require_valid_git_branch(&repo.git_branch)?;
     if db
         .managed_remove_blocks_new_work(&id)
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -2378,6 +2380,8 @@ async fn resume_repo_import(
         .get_repository(&id)
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+    // A pair saved before branch names were checked must not reach Git.
+    require_valid_git_branch(&repo.git_branch)?;
     let requested = db
         .get_import_operation(&id, &operation_id)
         .map_err(|e| AppError::Internal(e.to_string()))?
