@@ -828,58 +828,50 @@ async fn main() -> Result<()> {
     let ws_broadcast = web_server.broadcast_sender();
     let listen_addr = config.web.listen.clone();
 
-    // Spawn Teams notification listener if configured.
-    // Subscribes to the same broadcast channel as WebSocket clients
-    // and forwards relevant events to Teams as Adaptive Cards.
-    if let Some(ref teams_url) = config.notifications.teams_webhook_url {
-        let teams_notifier = reposync_core::notify::teams::TeamsNotifier::new(teams_url.clone());
-        let mut teams_rx = ws_broadcast.subscribe();
-        tokio::spawn(async move {
-            info!("Teams notification listener started");
-            loop {
-                match teams_rx.recv().await {
-                    Ok(msg) => {
-                        teams_notifier.process_event(&msg).await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(skipped = n, "Teams listener lagged, missed events");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        info!("Teams listener: broadcast channel closed, shutting down");
-                        break;
-                    }
+    // Teams notifications. The server configuration's URL takes precedence;
+    // otherwise the URL saved in Settings is read for each event, so saving,
+    // replacing or removing it there applies without a restart.
+    {
+        let config_url = config
+            .notifications
+            .teams_webhook_url
+            .clone()
+            .filter(|u| !u.trim().is_empty());
+        let settings_db = if config_url.is_none() {
+            match reposync_core::db::Database::new(config.daemon.data_dir.join("reposync.db")) {
+                Ok(db) => Some(db),
+                Err(e) => {
+                    warn!(error = %e, "Teams notifications: cannot open the database to read the Settings URL");
+                    None
                 }
             }
-        });
-    }
-
-    // Also check for Teams webhook URL from database (kv_state)
-    // This allows admin to configure via the Settings UI without restarting
-    {
-        let check_db =
-            reposync_core::db::Database::new(config.daemon.data_dir.join("reposync.db")).ok();
-        let db_teams_url = check_db
-            .and_then(|db| db.get_state("teams_webhook_url").ok().flatten())
-            .filter(|v| !v.is_empty());
-        if let Some(ref url) = db_teams_url {
-            if config.notifications.teams_webhook_url.is_none() {
-                let teams_notifier = reposync_core::notify::teams::TeamsNotifier::new(url.clone());
-                let mut teams_rx = ws_broadcast.subscribe();
-                tokio::spawn(async move {
-                    info!("Teams notification listener started (from DB config)");
-                    loop {
-                        match teams_rx.recv().await {
-                            Ok(msg) => {
-                                teams_notifier.process_event(&msg).await;
+        } else {
+            None
+        };
+        if config_url.is_some() || settings_db.is_some() {
+            let events = ws_broadcast.subscribe();
+            tokio::spawn(async move {
+                info!(
+                    source = if config_url.is_some() {
+                        "config"
+                    } else {
+                        "settings"
+                    },
+                    "Teams notification listener started"
+                );
+                reposync_core::notify::teams::run_listener(events, move || {
+                    config_url.clone().or_else(|| {
+                        match settings_db.as_ref()?.get_state("teams_webhook_url") {
+                            Ok(url) => url,
+                            Err(e) => {
+                                warn!(error = %e, "Teams notifications: cannot read the Settings URL; skipping this event");
+                                None
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                warn!(skipped = n, "Teams listener lagged");
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
-                    }
-                });
-            }
+                    })
+                })
+                .await;
+            });
         }
     }
     let app_state_for_cleanup = web_server.app_state();

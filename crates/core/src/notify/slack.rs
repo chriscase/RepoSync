@@ -41,7 +41,7 @@ impl SlackNotifier {
             .json(&payload)
             .send()
             .await
-            .map_err(NotificationError::HttpError)?;
+            .map_err(|e| NotificationError::HttpError(e.without_url()))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
