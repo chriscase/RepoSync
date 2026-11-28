@@ -410,7 +410,7 @@ function AdminSetupWizard() {
         sync_auto_merge: data.sync_auto_merge,
         sync_tags: data.sync_tags,
         max_file_size: Math.max(0, Math.round(data.max_file_size_mb * 1024 * 1024)),
-        lfs_threshold: data.lfs_threshold_mb > 0 ? data.lfs_threshold_mb * 1024 * 1024 : undefined,
+        lfs_threshold: data.lfs_threshold_mb > 0 ? Math.round(data.lfs_threshold_mb * 1024 * 1024) : undefined,
         lfs_patterns: data.lfs_patterns.split(',').map(s => s.trim()).filter(Boolean),
         ignore_patterns: data.ignore_patterns.split(',').map(s => s.trim()).filter(Boolean),
         identity_email_domain: data.identity_email_domain,
