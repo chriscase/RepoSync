@@ -476,14 +476,26 @@ fn mapping_path_matches(
 
 /// Settings the wizard collects but `apply` does not store: they are read
 /// only from the server configuration file. Names those the request sets to
-/// something other than the running configuration, so a change is never
-/// silently dropped.
+/// something other than the running configuration (an empty value included,
+/// so clearing one is reported too), so a change is never silently dropped.
+/// Values are compared after trimming, and lists after the wizard's own
+/// comma join, so an unchanged form reports nothing.
 fn unapplied_settings_warning(
     body: &ApplyConfigRequest,
     config: &reposync_core::config::AppConfig,
 ) -> Option<String> {
-    fn text(value: &Option<String>) -> Option<&str> {
-        value.as_deref().map(str::trim).filter(|v| !v.is_empty())
+    fn list(items: &[String]) -> String {
+        items
+            .iter()
+            .map(|i| i.trim())
+            .filter(|i| !i.is_empty())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+    fn text_differs(requested: &Option<String>, current: &str) -> bool {
+        requested
+            .as_deref()
+            .is_some_and(|v| v.trim() != current.trim())
     }
     let mut differ: Vec<&str> = Vec::new();
     let mut check = |name: &'static str, changed: bool| {
@@ -493,19 +505,19 @@ fn unapplied_settings_warning(
     };
     check(
         "svn_password_env",
-        text(&body.svn_password_env).is_some_and(|v| v != config.svn.password_env),
+        text_differs(&body.svn_password_env, &config.svn.password_env),
     );
     check(
         "svn_branches_path",
-        text(&body.svn_branches_path).is_some_and(|v| v != config.svn.branches_path),
+        text_differs(&body.svn_branches_path, &config.svn.branches_path),
     );
     check(
         "svn_tags_path",
-        text(&body.svn_tags_path).is_some_and(|v| v != config.svn.tags_path),
+        text_differs(&body.svn_tags_path, &config.svn.tags_path),
     );
     check(
         "git_token_env",
-        text(&body.git_token_env).is_some_and(|v| v != config.github.token_env),
+        text_differs(&body.git_token_env, &config.github.token_env),
     );
     check(
         "sync_tags",
@@ -520,36 +532,41 @@ fn unapplied_settings_warning(
         "lfs_patterns",
         body.lfs_patterns
             .as_ref()
-            .is_some_and(|v| *v != config.sync.lfs_patterns),
+            .is_some_and(|v| list(v) != list(&config.sync.lfs_patterns)),
     );
     check(
         "ignore_patterns",
         body.ignore_patterns
             .as_ref()
-            .is_some_and(|v| *v != config.sync.ignore_patterns),
+            .is_some_and(|v| list(v) != list(&config.sync.ignore_patterns)),
     );
     check(
         "identity_email_domain",
-        text(&body.identity_email_domain)
-            .is_some_and(|v| Some(v) != config.identity.email_domain.as_deref()),
+        text_differs(
+            &body.identity_email_domain,
+            config.identity.email_domain.as_deref().unwrap_or_default(),
+        ),
     );
     check(
         "daemon_log_level",
-        text(&body.daemon_log_level).is_some_and(|v| v != config.daemon.log_level),
+        text_differs(&body.daemon_log_level, &config.daemon.log_level),
     );
     check(
         "daemon_data_dir",
-        text(&body.daemon_data_dir)
-            .is_some_and(|v| std::path::Path::new(v) != config.daemon.data_dir),
+        body.daemon_data_dir
+            .as_deref()
+            .is_some_and(|v| std::path::Path::new(v.trim()) != config.daemon.data_dir),
     );
     check(
         "web_listen",
-        text(&body.web_listen).is_some_and(|v| v != config.web.listen),
+        text_differs(&body.web_listen, &config.web.listen),
     );
     check(
         "web_admin_password_env",
-        text(&body.web_admin_password_env)
-            .is_some_and(|v| Some(v) != config.web.admin_password_env.as_deref()),
+        text_differs(
+            &body.web_admin_password_env,
+            config.web.admin_password_env.as_deref().unwrap_or_default(),
+        ),
     );
     if differ.is_empty() {
         return None;

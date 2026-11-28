@@ -351,7 +351,34 @@ async fn an_unchanged_wizard_round_trip_reports_nothing() {
         assert!(!cfg[from].is_null(), "{from} missing from {cfg}");
         body[to] = cfg[from].clone();
     }
+    body["max_file_size"] = cfg["max_file_size"].clone();
     let (status, json) = apply(&f, body).await;
     assert_eq!(status, 200, "{json}");
     assert_eq!(json["warnings"], json!([]), "{json}");
+}
+
+/// Clearing a setting is a change too, and the wizard's own encodings
+/// (trimmed values, comma-split lists, an absent env name as "") are not.
+#[tokio::test]
+async fn cleared_values_are_reported_and_encodings_are_not() {
+    let f = fixture(None).await;
+    let mut body = apply_body(None, json!([]));
+    body["svn_tags_path"] = json!("");
+    body["web_admin_password_env"] = json!("");
+    body["svn_branches_path"] = json!(format!(" {} ", f.state.config.svn.branches_path));
+    body["max_file_size"] = json!(f.state.config.sync.max_file_size);
+    body["lfs_patterns"] = json!([]);
+    let (status, json) = apply(&f, body).await;
+    assert_eq!(status, 200, "{json}");
+    let w = json["warnings"][0].as_str().unwrap_or_default().to_string();
+    assert!(w.contains("svn_tags_path"), "{json}");
+    for name in [
+        "web_admin_password_env",
+        "svn_branches_path",
+        "max_file_size",
+        "lfs_patterns",
+    ] {
+        assert!(!w.contains(name), "{name}: {json}");
+    }
+    assert_eq!(json["warnings"].as_array().unwrap().len(), 1, "{json}");
 }
