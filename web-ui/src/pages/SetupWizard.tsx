@@ -144,7 +144,7 @@ type Errors = Record<string, string>;
 
 // Each check runs on the step that shows its field, so its error appears next to that field
 // (#264, G12.9). Step 3 is Sync Settings, step 4 Identity Mapping, step 5 Server & Auth.
-function validateStep(step: number, data: WizardData): Errors {
+function validateStep(step: number, data: WizardData, opts: { adminPasswordSet?: boolean; savedConfigLoaded?: boolean } = {}): Errors {
   const errors: Errors = {};
 
   if (step === 1) {
@@ -180,7 +180,10 @@ function validateStep(step: number, data: WizardData): Errors {
       errors.web_listen = 'Must be in host:port format (e.g. 0.0.0.0:8080)';
     if (data.daemon_poll_interval < 1) errors.daemon_poll_interval = 'Must be at least 1 second';
     if (!data.daemon_data_dir.trim()) errors.daemon_data_dir = 'Data directory is required';
-    if ((data.web_auth_mode === 'simple' || data.web_auth_mode === 'both') && !data.web_admin_password_env.trim())
+    // The env var name is read only from the configuration file, so it is
+    // required only when nothing was read from the server and no admin
+    // password is stored (#268).
+    if ((data.web_auth_mode === 'simple' || data.web_auth_mode === 'both') && !opts.adminPasswordSet && !opts.savedConfigLoaded && !data.web_admin_password_env.trim())
       errors.web_admin_password_env = 'Admin password env var is required for simple auth';
   }
 
@@ -233,6 +236,17 @@ function savedConfigFields(cfg: WizardSetupConfig): {
   if (cfg.poll_interval > 0) merged.daemon_poll_interval = cfg.poll_interval;
   if (cfg.log_level) merged.daemon_log_level = cfg.log_level;
   if (cfg.data_dir) merged.daemon_data_dir = cfg.data_dir;
+
+  // Settings only the configuration file sets. Pre-filling them means an
+  // unchanged form does not report them as "not applied" on save.
+  if (cfg.svn_branches_path !== undefined) merged.svn_branches_path = cfg.svn_branches_path;
+  if (cfg.svn_tags_path !== undefined) merged.svn_tags_path = cfg.svn_tags_path;
+  if (cfg.svn_password_env !== undefined) merged.svn_password_env = cfg.svn_password_env;
+  if (cfg.git_token_env !== undefined) merged.git_token_env = cfg.git_token_env;
+  if (cfg.admin_password_env !== undefined) merged.web_admin_password_env = cfg.admin_password_env;
+  if (cfg.max_file_size !== undefined) merged.max_file_size_mb = cfg.max_file_size / (1024 * 1024);
+  if (cfg.lfs_patterns) merged.lfs_patterns = cfg.lfs_patterns.join(', ');
+  if (cfg.ignore_patterns) merged.ignore_patterns = cfg.ignore_patterns.join(', ');
 
   return {
     fields: merged,
@@ -307,8 +321,7 @@ function AdminSetupWizard() {
   // Track whether secrets are already saved on the server
   const [svnPasswordSaved, setSvnPasswordSaved] = useState(false);
   const [gitTokenSaved, setGitTokenSaved] = useState(false);
-  // adminPasswordSaved reserved for future use when admin password field is added
-  const [, setAdminPasswordSaved] = useState(false);
+  const [adminPasswordSaved, setAdminPasswordSaved] = useState(false);
   // Track whether user has typed new values for password fields
   const [svnPasswordDirty, setSvnPasswordDirty] = useState(false);
   const [gitTokenDirty, setGitTokenDirty] = useState(false);
@@ -359,7 +372,7 @@ function AdminSetupWizard() {
 
   const goNext = () => {
     if (formOff) return;
-    const errs = validateStep(step, data);
+    const errs = validateStep(step, data, { adminPasswordSet: adminPasswordSaved, savedConfigLoaded: configRead.status === 'loaded' });
     setErrors(errs);
     if (Object.keys(errs).length > 0) return;
     setCheckingOnEntry(false);
@@ -380,32 +393,34 @@ function AdminSetupWizard() {
         svn_url: data.svn_url,
         svn_username: data.svn_username,
         svn_password: data.svn_password || undefined,
-        svn_password_env: data.svn_password_env || undefined,
+        // Settings only the configuration file sets are always sent as shown,
+        // cleared ones included, so the server can say which were not applied.
+        svn_password_env: data.svn_password_env,
         svn_layout: data.svn_layout,
         svn_trunk_path: data.svn_trunk_path,
-        svn_branches_path: data.svn_branches_path || undefined,
-        svn_tags_path: data.svn_tags_path || undefined,
+        svn_branches_path: data.svn_branches_path,
+        svn_tags_path: data.svn_tags_path,
         git_provider: data.git_provider,
         git_api_url: data.git_api_url,
         git_repo: data.git_repo,
         git_token: data.git_token || undefined,
-        git_token_env: data.git_token_env || undefined,
+        git_token_env: data.git_token_env,
         git_default_branch: data.git_default_branch,
         sync_mode: data.sync_mode,
         sync_auto_merge: data.sync_auto_merge,
         sync_tags: data.sync_tags,
-        max_file_size: data.max_file_size_mb > 0 ? data.max_file_size_mb * 1024 * 1024 : undefined,
+        max_file_size: Math.max(0, Math.round(data.max_file_size_mb * 1024 * 1024)),
         lfs_threshold: data.lfs_threshold_mb > 0 ? data.lfs_threshold_mb * 1024 * 1024 : undefined,
-        lfs_patterns: data.lfs_patterns ? data.lfs_patterns.split(',').map(s => s.trim()).filter(Boolean) : undefined,
-        ignore_patterns: data.ignore_patterns ? data.ignore_patterns.split(',').map(s => s.trim()).filter(Boolean) : undefined,
-        identity_email_domain: data.identity_email_domain || undefined,
+        lfs_patterns: data.lfs_patterns.split(',').map(s => s.trim()).filter(Boolean),
+        ignore_patterns: data.ignore_patterns.split(',').map(s => s.trim()).filter(Boolean),
+        identity_email_domain: data.identity_email_domain,
         identity_mapping_file: data.identity_mapping_file || undefined,
         identity_mappings: data.identity_mappings.length > 0 ? data.identity_mappings : undefined,
         daemon_poll_interval: data.daemon_poll_interval,
         daemon_log_level: data.daemon_log_level,
         daemon_data_dir: data.daemon_data_dir,
         web_listen: data.web_listen,
-        web_admin_password_env: data.web_admin_password_env || undefined,
+        web_admin_password_env: data.web_admin_password_env,
       };
       const result = await api.applyConfig(payload);
       if (result.ok) {

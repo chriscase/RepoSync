@@ -84,6 +84,30 @@ describe('#264 G12.9 setup validation runs each check on the step that shows its
     expect(validateStep(5, wizard({ identity_email_domain: 'nope', lfs_threshold_mb: -5 }))).toEqual({});
   });
 
+  it('needs no admin password env var name once an admin password is stored (#268)', () => {
+    const noEnv = wizard({ web_auth_mode: 'simple', web_admin_password_env: '' });
+    expect(validateStep(5, noEnv)).toEqual({
+      web_admin_password_env: 'Admin password env var is required for simple auth',
+    });
+    expect(validateStep(5, noEnv, { adminPasswordSet: true })).toEqual({});
+    // Users but no admin password: the name read from the server is used as is.
+    expect(validateStep(5, noEnv, { savedConfigLoaded: true })).toEqual({});
+  });
+
+  it('pre-fills every config-file-only setting exactly, empty values included (#268)', () => {
+    const cfg = {
+      svn_branches_path: 'b', svn_tags_path: 't', svn_password_env: '', git_token_env: 'TOK',
+      admin_password_env: '', max_file_size: 3 * 1024 * 1024, lfs_patterns: ['*.{psd,ai}'],
+      ignore_patterns: [],
+    } as unknown as WizardSetupConfig;
+    const { fields } = savedConfigFields(cfg);
+    expect(fields).toMatchObject({
+      svn_branches_path: 'b', svn_tags_path: 't', svn_password_env: '', git_token_env: 'TOK',
+      web_admin_password_env: '', max_file_size_mb: 3, lfs_patterns: '*.{psd,ai}',
+      ignore_patterns: '',
+    });
+  });
+
   it('still accepts valid values on the steps that now hold the moved checks', () => {
     expect(validateStep(3, wizard({ lfs_threshold_mb: 0 }))).toEqual({});
     expect(validateStep(4, wizard({ identity_email_domain: 'example.org' }))).toEqual({});

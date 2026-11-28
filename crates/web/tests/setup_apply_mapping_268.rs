@@ -277,3 +277,108 @@ async fn an_unreadable_existing_file_is_left_unchanged() {
         "this is not toml = = ="
     );
 }
+
+/// #268: settings the wizard collects but apply does not store are named
+/// when they differ from the running configuration, never silently dropped.
+#[tokio::test]
+async fn settings_apply_cannot_store_are_reported_only_when_changed() {
+    let f = fixture(None).await;
+    let cfg = &f.state.config;
+
+    // The values the wizard pre-fills from the running configuration.
+    let mut same = apply_body(None, json!([]));
+    same["web_listen"] = json!(cfg.web.listen);
+    same["daemon_data_dir"] = json!(cfg.daemon.data_dir.display().to_string());
+    same["daemon_log_level"] = json!(cfg.daemon.log_level);
+    same["sync_tags"] = json!(cfg.sync.sync_tags);
+    same["identity_email_domain"] = json!("");
+    let (status, json) = apply(&f, same).await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["warnings"], json!([]), "{json}");
+
+    let mut changed = apply_body(None, json!([]));
+    changed["web_listen"] = json!("127.0.0.1:9999");
+    changed["daemon_data_dir"] = json!("/srv/elsewhere");
+    changed["sync_tags"] = json!(!cfg.sync.sync_tags);
+    changed["ignore_patterns"] = json!(["*.tmp"]);
+    changed["daemon_log_level"] = json!(cfg.daemon.log_level);
+    let (status, json) = apply(&f, changed).await;
+    assert_eq!(status, 200, "{json}");
+    let warnings = json["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{json}");
+    let w = warnings[0].as_str().unwrap();
+    assert!(w.contains("not applied"), "{w}");
+    for name in [
+        "web_listen",
+        "daemon_data_dir",
+        "sync_tags",
+        "ignore_patterns",
+    ] {
+        assert!(w.contains(name), "{name} missing: {w}");
+    }
+    assert!(!w.contains("daemon_log_level"), "{w}");
+}
+
+/// What the wizard reads back from `GET /api/setup/config` and sends
+/// unchanged produces no "not applied" warning.
+#[tokio::test]
+async fn an_unchanged_wizard_round_trip_reports_nothing() {
+    let f = fixture(None).await;
+    let cfg: Value = reqwest::Client::new()
+        .get(format!("http://{}/api/setup/config", f.addr))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut body = apply_body(None, json!([]));
+    for (to, from) in [
+        ("svn_branches_path", "svn_branches_path"),
+        ("svn_tags_path", "svn_tags_path"),
+        ("svn_password_env", "svn_password_env"),
+        ("git_token_env", "git_token_env"),
+        ("web_admin_password_env", "admin_password_env"),
+        ("web_listen", "listen"),
+        ("daemon_log_level", "log_level"),
+        ("daemon_data_dir", "data_dir"),
+        ("sync_tags", "sync_tags"),
+        ("lfs_patterns", "lfs_patterns"),
+        ("ignore_patterns", "ignore_patterns"),
+        ("identity_email_domain", "email_domain"),
+    ] {
+        assert!(!cfg[from].is_null(), "{from} missing from {cfg}");
+        body[to] = cfg[from].clone();
+    }
+    body["max_file_size"] = cfg["max_file_size"].clone();
+    let (status, json) = apply(&f, body).await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["warnings"], json!([]), "{json}");
+}
+
+/// Clearing a setting is a change too, and the wizard's own encodings
+/// (trimmed values, comma-split lists, an absent env name as "") are not.
+#[tokio::test]
+async fn cleared_values_are_reported_and_encodings_are_not() {
+    let f = fixture(None).await;
+    let mut body = apply_body(None, json!([]));
+    body["svn_tags_path"] = json!("");
+    body["web_admin_password_env"] = json!("");
+    body["svn_branches_path"] = json!(format!(" {} ", f.state.config.svn.branches_path));
+    body["max_file_size"] = json!(f.state.config.sync.max_file_size);
+    body["lfs_patterns"] = json!([]);
+    let (status, json) = apply(&f, body).await;
+    assert_eq!(status, 200, "{json}");
+    let w = json["warnings"][0].as_str().unwrap_or_default().to_string();
+    assert!(w.contains("svn_tags_path"), "{json}");
+    for name in [
+        "web_admin_password_env",
+        "svn_branches_path",
+        "max_file_size",
+        "lfs_patterns",
+    ] {
+        assert!(!w.contains(name), "{name}: {json}");
+    }
+    assert_eq!(json["warnings"].as_array().unwrap().len(), 1, "{json}");
+}

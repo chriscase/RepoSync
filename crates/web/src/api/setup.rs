@@ -146,6 +146,9 @@ pub struct SetupConfigResponse {
     pub svn_username: String,
     pub svn_layout: String,
     pub svn_trunk_path: String,
+    pub svn_branches_path: String,
+    pub svn_tags_path: String,
+    pub svn_password_env: String,
     pub svn_password_set: bool,
 
     // Git
@@ -153,6 +156,7 @@ pub struct SetupConfigResponse {
     pub git_api_url: String,
     pub git_repo: String,
     pub git_branch: String,
+    pub git_token_env: String,
     pub git_token_set: bool,
 
     // Sync
@@ -160,6 +164,9 @@ pub struct SetupConfigResponse {
     pub auto_merge: bool,
     pub sync_tags: bool,
     pub lfs_threshold: u64,
+    pub max_file_size: u64,
+    pub lfs_patterns: Vec<String>,
+    pub ignore_patterns: Vec<String>,
 
     // Identity
     pub email_domain: String,
@@ -170,6 +177,7 @@ pub struct SetupConfigResponse {
     pub poll_interval: u64,
     pub log_level: String,
     pub data_dir: String,
+    pub admin_password_env: String,
     pub admin_password_set: bool,
 
     /// Whether a config file exists on disk.
@@ -239,18 +247,25 @@ async fn get_setup_config(
             "standard".into()
         },
         svn_trunk_path: cfg.svn.trunk_path.clone(),
+        svn_branches_path: cfg.svn.branches_path.clone(),
+        svn_tags_path: cfg.svn.tags_path.clone(),
+        svn_password_env: cfg.svn.password_env.clone(),
         svn_password_set,
 
         git_provider: "github".into(),
         git_api_url: cfg.github.api_url.clone(),
         git_repo: cfg.github.repo.clone(),
         git_branch: cfg.github.default_branch.clone(),
+        git_token_env: cfg.github.token_env.clone(),
         git_token_set,
 
         sync_mode: format!("{:?}", cfg.sync.mode).to_lowercase(),
         auto_merge: cfg.sync.auto_merge,
         sync_tags: cfg.sync.sync_tags,
         lfs_threshold: cfg.sync.lfs_threshold,
+        max_file_size: cfg.sync.max_file_size,
+        lfs_patterns: cfg.sync.lfs_patterns.clone(),
+        ignore_patterns: cfg.sync.ignore_patterns.clone(),
 
         email_domain: cfg.identity.email_domain.clone().unwrap_or_default(),
 
@@ -259,6 +274,7 @@ async fn get_setup_config(
         poll_interval: cfg.daemon.poll_interval_secs,
         log_level: cfg.daemon.log_level.clone(),
         data_dir: cfg.daemon.data_dir.display().to_string(),
+        admin_password_env: cfg.web.admin_password_env.clone().unwrap_or_default(),
         admin_password_set,
 
         config_exists: true,
@@ -456,6 +472,110 @@ fn mapping_path_matches(
         Some(parent.canonicalize().ok()?.join(name))
     };
     matches!((canonical(&resolved), canonical(target)), (Some(a), Some(b)) if a == b)
+}
+
+/// Settings the wizard collects but `apply` does not store: they are read
+/// only from the server configuration file. Names those the request sets to
+/// something other than the running configuration (an empty value included,
+/// so clearing one is reported too), so a change is never silently dropped.
+/// Values are compared after trimming, and lists after the wizard's own
+/// comma join, so an unchanged form reports nothing.
+fn unapplied_settings_warning(
+    body: &ApplyConfigRequest,
+    config: &reposync_core::config::AppConfig,
+) -> Option<String> {
+    fn list(items: &[String]) -> String {
+        items
+            .iter()
+            .map(|i| i.trim())
+            .filter(|i| !i.is_empty())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+    fn text_differs(requested: &Option<String>, current: &str) -> bool {
+        requested
+            .as_deref()
+            .is_some_and(|v| v.trim() != current.trim())
+    }
+    let mut differ: Vec<&str> = Vec::new();
+    let mut check = |name: &'static str, changed: bool| {
+        if changed {
+            differ.push(name);
+        }
+    };
+    check(
+        "svn_password_env",
+        text_differs(&body.svn_password_env, &config.svn.password_env),
+    );
+    check(
+        "svn_branches_path",
+        text_differs(&body.svn_branches_path, &config.svn.branches_path),
+    );
+    check(
+        "svn_tags_path",
+        text_differs(&body.svn_tags_path, &config.svn.tags_path),
+    );
+    check(
+        "git_token_env",
+        text_differs(&body.git_token_env, &config.github.token_env),
+    );
+    check(
+        "sync_tags",
+        body.sync_tags.is_some_and(|v| v != config.sync.sync_tags),
+    );
+    check(
+        "max_file_size",
+        body.max_file_size
+            .is_some_and(|v| v != config.sync.max_file_size),
+    );
+    check(
+        "lfs_patterns",
+        body.lfs_patterns
+            .as_ref()
+            .is_some_and(|v| list(v) != list(&config.sync.lfs_patterns)),
+    );
+    check(
+        "ignore_patterns",
+        body.ignore_patterns
+            .as_ref()
+            .is_some_and(|v| list(v) != list(&config.sync.ignore_patterns)),
+    );
+    check(
+        "identity_email_domain",
+        text_differs(
+            &body.identity_email_domain,
+            config.identity.email_domain.as_deref().unwrap_or_default(),
+        ),
+    );
+    check(
+        "daemon_log_level",
+        text_differs(&body.daemon_log_level, &config.daemon.log_level),
+    );
+    check(
+        "daemon_data_dir",
+        body.daemon_data_dir.as_deref().is_some_and(|v| {
+            let current = config.daemon.data_dir.display().to_string();
+            std::path::Path::new(v.trim()) != std::path::Path::new(current.trim())
+        }),
+    );
+    check(
+        "web_listen",
+        text_differs(&body.web_listen, &config.web.listen),
+    );
+    check(
+        "web_admin_password_env",
+        text_differs(
+            &body.web_admin_password_env,
+            config.web.admin_password_env.as_deref().unwrap_or_default(),
+        ),
+    );
+    if differ.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "These settings were not applied, because the server reads them only from its configuration file: {}. Edit them there and restart the server to change them.",
+        differ.join(", ")
+    ))
 }
 
 async fn apply_config(
@@ -700,6 +820,10 @@ async fn apply_config(
                 Err(e) => warnings.push(format!("Failed to create repository: {}", e)),
             }
         }
+    }
+
+    if let Some(warning) = unapplied_settings_warning(&body, &state.config) {
+        warnings.push(warning);
     }
 
     // LFS check
