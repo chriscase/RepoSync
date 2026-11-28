@@ -84,9 +84,10 @@ Two later changes, newer than that pin:
   paths or blocked patterns are ones scheduled sync cannot use. The reply names the
   setting.
 - For a pair with sync turned on, it records a request and wakes the scheduler. The
-  pair's next inspection skips its poll wait once. Every hold, pause and busy check
-  still applies, so the reply's `"queued": true` says the request was recorded, not
-  that a cycle ran or finished. With sync turned off the reply says `"queued": false`.
+  pair's poll wait is skipped once, when its next cycle starts. Every hold, pause and
+  busy check still applies, and a request that cannot start within 15 minutes expires.
+  The reply's `"queued": true` says the request was recorded, not that a cycle ran or
+  finished. With sync turned off the reply says `"queued": false`.
 
 To see what happened, read [status](status-and-reconciliation.md#reading-the-status), not this reply.
 

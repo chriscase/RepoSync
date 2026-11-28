@@ -72,4 +72,33 @@ async fn a_request_does_not_override_a_configuration_refusal() {
     let log = tick(&scheduler).await;
     assert!(logged(&log, "Git branch name is not usable", id), "{log}");
     assert!(!logged(&log, "starting per-repo sync cycle", id), "{log}");
+    assert!(
+        scheduler.db.manual_sync_requested(id),
+        "a request that could not start is kept, not used up"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_request_is_dropped_without_a_cycle() {
+    let id = "manual-expired";
+    let (_tmp, scheduler) = not_due(id);
+    let old = Utc::now()
+        - chrono::Duration::seconds(
+            reposync_core::db::queries::MANUAL_SYNC_REQUEST_MAX_AGE_SECS + 5,
+        );
+    scheduler
+        .db
+        .set_state(&format!("manual_sync_requested_{id}"), &old.to_rfc3339())
+        .unwrap();
+
+    let log = tick(&scheduler).await;
+    assert!(logged(&log, "repo not due for sync yet", id), "{log}");
+    assert!(!logged(&log, "starting per-repo sync cycle", id), "{log}");
+    assert_eq!(
+        scheduler
+            .db
+            .get_state(&format!("manual_sync_requested_{id}"))
+            .unwrap(),
+        None
+    );
 }

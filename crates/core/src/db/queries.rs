@@ -1687,13 +1687,23 @@ impl Database {
         self.set_state(&manual_sync_request_key(repo_id), &Utc::now().to_rfc3339())
     }
 
-    /// Whether a manual sync request is waiting for this pair. A read error
-    /// counts as no request, so the pair keeps its normal schedule.
+    /// Whether a manual sync request is waiting for this pair. A request
+    /// expires after [`MANUAL_SYNC_REQUEST_MAX_AGE_SECS`], so one that met a
+    /// long hold does not start a cycle long after it was asked for. A read
+    /// error, an unreadable time or an expired request all count as no
+    /// request, and the pair keeps its normal schedule.
     pub fn manual_sync_requested(&self, repo_id: &str) -> bool {
-        matches!(
-            self.get_state(&manual_sync_request_key(repo_id)),
-            Ok(Some(_))
-        )
+        let Ok(Some(requested_at)) = self.get_state(&manual_sync_request_key(repo_id)) else {
+            return false;
+        };
+        let fresh = DateTime::parse_from_rfc3339(&requested_at).is_ok_and(|at| {
+            let age = Utc::now().signed_duration_since(at).num_seconds();
+            (0..=MANUAL_SYNC_REQUEST_MAX_AGE_SECS).contains(&age)
+        });
+        if !fresh {
+            let _ = self.clear_manual_sync_request(repo_id);
+        }
+        fresh
     }
 
     /// Forget this pair's manual sync request once its cycle starts.
@@ -4330,6 +4340,9 @@ impl Database {
         }
     }
 }
+
+/// How long a manual sync request stays valid while the pair cannot start.
+pub const MANUAL_SYNC_REQUEST_MAX_AGE_SECS: i64 = 15 * 60;
 
 fn manual_sync_request_key(repo_id: &str) -> String {
     format!("manual_sync_requested_{repo_id}")

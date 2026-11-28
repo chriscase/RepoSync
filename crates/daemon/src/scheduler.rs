@@ -394,19 +394,8 @@ impl Scheduler {
         }
         self.stats.poll_ticks.fetch_add(1, Ordering::SeqCst);
 
-        // Memory guard: skip sync cycles if RSS exceeds limit
-        if self.memory_limit_bytes > 0 {
-            let rss = crate::memory::process_rss_bytes();
-            if rss > self.memory_limit_bytes {
-                warn!(
-                    rss_mb = rss / 1024 / 1024,
-                    limit_mb = self.memory_limit_bytes / 1024 / 1024,
-                    "memory limit exceeded ({} MB > {} MB), skipping sync cycle",
-                    rss / 1024 / 1024,
-                    self.memory_limit_bytes / 1024 / 1024,
-                );
-                return;
-            }
+        if self.over_memory_limit() {
+            return;
         }
 
         // Observe-first auto-reconcile for held import and external-write
@@ -430,8 +419,32 @@ impl Scheduler {
         }
     }
 
+    /// Memory guard: sync cycles are skipped while RSS exceeds the limit.
+    fn over_memory_limit(&self) -> bool {
+        if self.memory_limit_bytes == 0 {
+            return false;
+        }
+        let rss = crate::memory::process_rss_bytes();
+        if rss <= self.memory_limit_bytes {
+            return false;
+        }
+        warn!(
+            rss_mb = rss / 1024 / 1024,
+            limit_mb = self.memory_limit_bytes / 1024 / 1024,
+            "memory limit exceeded ({} MB > {} MB), skipping sync cycle",
+            rss / 1024 / 1024,
+            self.memory_limit_bytes / 1024 / 1024,
+        );
+        true
+    }
+
     async fn handle_webhook_tick(&self) {
         if self.shutdown_requested() {
+            return;
+        }
+        // A webhook or manual request starts the same work as a poll, so
+        // the same memory guard applies.
+        if self.over_memory_limit() {
             return;
         }
         info!("immediate sync requested via webhook (same polling inspection)");

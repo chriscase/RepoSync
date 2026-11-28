@@ -1242,21 +1242,28 @@ async fn trigger_sync(
         true,
     );
 
-    // Ask the scheduler to sync this pair at its next inspection without
-    // waiting out the poll interval, then wake it. A pair with sync turned
-    // off is not queued: it would run the moment sync is turned back on.
-    let queued = repo.enabled
-        && match db.request_manual_sync(&id) {
-            Ok(()) => true,
+    // Ask the scheduler to sync this pair without waiting out the poll
+    // interval, then wake it. A pair with sync turned off is not queued: it
+    // would run the moment sync is turned back on. A request that is already
+    // waiting is not repeated, so repeated calls do not add inspections.
+    let queued = if !repo.enabled {
+        false
+    } else if db.manual_sync_requested(&id) {
+        true
+    } else {
+        match db.request_manual_sync(&id) {
+            Ok(()) => {
+                // Full: a queued inspection will see the request. Closed: the
+                // scheduler is stopping, and the stored request expires.
+                let _ = state.sync_trigger.try_send(());
+                true
+            }
             Err(error) => {
                 warn!(repo_id = %id, %error, "could not record the manual sync request");
                 false
             }
-        };
-    if queued {
-        // A full queue already holds an inspection that will see the request.
-        let _ = state.sync_trigger.try_send(());
-    }
+        }
+    };
 
     Ok(Json(serde_json::json!({
         "ok": true,
