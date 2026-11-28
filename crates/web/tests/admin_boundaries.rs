@@ -109,6 +109,7 @@ async fn fixture_with(
     let app = Router::new()
         .merge(api::setup::routes())
         .merge(api::config::routes())
+        .merge(api::auth::routes())
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -519,5 +520,107 @@ async fn server_configured_teams_url_is_reported_and_tested() {
     .await
     .unwrap();
     assert_eq!(read["server_config_url_set"], false, "{read}");
+    server.abort();
+}
+
+/// The first-run window (no password, no account) closes as soon as the
+/// wizard saves an administrator password, without a restart: later setup
+/// calls need sign-in, and the saved password signs in at once.
+#[tokio::test]
+async fn first_run_window_closes_once_a_password_is_saved() {
+    let (addr, state, server, _tmp) = fixture(false).await;
+    let apply = |password: Option<&str>| {
+        let mut body = json!({"svn_url":"", "svn_username":"", "git_api_url":"", "git_repo":""});
+        if let Some(p) = password {
+            body["web_admin_password"] = json!(p);
+        }
+        body
+    };
+    // Open: apply needs no sign-in, and saves the password.
+    let response = call(
+        addr,
+        None,
+        "POST",
+        "/api/setup/apply",
+        apply(Some("first-run-pass")),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert!(state
+        .db
+        .get_state("secret_admin_password_hash")
+        .unwrap()
+        .is_some_and(|h| h.starts_with("$2")));
+    let hash = state.db.get_state("secret_admin_password_hash").unwrap();
+
+    // Closed: no unauthenticated setup call is admitted any more.
+    for (method, path, body) in [
+        ("POST", "/api/setup/apply", apply(Some("attacker-pass"))),
+        (
+            "POST",
+            "/api/setup/test-svn",
+            json!({"url":"","username":""}),
+        ),
+        (
+            "POST",
+            "/api/setup/test-git",
+            json!({"api_url":"","repo":"","provider":"gitea"}),
+        ),
+        ("POST", "/api/setup/import", json!(null)),
+        ("GET", "/api/setup/import/status", json!(null)),
+        ("POST", "/api/setup/import/cancel", json!(null)),
+        ("GET", "/api/setup/config", json!(null)),
+    ] {
+        let status = call(addr, None, method, path, body).await.status();
+        assert_eq!(status, 401, "{method} {path}");
+    }
+    assert_eq!(
+        state.db.get_state("secret_admin_password_hash").unwrap(),
+        hash,
+        "a refused apply must not replace the password"
+    );
+
+    // The saved password signs in, a wrong one does not, and the session works.
+    let wrong = call(
+        addr,
+        None,
+        "POST",
+        "/api/auth/login",
+        json!({"password":"attacker-pass"}),
+    )
+    .await;
+    assert_eq!(wrong.status(), 401);
+    let login: Value = call(
+        addr,
+        None,
+        "POST",
+        "/api/auth/login",
+        json!({"password":"first-run-pass"}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let token = login["token"]
+        .as_str()
+        .expect("login returns a token")
+        .to_string();
+    let read: Value = call(addr, Some(&token), "GET", "/api/setup/config", json!(null))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(read["admin_password_set"], true, "{read}");
+    assert_eq!(
+        call(addr, Some(&token), "POST", "/api/setup/apply", apply(None))
+            .await
+            .status(),
+        200
+    );
+    // The refused apply did not replace the password.
+    assert_eq!(
+        state.db.get_state("secret_admin_password_hash").unwrap(),
+        hash
+    );
     server.abort();
 }

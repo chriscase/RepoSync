@@ -266,12 +266,7 @@ async fn acknowledge_errors(
     if authorization
         .and_then(|h| h.strip_prefix("Bearer "))
         .is_none_or(str::is_empty)
-        || (state.config.web.admin_password.is_none()
-            && state
-                .db
-                .count_users()
-                .map_err(|e| AppError::Internal(e.to_string()))?
-                == 0)
+        || !crate::api::auth::sign_in_required(&state)?
     {
         return Err(AppError::Unauthorized("authentication required".into()));
     }

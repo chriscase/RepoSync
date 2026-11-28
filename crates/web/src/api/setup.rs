@@ -230,13 +230,7 @@ async fn get_setup_config(
         .unwrap_or(false)
         || cfg.github.token.is_some();
 
-    let admin_password_set = db
-        .get_state("secret_admin_password")
-        .ok()
-        .flatten()
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-        || cfg.web.admin_password.is_some();
+    let admin_password_set = crate::api::auth::admin_password(&state)?.is_some();
 
     Ok(Json(SetupConfigResponse {
         svn_url: cfg.svn.url.clone(),
@@ -291,8 +285,7 @@ async fn test_svn_connection(
     Json(body): Json<TestSvnRequest>,
 ) -> Result<Json<TestConnectionResponse>, AppError> {
     // Require auth unless this is a fresh instance with no users/password configured
-    let has_users = state.db.count_users().unwrap_or(0) > 0;
-    if state.config.web.admin_password.is_some() || has_users {
+    if crate::api::auth::sign_in_required(&state)? {
         require_admin(
             &state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
@@ -334,8 +327,7 @@ async fn test_git_connection(
     headers: axum::http::HeaderMap,
     Json(body): Json<TestGitRequest>,
 ) -> Result<Json<TestConnectionResponse>, AppError> {
-    let has_users = state.db.count_users().unwrap_or(0) > 0;
-    if state.config.web.admin_password.is_some() || has_users {
+    if crate::api::auth::sign_in_required(&state)? {
         require_admin(
             &state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
@@ -583,8 +575,7 @@ async fn apply_config(
     headers: axum::http::HeaderMap,
     Json(body): Json<ApplyConfigRequest>,
 ) -> Result<Json<ApplyConfigResponse>, AppError> {
-    let has_users = state.db.count_users().unwrap_or(0) > 0;
-    if state.config.web.admin_password.is_some() || has_users {
+    if crate::api::auth::sign_in_required(&state)? {
         require_admin(
             &state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
@@ -1090,8 +1081,7 @@ async fn setup_auth(
     state: &Arc<AppState>,
     headers: &HeaderMap,
 ) -> Result<(String, String), AppError> {
-    let has_users = state.db.count_users().unwrap_or(0) > 0;
-    if state.config.web.admin_password.is_some() || has_users {
+    if crate::api::auth::sign_in_required(state)? {
         require_admin(
             state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
