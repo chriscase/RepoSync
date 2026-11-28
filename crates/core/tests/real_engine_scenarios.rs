@@ -3788,80 +3788,115 @@ async fn scenario_r16_svnserve_git_remote_recreation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scenario_r17_svnserve_notification_isolation() {
+    // Notifications go to one global Teams channel (decided 2026-11-28): no
+    // pair has its own destination, so isolation means each pair's audit
+    // trail, watermark and counters record only its own cycle. The events the
+    // scheduler publishes for concurrent pairs, and the cards the single
+    // listener posts for them, are checked in the daemon and notify::teams
+    // tests.
     if !require_toolchain(CASE_NOTIFICATION_ISOLATION) {
         return;
     }
     let fixture = DualRepoFixture::new();
-    let db = setup_db(&fixture.db_path);
-    let alpha_hook = "https://notify.invalid/repo-alpha-only";
-    let beta_hook = "https://notify.invalid/repo-beta-only";
-    let mut alpha_repo = db.get_repository("repo_alpha").unwrap().unwrap();
-    alpha_repo.teams_webhook_url = Some(alpha_hook.into());
-    db.update_repository(&alpha_repo).unwrap();
-    let mut beta_repo = db.get_repository("repo_beta").unwrap().unwrap();
-    beta_repo.teams_webhook_url = Some(beta_hook.into());
-    db.update_repository(&beta_repo).unwrap();
+    // Open (and migrate) the database before both engines start, as the
+    // other two-pair scenarios do.
+    let _db = setup_db(&fixture.db_path);
     let ready = Arc::new(tokio::sync::Barrier::new(2));
     let (alpha_result, beta_result) = tokio::join!(
         async {
+            let mut engine = fixture.make_engine(&fixture.repos[0]);
             ready.wait().await;
-            fixture
-                .make_engine(&fixture.repos[0])
-                .run_sync_cycle()
-                .await
+            run_import_with_lock_retry(&mut engine, "repo_alpha", None).await
         },
         async {
+            let mut engine = fixture.make_engine(&fixture.repos[1]);
             ready.wait().await;
-            fixture
-                .make_engine(&fixture.repos[1])
-                .run_sync_cycle()
-                .await
+            run_import_with_lock_retry(&mut engine, "repo_beta", None).await
         }
     );
     let db = setup_db(&fixture.db_path);
-    let alpha_row = db.get_repository("repo_alpha").unwrap().unwrap();
-    let beta_row = db.get_repository("repo_beta").unwrap().unwrap();
-    let webhook_crossover = repo_teams_webhook(&db, "repo_alpha").as_deref() != Some(alpha_hook)
-        || repo_teams_webhook(&db, "repo_beta").as_deref() != Some(beta_hook);
-    let sync_status_crossover =
-        alpha_row.sync_status.contains("repo_beta") || beta_row.sync_status.contains("repo_alpha");
-    let audit_crossover: i64 = db.conn().query_row(
-        "SELECT COUNT(*) FROM audit_log WHERE (repo_id = 'repo_alpha' AND details LIKE '%repo-beta-only%') OR (repo_id = 'repo_beta' AND details LIKE '%repo-alpha-only%')",
-        [],
-        |row| row.get(0),
-    ).unwrap();
     let imports_ok = match (&alpha_result, &beta_result) {
         (Ok(alpha_stats), Ok(beta_stats)) => {
             alpha_stats.svn_to_git_count == 1 && beta_stats.svn_to_git_count == 1
         }
         _ => false,
     };
-    let per_repo_sync_counters = alpha_row.total_syncs >= 1 && beta_row.total_syncs >= 1;
-    let webhook_fields_persist = !webhook_crossover;
-    let confinement_ok = webhook_fields_persist && !sync_status_crossover && audit_crossover == 0;
-    let notification_delivery_observed = false;
-    let case_status = if !confinement_ok {
-        "FAIL"
-    } else if notification_delivery_observed {
+    // Each pair must hold exactly one audit row, for its own cycle: its own
+    // SVN author, its own revision and the commit now at its own bare HEAD.
+    // Its repository row must carry the same watermark and exactly one sync.
+    let mut pairs = Vec::new();
+    let mut confinement_ok = true;
+    for (repo, svn_user) in [(&fixture.repos[0], "alpha"), (&fixture.repos[1], "beta")] {
+        let row = db.get_repository(&repo.id).unwrap().unwrap();
+        // The bare remote's HEAD may name another branch; read main itself.
+        let bare_head = {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo.bare)
+                .args(["rev-parse", "--verify", "refs/heads/main"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let audit: Vec<(String, Option<i64>, Option<String>, Option<String>)> = {
+            let conn = db.conn();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT action, svn_rev, git_sha, author FROM audit_log \
+                     WHERE repo_id = ?1 ORDER BY id",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([&repo.id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        let own_audit = audit.len() == 1
+            && audit[0]
+                == (
+                    "sync_cycle".to_string(),
+                    Some(repo.svn_rev),
+                    Some(bare_head.clone()),
+                    Some(svn_user.to_string()),
+                );
+        let own_watermark = row.last_svn_rev == repo.svn_rev && row.last_git_sha == bare_head;
+        let one_sync = row.total_syncs == 1;
+        let own_status = !row.sync_status.contains("repo_");
+        confinement_ok &= own_audit && own_watermark && one_sync && own_status;
+        pairs.push(serde_json::json!({
+            "repo_id": repo.id,
+            "audit_rows": audit.len(),
+            "audit": audit,
+            "last_svn_rev": row.last_svn_rev,
+            "last_git_sha": row.last_git_sha,
+            "bare_head": bare_head,
+            "expected_svn_rev": repo.svn_rev,
+            "own_audit": own_audit,
+            "own_watermark": own_watermark,
+            "total_syncs": row.total_syncs,
+            "sync_status": row.sync_status,
+        }));
+    }
+    let case_status = if imports_ok && confinement_ok {
         "PASS"
     } else {
-        "PARTIAL"
+        "FAIL"
     };
     emit_evidence(
         CASE_NOTIFICATION_ISOLATION,
         case_status,
         serde_json::json!({
-            "teams_webhook_crossover": webhook_crossover,
-            "sync_status_crossover": sync_status_crossover,
-            "audit_log_crossover": audit_crossover,
-            "per_repo_sync_counters": per_repo_sync_counters,
-            "alpha_total_syncs": alpha_row.total_syncs,
-            "beta_total_syncs": beta_row.total_syncs,
+            "notification_routing": "single_global_channel",
             "imports_ok": imports_ok,
-            "webhook_fields_persist": webhook_fields_persist,
+            "alpha_error": alpha_result.as_ref().err().map(|e| e.to_string()),
+            "beta_error": beta_result.as_ref().err().map(|e| e.to_string()),
             "confinement_ok": confinement_ok,
-            "notification_delivery_observed": notification_delivery_observed,
-            "note": "SyncEngine does not read per-repo teams_webhook_url or invoke Notifier on svnserve cycles; webhook URL persistence and sync_status/audit confinement only",
+            "pairs": pairs,
+            "note": "one global Teams channel, no per-pair destination; scheduler event and listener card confinement are covered by daemon notification_isolation_tests and notify::teams tests",
         }),
     );
 }

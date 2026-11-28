@@ -25,10 +25,11 @@ def suite_summary(overall, timestamp):
         if entry["binary"] != "real_engine_scenarios":
             continue
         status = "NOT RUN" if overall == "NOT RUN" else "PASS"
-        if entry["id"] == "R17_SVNSERVE_NOTIFICATION_ISOLATION":
+        # R01 post-write recovery is the one scenario allowed to report PARTIAL.
+        if entry["id"] == "R01_SVNSERVE_POST_WRITE_RECOVERY":
             status = overall
         detail = {"fixture": True}
-        if entry["id"] == "R01_SVNSERVE_POST_WRITE_RECOVERY" and status == "PASS":
+        if entry["id"] == "R01_SVNSERVE_POST_WRITE_RECOVERY" and status in ("PASS", "PARTIAL"):
             direct = {"status": "PASS", "registration_mode": "direct", "push_initiator": "team_worker"}
             detail = {
                 "recovery_ok": True, "expected_watermark": 3, "final_watermark": 3,
@@ -41,6 +42,9 @@ def suite_summary(overall, timestamp):
                     "contradictory_mirror_hold": {**direct, "pr_registration": {**direct, "registration_mode": "pr"}},
                 },
             }
+            if status == "PARTIAL":
+                # A real PARTIAL receipt: recovery stays held.
+                detail.update(recovery_ok=False, final_watermark=1, mapping_count=0, mapped_git_sha=None)
         if status == "NOT RUN":
             detail = {"reason": "missing_tool", "tool": "svnserve"}
         rows.append({"id": entry["id"], "test": entry["test"], "status": status, "detail": detail})
