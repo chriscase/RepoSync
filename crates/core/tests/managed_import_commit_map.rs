@@ -626,7 +626,8 @@ async fn snapshot_continuation(fail_checkpoint: bool, payload: SnapshotGitPayloa
             second.expect_err("missing LFS objects must never be published as pointer text");
         assert!(
             matches!(&error, reposync_core::errors::SyncError::HistoryBlocked { reason, detail }
-            if reason == "unsupported_git_semantics" && detail.contains("LFS")),
+            if reason == "unsupported_git_semantics"
+                && detail.contains("requires qualified object hydration")),
             "{error}"
         );
         assert_eq!(

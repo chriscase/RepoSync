@@ -4125,12 +4125,25 @@ impl SyncEngine {
                             .ok()
                             .and_then(|scratch| {
                                 let index = scratch.path().join("index");
+                                // Some Git releases skip index attribute
+                                // files outside a sparse cone. The private
+                                // index always holds the whole commit.
+                                const WHOLE: [&str; 4] = ["-c", "core.sparseCheckout=false",
+                                    "-c", "index.sparse=false"];
+                                let read_tree = [&WHOLE[..], &["read-tree", &change.sha]].concat();
                                 sync_git_command_output_with_index(git.repo_path(),
-                                    &["read-tree", &change.sha],
+                                    &read_tree,
                                     Duration::from_secs(30), None, Some(&index))
                                     .filter(|output| output.status.success())?;
+                                // An absent index would read as "no
+                                // attributes", so require the one just built.
+                                if !index.is_file() {
+                                    return None;
+                                }
+                                let check = [&WHOLE[..], &["check-attr", "-z", "--cached",
+                                    "--all", "--", &item.path]].concat();
                                 sync_git_command_output_with_index(git.repo_path(),
-                                    &["check-attr", "-z", "--cached", "--all", "--", &item.path],
+                                    &check,
                                     Duration::from_secs(5), None, Some(&index))
                             })
                             .filter(|output| output.status.success())
