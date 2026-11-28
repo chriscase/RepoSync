@@ -394,19 +394,8 @@ impl Scheduler {
         }
         self.stats.poll_ticks.fetch_add(1, Ordering::SeqCst);
 
-        // Memory guard: skip sync cycles if RSS exceeds limit
-        if self.memory_limit_bytes > 0 {
-            let rss = crate::memory::process_rss_bytes();
-            if rss > self.memory_limit_bytes {
-                warn!(
-                    rss_mb = rss / 1024 / 1024,
-                    limit_mb = self.memory_limit_bytes / 1024 / 1024,
-                    "memory limit exceeded ({} MB > {} MB), skipping sync cycle",
-                    rss / 1024 / 1024,
-                    self.memory_limit_bytes / 1024 / 1024,
-                );
-                return;
-            }
+        if self.over_memory_limit() {
+            return;
         }
 
         // Observe-first auto-reconcile for held import and external-write
@@ -430,8 +419,32 @@ impl Scheduler {
         }
     }
 
+    /// Memory guard: sync cycles are skipped while RSS exceeds the limit.
+    fn over_memory_limit(&self) -> bool {
+        if self.memory_limit_bytes == 0 {
+            return false;
+        }
+        let rss = crate::memory::process_rss_bytes();
+        if rss <= self.memory_limit_bytes {
+            return false;
+        }
+        warn!(
+            rss_mb = rss / 1024 / 1024,
+            limit_mb = self.memory_limit_bytes / 1024 / 1024,
+            "memory limit exceeded ({} MB > {} MB), skipping sync cycle",
+            rss / 1024 / 1024,
+            self.memory_limit_bytes / 1024 / 1024,
+        );
+        true
+    }
+
     async fn handle_webhook_tick(&self) {
         if self.shutdown_requested() {
+            return;
+        }
+        // A webhook or manual request starts the same work as a poll, so
+        // the same memory guard applies.
+        if self.over_memory_limit() {
             return;
         }
         info!("immediate sync requested via webhook (same polling inspection)");
@@ -920,10 +933,13 @@ impl Scheduler {
                 self.poll_interval.as_secs() as i64
             };
 
+            // An operator's "sync now" request skips this wait once. Every
+            // hold, pause and ownership check around it still applies.
+            let manual_request = self.db.manual_sync_requested(&repo.id);
             if let Some(ref last_sync) = repo.last_sync_at {
                 if let Ok(last) = chrono::DateTime::parse_from_rfc3339(last_sync) {
                     let elapsed = now.signed_duration_since(last);
-                    if elapsed.num_seconds() < interval_secs {
+                    if elapsed.num_seconds() < interval_secs && !manual_request {
                         debug!(
                             repo_name = %repo.name,
                             elapsed_secs = elapsed.num_seconds(),
@@ -1238,9 +1254,15 @@ impl Scheduler {
                 break;
             }
             let make_sync = || {
+                if manual_request {
+                    if let Err(error) = self.db.clear_manual_sync_request(&repo_id) {
+                        warn!(repo_id = %repo_id, %error, "could not clear the manual sync request");
+                    }
+                }
                 info!(
                     repo_name = %repo_name,
                     repo_id = %repo_id,
+                    manual_request,
                     "starting per-repo sync cycle"
                 );
                 async move {
@@ -2286,6 +2308,10 @@ mod allowed_paths_tests;
 #[cfg(test)]
 #[path = "scheduler/git_branch_guard_tests.rs"]
 mod git_branch_guard_tests;
+
+#[cfg(test)]
+#[path = "scheduler/manual_sync_request_tests.rs"]
+mod manual_sync_request_tests;
 
 #[cfg(test)]
 #[path = "scheduler/pair_engine_config_tests.rs"]

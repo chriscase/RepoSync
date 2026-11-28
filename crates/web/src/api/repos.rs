@@ -1228,7 +1228,7 @@ async fn trigger_sync(
 
     info!(repo_id = %id, "manual sync triggered for repository");
 
-    // Record an audit entry so the scheduler can pick it up.
+    // Record who asked; the request itself is queued below.
     let _ = db.insert_audit_log(
         "sync_trigger",
         Some("api"),
@@ -1242,11 +1242,32 @@ async fn trigger_sync(
         true,
     );
 
+    // Ask the scheduler to sync this pair without waiting out the poll
+    // interval, then wake it. A pair with sync turned off is not queued: it
+    // would run the moment sync is turned back on. A request that is already
+    // waiting is not recorded again, so its expiry counts from the first ask.
+    let queued = repo.enabled
+        && (db.manual_sync_requested(&id)
+            || match db.request_manual_sync(&id) {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(repo_id = %id, %error, "could not record the manual sync request");
+                    false
+                }
+            });
+    if queued {
+        // Wakes are folded by the scheduler. Full: a queued inspection will
+        // see the request. Closed: the scheduler is stopping, and the stored
+        // request expires.
+        let _ = state.sync_trigger.try_send(());
+    }
+
     Ok(Json(serde_json::json!({
         "ok": true,
         "message": "Sync triggered",
         "repo_name": repo.name,
         "enabled": repo.enabled,
+        "queued": queued,
         "import_phase": import_phase,
     })))
 }
