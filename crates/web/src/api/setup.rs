@@ -201,9 +201,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 // ---------------------------------------------------------------------------
 
 /// The repository pair the setup wizard edits: `apply` updates the first
-/// listed pair, or creates one when none exists. The wizard pre-fills the
-/// settings it stores there from this row, so reopening it shows what was
-/// saved and applying again does not revert the pair to the file's values.
+/// listed pair, or creates one when none exists.
 fn wizard_repository(
     state: &AppState,
 ) -> Result<Option<reposync_core::models::Repository>, AppError> {
@@ -247,9 +245,6 @@ async fn get_setup_config(
 
     let admin_password_set = crate::api::auth::admin_password(&state)?.is_some();
     let pair = wizard_repository(&state)?;
-    let svn_trunk_path = pair
-        .as_ref()
-        .map_or_else(|| cfg.svn.trunk_path.clone(), |r| r.svn_branch.clone());
 
     let mut response = SetupConfigResponse {
         svn_url: cfg.svn.url.clone(),
@@ -292,24 +287,19 @@ async fn get_setup_config(
 
         config_exists: true,
     };
-    response.svn_trunk_path = svn_trunk_path;
+    // Apply stores these on the pair, never in the file, and no target
+    // check compares them with the file. Show the saved values so applying
+    // the reopened form unchanged does not revert the pair. The SVN and Git
+    // target stay the file's: setup import requires the pair to match them,
+    // and saving the form is how a pair is brought back in line.
     if let Some(repo) = pair {
-        response.svn_url = repo.svn_url;
-        response.svn_username = repo.svn_username;
-        response.git_provider = repo.git_provider;
-        response.git_api_url = repo.git_api_url;
-        response.git_repo = repo.git_repo;
-        response.git_branch = repo.git_branch;
         response.sync_mode = repo.sync_mode;
         response.auto_merge = repo.auto_merge;
-        response.poll_interval = repo.poll_interval_secs.max(0) as u64;
-        response.lfs_threshold = (repo.lfs_threshold_mb.max(0) as u64) * 1024 * 1024;
+        if repo.poll_interval_secs > 0 {
+            response.poll_interval = repo.poll_interval_secs as u64;
+        }
+        response.lfs_threshold = (repo.lfs_threshold_mb.max(0) as u64).saturating_mul(1024 * 1024);
     }
-    response.svn_layout = if response.svn_trunk_path.is_empty() {
-        "single".into()
-    } else {
-        "standard".into()
-    };
     Ok(Json(response))
 }
 

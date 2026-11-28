@@ -451,27 +451,21 @@ async fn setup_config(f: &Fixture) -> Value {
         .unwrap()
 }
 
-/// Apply stores the pair settings on the repository row, not in the file.
-/// Reopening the wizard must show those saved values, so that applying the
-/// form again unchanged keeps the pair as it is instead of reverting it to
-/// the file's values.
+/// Apply stores sync mode, auto-merge, poll interval and the LFS threshold on
+/// the repository row, not in the file. Reopening the wizard must show those
+/// saved values, so applying the form again unchanged keeps them instead of
+/// reverting them to the file's. The SVN and Git target still come from the
+/// file, which setup import requires the pair to match.
 #[tokio::test]
 async fn the_wizard_reopens_with_the_pair_settings_it_saved() {
     let f = fixture(None).await;
-    // Before any pair exists, the file's values are shown.
     let before = setup_config(&f).await;
-    assert_eq!(before["git_repo"], "test/repo", "{before}");
-    assert_eq!(before["git_branch"], "main", "{before}");
+    assert_eq!(before["sync_mode"], "direct", "{before}");
+    assert_eq!(before["lfs_threshold"], 0, "{before}");
 
     let mut body = apply_body(None, json!([]));
     for (key, value) in [
-        ("svn_url", json!("https://svn.saved.invalid/repo")),
-        ("svn_username", json!("saved-user")),
-        ("svn_trunk_path", json!("")),
-        ("git_provider", json!("gitea")),
-        ("git_api_url", json!("https://git.saved.invalid/api/v1")),
         ("git_repo", json!("saved/repo")),
-        ("git_default_branch", json!("release/2026.11")),
         ("sync_mode", json!("pr")),
         ("sync_auto_merge", json!(false)),
         ("daemon_poll_interval", json!(120)),
@@ -484,33 +478,20 @@ async fn the_wizard_reopens_with_the_pair_settings_it_saved() {
 
     let cfg = setup_config(&f).await;
     for (key, expected) in [
-        ("svn_url", json!("https://svn.saved.invalid/repo")),
-        ("svn_username", json!("saved-user")),
-        ("svn_trunk_path", json!("")),
-        ("svn_layout", json!("single")),
-        ("git_provider", json!("gitea")),
-        ("git_api_url", json!("https://git.saved.invalid/api/v1")),
-        ("git_repo", json!("saved/repo")),
-        ("git_branch", json!("release/2026.11")),
         ("sync_mode", json!("pr")),
         ("auto_merge", json!(false)),
         ("poll_interval", json!(120)),
         ("lfs_threshold", json!(5 * 1024 * 1024)),
+        // The target is still the file's.
+        ("git_repo", json!("test/repo")),
+        ("git_branch", json!("main")),
     ] {
         assert_eq!(cfg[key], expected, "{key}: {cfg}");
     }
 
-    // Sending the reopened form back unchanged leaves the pair as saved.
-    let saved = f.state.db.list_repositories().unwrap();
+    // Sending the reopened form back unchanged keeps the saved settings.
     let mut again = apply_body(None, json!([]));
     for (to, from) in [
-        ("svn_url", "svn_url"),
-        ("svn_username", "svn_username"),
-        ("svn_trunk_path", "svn_trunk_path"),
-        ("git_provider", "git_provider"),
-        ("git_api_url", "git_api_url"),
-        ("git_repo", "git_repo"),
-        ("git_default_branch", "git_branch"),
         ("sync_mode", "sync_mode"),
         ("sync_auto_merge", "auto_merge"),
         ("daemon_poll_interval", "poll_interval"),
@@ -522,33 +503,20 @@ async fn the_wizard_reopens_with_the_pair_settings_it_saved() {
     assert_eq!(status, 200, "{json}");
     let after = f.state.db.list_repositories().unwrap();
     assert_eq!(after.len(), 1, "{after:?}");
-    let (a, b) = (&saved[0], &after[0]);
+    let pair = &after[0];
     assert_eq!(
         (
-            &a.svn_url,
-            &a.svn_username,
-            &a.svn_branch,
-            &a.git_provider,
-            &a.git_api_url,
-            &a.git_repo,
-            &a.git_branch,
-            &a.sync_mode,
-            a.auto_merge,
-            a.poll_interval_secs,
-            a.lfs_threshold_mb,
+            pair.sync_mode.as_str(),
+            pair.auto_merge,
+            pair.poll_interval_secs,
+            pair.lfs_threshold_mb
         ),
-        (
-            &b.svn_url,
-            &b.svn_username,
-            &b.svn_branch,
-            &b.git_provider,
-            &b.git_api_url,
-            &b.git_repo,
-            &b.git_branch,
-            &b.sync_mode,
-            b.auto_merge,
-            b.poll_interval_secs,
-            b.lfs_threshold_mb,
-        )
+        ("pr", false, 120, 5)
     );
+
+    // A threshold too large to convert does not overflow the response.
+    let mut huge = pair.clone();
+    huge.lfs_threshold_mb = i64::MAX;
+    f.state.db.update_repository(&huge).unwrap();
+    assert_eq!(setup_config(&f).await["lfs_threshold"], json!(u64::MAX));
 }
