@@ -197,7 +197,11 @@ struct RepoDetail {
     history_boundary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot_pin: Option<SnapshotPin>,
-    /// Why scheduled sync is skipping this pair as it is stored. Absent
+    /// Stored path rules, as JSON arrays of strings. The edit form sends
+    /// these back on every save, so leaving them out clears them.
+    allowed_paths: Option<String>,
+    blocked_patterns: Option<String>,
+    /// Why scheduled sync would skip this pair as it is stored. Absent
     /// when its stored settings are usable.
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_configuration_problem: Option<String>,
@@ -241,6 +245,8 @@ impl From<reposync_core::models::Repository> for RepoDetail {
             starting_revision: None,
             history_boundary: None,
             snapshot_pin: None,
+            allowed_paths: r.allowed_paths,
+            blocked_patterns: r.blocked_patterns,
             sync_configuration_problem,
         }
     }

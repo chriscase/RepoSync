@@ -831,6 +831,10 @@ async fn manual_sync_names_the_stored_setting_that_blocks_sync() {
         detail.get("sync_configuration_problem").is_none(),
         "{detail}"
     );
+    // The stored path rules come back, so an edit that resends the form
+    // does not clear them.
+    assert_eq!(detail["allowed_paths"], "[\"src/\"]");
+    assert_eq!(detail["blocked_patterns"], "[]");
     server.abort();
 }
 

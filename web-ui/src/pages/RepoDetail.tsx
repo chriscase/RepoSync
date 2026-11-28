@@ -98,9 +98,25 @@ function repoToForm(repo: Repository): EditForm {
     poll_interval_secs: repo.poll_interval_secs,
     lfs_threshold_mb: repo.lfs_threshold_mb,
     auto_merge: repo.auto_merge,
-    allowed_paths: repo.allowed_paths ? JSON.parse(repo.allowed_paths).join('\n') : '',
-    blocked_patterns: repo.blocked_patterns ? JSON.parse(repo.blocked_patterns).join('\n') : '',
+    allowed_paths: storedListToText(repo.allowed_paths),
+    blocked_patterns: storedListToText(repo.blocked_patterns),
   };
+}
+
+/**
+ * A stored path rule list as one entry per line. A stored value that is not a JSON
+ * array is shown as it is, so the form still opens and the value can be corrected.
+ */
+function storedListToText(raw: string | null | undefined): string {
+  if (!raw) return '';
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.map(item => String(item)).join('\n');
+    if (typeof parsed === 'string') return parsed;
+  } catch {
+    // Not JSON: fall through and show the stored text.
+  }
+  return raw;
 }
 
 const inputClass =
@@ -2610,8 +2626,9 @@ export function SyncSettingsProblemNotice({ problem }: { problem?: string | null
   if (!problem) return null;
   return (
     <div role="alert" data-testid="sync-settings-problem" className="rs-bn rs-bn--danger bg-red-900/30 border border-red-700 rounded-lg p-4 text-sm text-red-300" {...region('head', EVERY_SECTION)}>
-      <p className="font-medium">Sync is not running for this pair</p>
-      <p className="mt-1">A saved setting cannot be used, so scheduled sync skips this pair until it is corrected: {problem}</p>
+      <p className="font-medium">A saved setting stops sync for this pair</p>
+      <p className="mt-1">Scheduled sync skips this pair while this setting is as saved: {problem}</p>
+      <p className="mt-1">An administrator can correct it with Edit.</p>
     </div>
   );
 }
@@ -2949,7 +2966,7 @@ export function SyncRecordsBody({ read }: { read: { data?: { entries?: SyncRecor
 
 // Pure helpers, exported for this page's tests only.
 // eslint-disable-next-line react-refresh/only-export-components
-export { syncReplyLabel, normaliseRepoSection, sectionSearch, sectionNavDisplayed, repositoryStatusLine, credentialState, headerSyncSwitch, fetchPreCommitHook, saveTextDownload, skipChoiceHelp, resumeSyncConsequences, removePairWording, latePairStateWord, REPO_SECTIONS };
+export { storedListToText, syncReplyLabel, normaliseRepoSection, sectionSearch, sectionNavDisplayed, repositoryStatusLine, credentialState, headerSyncSwitch, fetchPreCommitHook, saveTextDownload, skipChoiceHelp, resumeSyncConsequences, removePairWording, latePairStateWord, REPO_SECTIONS };
 
 /* ---- Sub-components ---- */
 
