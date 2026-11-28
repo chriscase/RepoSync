@@ -93,7 +93,8 @@ prints the one line to add to it. Use `--dry-run` to see the plan first, and
 
 SVN runs hooks with an empty environment, so the secret cannot come from an
 environment variable. Put the same value the server reads through
-`svn.webhook_secret_env` on the first line of the `--secret-file`, readable
+`svn.webhook_secret_env` on the first line of the `--secret-file` (without leading or trailing
+spaces, which HTTP drops), readable
 by the account that runs SVN hooks (the installer warns when that looks
 unlikely). The hook reads it at commit time and hands it to curl as a config
 file on standard input, so it never appears on a command line. Without a
@@ -106,8 +107,9 @@ value without starting another inspection while the server keeps running. The
 notification only asks for an early poll, so a lost, late or deduplicated one
 changes nothing, and the hook never delays or fails a commit. Symbolic links
 at `hooks/post-commit` or `hooks/reposync-post-commit` are refused rather
-than replaced; re-running `install` rewrites only files it wrote and left
-unchanged.
+than replaced. Re-running `install` always rewrites `hooks/reposync-post-commit`,
+which RepoSync owns, but rewrites `hooks/post-commit` only while it is still
+the unchanged wrapper, so steps you added there are kept.
 
 ## Step 3: Prepare Your GitHub Repository
 
