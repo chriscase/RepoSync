@@ -595,14 +595,43 @@ async fn pair_git_branch_must_be_a_branch_git_accepts() {
         state.db.get_repository(id).unwrap().unwrap().git_branch,
         "release/2.x"
     );
-    // Edits that leave the branch alone, or set a valid one, still save.
+    // An edit that sets a valid branch saves.
     let edit = serde_json::json!({"save_request_id":uuid::Uuid::new_v4().to_string(),
         "expected_updated_at":created["updated_at"],"git_branch":"develop"});
     let response = client.put(&endpoint).json(&edit).send().await.unwrap();
     assert_eq!(response.status(), 200);
+    let edited: serde_json::Value = response.json().await.unwrap();
     assert_eq!(
         state.db.get_repository(id).unwrap().unwrap().git_branch,
         "develop"
     );
+
+    // A pair stored before this check with a branch Git refuses can still have
+    // its other settings saved, with or without its stored branch in the
+    // request (the edit form always sends it). Changing it to another invalid
+    // name is still refused.
+    let mut legacy = state.db.get_repository(id).unwrap().unwrap();
+    legacy.git_branch = "main ".into();
+    legacy.updated_at = edited["updated_at"].as_str().unwrap().into();
+    state.db.update_repository(&legacy).unwrap();
+    let mut expected = edited["updated_at"].clone();
+    for edit in [
+        serde_json::json!({"name":"Renamed"}),
+        serde_json::json!({"name":"Renamed again","git_branch":"main "}),
+    ] {
+        let mut edit = edit;
+        edit["save_request_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+        edit["expected_updated_at"] = expected.clone();
+        let response = client.put(&endpoint).json(&edit).send().await.unwrap();
+        assert_eq!(response.status(), 200, "{edit}");
+        let saved: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(saved["name"], edit["name"]);
+        assert_eq!(saved["git_branch"], "main ");
+        expected = saved["updated_at"].clone();
+    }
+    let edit = serde_json::json!({"save_request_id":uuid::Uuid::new_v4().to_string(),
+        "expected_updated_at":expected,"git_branch":"main  "});
+    let response = client.put(&endpoint).json(&edit).send().await.unwrap();
+    assert_eq!(response.status(), 400);
     server.abort();
 }

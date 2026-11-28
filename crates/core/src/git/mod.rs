@@ -28,6 +28,10 @@ pub fn git_branch_name_problem(name: &str) -> Option<&'static str> {
     if name.starts_with('-') {
         return Some("must not start with '-'");
     }
+    // libgit2 lets DEL (0x7f) through; Git itself refuses every control character.
+    if name.chars().any(char::is_control) {
+        return Some("must not contain control characters");
+    }
     if !git2::Reference::is_valid_name(&format!("refs/heads/{name}")) {
         return Some(
             "is not a valid Git branch name (no spaces, control characters, \
@@ -84,6 +88,10 @@ mod branch_name_tests {
             "@",
             "line\nbreak",
             "tab\there",
+            "del\u{7f}char",
+            ".main",
+            "a/.b",
+            "a.lock/b",
         ] {
             assert!(
                 git_branch_name_problem(name).is_some(),

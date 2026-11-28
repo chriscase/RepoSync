@@ -604,8 +604,16 @@ async fn update_repo(
         }
     }
     writable?;
+    // Only a changed branch is checked, so a pair saved before this check
+    // with a name Git refuses can still have its other settings edited.
     if let Some(branch) = body.git_branch() {
-        require_valid_git_branch(branch)?;
+        let stored = db
+            .get_repository(&id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .map(|r| r.git_branch);
+        if stored.as_deref() != Some(branch) {
+            require_valid_git_branch(branch)?;
+        }
     }
 
     let (current, receipt) = db
@@ -3208,6 +3216,9 @@ async fn create_branch_pair(
             "git_branch uses a reserved name".into(),
         ));
     }
+    // Git's own rules also refuse names the checks above let through, such
+    // as a component starting with '.' or ending in '.lock'.
+    require_valid_git_branch(&git_branch)?;
 
     // Parent must be enabled
     if !parent.enabled {
