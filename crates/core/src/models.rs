@@ -445,9 +445,14 @@ impl Repository {
         if let Err(error) =
             crate::svn::operand::configured_branch_url(&self.svn_url, &self.svn_branch)
         {
+            // The URL is built from both settings, so either can be at fault.
+            let detail = match &error {
+                crate::errors::SvnError::WorkingCopyError { detail, .. } => detail.clone(),
+                other => other.to_string(),
+            };
             return Some(format!(
-                "svn_branch is not usable: {}",
-                crate::errors::redact_vcs_error_detail(&error.to_string())
+                "svn_url or svn_branch is not usable: {}",
+                crate::errors::redact_vcs_error_detail(&detail)
             ));
         }
         for (setting, raw) in [

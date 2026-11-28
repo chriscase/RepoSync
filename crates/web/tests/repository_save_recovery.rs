@@ -768,10 +768,11 @@ async fn manual_sync_names_the_stored_setting_that_blocks_sync() {
     assert_eq!(body["ok"], true);
 
     type Break = fn(&mut reposync_core::models::Repository);
-    let cases: [(&str, Break); 5] = [
+    let cases: [(&str, Break); 6] = [
         ("git_branch", |r| r.git_branch = "--force".into()),
         ("git_branch", |r| r.git_branch = String::new()),
         ("svn_branch", |r| r.svn_branch = "a/../b".into()),
+        ("svn_url", |r| r.svn_url = "svn://host/repo?x=1".into()),
         ("allowed_paths", |r| {
             r.allowed_paths = Some("\"src/\"".into())
         }),
