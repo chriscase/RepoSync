@@ -228,3 +228,52 @@ async fn other_paths_are_never_written_and_are_reported() {
     assert_eq!(json["warnings"], json!([]), "{json}");
     assert!(!configured.exists());
 }
+
+#[tokio::test]
+async fn existing_entries_in_the_configured_file_are_kept() {
+    let f = fixture(Some("authors.toml")).await;
+    let configured = f.tmp.path().join("authors.toml");
+    std::fs::write(
+        &configured,
+        "[authors]\nkeep = { name = \"Kept\", email = \"keep@example.invalid\" }\njdoe = { name = \"Old\", email = \"old@example.invalid\" }\n",
+    )
+    .unwrap();
+
+    let (status, json) = apply(&f, apply_body(None, hostile())).await;
+    assert_eq!(status, 200, "{json}");
+    let authors = MappingFile::load(&configured).unwrap();
+    assert_eq!(authors.len(), 3, "{authors:?}");
+    assert_eq!(authors["keep"].email, "keep@example.invalid");
+    assert_eq!(
+        authors["jdoe"].email, "jdoe@example.invalid",
+        "the wizard's entry wins"
+    );
+
+    // Rows with only blank usernames leave the file exactly as it was.
+    let before = std::fs::read(&configured).unwrap();
+    let blank = json!([{"svn_username": " ", "name": "x", "email": "x@example.invalid"}]);
+    let (status, json) = apply(&f, apply_body(None, blank)).await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(std::fs::read(&configured).unwrap(), before);
+}
+
+#[tokio::test]
+async fn an_unreadable_existing_file_is_left_unchanged() {
+    let f = fixture(Some("authors.toml")).await;
+    let configured = f.tmp.path().join("authors.toml");
+    std::fs::write(&configured, "this is not toml = = =").unwrap();
+
+    let (status, json) = apply(&f, apply_body(None, hostile())).await;
+    assert_eq!(status, 200, "{json}");
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("could not be read")),
+        "{json}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&configured).unwrap(),
+        "this is not toml = = ="
+    );
+}

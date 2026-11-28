@@ -526,16 +526,34 @@ async fn apply_config(
                     )
                 })
                 .collect();
-            if let Err(e) =
-                reposync_core::identity::mapping_file::MappingFile::save(&mapping_target, &authors)
-            {
-                warnings.push(format!("Failed to write identity mapping file: {}", e));
+            // Merge into the existing file so entries the operator already
+            // maintains there are kept; the wizard's entries win on conflict.
+            use reposync_core::identity::mapping_file::MappingFile;
+            let existing = if mapping_target.exists() {
+                MappingFile::load(&mapping_target).map(Some)
             } else {
-                info!(
-                    path = %mapping_target.display(),
-                    count = authors.len(),
-                    "Wrote identity mappings file"
-                );
+                Ok(None)
+            };
+            match existing {
+                _ if authors.is_empty() => {}
+                Err(e) => warnings.push(format!(
+                    "Identity mappings were not written: the existing file {} could not be read ({}), so it was left unchanged.",
+                    mapping_target.display(),
+                    e
+                )),
+                Ok(existing) => {
+                    let mut merged = existing.unwrap_or_default();
+                    merged.extend(authors);
+                    if let Err(e) = MappingFile::save(&mapping_target, &merged) {
+                        warnings.push(format!("Failed to write identity mapping file: {}", e));
+                    } else {
+                        info!(
+                            path = %mapping_target.display(),
+                            count = merged.len(),
+                            "Wrote identity mappings file"
+                        );
+                    }
+                }
             }
 
             // Also store in DB for the dashboard to display

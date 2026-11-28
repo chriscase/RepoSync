@@ -71,7 +71,22 @@ impl MappingFile {
 
         let toml_str =
             toml::to_string_pretty(&data).map_err(|e| IdentityError::ParseError(e.to_string()))?;
-        std::fs::write(path, toml_str).map_err(IdentityError::IoError)?;
+        // Write a sibling temporary file and rename it into place, so a
+        // failed write never leaves a truncated mapping file behind. A
+        // symlinked mapping file is updated at its target, as a plain write
+        // would, rather than replaced by a regular file.
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = resolved.as_path();
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "mappings.toml".into());
+        let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+        std::fs::write(&tmp, toml_str).map_err(IdentityError::IoError)?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(IdentityError::IoError(e));
+        }
 
         debug!(count = mappings.len(), "saved author mappings");
         Ok(())
@@ -124,6 +139,37 @@ email = "alice@example.com"
         let reloaded = MappingFile::load(&path).unwrap();
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded["bob"].name, "Bob Builder");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_updates_a_symlinked_file_at_its_target_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "[authors]\n").unwrap();
+        let link = dir.path().join("authors.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "bob".to_string(),
+            AuthorEntry {
+                name: "Bob".to_string(),
+                email: "bob@example.com".to_string(),
+            },
+        );
+        MappingFile::save(&link, &mappings).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(MappingFile::load(&real).unwrap().contains_key("bob"));
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
     }
 
     #[test]
