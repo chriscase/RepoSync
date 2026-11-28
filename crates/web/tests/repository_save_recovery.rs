@@ -769,26 +769,36 @@ async fn manual_sync_names_the_stored_setting_that_blocks_sync() {
 
     type Break = fn(&mut reposync_core::models::Repository);
     let cases: [(&str, Break); 6] = [
-        ("git_branch", |r| r.git_branch = "--force".into()),
-        ("git_branch", |r| r.git_branch = String::new()),
-        ("svn_branch", |r| r.svn_branch = "a/../b".into()),
-        ("svn_url", |r| r.svn_url = "svn://host/repo?x=1".into()),
-        ("allowed_paths", |r| {
+        ("git_branch must not start with '-'", |r| {
+            r.git_branch = "--force".into()
+        }),
+        ("git_branch must not be empty", |r| {
+            r.git_branch = String::new()
+        }),
+        (
+            "svn_url or svn_branch is not usable: expected a confined",
+            |r| r.svn_branch = "a/../b".into(),
+        ),
+        (
+            "svn_url or svn_branch is not usable: unsupported SVN URL",
+            |r| r.svn_url = "svn://host/repo?x=1".into(),
+        ),
+        ("allowed_paths must be a JSON array of strings", |r| {
             r.allowed_paths = Some("\"src/\"".into())
         }),
-        ("blocked_patterns", |r| {
+        ("blocked_patterns must be a JSON array of strings", |r| {
             r.blocked_patterns = Some("{}".into())
         }),
     ];
-    for (setting, break_it) in cases {
+    for (expected, break_it) in cases {
         let mut broken = good.clone();
         break_it(&mut broken);
         state.db.update_repository(&broken).unwrap();
         let response = client.post(&url).send().await.unwrap();
-        assert_eq!(response.status(), 400, "{setting}");
+        assert_eq!(response.status(), 400, "{expected}");
         let text = response.text().await.unwrap();
-        assert!(text.contains(setting), "{setting}: {text}");
-        assert!(text.contains("sync cannot run"), "{setting}: {text}");
+        assert!(text.contains(expected), "{expected}: {text}");
+        assert!(text.contains("sync cannot run"), "{expected}: {text}");
     }
 
     // Valid optional settings do not block.

@@ -74,10 +74,10 @@ curl --fail-with-body -sS -X POST -H @"$HDR" "$BASE/api/repos/REPO_ID/sync"
 ```
 
 At the pinned commit, this handler checks that the repository exists, refuses if
-an import is active or unresolved or if removal is in progress, refuses with
-400 if the pair's stored Git branch, SVN URL or branch, allowed paths or blocked
-patterns are ones scheduled sync cannot use (the reply names the setting), writes
-an audit-log row, and returns. **We found no code in the tree that reads that audit row to
+an import is active or unresolved or if removal is in progress, writes an audit-log
+row, and returns. A later change, newer than that pin, adds one refusal before the
+audit row: 400 if the pair's stored Git branch, SVN URL or branch, allowed paths or
+blocked patterns are ones scheduled sync cannot use. The reply names the setting. **We found no code in the tree that reads that audit row to
 start a cycle.** The reply says the request was recorded; it does not say a
 cycle ran or finished. Your push is picked up by the next scheduled poll. To
 see what happened, read [status](status-and-reconciliation.md#reading-the-status), not this reply.
