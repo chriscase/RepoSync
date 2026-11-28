@@ -562,9 +562,10 @@ export function NotificationsView(props: NotificationsViewProps) {
 
         {known && read.serverConfigured && (
           <p role="note" className="rs-bn bg-yellow-900/30 border border-yellow-700 text-yellow-200 px-4 py-3 rounded text-sm">
-            The server configuration sets a Teams webhook (<code>notifications.teams_webhook_url</code>).
-            Notifications and Test use that one. A URL saved here is used only once the server
-            configuration no longer sets one.
+            The server configuration sets a Teams webhook (<code>notifications.teams_webhook_url</code>{' '}
+            or <code>teams_webhook_url_env</code>). Notifications and Test use that one. A URL saved
+            here is used only after it is removed from the server configuration and the server is
+            restarted.
           </p>
         )}
 

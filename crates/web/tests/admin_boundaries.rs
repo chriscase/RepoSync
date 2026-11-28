@@ -441,6 +441,7 @@ async fn capture_one() -> (String, tokio::task::JoinHandle<String>) {
         let mut chunk = [0u8; 4096];
         loop {
             let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "connection closed before a full request arrived");
             buf.extend_from_slice(&chunk[..n]);
             let text = String::from_utf8_lossy(&buf).to_string();
             if let Some((head, body)) = text.split_once("\r\n\r\n") {
@@ -452,7 +453,7 @@ async fn capture_one() -> (String, tokio::task::JoinHandle<String>) {
                             .map(|v| v.trim().parse::<usize>().unwrap())
                     })
                     .unwrap_or(0);
-                if body.len() >= len || n == 0 {
+                if body.len() >= len {
                     stream
                         .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
                         .await
