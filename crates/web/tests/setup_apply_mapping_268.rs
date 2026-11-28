@@ -520,3 +520,54 @@ async fn the_wizard_reopens_with_the_pair_settings_it_saved() {
     f.state.db.update_repository(&huge).unwrap();
     assert_eq!(setup_config(&f).await["lfs_threshold"], json!(u64::MAX));
 }
+
+// The wizard edits the earliest root pair, not whichever pair sorts first by
+// name: a later root pair or a child branch pair must not take its place.
+#[tokio::test]
+async fn the_wizard_keeps_editing_the_pair_it_created() {
+    let f = fixture(None).await;
+    let mut body = apply_body(None, json!([]));
+    body["sync_mode"] = json!("pr");
+    let (status, json) = apply(&f, body).await;
+    assert_eq!(status, 200, "{json}");
+    let created = f.state.db.list_repositories().unwrap().remove(0);
+
+    let mut later = created.clone();
+    later.id = "later-root".into();
+    later.name = "aaa-later-root".into();
+    later.svn_branch = "branches/later".into();
+    later.sync_mode = "direct".into();
+    f.state.db.insert_repository(&later).unwrap();
+    let mut child = created.clone();
+    child.id = "child".into();
+    child.name = "aaa-child".into();
+    child.svn_branch = "branches/child".into();
+    child.sync_mode = "direct".into();
+    child.parent_id = Some(created.id.clone());
+    f.state.db.insert_repository(&child).unwrap();
+    assert_ne!(
+        f.state.db.list_repositories().unwrap()[0].id,
+        created.id,
+        "another pair sorts first by name"
+    );
+
+    assert_eq!(setup_config(&f).await["sync_mode"], "pr");
+    let mut again = apply_body(None, json!([]));
+    again["sync_mode"] = json!("direct");
+    again["daemon_poll_interval"] = json!(90);
+    let (status, json) = apply(&f, again).await;
+    assert_eq!(status, 200, "{json}");
+
+    let get = |id: &str| f.state.db.get_repository(id).unwrap().unwrap();
+    assert_eq!(get(&created.id).poll_interval_secs, 90);
+    for untouched in [&later, &child] {
+        let row = get(&untouched.id);
+        assert_eq!(
+            (row.sync_mode.as_str(), row.poll_interval_secs),
+            (untouched.sync_mode.as_str(), untouched.poll_interval_secs),
+            "{}",
+            untouched.name
+        );
+    }
+    assert_eq!(f.state.db.list_repositories().unwrap().len(), 3);
+}
