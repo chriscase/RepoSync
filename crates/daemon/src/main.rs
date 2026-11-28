@@ -861,9 +861,13 @@ async fn main() -> Result<()> {
                 );
                 reposync_core::notify::teams::run_listener(events, move || {
                     config_url.clone().or_else(|| {
-                        settings_db
-                            .as_ref()
-                            .and_then(|db| db.get_state("teams_webhook_url").ok().flatten())
+                        match settings_db.as_ref()?.get_state("teams_webhook_url") {
+                            Ok(url) => url,
+                            Err(e) => {
+                                warn!(error = %e, "Teams notifications: cannot read the Settings URL; skipping this event");
+                                None
+                            }
+                        }
                     })
                 })
                 .await;

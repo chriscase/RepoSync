@@ -49,7 +49,7 @@ impl TeamsNotifier {
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .map_err(NotificationError::HttpError)?;
+            .map_err(|e| NotificationError::HttpError(e.without_url()))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -754,6 +754,15 @@ mod tests {
             }
         });
         (url, rx)
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_does_not_reveal_the_webhook_url() {
+        // Nothing listens on port 9 of the loopback address.
+        let notifier = TeamsNotifier::new("http://127.0.0.1:9/hook?sig=secret-token".into());
+        let err = notifier.send_card(json!([])).await.unwrap_err().to_string();
+        assert!(!err.contains("secret-token"), "{err}");
+        assert!(!err.contains("127.0.0.1:9"), "{err}");
     }
 
     fn failed_event(repo: &str) -> String {
