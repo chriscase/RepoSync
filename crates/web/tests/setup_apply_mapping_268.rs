@@ -389,7 +389,12 @@ async fn cleared_values_are_reported_and_encodings_are_not() {
 #[tokio::test]
 async fn lfs_threshold_is_stored_on_the_pair_in_megabytes() {
     let f = fixture(None).await;
-    for (bytes, mb) in [(5 * 1024 * 1024, 5), (1, 1), (0, 0)] {
+    for (bytes, mb) in [
+        (5 * 1024 * 1024, 5),
+        (5 * 1024 * 1024 + 1, 6),
+        (1, 1),
+        (0, 0),
+    ] {
         let mut body = apply_body(None, json!([]));
         body["lfs_threshold"] = json!(bytes);
         let (status, json) = apply(&f, body).await;
