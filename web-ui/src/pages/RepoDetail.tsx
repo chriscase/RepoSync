@@ -191,7 +191,7 @@ function RepositoryDetailEditor() {
   const [localNotice, setLocalNotice] = useState<RemovalNotice | null>(null);
   const [retiredId, setRetiredId] = useState<string | null>(null);
 
-  const [syncTriggered, setSyncTriggered] = useState(false);
+  const [syncTriggered, setSyncTriggered] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
   const saveFlow=useRepositorySave(id,editing);
   const [saveMessage,setSaveMessage]=useState<string | null>(null);
@@ -454,11 +454,11 @@ function RepositoryDetailEditor() {
 
   const syncMutation = useMutation({
     mutationFn: () => api.triggerRepoSync(id!),
-    onSuccess: () => {
-      setSyncTriggered(true);
+    onSuccess: (reply) => {
+      setSyncTriggered(syncReplyLabel(reply));
       queryClient.invalidateQueries({ queryKey: ['repo', id] });
       queryClient.invalidateQueries({ queryKey: ['status', id] });
-      setTimeout(() => setSyncTriggered(false), 3000);
+      setTimeout(() => setSyncTriggered(null), 3000);
     },
   });
 
@@ -1225,11 +1225,11 @@ function RepositoryDetailEditor() {
           )}
           <button
             onClick={() => syncMutation.mutate()}
-            disabled={archived || syncMutation.isPending || syncTriggered || !statusView.canAct}
+            disabled={archived || syncMutation.isPending || syncTriggered !== null || !statusView.canAct}
             className="rs-btn rs-btn--primary inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed rs-text-on-accent text-sm font-medium transition-colors"
           >
             <RefreshCw className={`w-4 h-4 ${syncMutation.isPending ? 'animate-spin' : ''}`} />
-            {syncTriggered ? 'Sync Triggered' : 'Trigger Sync'}
+            {syncTriggered ?? 'Trigger Sync'}
           </button>
         </div>
       </div>
@@ -2563,6 +2563,12 @@ const toneClasses: Record<Tone, string> = {
 };
 const markClass = 'rs-mark inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium';
 
+/** What the head button shows for a few seconds after a Sync Now reply. */
+function syncReplyLabel(reply: { queued?: boolean; retry_after_secs?: number | null }): string {
+  if (reply.queued !== false) return 'Sync Triggered';
+  return reply.retry_after_secs ? `Sync just started, wait ${reply.retry_after_secs}s` : 'Not queued';
+}
+
 function observedClock(iso: string): string {
   return `${new Date(iso).toLocaleTimeString()} · ${formatTimeAgo(iso)}`;
 }
@@ -2928,7 +2934,7 @@ export function SyncRecordsBody({ read }: { read: { data?: { entries?: SyncRecor
 
 // Pure helpers, exported for this page's tests only.
 // eslint-disable-next-line react-refresh/only-export-components
-export { normaliseRepoSection, sectionSearch, sectionNavDisplayed, repositoryStatusLine, credentialState, headerSyncSwitch, fetchPreCommitHook, saveTextDownload, skipChoiceHelp, resumeSyncConsequences, removePairWording, latePairStateWord, REPO_SECTIONS };
+export { syncReplyLabel, normaliseRepoSection, sectionSearch, sectionNavDisplayed, repositoryStatusLine, credentialState, headerSyncSwitch, fetchPreCommitHook, saveTextDownload, skipChoiceHelp, resumeSyncConsequences, removePairWording, latePairStateWord, REPO_SECTIONS };
 
 /* ---- Sub-components ---- */
 

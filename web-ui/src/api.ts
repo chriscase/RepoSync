@@ -733,7 +733,7 @@ export const api = {
   },
 
   triggerRepoSync: (id: string) =>
-    fetchJson<{ ok: boolean }>(`/repos/${id}/sync`, { method: 'POST' }),
+    fetchJson<{ ok: boolean; queued?: boolean; retry_after_secs?: number | null }>(`/repos/${id}/sync`, { method: 'POST' }),
 
   getSkipCommitContext: (repoId: string) =>
     fetchJson<{ ok: boolean; context: SkipCommitContext }>(

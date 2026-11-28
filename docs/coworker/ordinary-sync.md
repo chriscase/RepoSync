@@ -87,6 +87,8 @@ Two later changes, newer than that pin:
   pair's poll wait is skipped once, when its next cycle starts. Every hold, pause and
   busy check still applies, and a request that cannot start within 15 minutes expires.
   Calling again while a request waits wakes the scheduler but does not extend it.
+  For 30 seconds after a requested cycle starts, a new call is not queued: the reply
+  says `"queued": false` and gives `"retry_after_secs"`.
   The reply's `"queued": true` says the request was recorded, not that a cycle ran or
   finished. With sync turned off the reply says `"queued": false`.
 
