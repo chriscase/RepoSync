@@ -1317,7 +1317,7 @@ export function IdentityStep({
           value={data.identity_mapping_file}
           onChange={(v) => update({ identity_mapping_file: v })}
           placeholder="Leave blank to use the configured file"
-          help="Optional. Mappings below are saved to identity.mapping_file from the server configuration (or identity-mappings.toml beside it). Any other path is refused."
+          help="Optional. Mappings below are saved to identity.mapping_file from the server configuration (or identity-mappings.toml beside it), keeping entries already there. A different path here is not used; the server reports it as a warning."
           mono
         />
       </div>
