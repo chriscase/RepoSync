@@ -90,6 +90,8 @@ describe('#264 G12.9 setup validation runs each check on the step that shows its
       web_admin_password_env: 'Admin password env var is required for simple auth',
     });
     expect(validateStep(5, noEnv, { adminPasswordSet: true })).toEqual({});
+    // Users but no admin password: the name read from the server is used as is.
+    expect(validateStep(5, noEnv, { savedConfigLoaded: true })).toEqual({});
   });
 
   it('pre-fills every config-file-only setting exactly, empty values included (#268)', () => {

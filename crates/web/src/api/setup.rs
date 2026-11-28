@@ -553,9 +553,10 @@ fn unapplied_settings_warning(
     );
     check(
         "daemon_data_dir",
-        body.daemon_data_dir
-            .as_deref()
-            .is_some_and(|v| std::path::Path::new(v.trim()) != config.daemon.data_dir),
+        body.daemon_data_dir.as_deref().is_some_and(|v| {
+            let current = config.daemon.data_dir.display().to_string();
+            std::path::Path::new(v.trim()) != std::path::Path::new(current.trim())
+        }),
     );
     check(
         "web_listen",

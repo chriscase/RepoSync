@@ -144,7 +144,7 @@ type Errors = Record<string, string>;
 
 // Each check runs on the step that shows its field, so its error appears next to that field
 // (#264, G12.9). Step 3 is Sync Settings, step 4 Identity Mapping, step 5 Server & Auth.
-function validateStep(step: number, data: WizardData, opts: { adminPasswordSet?: boolean } = {}): Errors {
+function validateStep(step: number, data: WizardData, opts: { adminPasswordSet?: boolean; savedConfigLoaded?: boolean } = {}): Errors {
   const errors: Errors = {};
 
   if (step === 1) {
@@ -180,8 +180,10 @@ function validateStep(step: number, data: WizardData, opts: { adminPasswordSet?:
       errors.web_listen = 'Must be in host:port format (e.g. 0.0.0.0:8080)';
     if (data.daemon_poll_interval < 1) errors.daemon_poll_interval = 'Must be at least 1 second';
     if (!data.daemon_data_dir.trim()) errors.daemon_data_dir = 'Data directory is required';
-    // An admin password already stored needs no env var name.
-    if ((data.web_auth_mode === 'simple' || data.web_auth_mode === 'both') && !opts.adminPasswordSet && !data.web_admin_password_env.trim())
+    // The env var name is read only from the configuration file, so it is
+    // required only when nothing was read from the server and no admin
+    // password is stored (#268).
+    if ((data.web_auth_mode === 'simple' || data.web_auth_mode === 'both') && !opts.adminPasswordSet && !opts.savedConfigLoaded && !data.web_admin_password_env.trim())
       errors.web_admin_password_env = 'Admin password env var is required for simple auth';
   }
 
@@ -370,7 +372,7 @@ function AdminSetupWizard() {
 
   const goNext = () => {
     if (formOff) return;
-    const errs = validateStep(step, data, { adminPasswordSet: adminPasswordSaved });
+    const errs = validateStep(step, data, { adminPasswordSet: adminPasswordSaved, savedConfigLoaded: configRead.status === 'loaded' });
     setErrors(errs);
     if (Object.keys(errs).length > 0) return;
     setCheckingOnEntry(false);
