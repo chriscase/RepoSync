@@ -712,10 +712,9 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Validate that all required fields are present and sane.
     /// Refuse a `github.default_branch` Git cannot use. The daemon seeds the
     /// first repository pair and initializes its Git bridge from it, and setup
-    /// import, Reset & Reimport and `reposync sync` push to it, so every
+    /// import, Reset & Reimport and the CLI's writer commands push to it, so every
     /// reader of the file configuration checks it before anything is written.
     pub fn validate_default_branch(&self) -> Result<(), ConfigError> {
         match crate::git::git_branch_name_problem(&self.github.default_branch) {
@@ -727,6 +726,7 @@ impl AppConfig {
         }
     }
 
+    /// Validate that all required fields are present and sane.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.svn.url.is_empty() {
             return Err(ConfigError::InvalidValue {
@@ -918,6 +918,8 @@ auto_merge = false
     fn test_validate_rejects_an_unusable_default_branch() {
         for branch in [
             "",
+            " main",
+            "main ",
             "refs/heads/main",
             "HEAD",
             "-main",
