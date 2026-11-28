@@ -757,7 +757,10 @@ async fn apply_config(
         let sync_mode = body.sync_mode.as_deref().unwrap_or("direct");
         let git_branch = body.git_default_branch.as_deref().unwrap_or("main");
         let poll_secs = body.daemon_poll_interval.unwrap_or(60) as i64;
-        let lfs_mb = body.lfs_threshold.unwrap_or(0) as i64;
+        // The wizard sends the threshold in bytes; pairs store whole MB
+        // (the scheduler multiplies by 1 MiB). Round up so a small non-zero
+        // threshold stays enabled.
+        let lfs_mb = body.lfs_threshold.unwrap_or(0).div_ceil(1024 * 1024) as i64;
         let auto_merge = body.sync_auto_merge.unwrap_or(true);
 
         // Check if a default repository already exists (update it), otherwise create one.

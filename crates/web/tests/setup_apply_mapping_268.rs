@@ -382,3 +382,20 @@ async fn cleared_values_are_reported_and_encodings_are_not() {
     }
     assert_eq!(json["warnings"].as_array().unwrap().len(), 1, "{json}");
 }
+
+/// The wizard sends the LFS threshold in bytes; the pair stores whole MB,
+/// which the scheduler multiplies by 1 MiB. Storing bytes there made a
+/// 5 MB threshold 5 TB, so LFS never applied.
+#[tokio::test]
+async fn lfs_threshold_is_stored_on_the_pair_in_megabytes() {
+    let f = fixture(None).await;
+    for (bytes, mb) in [(5 * 1024 * 1024, 5), (1, 1), (0, 0)] {
+        let mut body = apply_body(None, json!([]));
+        body["lfs_threshold"] = json!(bytes);
+        let (status, json) = apply(&f, body).await;
+        assert_eq!(status, 200, "{json}");
+        let repos = f.state.db.list_repositories().unwrap();
+        assert_eq!(repos.len(), 1, "{repos:?}");
+        assert_eq!(repos[0].lfs_threshold_mb, mb, "{bytes} bytes");
+    }
+}
