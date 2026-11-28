@@ -13,7 +13,7 @@ use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use reposync_core::busy::PairBusyGuard;
@@ -200,17 +200,74 @@ pub fn routes() -> Router<Arc<AppState>> {
 // Get saved config for wizard pre-population
 // ---------------------------------------------------------------------------
 
-/// The repository pair the setup wizard edits: `apply` updates the first
-/// listed pair, or creates one when none exists.
-fn wizard_repository(
-    state: &AppState,
-) -> Result<Option<reposync_core::models::Repository>, AppError> {
-    Ok(state
+/// Whether `repo` is the root pair whose SVN and Git target the service
+/// configuration names.
+fn config_names_pair(config: &AppConfig, repo: &Repository) -> bool {
+    let svn_target = |url: &str, branch: &str| {
+        reposync_core::svn::operand::configured_branch_url(
+            url,
+            if branch.is_empty() { "trunk" } else { branch },
+        )
+        .ok()
+    };
+    let service_svn = svn_target(&config.svn.url, &config.svn.trunk_path);
+    repo.parent_id.is_none()
+        && service_svn.is_some()
+        && svn_target(&repo.svn_url, &repo.svn_branch) == service_svn
+        && repo.git_repo == config.github.repo
+        && repo.git_branch == config.github.default_branch
+        && repo.git_api_url.trim_end_matches('/') == config.github.api_url.trim_end_matches('/')
+}
+
+/// The kv key holding the id of the pair that setup apply last saved.
+const WIZARD_PAIR_KEY: &str = "setup_wizard_repository_id";
+
+/// The pair that the setup wizard edits and setup import starts on, in order:
+/// 1. the root pair that the configuration file uniquely names (the loaded
+///    configuration if the file cannot be read);
+/// 2. the root pair that setup apply last saved, unless the configuration
+///    names other pairs. Apply copies the form's target onto the pair but
+///    not into the file, so an edited target stops matching the file;
+/// 3. the earliest registered root pair.
+///
+/// Name order is not used, because a rename or a child branch pair would
+/// change the choice.
+fn setup_pair(state: &AppState) -> Result<Option<Repository>, DatabaseError> {
+    let file = AppConfig::load_from_file(&state.config_path);
+    if let Err(error) = &file {
+        debug!(%error, "setup pair selection is using the loaded configuration");
+    }
+    let config = file.as_ref().unwrap_or(&state.config);
+    let named: Vec<Repository> = state
         .db
-        .list_repositories()
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
+        .list_repositories()?
         .into_iter()
-        .next())
+        .filter(|r| config_names_pair(config, r))
+        .collect();
+    if let [only] = named.as_slice() {
+        return Ok(Some(only.clone()));
+    }
+    if let Some(id) = state.db.get_state(WIZARD_PAIR_KEY)? {
+        if let Some(saved) = state.db.get_repository(&id)? {
+            if saved.parent_id.is_none() && (named.is_empty() || named.iter().any(|r| r.id == id)) {
+                return Ok(Some(saved));
+            }
+        }
+    }
+    state.db.earliest_root_repository()
+}
+
+fn remember_wizard_pair(db: &Database, id: &str, warnings: &mut Vec<String>) {
+    if let Err(e) = db.set_state(WIZARD_PAIR_KEY, id) {
+        warnings.push(format!(
+            "Failed to record which repository the wizard edits: {}",
+            e
+        ));
+    }
+}
+
+fn wizard_repository(state: &AppState) -> Result<Option<Repository>, AppError> {
+    setup_pair(state).map_err(|e| AppError::Internal(format!("database error: {}", e)))
 }
 
 async fn get_setup_config(
@@ -807,7 +864,10 @@ async fn apply_config(
                 ..existing
             };
             match db.update_repository(&updated) {
-                Ok(()) => info!(id = %updated.id, "Updated repository from setup wizard"),
+                Ok(()) => {
+                    info!(id = %updated.id, "Updated repository from setup wizard");
+                    remember_wizard_pair(db, &updated.id, &mut warnings);
+                }
                 Err(e) => warnings.push(format!("Failed to update repository: {}", e)),
             }
         } else {
@@ -843,7 +903,8 @@ async fn apply_config(
             };
             match db.insert_repository(&new_repo) {
                 Ok(()) => {
-                    info!(id = %new_repo.id, name = %new_repo.name, "Created repository from setup wizard")
+                    info!(id = %new_repo.id, name = %new_repo.name, "Created repository from setup wizard");
+                    remember_wizard_pair(db, &new_repo.id, &mut warnings);
                 }
                 Err(e) => warnings.push(format!("Failed to create repository: {}", e)),
             }
@@ -892,11 +953,9 @@ fn setup_import_phase_busy(phase: &ImportPhase) -> bool {
     )
 }
 
-fn setup_repository(db: &Database) -> Result<Repository, AppError> {
-    db.list_repositories()
+fn setup_repository(state: &AppState) -> Result<Repository, AppError> {
+    setup_pair(state)
         .map_err(|e| AppError::Internal(e.to_string()))?
-        .into_iter()
-        .next()
         .ok_or_else(|| AppError::BadRequest("apply configuration before starting import".into()))
 }
 
@@ -927,28 +986,14 @@ fn target_matches(
     repo: &Repository,
     config: &AppConfig,
 ) -> Result<bool, AppError> {
-    let svn_target = |url: &str, branch: &str| {
-        reposync_core::svn::operand::configured_branch_url(
-            url,
-            if branch.is_empty() { "trunk" } else { branch },
-        )
-        .ok()
-    };
-    let service_svn = svn_target(&config.svn.url, &config.svn.trunk_path);
-    let registered = |r: &Repository| {
-        r.parent_id.is_none()
-            && service_svn.is_some()
-            && svn_target(&r.svn_url, &r.svn_branch) == service_svn
-            && r.git_repo == config.github.repo
-            && r.git_branch == config.github.default_branch
-            && r.git_api_url.trim_end_matches('/') == config.github.api_url.trim_end_matches('/')
-    };
+    let registered = |r: &Repository| config_names_pair(config, r);
     let repositories = state.db.list_repositories().map_err(import_read_error)?;
+    let selected = setup_pair(state).map_err(import_read_error)?;
     let mut candidates = repositories.iter().filter(|r| registered(r));
     Ok(config.daemon.data_dir == state.config.daemon.data_dir
         && registered(repo)
-        && repositories
-            .first()
+        && selected
+            .as_ref()
             .is_some_and(|selected| selected.id == repo.id)
         && candidates
             .next()
@@ -1149,7 +1194,7 @@ async fn admit_setup_import(
     expected_repository_id: Option<&str>,
 ) -> Result<SetupAdmission, AppError> {
     let db = &state.db;
-    let repo = setup_repository(db)?;
+    let repo = setup_repository(state)?;
     if expected_repository_id.is_some_and(|expected| expected != repo.id) {
         return Ok(SetupAdmission::Busy {
             message: "Setup repository selection changed; refresh before starting an import".into(),
@@ -1459,12 +1504,7 @@ async fn import_status(
             .get_repository(&owner.operation.repo_id)
             .map_err(import_read_error)?
     } else {
-        state
-            .db
-            .list_repositories()
-            .map_err(import_read_error)?
-            .into_iter()
-            .next()
+        setup_pair(&state).map_err(import_read_error)?
     };
     let active = if let Some(repo) = &repo {
         state
@@ -1624,13 +1664,7 @@ async fn cancel_import(
         // An explicit pointer remains authoritative even if the repository
         // was renamed, reordered or edited since registration.
         Some(owner.operation)
-    } else if let Some(repo) = state
-        .db
-        .list_repositories()
-        .map_err(import_read_error)?
-        .into_iter()
-        .next()
-    {
+    } else if let Some(repo) = setup_pair(&state).map_err(import_read_error)? {
         let active = state
             .db
             .active_import_operation(&repo.id)
@@ -1993,7 +2027,7 @@ async fn reset_and_reimport(
         return Err(AppError::Forbidden("admin access required".into()));
     }
 
-    let repo = setup_repository(&state.db)?;
+    let repo = setup_repository(&state)?;
     // Reserve the shared checkout before inspecting holds or performing any
     // preparation. Keep both guards through terminal worker cleanup.
     let reservation = reposync_core::busy::try_acquire_pair(&repo.id, &setup_workdir_key(&state));

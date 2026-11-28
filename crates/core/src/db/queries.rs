@@ -3061,6 +3061,24 @@ impl Database {
         }
     }
 
+    /// The earliest registered root pair (no parent), by insertion order.
+    /// Unlike name order, a rename does not change it and a child branch
+    /// pair is never chosen.
+    pub fn earliest_root_repository(&self) -> Result<Option<models::Repository>, DatabaseError> {
+        let conn = self.conn();
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM repositories WHERE parent_id IS NULL ORDER BY rowid LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => Self::get_repository_tx(&conn, &id),
+            None => Ok(None),
+        }
+    }
+
     /// List all repositories ordered by name.
     pub fn list_repositories(&self) -> Result<Vec<models::Repository>, DatabaseError> {
         let conn = self.conn();
