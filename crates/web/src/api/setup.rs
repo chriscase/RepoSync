@@ -508,7 +508,14 @@ async fn test_git_connection(
 /// The only file the setup wizard writes mappings to: the configured
 /// `identity.mapping_file` (the file the identity mapper reads), or
 /// `identity-mappings.toml` beside the configuration file when none is set.
-fn setup_mapping_target(state: &AppState) -> std::path::PathBuf {
+/// Serializes every load-merge-save of the identity mapping file (setup apply
+/// and the Settings page), so concurrent saves cannot drop each other's
+/// entries.
+pub(crate) static MAPPING_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The identity mapping file the server writes: `identity.mapping_file`, or
+/// `identity-mappings.toml` beside the configuration file.
+pub(crate) fn setup_mapping_target(state: &AppState) -> std::path::PathBuf {
     match &state.config.identity.mapping_file {
         Some(path) => path.clone(),
         None => config_dir(&state.config_path).join(DEFAULT_SETUP_MAPPING_FILE),
@@ -740,9 +747,8 @@ async fn apply_config(
             // Merge into the existing file so entries the operator already
             // maintains there are kept; the wizard's entries win on conflict.
             use reposync_core::identity::mapping_file::MappingFile;
-            // One load-merge-save at a time, so concurrent applies cannot
+            // One load-merge-save at a time, so concurrent saves cannot
             // drop each other's entries.
-            static MAPPING_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
             let _guard = MAPPING_WRITE.lock().unwrap_or_else(|p| p.into_inner());
             let mut written = false;
             let existing = if mapping_target.exists() {

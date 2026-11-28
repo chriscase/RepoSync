@@ -78,6 +78,7 @@ async fn fixture(mapping_file: Option<&str>) -> Fixture {
     );
     let app = Router::new()
         .merge(api::setup::routes())
+        .merge(api::config::routes())
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -649,4 +650,121 @@ async fn an_out_of_range_lfs_threshold_is_refused_before_anything_is_written() {
         pair.lfs_threshold_mb,
         reposync_core::models::MAX_LFS_THRESHOLD_MB
     );
+}
+
+async fn settings_call(f: &Fixture, method: reqwest::Method, body: Option<Value>) -> (u16, Value) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let mut req = client
+        .request(method, format!("http://{}/api/config/identity", f.addr))
+        .bearer_auth(TOKEN);
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+// Settings > Identity mappings edits the file the identity mapper reads, and
+// a running mapper picks the change up without a restart.
+#[tokio::test]
+async fn settings_identity_mappings_edit_the_file_the_mapper_reads() {
+    let f = fixture(Some("authors.toml")).await;
+    let path = f.tmp.path().join("authors.toml");
+    let mapper = IdentityMapper::new(&f.state.config.identity).unwrap();
+    assert!(mapper.svn_to_git("jdoe").is_err(), "no mapping yet");
+
+    // Entries already in the file are listed.
+    let mut existing = HashMap::new();
+    existing.insert(
+        "ops".to_string(),
+        reposync_core::identity::mapping_file::AuthorEntry {
+            name: "Ops".into(),
+            email: "ops@example.invalid".into(),
+        },
+    );
+    MappingFile::save(&path, &existing).unwrap();
+    let (status, listed) = settings_call(&f, reqwest::Method::GET, None).await;
+    assert_eq!(status, 200, "{listed}");
+    assert_eq!(
+        listed,
+        json!([{"svn_username":"ops","name":"Ops","email":"ops@example.invalid"}])
+    );
+
+    // Saving the list writes the file; the GitHub login is kept beside it.
+    let list = json!([
+        {"svn_username":"jdoe","name":"John Doe","email":"jdoe@example.invalid","github":"jdoe-gh"},
+        {"svn_username":"ops","name":"Ops","email":"ops@example.invalid"},
+    ]);
+    let (status, json) =
+        settings_call(&f, reqwest::Method::PUT, Some(json!({"mappings": list}))).await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["warnings"], json!([]));
+    let file = MappingFile::load(&path).unwrap();
+    assert_eq!(file["jdoe"].email, "jdoe@example.invalid");
+    assert_eq!(file.len(), 2);
+    assert_eq!(mapper.svn_to_git("jdoe").unwrap().name, "John Doe");
+    let (_, listed) = settings_call(&f, reqwest::Method::GET, None).await;
+    assert_eq!(listed, list);
+
+    // Removing an entry removes it from the file.
+    let (status, _) = settings_call(
+        &f,
+        reqwest::Method::PUT,
+        Some(json!({"mappings": [list[1].clone()]})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(!MappingFile::load(&path).unwrap().contains_key("jdoe"));
+    assert!(mapper.svn_to_git("jdoe").is_err());
+
+    // Incomplete or duplicate entries are refused and change nothing.
+    for bad in [
+        json!([{"svn_username":" ","name":"N","email":"n@example.invalid"}]),
+        json!([{"svn_username":"a","name":"","email":"a@example.invalid"}]),
+        json!([
+            {"svn_username":"a","name":"A","email":"a@example.invalid"},
+            {"svn_username":"a","name":"B","email":"b@example.invalid"},
+        ]),
+    ] {
+        let (status, json) =
+            settings_call(&f, reqwest::Method::PUT, Some(json!({"mappings": bad}))).await;
+        assert_eq!(status, 400, "{json}");
+    }
+    assert_eq!(MappingFile::load(&path).unwrap().len(), 1);
+}
+
+// Without identity.mapping_file, saved mappings go to the default file and
+// the response says they are not in effect yet. A list saved by an earlier
+// version, before any file existed, is still shown.
+#[tokio::test]
+async fn settings_identity_mappings_without_a_configured_file() {
+    let f = fixture(None).await;
+    let legacy = json!([{"svn_username":"old","name":"Old","email":"old@example.invalid"}]);
+    f.state
+        .db
+        .set_state("identity_mappings", &legacy.to_string())
+        .unwrap();
+    let (status, listed) = settings_call(&f, reqwest::Method::GET, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(listed, legacy);
+
+    let (status, json) =
+        settings_call(&f, reqwest::Method::PUT, Some(json!({"mappings": legacy}))).await;
+    assert_eq!(status, 200, "{json}");
+    assert!(json["warnings"][0]
+        .as_str()
+        .unwrap()
+        .contains("identity.mapping_file"));
+    let default = f.tmp.path().join("identity-mappings.toml");
+    assert_eq!(MappingFile::load(&default).unwrap()["old"].name, "Old");
+
+    // An empty list with no file writes nothing.
+    let f = fixture(None).await;
+    let (status, _) = settings_call(&f, reqwest::Method::PUT, Some(json!({"mappings": []}))).await;
+    assert_eq!(status, 200);
+    assert!(!f.tmp.path().join("identity-mappings.toml").exists());
 }

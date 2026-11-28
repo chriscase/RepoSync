@@ -383,7 +383,7 @@ export const api = {
   getIdentityMappings: () => fetchJson<AuthorMapping[]>('/config/identity'),
 
   updateIdentityMappings: (mappings: AuthorMapping[]) =>
-    fetchJson<{ ok: boolean }>('/config/identity', {
+    fetchJson<{ ok: boolean; count?: number; warnings?: string[] }>('/config/identity', {
       method: 'PUT',
       body: JSON.stringify({ mappings }),
     }),

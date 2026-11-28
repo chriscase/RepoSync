@@ -37,7 +37,7 @@ RepoSync is configured via a TOML file, typically at `/etc/reposync/config.toml`
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|
-| `mapping_file` | string | no | Path to the author mapping file, if used |
+| `mapping_file` | string | no | Path to the author mapping file, if used. Settings > Identity mappings and the setup wizard write this file (or `identity-mappings.toml` beside the configuration file when it is unset, which the mapper does not read). A running sync picks up a saved change on its next lookup. |
 | `email_domain` | string | no | Fallback domain for unmapped users |
 | `ldap_url` | string | no | LDAP server URL for automatic lookup |
 | `ldap_base_dn` | string | no | LDAP base DN for searches |

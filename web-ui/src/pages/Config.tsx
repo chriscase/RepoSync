@@ -106,6 +106,7 @@ function AdminConfig() {
         readError={readError ? readError.message : ''}
         saving={updateMutation.isPending}
         saveError={!confirmRemove && updateMutation.error ? updateMutation.error.message : ''}
+        saveWarnings={updateMutation.data?.warnings ?? []}
         newMapping={newMapping}
         onNewMapping={setNewMapping}
         onAdd={addMapping}
@@ -159,6 +160,8 @@ export interface IdentityMappingsViewProps {
   readError: string;
   saving: boolean;
   saveError: string;
+  /** Server notes on the last successful save, such as a mapping file the server does not read yet. */
+  saveWarnings?: string[];
   newMapping: AuthorMapping;
   onNewMapping: (mapping: AuthorMapping) => void;
   onAdd: () => void;
@@ -166,7 +169,7 @@ export interface IdentityMappingsViewProps {
   onRetry: () => void;
 }
 
-export function IdentityMappingsView({ mappings, loading, readError, saving, saveError, newMapping, onNewMapping, onAdd, onRemove, onRetry }: IdentityMappingsViewProps) {
+export function IdentityMappingsView({ mappings, loading, readError, saving, saveError, saveWarnings = [], newMapping, onNewMapping, onAdd, onRemove, onRetry }: IdentityMappingsViewProps) {
   const t = useText();
   const editingOff = mappings === undefined;
   return (
@@ -176,7 +179,9 @@ export function IdentityMappingsView({ mappings, loading, readError, saving, sav
       </h2>
       <p className="text-sm text-gray-400 mb-4">
         Map SVN usernames to Git author identities. These mappings ensure
-        commits are attributed to the correct developer on both sides.
+        commits are attributed to the correct developer on both sides. They
+        are saved to the server's identity mapping file, and syncs use a saved
+        change from their next commit.
       </p>
 
       {loading && (
@@ -202,6 +207,12 @@ export function IdentityMappingsView({ mappings, loading, readError, saving, sav
         <div role="alert" className="rs-bn rs-bn--danger mb-4 bg-red-900/40 border border-red-700 text-red-300 px-4 py-3 rounded text-sm space-y-1">
           <p className="font-medium">The mappings were not saved</p>
           <p>{saveError}</p>
+        </div>
+      )}
+
+      {saveWarnings.length > 0 && !saveError && (
+        <div role="status" className="rs-bn rs-bn--warn mb-4 bg-yellow-900/30 border border-yellow-700 text-yellow-300 px-4 py-3 rounded text-sm space-y-1">
+          {saveWarnings.map((w) => <p key={w}>{w}</p>)}
         </div>
       )}
 
