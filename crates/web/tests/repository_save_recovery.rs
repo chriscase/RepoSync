@@ -635,3 +635,81 @@ async fn pair_git_branch_must_be_a_branch_git_accepts() {
     assert_eq!(response.status(), 400);
     server.abort();
 }
+
+/// The LFS threshold must be 0 (disabled) up to the bound, so its byte value
+/// cannot overflow. A pair stored before the bound can still have its other
+/// settings saved.
+#[tokio::test]
+async fn pair_lfs_threshold_must_be_within_bounds() {
+    let (addr, state, server, _tmp) = save_fixture(&[]).await;
+    let client = authed_client();
+    let max = reposync_core::models::MAX_LFS_THRESHOLD_MB;
+    for mb in [-1, max + 1, i64::MAX] {
+        let mut body = create_body(&uuid::Uuid::new_v4().to_string());
+        body["lfs_threshold_mb"] = serde_json::json!(mb);
+        let response = client
+            .post(format!("http://{addr}/api/repos"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "{mb}");
+        let text = response.text().await.unwrap();
+        assert!(text.contains("lfs_threshold_mb"), "{mb}: {text}");
+    }
+    assert!(state.db.list_repositories().unwrap().is_empty());
+
+    let mut body = create_body(&uuid::Uuid::new_v4().to_string());
+    body["lfs_threshold_mb"] = serde_json::json!(max);
+    let created = create(&client, addr, &body).await;
+    assert_eq!(created["lfs_threshold_mb"], max);
+    let id = created["id"].as_str().unwrap();
+    let endpoint = format!("http://{addr}/api/repos/{id}");
+    for mb in [-5, max + 1] {
+        let edit = serde_json::json!({"save_request_id":uuid::Uuid::new_v4().to_string(),
+            "expected_updated_at":created["updated_at"],"lfs_threshold_mb":mb});
+        let response = client.put(&endpoint).json(&edit).send().await.unwrap();
+        assert_eq!(response.status(), 400, "{mb}");
+    }
+    assert_eq!(
+        state
+            .db
+            .get_repository(id)
+            .unwrap()
+            .unwrap()
+            .lfs_threshold_mb,
+        max
+    );
+
+    // A legacy out-of-range value converts without overflow and does not
+    // block other edits, with or without the stored value in the request.
+    let mut legacy = state.db.get_repository(id).unwrap().unwrap();
+    legacy.lfs_threshold_mb = i64::MAX;
+    state.db.update_repository(&legacy).unwrap();
+    assert_eq!(legacy.lfs_threshold_bytes(), u64::MAX);
+    let mut expected = serde_json::json!(legacy.updated_at);
+    for edit in [
+        serde_json::json!({"name":"Renamed"}),
+        serde_json::json!({"name":"Renamed again","lfs_threshold_mb":i64::MAX}),
+        serde_json::json!({"name":"Back in range","lfs_threshold_mb":10}),
+    ] {
+        let mut edit = edit;
+        edit["save_request_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+        edit["expected_updated_at"] = expected.clone();
+        let response = client.put(&endpoint).json(&edit).send().await.unwrap();
+        assert_eq!(response.status(), 200, "{edit}");
+        let saved: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(saved["name"], edit["name"]);
+        expected = saved["updated_at"].clone();
+    }
+    assert_eq!(
+        state
+            .db
+            .get_repository(id)
+            .unwrap()
+            .unwrap()
+            .lfs_threshold_mb,
+        10
+    );
+    server.abort();
+}

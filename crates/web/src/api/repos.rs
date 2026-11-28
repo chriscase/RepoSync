@@ -458,6 +458,7 @@ async fn create_repo(
         return Err(AppError::BadRequest("svn_url is required".into()));
     }
     require_valid_git_branch(&body.git_branch)?;
+    require_valid_lfs_threshold(body.lfs_threshold_mb)?;
 
     let payload = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.to_string()))?;
     let request_id = body.save_request_id.clone();
@@ -538,6 +539,14 @@ async fn get_repo(
     Ok(Json(enrich_repo_detail(db, RepoDetail::from(repo))?))
 }
 
+/// Refuse an LFS threshold that is negative or too large to convert to bytes.
+fn require_valid_lfs_threshold(mb: i64) -> Result<(), AppError> {
+    match reposync_core::models::lfs_threshold_mb_problem(mb) {
+        None => Ok(()),
+        Some(problem) => Err(AppError::BadRequest(format!("lfs_threshold_mb {problem}"))),
+    }
+}
+
 /// Refuse a pair Git branch the engine could not fetch or push.
 fn require_valid_git_branch(name: &str) -> Result<(), AppError> {
     match reposync_core::git::git_branch_name_problem(name) {
@@ -606,13 +615,20 @@ async fn update_repo(
     writable?;
     // Only a changed branch is checked, so a pair saved before this check
     // with a name Git refuses can still have its other settings edited.
-    if let Some(branch) = body.git_branch() {
+    // The same holds for the LFS threshold.
+    if body.git_branch().is_some() || body.lfs_threshold_mb().is_some() {
         let stored = db
             .get_repository(&id)
-            .map_err(|e| AppError::Internal(e.to_string()))?
-            .map(|r| r.git_branch);
-        if stored.as_deref() != Some(branch) {
-            require_valid_git_branch(branch)?;
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        if let Some(branch) = body.git_branch() {
+            if stored.as_ref().map(|r| r.git_branch.as_str()) != Some(branch) {
+                require_valid_git_branch(branch)?;
+            }
+        }
+        if let Some(mb) = body.lfs_threshold_mb() {
+            if stored.as_ref().map(|r| r.lfs_threshold_mb) != Some(mb) {
+                require_valid_lfs_threshold(mb)?;
+            }
         }
     }
 
@@ -1820,11 +1836,7 @@ async fn start_repo_import(
     let identity_mapper = IdentityMapper::new(&identity_config)
         .map_err(|e| AppError::Internal(format!("failed to init identity mapper: {}", e)))?;
 
-    let lfs_threshold_bytes = if repo.lfs_threshold_mb > 0 {
-        (repo.lfs_threshold_mb as u64) * 1024 * 1024
-    } else {
-        0
-    };
+    let lfs_threshold_bytes = repo.lfs_threshold_bytes();
     let file_policy = FilePolicy::with_lfs(0, vec![], lfs_threshold_bytes, &[]);
 
     // 11. Build ImportConfig from repo settings
@@ -2475,11 +2487,7 @@ async fn resume_repo_import(
         p.errors.clear();
     }
 
-    let lfs_threshold_bytes = if repo.lfs_threshold_mb > 0 {
-        (repo.lfs_threshold_mb as u64) * 1024 * 1024
-    } else {
-        0
-    };
+    let lfs_threshold_bytes = repo.lfs_threshold_bytes();
     let file_policy = FilePolicy::with_lfs(0, vec![], lfs_threshold_bytes, &[]);
     let import_config = ImportConfig {
         committer_name: "RepoSync".into(),
