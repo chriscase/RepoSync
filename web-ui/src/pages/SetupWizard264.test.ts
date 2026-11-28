@@ -144,18 +144,15 @@ describe('#264 G12.9 setup validation runs each check on the step that shows its
 });
 
 describe('#264 G12.4 and G12.6 mark the fields that are collected but not sent today', () => {
-  it('step 4 marks the pull request settings, and only when they are shown', () => {
-    const pr = renderToStaticMarkup(stepElement(3, wizard({ sync_mode: 'pr' }), {}));
-    expect(count(pr, MARKER)).toBe(1);
-    const heading = pr.indexOf('Pull Request Settings');
-    expect(heading).toBeGreaterThan(-1);
-    expect(pr.indexOf(MARKER)).toBeGreaterThan(pr.indexOf('Auto-merge PRs'));
-    expect(pr.indexOf('Auto-merge PRs')).toBeGreaterThan(heading);
-    expect(pr).toContain('class="rs-mark');
-
-    const direct = renderToStaticMarkup(stepElement(3, wizard({ sync_mode: 'direct' }), {}));
-    expect(direct).not.toContain('Pull Request Settings');
-    expect(direct).not.toContain(MARKER);
+  it('step 4 shows no sync mode choice and no pull request settings, whatever mode is stored', () => {
+    for (const mode of ['direct', 'pr'] as const) {
+      const html = renderToStaticMarkup(stepElement(3, wizard({ sync_mode: mode }), {}));
+      expect(html).not.toContain('Sync Mode');
+      expect(html).not.toContain('Pull Request Settings');
+      expect(html).not.toContain('Auto-merge PRs');
+      expect(html).not.toContain(MARKER);
+      expect(html).toContain('Auto Merge');
+    }
   });
 
   it.each(['simple', 'github_oauth', 'both'] as const)('step 6 marks authentication mode, OAuth and notification fields (%s)', mode => {

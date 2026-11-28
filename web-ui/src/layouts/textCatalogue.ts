@@ -49,7 +49,6 @@ export const TEXT_CATALOGUE = entries({
   'field.svnPassword': { existing: 'Password', plain: 'SVN password' },
   'field.defaultBranch': { existing: 'Default Branch', plain: 'Branch' },
   'field.gitToken': { existing: 'Git Token', plain: 'Git token' },
-  'field.syncMode': { existing: 'Sync Mode', plain: 'Sync mode' },
   'field.pollInterval': { existing: 'Poll Interval', plain: 'Poll interval' },
   'field.lfsThreshold': { existing: 'LFS Threshold', plain: 'LFS threshold' },
   'field.autoMerge': { existing: 'Auto Merge', plain: 'Auto merge' },

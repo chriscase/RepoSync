@@ -1378,15 +1378,6 @@ function RepositoryDetailEditor() {
         </div>
         {editing && form ? (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-            <FieldSelect
-              label={t('field.syncMode')}
-              value={form.sync_mode}
-              options={[
-                { value: 'direct', label: 'Direct' },
-                { value: 'pr', label: 'Pull Request' },
-              ]}
-              onChange={(v) => setField('sync_mode', v)}
-            />
             <FieldNumber label={t('repo.field.pollInterval')} value={form.poll_interval_secs} onChange={(v) => setField('poll_interval_secs', v)} min={10} />
             <FieldNumber label={t('repo.field.lfsThreshold')} value={form.lfs_threshold_mb} onChange={(v) => setField('lfs_threshold_mb', v)} min={0} />
             <FieldToggle label={t('field.autoMerge')} checked={form.auto_merge} onChange={(v) => setField('auto_merge', v)} />
@@ -1417,10 +1408,6 @@ function RepositoryDetailEditor() {
           </div>
         ) : (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div>
-              <span className="text-sm text-gray-400">{t('field.syncMode')}</span>
-              <p className="text-lg text-gray-100 capitalize">{repo.sync_mode}</p>
-            </div>
             <div>
               <span className="text-sm text-gray-400">{t('field.pollInterval')}</span>
               <p className="text-lg text-gray-100">{repo.poll_interval_secs}s</p>

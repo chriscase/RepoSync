@@ -130,11 +130,12 @@ describe('#264 R4: a control that shows its state by colour carries the primary 
     }
   });
 
-  it('sync mode: the chosen mode is primary and pressed, the other quiet', () => {
+  it('sync mode: the wizard offers no mode choice, whatever mode is stored', () => {
     for (const mode of ['direct', 'pr'] as const) {
       const html = renderToStaticMarkup(createElement(SyncStep, { data: wizard({ sync_mode: mode }), update: noop, errors: {} }));
-      expectChoice(button(html, /^Direct Push/), mode === 'direct');
-      expectChoice(button(html, /^Pull Request/), mode === 'pr');
+      expect(html).not.toContain('Sync Mode');
+      expect(html).not.toContain('Direct Push');
+      expect(html).not.toContain('Pull Request');
     }
   });
 

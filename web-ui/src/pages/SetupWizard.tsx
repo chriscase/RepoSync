@@ -1138,39 +1138,6 @@ export function SyncStep({
         color="cyan"
       />
 
-      {/* Mode selection */}
-      <div>
-        <p id={`${fieldId}-sync-mode`} className="block text-sm font-medium text-gray-300 mb-2">Sync Mode</p>
-        <div role="group" aria-labelledby={`${fieldId}-sync-mode`} className="flex space-x-3">
-          <button
-            aria-pressed={data.sync_mode === 'direct'} onClick={() => update({ sync_mode: 'direct' })}
-            className={`rs-btn rs-choice flex-1 py-3 px-4 rounded-lg border text-left transition-all ${
-              data.sync_mode === 'direct'
-                ? 'rs-btn--primary border-blue-500 bg-blue-600/10'
-                : 'rs-btn--quiet border-gray-600 bg-gray-700/50 hover:bg-gray-700'
-            }`}
-          >
-            <div className={`text-sm font-medium ${data.sync_mode === 'direct' ? 'text-blue-400' : 'text-gray-300'}`}>
-              Direct Push
-            </div>
-            <p className="text-xs text-gray-400 mt-1">Commits are pushed directly to the target branch</p>
-          </button>
-          <button
-            aria-pressed={data.sync_mode === 'pr'} onClick={() => update({ sync_mode: 'pr' })}
-            className={`rs-btn rs-choice flex-1 py-3 px-4 rounded-lg border text-left transition-all ${
-              data.sync_mode === 'pr'
-                ? 'rs-btn--primary border-blue-500 bg-blue-600/10'
-                : 'rs-btn--quiet border-gray-600 bg-gray-700/50 hover:bg-gray-700'
-            }`}
-          >
-            <div className={`text-sm font-medium ${data.sync_mode === 'pr' ? 'text-blue-400' : 'text-gray-300'}`}>
-              Pull Request
-            </div>
-            <p className="text-xs text-gray-400 mt-1">Changes create a PR for review before merging</p>
-          </button>
-        </div>
-      </div>
-
       <div className="space-y-4">
         <ToggleSwitch
           label="Auto Merge"
@@ -1238,47 +1205,6 @@ export function SyncStep({
           help="Comma-separated glob patterns. Matching files are excluded from sync."
         />
       </div>
-
-      {/* PR-specific settings */}
-      {data.sync_mode === 'pr' && (
-        <div className="border-t border-gray-700 pt-5 space-y-4">
-          <h3 className="rs-heading text-sm font-semibold text-gray-200">Pull Request Settings</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <FormField
-              label="PR Title Prefix"
-              name="pr_title_prefix"
-              value={data.pr_title_prefix}
-              onChange={(v) => update({ pr_title_prefix: v })}
-              placeholder="[svn-sync]"
-            />
-            <FormField
-              label="Labels"
-              name="pr_labels"
-              value={data.pr_labels}
-              onChange={(v) => update({ pr_labels: v })}
-              placeholder="svn-sync, automated"
-              help="Comma-separated list"
-            />
-            <FormField
-              label="Reviewers"
-              name="pr_reviewers"
-              value={data.pr_reviewers}
-              onChange={(v) => update({ pr_reviewers: v })}
-              placeholder="username1, username2"
-              help="Comma-separated GitHub usernames"
-            />
-            <div className="flex items-end">
-              <ToggleSwitch
-                label="Auto-merge PRs"
-                checked={data.pr_auto_merge}
-                onChange={(v) => update({ pr_auto_merge: v })}
-                help="Automatically merge PRs when checks pass"
-              />
-            </div>
-          </div>
-          <NotSentMarker />
-        </div>
-      )}
     </div>
   );
 }
@@ -1637,7 +1563,6 @@ export function ReviewStep({
           title="Sync"
           color="cyan"
           items={[
-            ['Mode', data.sync_mode],
             ['Auto Merge', data.sync_auto_merge ? 'Yes' : 'No'],
             ['Sync Tags', data.sync_tags ? 'Yes' : 'No'],
             ...(data.lfs_threshold_mb > 0 ? [['LFS Threshold', `${data.lfs_threshold_mb} MB`] as [string, string]] : []),
