@@ -713,6 +713,20 @@ impl AppConfig {
     }
 
     /// Validate that all required fields are present and sane.
+    /// Refuse a `github.default_branch` Git cannot use. The daemon seeds the
+    /// first repository pair and initializes its Git bridge from it, and setup
+    /// import, Reset & Reimport and `reposync sync` push to it, so every
+    /// reader of the file configuration checks it before anything is written.
+    pub fn validate_default_branch(&self) -> Result<(), ConfigError> {
+        match crate::git::git_branch_name_problem(&self.github.default_branch) {
+            Some(problem) => Err(ConfigError::InvalidValue {
+                field: "github.default_branch".into(),
+                detail: format!("'{}' {}", self.github.default_branch, problem),
+            }),
+            None => Ok(()),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.svn.url.is_empty() {
             return Err(ConfigError::InvalidValue {
@@ -738,15 +752,7 @@ impl AppConfig {
                 detail: "GitHub repo must be in 'owner/repo' format".into(),
             });
         }
-        // The daemon creates the first repository pair and initializes its
-        // Git bridge from this branch, so refuse a name Git cannot use before
-        // anything is written.
-        if let Some(problem) = crate::git::git_branch_name_problem(&self.github.default_branch) {
-            return Err(ConfigError::InvalidValue {
-                field: "github.default_branch".into(),
-                detail: format!("'{}' {}", self.github.default_branch, problem),
-            });
-        }
+        self.validate_default_branch()?;
         if self.daemon.poll_interval_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "daemon.poll_interval_secs".into(),
@@ -935,6 +941,20 @@ auto_merge = false
             config.github.default_branch = branch.into();
             config.validate().unwrap();
         }
+        // The same refusal reaches a hand-edited file loaded from disk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let text = sample_toml().replace(
+            "default_branch = \"main\"",
+            "default_branch = \"refs/heads/main\"",
+        );
+        assert!(text.contains("refs/heads/main"));
+        std::fs::write(&path, text).unwrap();
+        let loaded = AppConfig::load_from_file(&path).unwrap();
+        assert!(matches!(
+            loaded.validate_default_branch(),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "github.default_branch"
+        ));
     }
 
     #[test]

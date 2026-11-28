@@ -241,6 +241,10 @@ fn load_config(path: &PathBuf) -> Result<AppConfig> {
     config
         .resolve_env_vars()
         .context("failed to resolve environment variables")?;
+    // `reposync sync` fetches and pushes this branch.
+    config
+        .validate_default_branch()
+        .context("configuration validation failed")?;
     Ok(config)
 }
 
@@ -638,5 +642,34 @@ fn truncate(s: &str, max_len: usize) -> String {
         s.to_string()
     } else {
         format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
+#[cfg(test)]
+mod load_config_tests {
+    use super::load_config;
+
+    fn write_config(dir: &std::path::Path, branch: &str) -> std::path::PathBuf {
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[daemon]\n[svn]\nurl = \"https://svn.example.com/repo\"\nusername = \"u\"\n\
+                 [github]\nrepo = \"acme/repo\"\ndefault_branch = \"{branch}\"\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn commands_refuse_an_unusable_default_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = load_config(&write_config(dir.path(), "refs/heads/main")).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("github.default_branch"),
+            "{error:#}"
+        );
+        load_config(&write_config(dir.path(), "main")).unwrap();
     }
 }

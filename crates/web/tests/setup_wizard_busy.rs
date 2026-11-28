@@ -769,6 +769,51 @@ async fn rs19_start_and_reset_respect_shared_checkout_guard_before_any_admission
 }
 
 #[tokio::test]
+async fn setup_refuses_an_unusable_default_branch_edited_into_the_configuration() {
+    // The service started with a valid branch; the file was then hand-edited.
+    let (addr, state, server, tmp, id, bare) = setup_wizard_fixture().await;
+    let config_path = tmp.path().join("config.toml");
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        &config_path,
+        text.replace(
+            "default_branch = \"main\"",
+            "default_branch = \"refs/heads/main\"",
+        ),
+    )
+    .unwrap();
+    let client = authed_client();
+    let status = setup_status(&client, addr).await;
+    assert_eq!(status["can_start"], false, "{status}");
+    assert!(status["start_blocked_reason"]
+        .as_str()
+        .unwrap()
+        .contains("github.default_branch"));
+    for route in ["import", "reset-reimport"] {
+        let response = client
+            .post(format!("http://{addr}/api/setup/{route}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "{route}");
+        assert_eq!(state.import_progress.read().await.phase, ImportPhase::Idle);
+        assert!(state.db.latest_import_operation(&id).unwrap().is_none());
+        assert!(state.db.setup_import_owner().unwrap().is_none());
+        assert!(!tmp.path().join("git-repo").exists(), "{route}");
+        assert!(git2::Repository::open_bare(&bare)
+            .unwrap()
+            .references()
+            .unwrap()
+            .next()
+            .is_none());
+    }
+    // Restoring a usable branch makes setup startable again.
+    std::fs::write(&config_path, text).unwrap();
+    assert_eq!(setup_status(&client, addr).await["can_start"], true);
+    server.abort();
+}
+
+#[tokio::test]
 async fn rs19_completed_setup_history_and_new_start_display_their_own_repository() {
     let (addr, state, server, _tmp, id, _) = setup_wizard_fixture().await;
     let mut other = state.db.get_repository(&id).unwrap().unwrap();
