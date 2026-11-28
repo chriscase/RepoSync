@@ -412,6 +412,52 @@ async fn test_git_connection(
 // Apply configuration
 // ---------------------------------------------------------------------------
 
+/// The only file the setup wizard writes mappings to: the configured
+/// `identity.mapping_file` (the file the identity mapper reads), or
+/// `identity-mappings.toml` beside the configuration file when none is set.
+fn setup_mapping_target(state: &AppState) -> std::path::PathBuf {
+    match &state.config.identity.mapping_file {
+        Some(path) => path.clone(),
+        None => config_dir(&state.config_path).join(DEFAULT_SETUP_MAPPING_FILE),
+    }
+}
+
+const DEFAULT_SETUP_MAPPING_FILE: &str = "identity-mappings.toml";
+
+fn config_dir(config_path: &std::path::Path) -> &std::path::Path {
+    config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
+/// Whether a requested mapping path names `target`: the same text, the same
+/// path resolved beside the configuration file, or the same file once both
+/// parent directories are canonicalized. Used only to decide whether to warn.
+fn mapping_path_matches(
+    requested: &str,
+    target: &std::path::Path,
+    config_path: &std::path::Path,
+) -> bool {
+    let requested = std::path::Path::new(requested);
+    let resolved = if requested.is_relative() {
+        config_dir(config_path).join(requested)
+    } else {
+        requested.to_path_buf()
+    };
+    if requested == target || resolved == target {
+        return true;
+    }
+    let canonical = |p: &std::path::Path| {
+        let name = p.file_name()?.to_owned();
+        let parent = match p.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => std::path::PathBuf::from("."),
+        };
+        Some(parent.canonicalize().ok()?.join(name))
+    };
+    matches!((canonical(&resolved), canonical(target)), (Some(a), Some(b)) if a == b)
+}
+
 async fn apply_config(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -427,51 +473,107 @@ async fn apply_config(
     }
     let mut warnings = Vec::new();
 
+    // The wizard writes mappings only to `mapping_target`. A requested path
+    // never chooses the write location; one that names another file is
+    // reported so the caller is not misled.
+    let mapping_target = setup_mapping_target(&state);
+    let writes_mappings = body
+        .identity_mappings
+        .as_ref()
+        .is_some_and(|m| !m.is_empty());
+    if let Some(requested) = body
+        .identity_mapping_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        if writes_mappings && !mapping_path_matches(requested, &mapping_target, &state.config_path)
+        {
+            warnings.push(format!(
+                "Identity mapping file '{}' was not used: the setup wizard writes only the \
+                 configured mapping file ({}).",
+                requested,
+                mapping_target.display()
+            ));
+        }
+    }
+    if writes_mappings && state.config.identity.mapping_file.is_none() {
+        warnings.push(format!(
+            "Identity mappings were saved to {}, but they take effect only once \
+             identity.mapping_file in the server configuration points to that file.",
+            mapping_target.display()
+        ));
+    }
+
     // Write identity mapping file if mappings are provided
     if let Some(ref mappings) = body.identity_mappings {
         if !mappings.is_empty() {
-            let mapping_path = body
-                .identity_mapping_file
-                .as_deref()
-                .unwrap_or("identity-mappings.toml");
-            let mut mapping_lines = Vec::new();
-            for m in mappings {
-                mapping_lines.push(format!("[mappings.\"{}\"]", m.svn_username));
-                mapping_lines.push(format!("name = \"{}\"", m.name));
-                mapping_lines.push(format!("email = \"{}\"", m.email));
-                mapping_lines.push(String::new());
-            }
-            let mapping_content = mapping_lines.join("\n");
-
-            // Resolve path relative to config file directory
-            let config_dir = state
-                .config_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."));
-            let full_mapping_path = if std::path::Path::new(mapping_path).is_absolute() {
-                std::path::PathBuf::from(mapping_path)
+            // Serialize in the format the identity mapper reads, so names and
+            // emails cannot inject TOML.
+            let authors: std::collections::HashMap<
+                String,
+                reposync_core::identity::mapping_file::AuthorEntry,
+            > = mappings
+                .iter()
+                .filter(|m| !m.svn_username.trim().is_empty())
+                .map(|m| {
+                    (
+                        m.svn_username.clone(),
+                        reposync_core::identity::mapping_file::AuthorEntry {
+                            name: m.name.clone(),
+                            email: m.email.clone(),
+                        },
+                    )
+                })
+                .collect();
+            // Merge into the existing file so entries the operator already
+            // maintains there are kept; the wizard's entries win on conflict.
+            use reposync_core::identity::mapping_file::MappingFile;
+            // One load-merge-save at a time, so concurrent applies cannot
+            // drop each other's entries.
+            static MAPPING_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _guard = MAPPING_WRITE.lock().unwrap_or_else(|p| p.into_inner());
+            let mut written = false;
+            let existing = if mapping_target.exists() {
+                MappingFile::load(&mapping_target).map(Some)
             } else {
-                config_dir.join(mapping_path)
+                Ok(None)
             };
-
-            if let Err(e) = std::fs::write(&full_mapping_path, &mapping_content) {
-                warnings.push(format!("Failed to write identity mapping file: {}", e));
-            } else {
-                info!(
-                    path = %full_mapping_path.display(),
-                    count = mappings.len(),
-                    "Wrote identity mappings file"
-                );
+            match existing {
+                _ if authors.is_empty() => {}
+                Err(e) => warnings.push(format!(
+                    "Identity mappings were not written: the existing file {} could not be read ({}), so it was left unchanged.",
+                    mapping_target.display(),
+                    e
+                )),
+                Ok(existing) => {
+                    let mut merged = existing.unwrap_or_default();
+                    merged.extend(authors);
+                    if let Err(e) = MappingFile::save(&mapping_target, &merged) {
+                        warnings.push(format!("Failed to write identity mapping file: {}", e));
+                    } else {
+                        written = true;
+                        info!(
+                            path = %mapping_target.display(),
+                            count = merged.len(),
+                            "Wrote identity mappings file"
+                        );
+                    }
+                }
             }
+            drop(_guard);
 
-            // Also store in DB for the dashboard to display
-            let db = &state.db;
-            let json_val = serde_json::to_string(mappings).unwrap_or_default();
-            let now = chrono::Utc::now().to_rfc3339();
-            let _ = db.conn().execute(
+            // Also store in DB for the dashboard to display, only when the
+            // file the mapper reads holds these entries.
+            if written {
+                let db = &state.db;
+                let json_val = serde_json::to_string(mappings).unwrap_or_default();
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = db.conn().execute(
                 "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('identity_mappings', ?1, ?2)",
                 rusqlite::params![json_val, now],
             );
+            }
         }
     }
 
