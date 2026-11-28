@@ -82,6 +82,14 @@ impl MappingFile {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
+        // A new file is written directly so it gets the usual umask-based
+        // mode (a temporary file would be created 0600); there is no
+        // existing content a failed write could truncate.
+        if std::fs::symlink_metadata(path).is_err() {
+            std::fs::write(path, toml_str).map_err(IdentityError::IoError)?;
+            debug!(count = mappings.len(), "saved new author mapping file");
+            return Ok(());
+        }
         let mut tmp = match tempfile::NamedTempFile::new_in(parent) {
             Ok(tmp) => tmp,
             // The directory may be writable only by an administrator while
@@ -231,6 +239,17 @@ email = "alice@example.com"
             .file_type()
             .is_symlink());
         assert!(dir.path().join("missing.toml").is_file());
+
+        // A new file is not left private to the writing user (0600).
+        let fresh = dir.path().join("fresh.toml");
+        MappingFile::save(&fresh, &HashMap::new()).unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        let umask_mode = {
+            let probe = dir.path().join("probe");
+            std::fs::write(&probe, "").unwrap();
+            std::fs::metadata(&probe).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode, umask_mode);
     }
 
     #[test]
