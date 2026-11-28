@@ -197,11 +197,20 @@ struct RepoDetail {
     history_boundary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot_pin: Option<SnapshotPin>,
+    /// Why scheduled sync is skipping this pair as it is stored. Absent
+    /// when its stored settings are usable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sync_configuration_problem: Option<String>,
 }
 
 impl From<reposync_core::models::Repository> for RepoDetail {
     fn from(r: reposync_core::models::Repository) -> Self {
         let archived = r.sync_status == "archived";
+        let sync_configuration_problem = if archived {
+            None
+        } else {
+            r.sync_configuration_problem()
+        };
         Self {
             save_receipt: None,
             id: r.id,
@@ -232,6 +241,7 @@ impl From<reposync_core::models::Repository> for RepoDetail {
             starting_revision: None,
             history_boundary: None,
             snapshot_pin: None,
+            sync_configuration_problem,
         }
     }
 }
