@@ -760,6 +760,7 @@ async fn manual_sync_names_the_stored_setting_that_blocks_sync() {
     .await;
     let id = created["id"].as_str().unwrap();
     let url = format!("http://{addr}/api/repos/{id}/sync");
+    let detail_url = format!("http://{addr}/api/repos/{id}");
     let good = state.db.get_repository(id).unwrap().unwrap();
 
     let response = client.post(&url).send().await.unwrap();
@@ -799,6 +800,17 @@ async fn manual_sync_names_the_stored_setting_that_blocks_sync() {
         let text = response.text().await.unwrap();
         assert!(text.contains(expected), "{expected}: {text}");
         assert!(text.contains("sync cannot run"), "{expected}: {text}");
+        // The pair's detail names the same problem, so the page can show it.
+        let detail: serde_json::Value = client
+            .get(&detail_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let shown = detail["sync_configuration_problem"].as_str().unwrap_or("");
+        assert!(shown.contains(expected), "{expected}: {detail}");
     }
 
     // Valid optional settings do not block.
@@ -807,6 +819,22 @@ async fn manual_sync_names_the_stored_setting_that_blocks_sync() {
     fine.blocked_patterns = Some("[]".into());
     state.db.update_repository(&fine).unwrap();
     assert_eq!(client.post(&url).send().await.unwrap().status(), 200);
+    let detail: serde_json::Value = client
+        .get(&detail_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        detail.get("sync_configuration_problem").is_none(),
+        "{detail}"
+    );
+    // The stored path rules come back, so an edit that resends the form
+    // does not clear them.
+    assert_eq!(detail["allowed_paths"], "[\"src/\"]");
+    assert_eq!(detail["blocked_patterns"], "[]");
     server.abort();
 }
 

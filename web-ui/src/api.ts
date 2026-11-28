@@ -961,6 +961,8 @@ export interface Repository {
   starting_revision?: number | null;
   history_boundary?: string | null;
   snapshot_pin?: SnapshotPin | null;
+  /** Why scheduled sync is skipping this pair as stored; absent when its settings are usable. */
+  sync_configuration_problem?: string | null;
 }
 
 export interface ImportStatus {

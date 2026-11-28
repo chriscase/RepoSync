@@ -83,6 +83,8 @@ Two later changes, newer than that pin:
 - It refuses with 400 if the pair's stored Git branch, SVN URL or branch, allowed
   paths or blocked patterns are ones scheduled sync cannot use. The reply names the
   setting.
+  The pair's detail (`GET /api/repos/{repo_id}`) carries the same text as
+  `"sync_configuration_problem"`, and the pair page shows it as a notice.
 - For a pair with sync turned on, it records a request and wakes the scheduler. The
   pair's poll wait is skipped once, when its next cycle starts. Every hold, pause and
   busy check still applies, and a request that cannot start within 15 minutes expires.
