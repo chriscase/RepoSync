@@ -111,6 +111,12 @@ describe('#264 G11.1 author identity mappings', () => {
     expect(button(html, 'Add')?.disabled).toBe(true);
   });
 
+  it('shows the server notes from a save', () => {
+    const html = mappingsView({ saveWarnings: ['take effect only once identity.mapping_file points to that file'] });
+    expect(html).toContain('<div role="status" class="rs-bn rs-bn--warn mb-4 bg-yellow-900/30 border border-yellow-700 text-yellow-300 px-4 py-3 rounded text-sm space-y-1"><p>take effect only once identity.mapping_file points to that file</p></div>');
+    expect(mappingsView({ saveWarnings: ['x'], saveError: 'API error 500: fixture' })).not.toContain('role="status" class="rs-bn rs-bn--warn');
+  });
+
   it('shows a failed save with the client error text', () => {
     const html = mappingsView({ saveError: 'API error 500: fixture' });
     expect(html).toContain('<div role="alert" class="rs-bn rs-bn--danger mb-4 bg-red-900/40 border border-red-700 text-red-300 px-4 py-3 rounded text-sm space-y-1"><p class="font-medium">The mappings were not saved</p><p>API error 500: fixture</p></div>');

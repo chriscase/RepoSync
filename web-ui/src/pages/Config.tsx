@@ -54,9 +54,14 @@ function AdminConfig() {
   const [confirmRemove, setConfirmRemove] = useState<AuthorMapping | null>(null);
 
   const updateMutation = useMutation({
-    mutationFn: (updated: AuthorMapping[]) =>
-      api.updateIdentityMappings(updated),
+    // The loaded list goes with every save, so an edit made elsewhere since
+    // (another tab, the setup wizard, the file itself) is not overwritten.
+    mutationFn: ({ updated, base }: { updated: AuthorMapping[]; base: AuthorMapping[] }) =>
+      api.updateIdentityMappings(updated, base),
     onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: ['identityMappings'] }),
+    // A refused save may mean the list changed elsewhere: show the current one.
+    onError: () =>
       queryClient.invalidateQueries({ queryKey: ['identityMappings'] }),
   });
 
@@ -73,7 +78,7 @@ function AdminConfig() {
     if (!listKnown || !mappings) return;
     if (!newMapping.svn_username || !newMapping.name || !newMapping.email) return;
     const updated = [...mappings, newMapping];
-    updateMutation.mutate(updated, { onSuccess: () => setNewMapping(EMPTY_MAPPING) });
+    updateMutation.mutate({ updated, base: mappings }, { onSuccess: () => setNewMapping(EMPTY_MAPPING) });
   };
 
   const askRemove = (mapping: AuthorMapping) => {
@@ -86,7 +91,7 @@ function AdminConfig() {
     const updated = mappings.filter(
       (m) => m.svn_username !== svnUsername
     );
-    updateMutation.mutate(updated, { onSuccess: () => setConfirmRemove(null) });
+    updateMutation.mutate({ updated, base: mappings }, { onSuccess: () => setConfirmRemove(null) });
   };
 
   // The first read keeps the page-level loading line. A retry after a failed
@@ -106,6 +111,7 @@ function AdminConfig() {
         readError={readError ? readError.message : ''}
         saving={updateMutation.isPending}
         saveError={!confirmRemove && updateMutation.error ? updateMutation.error.message : ''}
+        saveWarnings={updateMutation.data?.warnings ?? []}
         newMapping={newMapping}
         onNewMapping={setNewMapping}
         onAdd={addMapping}
@@ -159,6 +165,8 @@ export interface IdentityMappingsViewProps {
   readError: string;
   saving: boolean;
   saveError: string;
+  /** Server notes on the last successful save, such as a mapping file the server does not read yet. */
+  saveWarnings?: string[];
   newMapping: AuthorMapping;
   onNewMapping: (mapping: AuthorMapping) => void;
   onAdd: () => void;
@@ -166,7 +174,7 @@ export interface IdentityMappingsViewProps {
   onRetry: () => void;
 }
 
-export function IdentityMappingsView({ mappings, loading, readError, saving, saveError, newMapping, onNewMapping, onAdd, onRemove, onRetry }: IdentityMappingsViewProps) {
+export function IdentityMappingsView({ mappings, loading, readError, saving, saveError, saveWarnings = [], newMapping, onNewMapping, onAdd, onRemove, onRetry }: IdentityMappingsViewProps) {
   const t = useText();
   const editingOff = mappings === undefined;
   return (
@@ -176,7 +184,9 @@ export function IdentityMappingsView({ mappings, loading, readError, saving, sav
       </h2>
       <p className="text-sm text-gray-400 mb-4">
         Map SVN usernames to Git author identities. These mappings ensure
-        commits are attributed to the correct developer on both sides.
+        commits are attributed to the correct developer on both sides. They
+        are saved to the server's identity mapping file, and syncs use a saved
+        change from their next commit.
       </p>
 
       {loading && (
@@ -202,6 +212,12 @@ export function IdentityMappingsView({ mappings, loading, readError, saving, sav
         <div role="alert" className="rs-bn rs-bn--danger mb-4 bg-red-900/40 border border-red-700 text-red-300 px-4 py-3 rounded text-sm space-y-1">
           <p className="font-medium">The mappings were not saved</p>
           <p>{saveError}</p>
+        </div>
+      )}
+
+      {saveWarnings.length > 0 && !saveError && (
+        <div role="status" className="rs-bn rs-bn--warn mb-4 bg-yellow-900/30 border border-yellow-700 text-yellow-300 px-4 py-3 rounded text-sm space-y-1">
+          {saveWarnings.map((w) => <p key={w}>{w}</p>)}
         </div>
       )}
 

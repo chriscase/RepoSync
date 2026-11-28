@@ -1,5 +1,6 @@
 //! Configuration API endpoints.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::auth::validate_session_with_role;
 use crate::api::status::AppError;
 use crate::AppState;
+use reposync_core::identity::mapping_file::{AuthorEntry, MappingFile};
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -81,6 +83,10 @@ struct AuthorMapping {
 #[derive(Deserialize)]
 struct UpdateMappingsRequest {
     mappings: Vec<AuthorMapping>,
+    /// The list the editor loaded. When given, the save is refused if the
+    /// mappings changed since, so a concurrent edit is not overwritten.
+    #[serde(default)]
+    base: Option<Vec<AuthorMapping>>,
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -150,6 +156,11 @@ async fn get_config(
     }))
 }
 
+/// The mappings the identity mapper reads: the entries of the mapping file
+/// the server writes. The GitHub login, which that file does not hold, comes
+/// from the copy kept in the database. Before that file exists, the list
+/// saved in the database by earlier versions is returned, so saving it again
+/// writes it to the file.
 async fn get_identity_mappings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -160,22 +171,65 @@ async fn get_identity_mappings(
     )
     .await?;
 
-    let db = &state.db;
+    let target = crate::api::setup::setup_mapping_target(&state);
+    Ok(Json(listed_mappings(&state, &target)?))
+}
 
-    let value: Option<String> = db
+/// The list GET shows: the mapping file's entries with GitHub logins from
+/// the database copy, or that copy alone before the file exists.
+fn listed_mappings(
+    state: &AppState,
+    target: &std::path::Path,
+) -> Result<Vec<AuthorMapping>, AppError> {
+    let saved = saved_mappings(state)?;
+    if !target.exists() {
+        return Ok(saved);
+    }
+    let entries = MappingFile::load(target).map_err(|e| {
+        AppError::Internal(format!(
+            "could not read identity mapping file {}: {}",
+            target.display(),
+            e
+        ))
+    })?;
+    let github: HashMap<String, String> = saved
+        .into_iter()
+        .filter_map(|m| m.github.map(|g| (m.svn_username, g)))
+        .collect();
+    let mut mappings: Vec<AuthorMapping> = entries
+        .into_iter()
+        .map(|(svn_username, entry)| AuthorMapping {
+            github: github.get(&svn_username).cloned(),
+            svn_username,
+            name: entry.name,
+            email: entry.email,
+        })
+        .collect();
+    mappings.sort_by(|a, b| a.svn_username.cmp(&b.svn_username));
+    Ok(mappings)
+}
+
+/// The identities a list maps, ignoring order and GitHub logins.
+fn identities(list: &[AuthorMapping]) -> std::collections::BTreeMap<&str, (&str, &str)> {
+    list.iter()
+        .map(|m| (m.svn_username.as_str(), (m.name.as_str(), m.email.as_str())))
+        .collect()
+}
+
+fn saved_mappings(state: &AppState) -> Result<Vec<AuthorMapping>, AppError> {
+    match state
+        .db
         .get_state("identity_mappings")
-        .map_err(|e| AppError::Internal(format!("db error: {}", e)))?;
-
-    match value {
-        Some(json_str) => {
-            let mappings: Vec<AuthorMapping> = serde_json::from_str(&json_str)
-                .map_err(|e| AppError::Internal(format!("parse identity mappings: {}", e)))?;
-            Ok(Json(mappings))
-        }
-        None => Ok(Json(vec![])),
+        .map_err(|e| AppError::Internal(format!("db error: {}", e)))?
+    {
+        Some(json_str) => serde_json::from_str(&json_str)
+            .map_err(|e| AppError::Internal(format!("parse identity mappings: {}", e))),
+        None => Ok(vec![]),
     }
 }
 
+/// Replace the identity mappings. The list is written to the mapping file the
+/// identity mapper reads, which picks up the change on its next lookup.
 async fn update_identity_mappings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -187,17 +241,86 @@ async fn update_identity_mappings(
     )
     .await?;
 
-    let json_str = serde_json::to_string(&body.mappings)
+    let mut authors: HashMap<String, AuthorEntry> = HashMap::new();
+    let mut saved = Vec::with_capacity(body.mappings.len());
+    for m in &body.mappings {
+        let mapping = AuthorMapping {
+            svn_username: m.svn_username.trim().to_string(),
+            name: m.name.trim().to_string(),
+            email: m.email.trim().to_string(),
+            github: m
+                .github
+                .as_deref()
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+                .map(str::to_string),
+        };
+        if mapping.svn_username.is_empty() || mapping.name.is_empty() || mapping.email.is_empty() {
+            return Err(AppError::BadRequest(
+                "each mapping needs an SVN username, a name and an email".into(),
+            ));
+        }
+        let entry = AuthorEntry {
+            name: mapping.name.clone(),
+            email: mapping.email.clone(),
+        };
+        if authors
+            .insert(mapping.svn_username.clone(), entry)
+            .is_some()
+        {
+            return Err(AppError::BadRequest(format!(
+                "SVN username '{}' is mapped more than once",
+                mapping.svn_username
+            )));
+        }
+        saved.push(mapping);
+    }
+    let json_str = serde_json::to_string(&saved)
         .map_err(|e| AppError::Internal(format!("serialize mappings: {}", e)))?;
 
-    let db = &state.db;
+    let target = crate::api::setup::setup_mapping_target(&state);
+    {
+        let _guard = crate::api::setup::MAPPING_WRITE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(base) = &body.base {
+            let current = listed_mappings(&state, &target)?;
+            if identities(&current) != identities(base) {
+                return Err(AppError::Conflict(
+                    "The identity mappings changed since this page loaded them. Reload and make the change again.".into(),
+                ));
+            }
+        }
+        // An empty list on a server with no mapping file has nothing to write.
+        if !(authors.is_empty() && !target.exists()) {
+            MappingFile::save(&target, &authors).map_err(|e| {
+                AppError::Internal(format!(
+                    "could not write identity mapping file {}: {}",
+                    target.display(),
+                    e
+                ))
+            })?;
+        }
+        // The copy that keeps GitHub logins, written under the same lock so
+        // it matches the file.
+        state
+            .db
+            .set_state("identity_mappings", &json_str)
+            .map_err(|e| AppError::Internal(format!("db error: {}", e)))?;
+    }
 
-    db.set_state("identity_mappings", &json_str)
-        .map_err(|e| AppError::Internal(format!("db error: {}", e)))?;
-
+    let mut warnings = Vec::new();
+    if state.config.identity.mapping_file.is_none() && !authors.is_empty() {
+        warnings.push(format!(
+            "Identity mappings were saved to {}, but they take effect only once \
+             identity.mapping_file in the server configuration points to that file.",
+            target.display()
+        ));
+    }
     Ok(Json(serde_json::json!({
         "ok": true,
-        "count": body.mappings.len(),
+        "count": saved.len(),
+        "warnings": warnings,
     })))
 }
 

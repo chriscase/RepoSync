@@ -39,6 +39,28 @@ pub struct IdentityMapper {
     email_domain: Option<String>,
     /// LDAP resolver (if configured).
     ldap: Option<Arc<RwLock<LdapResolver>>>,
+    /// The mapping file version last loaded or attempted, so a lookup can
+    /// pick up a file that was saved since (for example from Settings).
+    loaded_stamp: std::sync::Mutex<Option<FileStamp>>,
+}
+
+/// What identifies one saved version of the mapping file.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct FileStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+        #[cfg(unix)]
+        inode: std::os::unix::fs::MetadataExt::ino(&meta),
+    })
 }
 
 impl IdentityMapper {
@@ -50,6 +72,7 @@ impl IdentityMapper {
         info!("initializing identity mapper");
 
         // Load mapping file if specified.
+        let stamp = config.mapping_file.as_deref().and_then(file_stamp);
         let entries = match &config.mapping_file {
             Some(path) if path.exists() => {
                 info!(path = %path.display(), "loading identity mapping file");
@@ -91,7 +114,31 @@ impl IdentityMapper {
             mapping_file_path: config.mapping_file.clone(),
             email_domain: config.email_domain.clone(),
             ldap,
+            loaded_stamp: std::sync::Mutex::new(stamp),
         })
+    }
+
+    /// Reload the mapping file if it was saved since it was last read, so a
+    /// running sync uses mappings edited in Settings without a restart. A
+    /// file that is missing keeps the current mappings, and one that cannot
+    /// be parsed is reported once and also keeps them.
+    fn refresh_if_changed(&self) {
+        let Some(path) = &self.mapping_file_path else {
+            return;
+        };
+        let Some(stamp) = file_stamp(path) else {
+            return;
+        };
+        {
+            let mut loaded = self.loaded_stamp.lock().unwrap_or_else(|p| p.into_inner());
+            if loaded.as_ref() == Some(&stamp) {
+                return;
+            }
+            *loaded = Some(stamp);
+        }
+        if let Err(e) = self.reload() {
+            warn!(path = %path.display(), error = %e, "identity mapping file changed but could not be read; keeping the previous mappings");
+        }
     }
 
     /// Map an SVN username to a Git identity.
@@ -101,6 +148,7 @@ impl IdentityMapper {
     /// 2. LDAP (if configured)
     /// 3. Fallback: derive from username + email_domain
     pub fn svn_to_git(&self, svn_username: &str) -> Result<GitIdentity, IdentityError> {
+        self.refresh_if_changed();
         // 1. Check mapping file cache.
         {
             let cache = self
@@ -154,6 +202,7 @@ impl IdentityMapper {
     /// 2. LDAP reverse lookup
     /// 3. Derive from email local-part
     pub fn git_to_svn(&self, git_name: &str, git_email: &str) -> Result<String, IdentityError> {
+        self.refresh_if_changed();
         // 1. Check reverse cache.
         {
             let reverse = self
@@ -381,5 +430,49 @@ email = "bob@example.com"
         mapper.reload().unwrap();
         let identity = mapper.svn_to_git("bob").unwrap();
         assert_eq!(identity.name, "Bob Builder");
+    }
+
+    #[test]
+    fn a_saved_mapping_file_is_picked_up_without_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authors.toml");
+        // The mapper starts before the file exists.
+        let mapper = IdentityMapper::new(&config_with_file(&path)).unwrap();
+        assert_eq!(mapper.svn_to_git("jdoe").unwrap().email, "jdoe@example.com");
+
+        let mut authors = HashMap::new();
+        authors.insert(
+            "jdoe".to_string(),
+            AuthorEntry {
+                name: "John Doe".into(),
+                email: "john.doe@example.com".into(),
+            },
+        );
+        MappingFile::save(&path, &authors).unwrap();
+        assert_eq!(
+            mapper.svn_to_git("jdoe").unwrap().email,
+            "john.doe@example.com"
+        );
+        assert_eq!(
+            mapper
+                .git_to_svn("John Doe", "john.doe@example.com")
+                .unwrap(),
+            "jdoe"
+        );
+
+        // A changed entry replaces the old one, and a removed one is gone.
+        authors.insert(
+            "jdoe".to_string(),
+            AuthorEntry {
+                name: "John Doe".into(),
+                email: "jd@example.com".into(),
+            },
+        );
+        MappingFile::save(&path, &authors).unwrap();
+        assert_eq!(mapper.svn_to_git("jdoe").unwrap().email, "jd@example.com");
+
+        // A file that cannot be parsed keeps the previous mappings.
+        std::fs::write(&path, "not [valid toml").unwrap();
+        assert_eq!(mapper.svn_to_git("jdoe").unwrap().email, "jd@example.com");
     }
 }

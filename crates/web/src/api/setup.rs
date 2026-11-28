@@ -508,7 +508,14 @@ async fn test_git_connection(
 /// The only file the setup wizard writes mappings to: the configured
 /// `identity.mapping_file` (the file the identity mapper reads), or
 /// `identity-mappings.toml` beside the configuration file when none is set.
-fn setup_mapping_target(state: &AppState) -> std::path::PathBuf {
+/// Serializes every load-merge-save of the identity mapping file (setup apply
+/// and the Settings page), so concurrent saves cannot drop each other's
+/// entries.
+pub(crate) static MAPPING_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The identity mapping file the server writes: `identity.mapping_file`, or
+/// `identity-mappings.toml` beside the configuration file.
+pub(crate) fn setup_mapping_target(state: &AppState) -> std::path::PathBuf {
     match &state.config.identity.mapping_file {
         Some(path) => path.clone(),
         None => config_dir(&state.config_path).join(DEFAULT_SETUP_MAPPING_FILE),
@@ -740,9 +747,8 @@ async fn apply_config(
             // Merge into the existing file so entries the operator already
             // maintains there are kept; the wizard's entries win on conflict.
             use reposync_core::identity::mapping_file::MappingFile;
-            // One load-merge-save at a time, so concurrent applies cannot
+            // One load-merge-save at a time, so concurrent saves cannot
             // drop each other's entries.
-            static MAPPING_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
             let _guard = MAPPING_WRITE.lock().unwrap_or_else(|p| p.into_inner());
             let mut written = false;
             let existing = if mapping_target.exists() {
@@ -772,19 +778,50 @@ async fn apply_config(
                     }
                 }
             }
-            drop(_guard);
-
-            // Also store in DB for the dashboard to display, only when the
-            // file the mapper reads holds these entries.
+            // Also update the database copy (which keeps GitHub logins) only
+            // when the file the mapper reads holds these entries. Entries the
+            // wizard did not send are kept, as they are in the file. Written
+            // under the same lock as the file.
             if written {
-                let db = &state.db;
-                let json_val = serde_json::to_string(mappings).unwrap_or_default();
-                let now = chrono::Utc::now().to_rfc3339();
-                let _ = db.conn().execute(
-                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('identity_mappings', ?1, ?2)",
-                rusqlite::params![json_val, now],
-            );
+                let mut copy: Vec<serde_json::Value> = state
+                    .db
+                    .get_state("identity_mappings")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| serde_json::from_str(&v).ok())
+                    .unwrap_or_default();
+                let sent: Vec<&IdentityMappingEntry> = mappings
+                    .iter()
+                    .filter(|m| !m.svn_username.trim().is_empty())
+                    .collect();
+                // A sent entry replaces the stored one, keeping its GitHub login.
+                for m in sent {
+                    let previous = copy
+                        .iter()
+                        .position(|old| {
+                            old["svn_username"].as_str() == Some(m.svn_username.as_str())
+                        })
+                        .map(|i| copy.remove(i));
+                    let mut entry = serde_json::json!({
+                        "svn_username": m.svn_username,
+                        "name": m.name,
+                        "email": m.email,
+                    });
+                    if let Some(github) = previous
+                        .as_ref()
+                        .and_then(|p| p.get("github"))
+                        .filter(|g| g.is_string())
+                    {
+                        entry["github"] = github.clone();
+                    }
+                    copy.push(entry);
+                }
+                let json_val = serde_json::to_string(&copy).unwrap_or_default();
+                if let Err(e) = state.db.set_state("identity_mappings", &json_val) {
+                    warnings.push(format!("Failed to record the identity mappings: {}", e));
+                }
             }
+            drop(_guard);
         }
     }
 
