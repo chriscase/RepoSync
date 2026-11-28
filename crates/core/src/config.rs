@@ -738,6 +738,15 @@ impl AppConfig {
                 detail: "GitHub repo must be in 'owner/repo' format".into(),
             });
         }
+        // The daemon creates the first repository pair and initializes its
+        // Git bridge from this branch, so refuse a name Git cannot use before
+        // anything is written.
+        if let Some(problem) = crate::git::git_branch_name_problem(&self.github.default_branch) {
+            return Err(ConfigError::InvalidValue {
+                field: "github.default_branch".into(),
+                detail: format!("'{}' {}", self.github.default_branch, problem),
+            });
+        }
         if self.daemon.poll_interval_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "daemon.poll_interval_secs".into(),
@@ -897,6 +906,35 @@ auto_merge = false
             result,
             Err(ConfigError::InvalidValue { ref field, .. }) if field == "github.repo"
         ));
+    }
+
+    #[test]
+    fn test_validate_rejects_an_unusable_default_branch() {
+        for branch in [
+            "",
+            "refs/heads/main",
+            "HEAD",
+            "-main",
+            "a..b",
+            "feature/",
+            "x\u{7f}",
+        ] {
+            let mut config: AppConfig = toml::from_str(sample_toml()).unwrap();
+            config.github.default_branch = branch.into();
+            let result = config.validate();
+            assert!(
+                matches!(
+                    result,
+                    Err(ConfigError::InvalidValue { ref field, .. }) if field == "github.default_branch"
+                ),
+                "{branch:?}: {result:?}"
+            );
+        }
+        for branch in ["main", "release/2026.11", "feature-x"] {
+            let mut config: AppConfig = toml::from_str(sample_toml()).unwrap();
+            config.github.default_branch = branch.into();
+            config.validate().unwrap();
+        }
     }
 
     #[test]
