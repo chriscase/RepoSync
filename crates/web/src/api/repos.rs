@@ -457,6 +457,7 @@ async fn create_repo(
     if body.svn_url.is_empty() {
         return Err(AppError::BadRequest("svn_url is required".into()));
     }
+    require_valid_git_branch(&body.git_branch)?;
 
     let payload = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.to_string()))?;
     let request_id = body.save_request_id.clone();
@@ -537,6 +538,14 @@ async fn get_repo(
     Ok(Json(enrich_repo_detail(db, RepoDetail::from(repo))?))
 }
 
+/// Refuse a pair Git branch the engine could not fetch or push.
+fn require_valid_git_branch(name: &str) -> Result<(), AppError> {
+    match reposync_core::git::git_branch_name_problem(name) {
+        None => Ok(()),
+        Some(problem) => Err(AppError::BadRequest(format!("git_branch {}", problem))),
+    }
+}
+
 fn repository_settings_writable(db: &Database, id: &str) -> Result<(), AppError> {
     db.require_repository_import_released(id)
         .map_err(|e| save_error(e.into()))?;
@@ -595,6 +604,9 @@ async fn update_repo(
         }
     }
     writable?;
+    if let Some(branch) = body.git_branch() {
+        require_valid_git_branch(branch)?;
+    }
 
     let (current, receipt) = db
         .save_repository_settings(&id, &user_id, body, &payload)

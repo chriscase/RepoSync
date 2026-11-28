@@ -591,6 +591,12 @@ async fn apply_config(
         )
         .await?;
     }
+    // Refuse before anything is written.
+    if let Some(branch) = body.git_default_branch.as_deref() {
+        if let Some(problem) = reposync_core::git::git_branch_name_problem(branch) {
+            return Err(AppError::BadRequest(format!("Git branch {}", problem)));
+        }
+    }
     let mut warnings = Vec::new();
 
     // The wizard writes mappings only to `mapping_target`. A requested path
