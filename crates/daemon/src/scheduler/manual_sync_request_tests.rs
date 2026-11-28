@@ -152,7 +152,8 @@ async fn an_ordinary_cycle_does_not_start_the_gap() {
         allowed_paths: None,
         blocked_patterns: None,
     }]);
-    let _ = tick(&scheduler).await;
+    let log = tick(&scheduler).await;
+    assert!(logged(&log, "starting per-repo sync cycle", id), "{log}");
     assert_eq!(
         scheduler
             .db

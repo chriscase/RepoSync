@@ -1707,8 +1707,11 @@ impl Database {
     /// The requested cycle is starting: use up the request and remember
     /// when, so the next request waits out the minimum gap.
     pub fn start_requested_manual_sync(&self, repo_id: &str) -> Result<(), DatabaseError> {
-        self.set_state(&manual_sync_started_key(repo_id), &Utc::now().to_rfc3339())?;
-        self.clear_manual_sync_request(repo_id)
+        // Clear the request even when the start time cannot be written, so
+        // a failed write costs the gap once and never repeats the cycle.
+        let started = self.set_state(&manual_sync_started_key(repo_id), &Utc::now().to_rfc3339());
+        let cleared = self.clear_manual_sync_request(repo_id);
+        started.and(cleared)
     }
 
     /// Whether a manual sync request is waiting for this pair. A request
@@ -5291,8 +5294,16 @@ mod tests {
         };
         db.insert_sync_record(&record).unwrap();
 
+        db.request_manual_sync("repo1").unwrap();
+        db.start_requested_manual_sync("repo1").unwrap();
+        db.request_manual_sync("repo1").unwrap();
+        db.set_state("manual_sync_requested_repo1", "waiting")
+            .unwrap();
+
         // Delete
         db.hard_delete_repository("repo1").unwrap();
+        assert_eq!(db.get_state("manual_sync_requested_repo1").unwrap(), None);
+        assert_eq!(db.get_state("manual_sync_started_repo1").unwrap(), None);
 
         // Verify repo gone
         assert!(db.get_repository("repo1").unwrap().is_none());
