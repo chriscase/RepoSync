@@ -2568,6 +2568,7 @@ function syncReplyLabel(reply: { queued?: boolean; not_queued_reason?: string | 
   if (reply.queued !== false) return 'Sync Triggered';
   if (reply.not_queued_reason === 'paused') return 'Sync is paused';
   if (reply.not_queued_reason === 'disabled') return 'Sync is off';
+  if (reply.not_queued_reason === 'held') return 'Sync is held';
   return reply.retry_after_secs ? `Sync just started, wait ${reply.retry_after_secs}s` : 'Not queued';
 }
 

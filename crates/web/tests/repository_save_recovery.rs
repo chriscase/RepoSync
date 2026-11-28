@@ -810,6 +810,74 @@ async fn manual_sync_names_the_stored_setting_that_blocks_sync() {
     server.abort();
 }
 
+/// A pair held until a write is reconciled is skipped by the scheduler, so
+/// a manual sync request for it is not queued and the reply says why.
+#[tokio::test]
+async fn manual_sync_is_not_queued_for_a_pair_held_for_reconciliation() {
+    use reposync_core::db::git_push_operations::GitPushIntent;
+    let (addr, state, server, _tmp) = save_fixture(&[]).await;
+    let client = authed_client();
+    let created = create(
+        &client,
+        addr,
+        &create_body(&uuid::Uuid::new_v4().to_string()),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap();
+    let url = format!("http://{addr}/api/repos/{id}/sync");
+    let sha = "a".repeat(40);
+    let tree = "b".repeat(40);
+    let push = state
+        .db
+        .begin_svn_to_git_push(GitPushIntent {
+            repo_id: id,
+            initiator_id: "fixture",
+            request_id: "held-push",
+            target_fingerprint: "target",
+            source_svn_rev: 2,
+            source_svn_author: "fixture",
+            source_svn_message: "fixture",
+            pre_push_git_remote: "file:///fixture/git",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: &sha,
+            pre_push_git_tree: Some(&tree),
+            intended_local_git_sha: &"c".repeat(40),
+            intended_local_git_parent: Some(&sha),
+            intended_local_git_tree: &tree,
+        })
+        .unwrap();
+
+    // Still in flight: not a hold, the request is queued.
+    let body: serde_json::Value = client
+        .post(&url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["queued"], true, "{body}");
+    state.db.clear_manual_sync_request(id).unwrap();
+
+    state
+        .db
+        .hold_svn_to_git_reconciliation(id, &push.id, "fixture hold")
+        .unwrap();
+    let body: serde_json::Value = client
+        .post(&url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["queued"], false, "{body}");
+    assert_eq!(body["not_queued_reason"], "held");
+    assert!(!state.db.manual_sync_requested(id));
+    server.abort();
+}
+
 /// A manual sync request is queued for the scheduler only when the pair can
 /// act on it: sync is on and its stored settings are usable.
 #[tokio::test]

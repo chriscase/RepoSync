@@ -1248,14 +1248,20 @@ async fn trigger_sync(
     use reposync_core::db::queries::ManualSyncRequest;
     let mut retry_after_secs = None;
     // Why the request was not queued, when it was not. A pair that is
-    // paused after an error is not queued either: the scheduler skips it,
-    // and the request would run unasked once sync is resumed.
+    // paused after an error, or held until a write is reconciled, is not
+    // queued either: the scheduler skips it, and the request would run
+    // unasked once the pause or hold is lifted.
     let not_queued = if !repo.enabled {
         Some(("disabled", "Sync is turned off for this repository"))
     } else if repo.sync_status == "error_paused" {
         Some((
             "paused",
             "Sync is paused after an error. Resume sync for this repository, then ask again",
+        ))
+    } else if sync_held_for_reconciliation(db, &id)? {
+        Some((
+            "held",
+            "Sync is held until an unconfirmed write is reconciled for this repository",
         ))
     } else {
         match db.request_manual_sync(&id) {
@@ -1302,6 +1308,27 @@ async fn trigger_sync(
 // ---------------------------------------------------------------------------
 // Per-repo import
 // ---------------------------------------------------------------------------
+
+/// Whether the scheduler is skipping this pair until an operator reconciles
+/// an unconfirmed git-to-svn commit or svn-to-git push. An unfinished write
+/// that is still in flight is not a hold.
+fn sync_held_for_reconciliation(db: &Database, repo_id: &str) -> Result<bool, AppError> {
+    use reposync_core::db::git_push_operations::GitPushOperationState;
+    use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
+    let commit_held = db
+        .active_svn_commit_operation(repo_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .is_some_and(|op| {
+            op.state == SvnCommitOperationState::ReconciliationRequired && !op.resume_authorized
+        });
+    let push_held = db
+        .active_git_push_operation(repo_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .is_some_and(|op| {
+            op.state == GitPushOperationState::ReconciliationRequired && !op.resume_authorized
+        });
+    Ok(commit_held || push_held)
+}
 
 fn reject_held_import(db: &Database, repo_id: &str) -> Result<(), AppError> {
     if db

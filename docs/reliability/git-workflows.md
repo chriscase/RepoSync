@@ -49,11 +49,12 @@ POST /api/repos/{repo_id}/sync
 Authorization: Bearer <session>
 ```
 
-The response `{"ok": true, "message": "Sync triggered"}` means the request was
-recorded. It does not mean the cycle finished. Read the repository status
+A response with `"queued": true` means the request was recorded. It does not
+mean the cycle finished. Read the repository status
 (`GET /api/status?repo_id={repo_id}`, same bearer token) or the UI. If the
-repository is held for reconciliation or removal, the sync route refuses and
-no new cycle starts.
+repository has unresolved import work or is being removed, the sync route
+refuses. If sync is off, paused, or held until a commit or push is reconciled,
+the response says `"queued": false` with the reason, and no new cycle starts.
 
 Ordinary publication appends commits. It is a fast-forward of the paired ref.
 It is not a force push.

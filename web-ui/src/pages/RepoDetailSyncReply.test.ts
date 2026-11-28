@@ -12,6 +12,7 @@ describe('Sync Now reply label', () => {
   it('does not claim a sync for a pair that was not queued', () => {
     expect(syncReplyLabel({ queued: false, not_queued_reason: 'paused' })).toBe('Sync is paused');
     expect(syncReplyLabel({ queued: false, not_queued_reason: 'disabled' })).toBe('Sync is off');
+    expect(syncReplyLabel({ queued: false, not_queued_reason: 'held' })).toBe('Sync is held');
     expect(syncReplyLabel({ queued: false, retry_after_secs: null })).toBe('Not queued');
   });
 });
