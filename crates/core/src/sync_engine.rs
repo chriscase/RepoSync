@@ -387,12 +387,27 @@ fn sync_git_command_output(
     timeout: Duration,
     http_auth_token: Option<String>,
 ) -> Option<std::process::Output> {
+    sync_git_command_output_with_index(repo_path, args, timeout, http_auth_token, None)
+}
+
+/// As `sync_git_command_output`, optionally against a private index file
+/// instead of the repository's own.
+fn sync_git_command_output_with_index(
+    repo_path: &Path,
+    args: &[&str],
+    timeout: Duration,
+    http_auth_token: Option<String>,
+    index_file: Option<&Path>,
+) -> Option<std::process::Output> {
     let arg_refs: Vec<&str> = args.to_vec();
     let mut command = crate::git::subprocess_auth::build_git_cli_command(
         repo_path,
         &arg_refs,
         http_auth_token.as_deref(),
     );
+    if let Some(index_file) = index_file {
+        command.env("GIT_INDEX_FILE", index_file);
+    }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
@@ -4099,10 +4114,38 @@ impl SyncEngine {
                                 "LFS pointer filter is ambiguous because local attribute overrides exist",
                                 Some(&change.sha), None, None, None));
                         }
-                        let source = format!("--source={}", change.sha);
-                        let attributes = sync_git_command_output(git.repo_path(),
-                            &["check-attr", "-z", &source, "--all", "--", &item.path],
-                            Duration::from_secs(5), None)
+                        // `check-attr --source` needs Git 2.40. Reading the
+                        // source commit into a private index and querying
+                        // that index answers the same question on older Git.
+                        // The repository's own index and worktree are not
+                        // touched.
+                        let attributes = tempfile::Builder::new()
+                            .prefix("reposync-attr-index-")
+                            .tempdir_in(git.repo().path())
+                            .ok()
+                            .and_then(|scratch| {
+                                let index = scratch.path().join("index");
+                                // Some Git releases skip index attribute
+                                // files outside a sparse cone. The private
+                                // index always holds the whole commit.
+                                const WHOLE: [&str; 4] = ["-c", "core.sparseCheckout=false",
+                                    "-c", "index.sparse=false"];
+                                let read_tree = [&WHOLE[..], &["read-tree", &change.sha]].concat();
+                                sync_git_command_output_with_index(git.repo_path(),
+                                    &read_tree,
+                                    Duration::from_secs(30), None, Some(&index))
+                                    .filter(|output| output.status.success())?;
+                                // An absent index would read as "no
+                                // attributes", so require the one just built.
+                                if !index.is_file() {
+                                    return None;
+                                }
+                                let check = [&WHOLE[..], &["check-attr", "-z", "--cached",
+                                    "--all", "--", &item.path]].concat();
+                                sync_git_command_output_with_index(git.repo_path(),
+                                    &check,
+                                    Duration::from_secs(5), None, Some(&index))
+                            })
                             .filter(|output| output.status.success())
                             .ok_or_else(|| self.record_history_block("unsupported_git_semantics",
                                 "LFS pointer source attributes could not be verified; no SVN publication is permitted",
