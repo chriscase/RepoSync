@@ -8,6 +8,7 @@
 
 mod personal;
 mod status;
+mod svn_hook;
 mod svn_recovery;
 mod svn_recovery_args;
 mod upgrade_preflight;
@@ -65,6 +66,12 @@ enum Commands {
     RecoverSvnLineage {
         #[command(subcommand)]
         action: svn_recovery_args::RecoveryAction,
+    },
+
+    /// Install or remove the SVN post-commit notification (run on the SVN server).
+    SvnHook {
+        #[command(subcommand)]
+        action: svn_hook::SvnHookAction,
     },
 
     /// Manage sync conflicts.
@@ -192,6 +199,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::UpgradePreflight { database } => upgrade_preflight::run(&database),
         Commands::RecoverSvnLineage { action } => svn_recovery::run(action).await,
         Commands::Validate => cmd_validate(&cli.config),
+        Commands::SvnHook { action } => svn_hook::run(action),
         Commands::Personal {
             personal_config,
             action,

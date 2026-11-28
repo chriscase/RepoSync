@@ -196,7 +196,7 @@ Webhooks allow RepoSync to react to GitHub pushes immediately instead of waiting
 
 | Field | Value |
 |-------|-------|
-| **Payload URL** | `https://reposync.yourcompany.com/api/webhooks/github` (or `http://reposync-server:8080/api/webhooks/github` if no reverse proxy) |
+| **Payload URL** | `https://reposync.yourcompany.com/webhook/github` (or `http://reposync-server:8080/webhook/github` if no reverse proxy) |
 | **Content type** | `application/json` |
 | **Secret** | The same value you set for `REPOSYNC_WEBHOOK_SECRET` |
 | **Events** | Select: **Pushes** and **Pull requests** |
@@ -211,25 +211,20 @@ Webhooks allow RepoSync to react to GitHub pushes immediately instead of waiting
 
 To get immediate sync on SVN commits (instead of waiting for the poll interval):
 
-1. On your SVN server, create/edit the `post-commit` hook:
+1. On your SVN server, install the notification hook:
 
 ```bash
-# In your SVN repo's hooks/ directory
-cat > hooks/post-commit << 'HOOK'
-#!/bin/bash
-REPOS="$1"
-REV="$2"
-# Notify RepoSync of the new commit
-curl -s -X POST \
-  -H "X-Webhook-Secret: YOUR_SVN_WEBHOOK_SECRET" \
-  -H "Content-Type: application/json" \
-  -d "{\"repository\": \"$REPOS\", \"revision\": $REV}" \
-  http://reposync-server:8080/api/webhooks/svn
-HOOK
-chmod +x hooks/post-commit
+reposync svn-hook install \
+  --repository /path/to/svn/repo \
+  --server-url http://reposync-server:8080 \
+  --secret-file /etc/reposync/svn-webhook-secret
 ```
 
-2. If using SVN webhook authentication, set `webhook_secret_env = "REPOSYNC_SVN_WEBHOOK_SECRET"` in `config.toml` and add `REPOSYNC_SVN_WEBHOOK_SECRET=your-secret` to the env file.
+   It notifies `POST /webhook/svn`. An existing `post-commit` hook that
+   RepoSync did not create is left unchanged, and the command prints the line
+   to add to it. `--dry-run` shows the plan without changing anything.
+
+2. If using SVN webhook authentication, set `webhook_secret_env = "REPOSYNC_SVN_WEBHOOK_SECRET"` in `config.toml` and add `REPOSYNC_SVN_WEBHOOK_SECRET=your-secret` to the server's env file. Put the same value in the `--secret-file` on the SVN server, readable only by the account that runs hooks: SVN runs hooks with an empty environment, so the hook cannot read the secret from an environment variable.
 
 ---
 
