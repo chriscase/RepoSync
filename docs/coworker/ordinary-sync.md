@@ -90,7 +90,11 @@ Two later changes, newer than that pin:
   For 30 seconds after a requested cycle starts, a new call is not queued: the reply
   says `"queued": false` and gives `"retry_after_secs"`.
   The reply's `"queued": true` says the request was recorded, not that a cycle ran or
-  finished. With sync turned off the reply says `"queued": false`.
+  finished.
+- When the request is not queued, the reply says `"queued": false`, and
+  `"not_queued_reason"` and `"message"` say why: `disabled` (sync is turned off),
+  `paused` (sync is paused after an error; resume it first), `too_soon` (the
+  30-second gap) or `not_recorded` (the request could not be stored).
 
 To see what happened, read [status](status-and-reconciliation.md#reading-the-status), not this reply.
 

@@ -1247,30 +1247,44 @@ async fn trigger_sync(
     // would run the moment sync is turned back on.
     use reposync_core::db::queries::ManualSyncRequest;
     let mut retry_after_secs = None;
-    let queued = repo.enabled
-        && match db.request_manual_sync(&id) {
-            Ok(ManualSyncRequest::Recorded | ManualSyncRequest::AlreadyWaiting) => true,
+    // Why the request was not queued, when it was not. A pair that is
+    // paused after an error is not queued either: the scheduler skips it,
+    // and the request would run unasked once sync is resumed.
+    let not_queued = if !repo.enabled {
+        Some(("disabled", "Sync is turned off for this repository"))
+    } else if repo.sync_status == "error_paused" {
+        Some((
+            "paused",
+            "Sync is paused after an error. Resume sync for this repository, then ask again",
+        ))
+    } else {
+        match db.request_manual_sync(&id) {
+            Ok(ManualSyncRequest::Recorded | ManualSyncRequest::AlreadyWaiting) => None,
             Ok(ManualSyncRequest::TooSoon {
                 retry_after_secs: wait,
             }) => {
                 retry_after_secs = Some(wait);
-                false
+                Some((
+                    "too_soon",
+                    "A requested sync for this repository started moments ago",
+                ))
             }
             Err(error) => {
                 warn!(repo_id = %id, %error, "could not record the manual sync request");
-                false
+                Some(("not_recorded", "The sync request could not be recorded"))
             }
-        };
+        }
+    };
+    let queued = not_queued.is_none();
     if queued {
         // Wakes are folded by the scheduler. Full: a queued inspection will
         // see the request. Closed: the scheduler is stopping, and the stored
         // request expires.
         let _ = state.sync_trigger.try_send(());
     }
-    let message = if retry_after_secs.is_some() {
-        "A requested sync for this repository started moments ago"
-    } else {
-        "Sync triggered"
+    let (reason, message) = match not_queued {
+        Some((reason, message)) => (Some(reason), message),
+        None => (None, "Sync triggered"),
     };
 
     Ok(Json(serde_json::json!({
@@ -1279,6 +1293,7 @@ async fn trigger_sync(
         "repo_name": repo.name,
         "enabled": repo.enabled,
         "queued": queued,
+        "not_queued_reason": reason,
         "retry_after_secs": retry_after_secs,
         "import_phase": import_phase,
     })))

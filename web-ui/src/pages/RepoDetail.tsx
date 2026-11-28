@@ -2564,8 +2564,10 @@ const toneClasses: Record<Tone, string> = {
 const markClass = 'rs-mark inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium';
 
 /** What the head button shows for a few seconds after a Sync Now reply. */
-function syncReplyLabel(reply: { queued?: boolean; retry_after_secs?: number | null }): string {
+function syncReplyLabel(reply: { queued?: boolean; not_queued_reason?: string | null; retry_after_secs?: number | null }): string {
   if (reply.queued !== false) return 'Sync Triggered';
+  if (reply.not_queued_reason === 'paused') return 'Sync is paused';
+  if (reply.not_queued_reason === 'disabled') return 'Sync is off';
   return reply.retry_after_secs ? `Sync just started, wait ${reply.retry_after_secs}s` : 'Not queued';
 }
 
