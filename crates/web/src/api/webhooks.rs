@@ -188,25 +188,59 @@ fn normalize_repo_name(value: &str) -> Option<String> {
     Some(format!("{}/{}", owner, name).to_ascii_lowercase())
 }
 
-/// Whether a push for `full_name` concerns a repository RepoSync syncs: the
-/// configured `github.repo` or the Git repository of an enabled pair.
-fn repository_in_scope(state: &AppState, full_name: &str) -> bool {
+/// Whether a push concerns something RepoSync syncs.
+#[derive(Debug, PartialEq, Eq)]
+enum PushScope {
+    /// The configured `github.repo` at `github.default_branch`, or an enabled
+    /// pair's Git repository at that pair's branch.
+    Synced,
+    /// No configured repository or enabled pair uses this repository.
+    RepositoryNotSynced,
+    /// The repository is synced, but not at this branch.
+    BranchNotSynced,
+}
+
+/// A configured branch as the bare name a push's `refs/heads/<name>` carries.
+fn configured_branch(value: &str) -> &str {
+    let trimmed = value.trim();
+    trimmed.strip_prefix("refs/heads/").unwrap_or(trimmed)
+}
+
+/// Scope a push of `branch` (without `refs/heads/`) to `full_name`. Branch
+/// names are compared exactly, as Git does; repository names are not
+/// case-sensitive, as on GitHub and Gitea.
+fn push_scope(state: &AppState, full_name: &str, branch: &str) -> PushScope {
     let Some(wanted) = normalize_repo_name(full_name) else {
-        return false;
+        return PushScope::RepositoryNotSynced;
     };
+    let mut repository_synced = false;
     if normalize_repo_name(&state.config.github.repo).as_deref() == Some(wanted.as_str()) {
-        return true;
+        if configured_branch(&state.config.github.default_branch) == branch {
+            return PushScope::Synced;
+        }
+        repository_synced = true;
     }
     match state.db.list_repositories() {
-        Ok(repos) => repos.iter().any(|r| {
-            r.enabled && normalize_repo_name(&r.git_repo).as_deref() == Some(wanted.as_str())
-        }),
+        Ok(repos) => {
+            for r in repos.iter().filter(|r| {
+                r.enabled && normalize_repo_name(&r.git_repo).as_deref() == Some(wanted.as_str())
+            }) {
+                if configured_branch(&r.git_branch) == branch {
+                    return PushScope::Synced;
+                }
+                repository_synced = true;
+            }
+        }
         Err(e) => {
             // Without the pair list the push cannot be scoped. Polling still
             // inspects every pair, so not triggering loses nothing.
             warn!("webhook scope check could not read repositories: {}", e);
-            false
         }
+    }
+    if repository_synced {
+        PushScope::BranchNotSynced
+    } else {
+        PushScope::RepositoryNotSynced
     }
 }
 
@@ -320,27 +354,42 @@ async fn github_webhook(
     let payload: GitHubPushPayload = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadRequest(format!("invalid JSON payload: {}", e)))?;
 
-    // Scope: only pushes to a repository RepoSync syncs, and only branches.
+    // Scope: only branch pushes to a repository and branch RepoSync syncs.
+    // Ignoring a push only gives up the early inspection; polling still
+    // inspects every pair.
     let Some(repo_name) = payload.repository.as_ref().map(|r| r.full_name.as_str()) else {
         info!("ignoring push webhook without a repository");
         return Ok(ignored("push ignored: payload names no repository".into()));
     };
-    if !repository_in_scope(&state, repo_name) {
-        info!(
-            repo = repo_name,
-            "ignoring push webhook for a repository RepoSync does not sync"
-        );
-        return Ok(ignored(format!(
-            "push ignored: repository '{}' is not synced by this RepoSync",
-            repo_name
-        )));
-    }
-    if !payload.git_ref.starts_with("refs/heads/") {
+    let Some(branch) = payload.git_ref.strip_prefix("refs/heads/") else {
         info!(git_ref = %payload.git_ref, "ignoring push webhook for a non-branch ref");
         return Ok(ignored(format!(
             "push ignored: '{}' is not a branch",
             payload.git_ref
         )));
+    };
+    match push_scope(&state, repo_name, branch) {
+        PushScope::Synced => {}
+        PushScope::RepositoryNotSynced => {
+            info!(
+                repo = repo_name,
+                "ignoring push webhook for a repository RepoSync does not sync"
+            );
+            return Ok(ignored(format!(
+                "push ignored: repository '{}' is not synced by this RepoSync",
+                repo_name
+            )));
+        }
+        PushScope::BranchNotSynced => {
+            info!(
+                repo = repo_name,
+                branch, "ignoring push webhook for a branch no enabled pair syncs"
+            );
+            return Ok(ignored(format!(
+                "push ignored: branch '{}' of '{}' is not synced by this RepoSync",
+                branch, repo_name
+            )));
+        }
     }
 
     let commit_count = payload.commits.as_ref().map(|c| c.len()).unwrap_or(0);

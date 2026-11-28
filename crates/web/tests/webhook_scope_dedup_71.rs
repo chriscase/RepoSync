@@ -273,7 +273,7 @@ async fn webhook_71_only_synced_repositories_and_branches_trigger() {
         .github(body.clone(), Some("scope-5"), Some(sign(&body)))
         .await;
     assert_eq!(json["triggered"], true, "{json}");
-    let body = push("team/paired", "refs/heads/feature", "1", "2");
+    let body = push("team/paired", "refs/heads/main", "1", "2");
     let (_, json) = h
         .github(body.clone(), Some("scope-6"), Some(sign(&body)))
         .await;
@@ -284,6 +284,62 @@ async fn webhook_71_only_synced_repositories_and_branches_trigger() {
     let body = push("test/repo", "refs/heads/main", "1", "2");
     let (_, json) = h
         .github(body.clone(), Some("scope-1"), Some(sign(&body)))
+        .await;
+    assert_eq!(json["triggered"], true, "{json}");
+    assert_eq!(h.drain(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_71_only_the_paired_branch_of_a_synced_repository_triggers() {
+    let mut h = harness(true, 8).await;
+    let mut child = paired_repo("pair-child", "team/paired", true);
+    child.git_branch = "refs/heads/release/2.x".into();
+    h.state.db.insert_repository(&child).unwrap();
+    h.state
+        .db
+        .insert_repository(&paired_repo("pair-main", "team/paired", true))
+        .unwrap();
+    let mut disabled = paired_repo("pair-off", "team/paired", false);
+    disabled.git_branch = "hotfix".into();
+    h.state.db.insert_repository(&disabled).unwrap();
+
+    // Branches nobody syncs, on synced repositories, are ignored and say so.
+    for (repo, git_ref, id) in [
+        ("team/paired", "refs/heads/feature", "branch-1"),
+        ("team/paired", "refs/heads/hotfix", "branch-2"),
+        ("team/paired", "refs/heads/Main", "branch-3"),
+        ("team/paired", "refs/heads/release/2.x/extra", "branch-4"),
+        ("test/repo", "refs/heads/feature", "branch-5"),
+    ] {
+        let body = push(repo, git_ref, "1", "2");
+        let (status, json) = h.github(body.clone(), Some(id), Some(sign(&body))).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{json}");
+        assert_eq!(json["triggered"], false, "{repo} {git_ref}: {json}");
+        let message = json["message"].as_str().unwrap();
+        assert!(
+            message.contains("branch") && message.contains("is not synced"),
+            "{json}"
+        );
+    }
+    assert_eq!(h.drain(), 0, "pushes to unpaired branches must not trigger");
+
+    // Each enabled pair's own branch triggers, including a stored
+    // `refs/heads/` form, as does the configured default branch.
+    for (repo, git_ref, id) in [
+        ("team/paired", "refs/heads/main", "branch-6"),
+        ("Team/Paired", "refs/heads/release/2.x", "branch-7"),
+        ("test/repo", "refs/heads/main", "branch-8"),
+    ] {
+        let body = push(repo, git_ref, "1", "2");
+        let (_, json) = h.github(body.clone(), Some(id), Some(sign(&body))).await;
+        assert_eq!(json["triggered"], true, "{repo} {git_ref}: {json}");
+        assert_eq!(h.drain(), 1);
+    }
+
+    // An ignored delivery did not reserve its ID.
+    let body = push("team/paired", "refs/heads/main", "1", "2");
+    let (_, json) = h
+        .github(body.clone(), Some("branch-1"), Some(sign(&body)))
         .await;
     assert_eq!(json["triggered"], true, "{json}");
     assert_eq!(h.drain(), 1);
