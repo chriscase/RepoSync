@@ -54,9 +54,14 @@ function AdminConfig() {
   const [confirmRemove, setConfirmRemove] = useState<AuthorMapping | null>(null);
 
   const updateMutation = useMutation({
-    mutationFn: (updated: AuthorMapping[]) =>
-      api.updateIdentityMappings(updated),
+    // The loaded list goes with every save, so an edit made elsewhere since
+    // (another tab, the setup wizard, the file itself) is not overwritten.
+    mutationFn: ({ updated, base }: { updated: AuthorMapping[]; base: AuthorMapping[] }) =>
+      api.updateIdentityMappings(updated, base),
     onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: ['identityMappings'] }),
+    // A refused save may mean the list changed elsewhere: show the current one.
+    onError: () =>
       queryClient.invalidateQueries({ queryKey: ['identityMappings'] }),
   });
 
@@ -73,7 +78,7 @@ function AdminConfig() {
     if (!listKnown || !mappings) return;
     if (!newMapping.svn_username || !newMapping.name || !newMapping.email) return;
     const updated = [...mappings, newMapping];
-    updateMutation.mutate(updated, { onSuccess: () => setNewMapping(EMPTY_MAPPING) });
+    updateMutation.mutate({ updated, base: mappings }, { onSuccess: () => setNewMapping(EMPTY_MAPPING) });
   };
 
   const askRemove = (mapping: AuthorMapping) => {
@@ -86,7 +91,7 @@ function AdminConfig() {
     const updated = mappings.filter(
       (m) => m.svn_username !== svnUsername
     );
-    updateMutation.mutate(updated, { onSuccess: () => setConfirmRemove(null) });
+    updateMutation.mutate({ updated, base: mappings }, { onSuccess: () => setConfirmRemove(null) });
   };
 
   // The first read keeps the page-level loading line. A retry after a failed

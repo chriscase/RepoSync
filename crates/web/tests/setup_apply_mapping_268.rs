@@ -768,3 +768,52 @@ async fn settings_identity_mappings_without_a_configured_file() {
     assert_eq!(status, 200);
     assert!(!f.tmp.path().join("identity-mappings.toml").exists());
 }
+
+// A save carries the list the page loaded. If the mappings changed since
+// (another tab, the setup wizard or the file itself), the save is refused so
+// the change is not overwritten. Values are stored without padding.
+#[tokio::test]
+async fn settings_identity_mappings_refuse_a_save_over_a_newer_list() {
+    let f = fixture(Some("authors.toml")).await;
+    let path = f.tmp.path().join("authors.toml");
+    let (_, loaded) = settings_call(&f, reqwest::Method::GET, None).await;
+    assert_eq!(loaded, json!([]));
+
+    // Someone else adds a mapping after the page loaded.
+    let (status, _) = settings_call(
+        &f,
+        reqwest::Method::PUT,
+        Some(
+            json!({"mappings":[{"svn_username":"ops","name":"Ops","email":"ops@example.invalid"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let mine =
+        json!([{"svn_username":" jdoe ","name":" John Doe ","email":" jdoe@example.invalid "}]);
+    let (status, json) = settings_call(
+        &f,
+        reqwest::Method::PUT,
+        Some(json!({"mappings": mine, "base": loaded})),
+    )
+    .await;
+    assert_eq!(status, 409, "{json}");
+    assert!(MappingFile::load(&path).unwrap().contains_key("ops"));
+
+    // Against the current list, the save goes through, trimmed.
+    let (_, current) = settings_call(&f, reqwest::Method::GET, None).await;
+    let mut both = current.as_array().unwrap().clone();
+    both.push(mine[0].clone());
+    let (status, json) = settings_call(
+        &f,
+        reqwest::Method::PUT,
+        Some(json!({"mappings": both, "base": current})),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    let file = MappingFile::load(&path).unwrap();
+    assert_eq!(file["jdoe"].name, "John Doe");
+    assert_eq!(file["jdoe"].email, "jdoe@example.invalid");
+    assert_eq!(file.len(), 2);
+}

@@ -382,10 +382,11 @@ export const api = {
 
   getIdentityMappings: () => fetchJson<AuthorMapping[]>('/config/identity'),
 
-  updateIdentityMappings: (mappings: AuthorMapping[]) =>
+  /** `base` is the list the editor loaded; the server refuses the save (409) if the mappings changed since. */
+  updateIdentityMappings: (mappings: AuthorMapping[], base?: AuthorMapping[]) =>
     fetchJson<{ ok: boolean; count?: number; warnings?: string[] }>('/config/identity', {
       method: 'PUT',
-      body: JSON.stringify({ mappings }),
+      body: JSON.stringify(base ? { mappings, base } : { mappings }),
     }),
 
   getConfig: () => fetchJson<ConfigResponse>('/config'),
