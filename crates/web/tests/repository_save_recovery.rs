@@ -745,3 +745,56 @@ async fn import_refuses_a_stored_branch_git_would_misread() {
     assert!(state.db.active_import_operation(id).unwrap().is_none());
     server.abort();
 }
+
+/// A manual sync request does not report "triggered" for a pair whose stored
+/// settings scheduled sync refuses; it names the setting instead.
+#[tokio::test]
+async fn manual_sync_names_the_stored_setting_that_blocks_sync() {
+    let (addr, state, server, _tmp) = save_fixture(&[]).await;
+    let client = authed_client();
+    let created = create(
+        &client,
+        addr,
+        &create_body(&uuid::Uuid::new_v4().to_string()),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap();
+    let url = format!("http://{addr}/api/repos/{id}/sync");
+    let good = state.db.get_repository(id).unwrap().unwrap();
+
+    let response = client.post(&url).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+
+    type Break = fn(&mut reposync_core::models::Repository);
+    let cases: [(&str, Break); 5] = [
+        ("git_branch", |r| r.git_branch = "--force".into()),
+        ("git_branch", |r| r.git_branch = String::new()),
+        ("svn_branch", |r| r.svn_branch = "a/../b".into()),
+        ("allowed_paths", |r| {
+            r.allowed_paths = Some("\"src/\"".into())
+        }),
+        ("blocked_patterns", |r| {
+            r.blocked_patterns = Some("{}".into())
+        }),
+    ];
+    for (setting, break_it) in cases {
+        let mut broken = good.clone();
+        break_it(&mut broken);
+        state.db.update_repository(&broken).unwrap();
+        let response = client.post(&url).send().await.unwrap();
+        assert_eq!(response.status(), 400, "{setting}");
+        let text = response.text().await.unwrap();
+        assert!(text.contains(setting), "{setting}: {text}");
+        assert!(text.contains("sync cannot run"), "{setting}: {text}");
+    }
+
+    // Valid optional settings do not block.
+    let mut fine = good.clone();
+    fine.allowed_paths = Some("[\"src/\"]".into());
+    fine.blocked_patterns = Some("[]".into());
+    state.db.update_repository(&fine).unwrap();
+    assert_eq!(client.post(&url).send().await.unwrap().status(), 200);
+    server.abort();
+}
