@@ -1247,30 +1247,50 @@ async fn trigger_sync(
     // would run the moment sync is turned back on.
     use reposync_core::db::queries::ManualSyncRequest;
     let mut retry_after_secs = None;
-    let queued = repo.enabled
-        && match db.request_manual_sync(&id) {
-            Ok(ManualSyncRequest::Recorded | ManualSyncRequest::AlreadyWaiting) => true,
+    // Why the request was not queued, when it was not. A pair that is
+    // paused after an error, or held until a write is reconciled, is not
+    // queued either: the scheduler skips it, and the request would run
+    // unasked once the pause or hold is lifted.
+    let not_queued = if !repo.enabled {
+        Some(("disabled", "Sync is turned off for this repository"))
+    } else if repo.sync_status == "error_paused" {
+        Some((
+            "paused",
+            "Sync is paused after an error. Resume sync for this repository, then ask again",
+        ))
+    } else if sync_held_for_reconciliation(db, &id)? {
+        Some((
+            "held",
+            "Sync is held until an unconfirmed write is reconciled for this repository",
+        ))
+    } else {
+        match db.request_manual_sync(&id) {
+            Ok(ManualSyncRequest::Recorded | ManualSyncRequest::AlreadyWaiting) => None,
             Ok(ManualSyncRequest::TooSoon {
                 retry_after_secs: wait,
             }) => {
                 retry_after_secs = Some(wait);
-                false
+                Some((
+                    "too_soon",
+                    "A requested sync for this repository started moments ago",
+                ))
             }
             Err(error) => {
                 warn!(repo_id = %id, %error, "could not record the manual sync request");
-                false
+                Some(("not_recorded", "The sync request could not be recorded"))
             }
-        };
+        }
+    };
+    let queued = not_queued.is_none();
     if queued {
         // Wakes are folded by the scheduler. Full: a queued inspection will
         // see the request. Closed: the scheduler is stopping, and the stored
         // request expires.
         let _ = state.sync_trigger.try_send(());
     }
-    let message = if retry_after_secs.is_some() {
-        "A requested sync for this repository started moments ago"
-    } else {
-        "Sync triggered"
+    let (reason, message) = match not_queued {
+        Some((reason, message)) => (Some(reason), message),
+        None => (None, "Sync triggered"),
     };
 
     Ok(Json(serde_json::json!({
@@ -1279,6 +1299,7 @@ async fn trigger_sync(
         "repo_name": repo.name,
         "enabled": repo.enabled,
         "queued": queued,
+        "not_queued_reason": reason,
         "retry_after_secs": retry_after_secs,
         "import_phase": import_phase,
     })))
@@ -1287,6 +1308,27 @@ async fn trigger_sync(
 // ---------------------------------------------------------------------------
 // Per-repo import
 // ---------------------------------------------------------------------------
+
+/// Whether the scheduler is skipping this pair until an operator reconciles
+/// an unconfirmed git-to-svn commit or svn-to-git push. An unfinished write
+/// that is still in flight is not a hold.
+fn sync_held_for_reconciliation(db: &Database, repo_id: &str) -> Result<bool, AppError> {
+    use reposync_core::db::git_push_operations::GitPushOperationState;
+    use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
+    let commit_held = db
+        .active_svn_commit_operation(repo_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .is_some_and(|op| {
+            op.state == SvnCommitOperationState::ReconciliationRequired && !op.resume_authorized
+        });
+    let push_held = db
+        .active_git_push_operation(repo_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .is_some_and(|op| {
+            op.state == GitPushOperationState::ReconciliationRequired && !op.resume_authorized
+        });
+    Ok(commit_held || push_held)
+}
 
 fn reject_held_import(db: &Database, repo_id: &str) -> Result<(), AppError> {
     if db
