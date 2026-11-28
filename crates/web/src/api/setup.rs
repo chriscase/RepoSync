@@ -13,7 +13,7 @@ use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use reposync_core::busy::PairBusyGuard;
@@ -219,21 +219,51 @@ fn config_names_pair(config: &AppConfig, repo: &Repository) -> bool {
         && repo.git_api_url.trim_end_matches('/') == config.github.api_url.trim_end_matches('/')
 }
 
-/// The pair that the setup wizard edits and setup import starts on: the root
-/// pair that the configuration file uniquely names, otherwise the earliest
-/// root pair. Name order is not used, because a rename or a child branch pair
-/// would change the choice.
+/// The kv key holding the id of the pair that setup apply last saved.
+const WIZARD_PAIR_KEY: &str = "setup_wizard_repository_id";
+
+/// The pair that the setup wizard edits and setup import starts on, in order:
+/// 1. the root pair that the configuration file uniquely names (the loaded
+///    configuration if the file cannot be read);
+/// 2. the root pair that setup apply last saved, unless the configuration
+///    names other pairs. Apply copies the form's target onto the pair but
+///    not into the file, so an edited target stops matching the file;
+/// 3. the earliest registered root pair.
+///
+/// Name order is not used, because a rename or a child branch pair would
+/// change the choice.
 fn setup_pair(state: &AppState) -> Result<Option<Repository>, DatabaseError> {
-    if let Ok(config) = AppConfig::load_from_file(&state.config_path) {
-        let repositories = state.db.list_repositories()?;
-        let mut named = repositories
-            .into_iter()
-            .filter(|r| config_names_pair(&config, r));
-        if let (Some(only), None) = (named.next(), named.next()) {
-            return Ok(Some(only));
+    let file = AppConfig::load_from_file(&state.config_path);
+    if let Err(error) = &file {
+        debug!(%error, "setup pair selection is using the loaded configuration");
+    }
+    let config = file.as_ref().unwrap_or(&state.config);
+    let named: Vec<Repository> = state
+        .db
+        .list_repositories()?
+        .into_iter()
+        .filter(|r| config_names_pair(config, r))
+        .collect();
+    if let [only] = named.as_slice() {
+        return Ok(Some(only.clone()));
+    }
+    if let Some(id) = state.db.get_state(WIZARD_PAIR_KEY)? {
+        if let Some(saved) = state.db.get_repository(&id)? {
+            if saved.parent_id.is_none() && (named.is_empty() || named.iter().any(|r| r.id == id)) {
+                return Ok(Some(saved));
+            }
         }
     }
     state.db.earliest_root_repository()
+}
+
+fn remember_wizard_pair(db: &Database, id: &str, warnings: &mut Vec<String>) {
+    if let Err(e) = db.set_state(WIZARD_PAIR_KEY, id) {
+        warnings.push(format!(
+            "Failed to record which repository the wizard edits: {}",
+            e
+        ));
+    }
 }
 
 fn wizard_repository(state: &AppState) -> Result<Option<Repository>, AppError> {
@@ -834,7 +864,10 @@ async fn apply_config(
                 ..existing
             };
             match db.update_repository(&updated) {
-                Ok(()) => info!(id = %updated.id, "Updated repository from setup wizard"),
+                Ok(()) => {
+                    info!(id = %updated.id, "Updated repository from setup wizard");
+                    remember_wizard_pair(db, &updated.id, &mut warnings);
+                }
                 Err(e) => warnings.push(format!("Failed to update repository: {}", e)),
             }
         } else {
@@ -870,7 +903,8 @@ async fn apply_config(
             };
             match db.insert_repository(&new_repo) {
                 Ok(()) => {
-                    info!(id = %new_repo.id, name = %new_repo.name, "Created repository from setup wizard")
+                    info!(id = %new_repo.id, name = %new_repo.name, "Created repository from setup wizard");
+                    remember_wizard_pair(db, &new_repo.id, &mut warnings);
                 }
                 Err(e) => warnings.push(format!("Failed to create repository: {}", e)),
             }

@@ -571,3 +571,61 @@ async fn the_wizard_keeps_editing_the_pair_it_created() {
     }
     assert_eq!(f.state.db.list_repositories().unwrap().len(), 3);
 }
+
+// Apply copies an edited target onto the pair but not into the configuration
+// file, so the pair stops matching it. The wizard must keep editing that pair
+// rather than move to an older one.
+#[tokio::test]
+async fn an_edited_target_keeps_the_wizard_on_the_same_pair() {
+    let f = fixture(None).await;
+    let (status, json) = apply(&f, apply_body(None, json!([]))).await;
+    assert_eq!(status, 200, "{json}");
+    // Rebuild the rows: an older root pair the configuration does not name,
+    // then a pair registered later that the configuration does name.
+    let template = f.state.db.list_repositories().unwrap().remove(0);
+    f.state
+        .db
+        .set_state("setup_wizard_repository_id", "")
+        .unwrap();
+    let mut older = template.clone();
+    older.id = "older-root".into();
+    older.name = "zzz-older-root".into();
+    older.git_repo = "elsewhere/repo".into();
+    older.svn_url = "https://svn.test.invalid/elsewhere".into();
+    let cfg = &f.state.config;
+    let mut named = template.clone();
+    named.id = "named-root".into();
+    named.name = "named-root".into();
+    named.svn_url = cfg.svn.url.clone();
+    named.svn_branch = cfg.svn.trunk_path.clone();
+    named.git_repo = cfg.github.repo.clone();
+    named.git_branch = cfg.github.default_branch.clone();
+    named.git_api_url = cfg.github.api_url.clone();
+    f.state.db.delete_repository(&template.id).unwrap();
+    f.state.db.insert_repository(&older).unwrap();
+    f.state.db.insert_repository(&named).unwrap();
+
+    // The configuration names `named`, so the wizard edits it, and the edit
+    // moves it to a target the configuration does not name.
+    let mut edit = apply_body(None, json!([]));
+    edit["git_repo"] = json!("edited/repo");
+    edit["sync_mode"] = json!("pr");
+    let (status, json) = apply(&f, edit).await;
+    assert_eq!(status, 200, "{json}");
+    let get = |id: &str| f.state.db.get_repository(id).unwrap().unwrap();
+    assert_eq!(get(&named.id).git_repo, "edited/repo");
+    assert_eq!(get(&older.id).git_repo, "elsewhere/repo");
+
+    // Reopening and saving again still edits the same pair.
+    assert_eq!(setup_config(&f).await["sync_mode"], "pr");
+    let mut again = apply_body(None, json!([]));
+    again["git_repo"] = json!("edited/repo");
+    again["daemon_poll_interval"] = json!(75);
+    let (status, json) = apply(&f, again).await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(get(&named.id).poll_interval_secs, 75);
+    let untouched = get(&older.id);
+    assert_eq!(untouched.git_repo, "elsewhere/repo");
+    assert_eq!(untouched.poll_interval_secs, older.poll_interval_secs);
+    assert_eq!(f.state.db.list_repositories().unwrap().len(), 2);
+}
