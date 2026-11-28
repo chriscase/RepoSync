@@ -236,19 +236,7 @@ fn pair_engine_config(
     app_config: &AppConfig,
     repo: &reposync_core::models::Repository,
 ) -> AppConfig {
-    let mut config = app_config.clone();
-    // The trunk_path must be empty because the branch path is already
-    // baked into the SVN URL (svn_url + svn_branch).
-    config.svn.trunk_path = String::new();
-    config.svn.layout = reposync_core::config::SvnLayout::Custom;
-    // The engine pulls the pair's branch (child branch pairs have a
-    // different git_branch than the service default_branch).
-    config.github.default_branch = repo.git_branch.clone();
-    // A pair with auto-merge turned off holds every conflict for review.
-    // The service setting stays a master switch: a pair cannot turn
-    // auto-merge on when the service configuration turns it off.
-    config.sync.auto_merge = app_config.sync.auto_merge && repo.auto_merge;
-    config
+    app_config.for_pair(repo)
 }
 
 impl Scheduler {

@@ -1592,10 +1592,7 @@ async fn replay_pending_git(
     })?;
     crate::git::sync_git_http_auth_from_resolution(&git_client, git_workdir, db, &child.id, None)
         .ok();
-    let mut repo_config = app_config.clone();
-    repo_config.svn.trunk_path = String::new();
-    repo_config.svn.layout = crate::config::SvnLayout::Custom;
-    repo_config.github.default_branch = child.git_branch.clone();
+    let mut repo_config = app_config.for_pair(child);
     repo_config.svn.url = child.svn_url.clone();
 
     let db_path = app_config.daemon.data_dir.join("reposync.db");
