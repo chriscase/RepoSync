@@ -48,7 +48,6 @@ This example imports the `sls_engr_trunk` branch from an internal SVN server int
 
 | Field | Value |
 |-------|-------|
-| Mode | Direct Push |
 | Auto Merge | Yes |
 | Sync Tags | Yes |
 | LFS Threshold | 10 MB (optional) |
@@ -79,7 +78,6 @@ Navigate to `http://<reposync-server>:8080/setup` in your browser.
 
 ### 4. Sync Settings (Step 4)
 
-- **Direct Push** mode is recommended for initial import
 - Enable **Auto Merge** and **Sync Tags** as desired
 - Set **LFS Threshold** if you have large binary files (e.g., 10 MB)
   - Requires `git-lfs` to be installed on the server: `sudo dnf install git-lfs`

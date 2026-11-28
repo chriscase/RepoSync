@@ -41,7 +41,7 @@ See [docs/personal-branch/](docs/personal-branch/) for the full Personal Branch 
 - **Conflict notifications** -- Slack and email alerts when human intervention needed (team mode)
 - **GitHub Enterprise & GitHub.com** -- first-class support via GitHub API and webhooks
 - **Configurable SVN layouts** -- standard (trunk/branches/tags) or custom paths
-- **Two sync modes** -- direct auto-sync or PR-gated for teams wanting review
+- **Direct auto-sync** -- changes flow between SVN and Git without a manual step
 - **Crash recovery** -- transaction log ensures no data loss on restart
 - **Docker & systemd** -- deploy however you prefer (team mode)
 

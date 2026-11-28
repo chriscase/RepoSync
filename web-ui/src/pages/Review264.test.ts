@@ -130,14 +130,6 @@ describe('#264 R4: a control that shows its state by colour carries the primary 
     }
   });
 
-  it('sync mode: the chosen mode is primary and pressed, the other quiet', () => {
-    for (const mode of ['direct', 'pr'] as const) {
-      const html = renderToStaticMarkup(createElement(SyncStep, { data: wizard({ sync_mode: mode }), update: noop, errors: {} }));
-      expectChoice(button(html, /^Direct Push/), mode === 'direct');
-      expectChoice(button(html, /^Pull Request/), mode === 'pr');
-    }
-  });
-
   it('switches keep their own shape: no rs-btn class on a role="switch" in the wizard', () => {
     for (const on of [true, false]) {
       const html = renderToStaticMarkup(createElement(SyncStep, { data: wizard({ sync_auto_merge: on, sync_tags: on }), update: noop, errors: {} }));

@@ -172,12 +172,15 @@ describe('#264 E3 Repositories in each vocabulary', () => {
 describe('#264 E3 repository page in each vocabulary', () => {
   const page = () => createElement(RepoDetail);
   const SECTIONS: TextKey[] = ['repo.section.svn', 'repo.section.git', 'repo.section.sync', 'repo.section.records', 'repo.section.commitMap', 'repo.section.audit', 'repo.section.pairs', 'repo.section.stopOrRemove'];
-  const READ_FIELDS: TextKey[] = ['field.svnPassword', 'repo.field.gitToken', 'field.syncMode', 'field.pollInterval', 'field.lfsThreshold', 'field.autoMerge', 'repo.about.lastUpdated', 'repo.about.createdBy'];
+  const READ_FIELDS: TextKey[] = ['field.svnPassword', 'repo.field.gitToken', 'field.pollInterval', 'field.lfsThreshold', 'field.autoMerge', 'repo.about.lastUpdated', 'repo.about.createdBy'];
   const IDLE_IMPORT: TextKey[] = ['import.manageRepositories'];
 
   it('renames headings, read labels, the pause and hook controls for a repository', () => {
     seedRepository();
     const { existing, plain } = inBothVocabularies(page, '/repos/r1', [...SECTIONS, ...READ_FIELDS, ...IDLE_IMPORT, 'repo.header.pause', 'repo.header.hook', 'server.title'], '/repos/:id');
+    // The stored sync mode is not applied by sync, so the page does not show it.
+    expect(existing).not.toContain('Sync Mode');
+    expect(plain).not.toContain('Sync mode');
     expect(existing).toMatch(/<button data-testid="header-sync-switch"[^>]*>.*?<\/svg>Turn sync off<\/button>/s);
     expect(plain).toMatch(/<button data-testid="header-sync-switch"[^>]*>.*?<\/svg>Pause sync…<\/button>/s);
     expect(existing).toMatch(/data-testid="download-pre-commit-hook"[^>]*>.*?<\/svg>Git Hook<\/button>/s);

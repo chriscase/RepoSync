@@ -69,18 +69,21 @@ RepoSync is configured via a TOML file, typically at `/etc/reposync/config.toml`
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mode` | string | `"direct"` | `"direct"` for auto-sync, `"pr"` for PR-gated |
+| `mode` | string | `"direct"` | Leave this at `"direct"`. PR-gated sync is not implemented: `"pr"` is accepted but does not change how sync pushes, and pair refresh refuses any value other than `"direct"`. The pair page and setup wizard do not offer this choice. |
 | `auto_merge` | boolean | `true` | Attempt 3-way merge for non-overlapping changes. This is the service-wide switch: when it is `false`, no pair auto-merges. When it is `true`, a pair whose own auto-merge setting is off still holds every conflict for review. The pair setting applies to scheduled sync and to publishing a late branch pair; the `sync now` command uses only this service setting. |
 | `sync_branches` | array of strings | `[]` | Branch names to synchronize. An empty list selects all branches. |
 | `sync_tags` | boolean | `true` | Sync tag creation |
 
-### [sync.pr] (only when mode = "pr")
+### [sync.pr] (not applied)
+
+These keys are accepted but have no effect, because PR-gated sync is not implemented.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `require_approval` | boolean | `true` | Require PR approval before SVN sync |
-| `auto_merge_approved` | boolean | `true` | Auto-merge approved PRs |
-| `reviewers` | array | `[]` | Default PR reviewers |
+| `title_prefix` | string | `"[svn-sync]"` | Title prefix for a sync PR |
+| `labels` | array of strings | `[]` | Labels for a sync PR |
+| `reviewers` | array of strings | `[]` | Reviewers to request |
+| `auto_merge` | boolean | `false` | Merge the PR when checks pass |
 
 ## Authors Mapping File
 

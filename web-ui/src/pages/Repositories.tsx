@@ -592,17 +592,6 @@ function RepositoriesEditor() {
                 </h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-11`}>{t('field.syncMode')}</label>
-                    <select
-                      className={selectClass}
-                      value={form.sync_mode}
-                      onChange={(e) => setField('sync_mode', e.target.value)} id={`${fieldId}-11`}
-                    >
-                      <option value="direct">Direct</option>
-                      <option value="pr">Pull Request</option>
-                    </select>
-                  </div>
-                  <div>
                     <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-12`}>{t('repos.add.pollInterval')}</label>
                     <input
                       type="number"

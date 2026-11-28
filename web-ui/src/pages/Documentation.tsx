@@ -93,7 +93,7 @@ function SectionOverview() {
         <li>Slack and email notifications when human intervention is needed</li>
         <li>GitHub Enterprise and GitHub.com support</li>
         <li>Configurable SVN layouts — standard or custom paths</li>
-        <li>Direct auto-sync or PR-gated sync modes</li>
+        <li>Direct auto-sync between SVN and Git</li>
         <li>Crash recovery with transaction logging</li>
       </ul>
     </div>
@@ -477,13 +477,13 @@ default_branch = "main"`}
 
       <h4 className="font-semibold text-gray-800 mt-4">[sync]</h4>
       <p className="text-gray-700">
-        Sync mode and merge behavior.
+        Merge behavior and what is synchronized.
       </p>
       <pre className="bg-gray-900 text-gray-100 rounded-lg p-4 overflow-x-auto text-sm">
 {`[sync]
-mode = "direct"       # "direct" = auto-sync, "pr" = create PR for review
+mode = "direct"       # leave at "direct"; PR-gated sync is not implemented
 auto_merge = true
-sync_branches = true
+sync_branches = []
 sync_tags = true`}
       </pre>
 
