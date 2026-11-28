@@ -274,8 +274,8 @@ The daemon embeds an Axum HTTP server that serves both the REST API and the Reac
 | `/api/users` | GET/POST | User management (admin only) |
 | `/api/config` | GET/PUT | View and update daemon configuration |
 | `/api/setup` | GET/POST | Initial setup wizard |
-| `/api/webhooks/github` | POST | GitHub webhook receiver |
-| `/api/webhooks/svn` | POST | SVN post-commit webhook receiver |
+| `/webhook/github` | POST | GitHub webhook receiver |
+| `/webhook/svn` | POST | SVN post-commit webhook receiver |
 
 ### WebSocket
 

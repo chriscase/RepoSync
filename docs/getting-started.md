@@ -75,25 +75,35 @@ Make it executable:
 chmod +x /path/to/svn/repos/hooks/pre-revprop-change
 ```
 
-Optionally, add a post-commit hook for instant sync (instead of polling):
+Optionally, add a post-commit hook for instant sync (instead of polling). On
+the SVN server, run:
 
 ```bash
-# /path/to/svn/repos/hooks/post-commit
-#!/bin/sh
-REPOS="$1"
-REV="$2"
-curl -s -X POST http://your-reposync-server:8080/webhook/svn \
-  -H "Content-Type: application/json" \
-  -H "X-Webhook-Secret: $REPOSYNC_SVN_WEBHOOK_SECRET" \
-  -H "X-Webhook-Delivery: $REPOS@$REV" \
-  -d "{\"repository\": \"$REPOS\", \"revision\": $REV}" || true
+reposync svn-hook install \
+  --repository /path/to/svn/repos \
+  --server-url http://your-reposync-server:8080 \
+  --secret-file /etc/reposync/svn-webhook-secret
 ```
 
-Send `X-Webhook-Secret` when `svn.webhook_secret_env` is configured; RepoSync
-checks it before parsing the body. `X-Webhook-Delivery` is optional and is only
-used when a secret is configured: a repeated value is then acknowledged without
-starting another inspection. The notification
-only asks for an early poll, so a lost or late one changes nothing.
+It writes `hooks/reposync-post-commit` and, when the repository has no
+`post-commit` hook yet, a `post-commit` that calls it. An existing
+`post-commit` that RepoSync did not create is never changed; the command
+prints the one line to add to it. Use `--dry-run` to see the plan first, and
+`reposync svn-hook remove --repository ...` to take it out again.
+
+SVN runs hooks with an empty environment, so the secret cannot come from an
+environment variable. Put the same value the server reads through
+`svn.webhook_secret_env` in the `--secret-file`, readable only by the account
+that runs SVN hooks. The hook reads it at commit time and passes it to curl on
+standard input, so it does not appear on a command line. Without a secret
+file, notifications carry no secret and a server with `svn.webhook_secret_env`
+set refuses them.
+
+The hook sends `X-Webhook-Delivery: <repository path>@<revision>`; RepoSync
+uses it only when a secret is configured, acknowledging a repeated value
+without starting another inspection. The notification only asks for an early
+poll, so a lost or late one changes nothing, and the hook never delays or
+fails a commit.
 
 ## Step 3: Prepare Your GitHub Repository
 
