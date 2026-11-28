@@ -221,8 +221,18 @@ async fn get_notification_config(
         .unwrap_or(None)
         .unwrap_or_default();
 
+    // Notifications go to the server configuration's URL when it sets one, so
+    // say so; the URL itself is not returned.
+    let server_config_url_set = state
+        .config
+        .notifications
+        .teams_webhook_url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty());
+
     Ok(Json(serde_json::json!({
         "teams_webhook_url": teams_url,
+        "server_config_url_set": server_config_url_set,
     })))
 }
 

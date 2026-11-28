@@ -187,6 +187,17 @@ describe('#264 G11.2 Teams webhook', () => {
     expect(html).not.toContain('<dialog');
   });
 
+  it('says when the server configuration overrides the saved webhook', () => {
+    for (const read of [{ state: 'set', serverConfigured: true }, { state: 'not_set', serverConfigured: true }] as const) {
+      const html = notificationsView({ read });
+      expect(html).toContain('<p role="note"');
+      expect(html).toContain('Notifications and Test use that one');
+    }
+    for (const read of [{ state: 'set' }, { state: 'not_set', serverConfigured: false }, { state: 'loading' }] as const) {
+      expect(notificationsView({ read })).not.toContain('role="note"');
+    }
+  });
+
   it('opens a blank field on Replace, with Save unavailable until a value is typed', () => {
     const html = notificationsView({ replacing: true });
     expect(html).toContain('<label class="block text-sm text-gray-400" for="teams-webhook-url">Teams Webhook URL</label>');

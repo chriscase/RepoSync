@@ -314,8 +314,8 @@ export function IdentityMappingsView({ mappings, loading, readError, saving, sav
 export type WebhookRead =
   | { state: 'loading' }
   | { state: 'failed'; error: string }
-  | { state: 'set' }
-  | { state: 'not_set' };
+  | { state: 'set'; serverConfigured?: boolean }
+  | { state: 'not_set'; serverConfigured?: boolean };
 
 async function postNotifications(teamsWebhookUrl: string | null): Promise<void> {
   const token = localStorage.getItem('session_token');
@@ -354,7 +354,8 @@ function NotificationsConfig() {
         return r.json();
       })
       .then((d) => {
-        setRead(d.teams_webhook_url ? { state: 'set' } : { state: 'not_set' });
+        const serverConfigured = d.server_config_url_set === true;
+        setRead(d.teams_webhook_url ? { state: 'set', serverConfigured } : { state: 'not_set', serverConfigured });
       })
       .catch((err) => setRead({ state: 'failed', error: err instanceof Error ? err.message : String(err) }));
   }, []);
@@ -372,7 +373,7 @@ function NotificationsConfig() {
     setMessage(null);
     try {
       await postNotifications(teamsUrl || null);
-      setRead({ state: 'set' });
+      setRead((r) => ({ state: 'set', serverConfigured: 'serverConfigured' in r && r.serverConfigured }));
       setReplacing(false);
       setTeamsUrl('');
       setMessage({type: 'success', text: 'Saved'});
@@ -390,7 +391,7 @@ function NotificationsConfig() {
     setMessage(null);
     try {
       await postNotifications(null);
-      setRead({ state: 'not_set' });
+      setRead((r) => ({ state: 'not_set', serverConfigured: 'serverConfigured' in r && r.serverConfigured }));
       setReplacing(false);
       setTeamsUrl('');
       setConfirmingRemove(false);
@@ -557,6 +558,14 @@ export function NotificationsView(props: NotificationsViewProps) {
               Retry
             </button>
           </div>
+        )}
+
+        {known && read.serverConfigured && (
+          <p role="note" className="rs-bn bg-yellow-900/30 border border-yellow-700 text-yellow-200 px-4 py-3 rounded text-sm">
+            The server configuration sets a Teams webhook (<code>notifications.teams_webhook_url</code>).
+            Notifications and Test use that one. A URL saved here is used only once the server
+            configuration no longer sets one.
+          </p>
         )}
 
         {known && (

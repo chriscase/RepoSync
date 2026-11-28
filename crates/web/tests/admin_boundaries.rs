@@ -46,6 +46,18 @@ async fn fixture(
     tokio::task::JoinHandle<()>,
     tempfile::TempDir,
 ) {
+    fixture_with(password, None).await
+}
+
+async fn fixture_with(
+    password: bool,
+    config_teams_url: Option<&str>,
+) -> (
+    SocketAddr,
+    Arc<AppState>,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let git_repo_path = tmp.path().join("git-repo");
     git2::Repository::init(&git_repo_path).expect("git init");
@@ -54,6 +66,7 @@ async fn fixture(
     if !password {
         config.web.admin_password = None;
     }
+    config.notifications.teams_webhook_url = config_teams_url.map(str::to_string);
 
     let web_db = Database::in_memory().expect("web db");
     web_db.initialize().expect("web db init");
@@ -415,4 +428,95 @@ async fn admin_and_bootstrap_matrix_preserves_existing_admission() {
         assert!(state.import_handles.lock().await.is_empty());
         server.abort();
     }
+}
+
+/// Accept one HTTP request on a loopback listener and return its body.
+async fn capture_one() -> (String, tokio::task::JoinHandle<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hook", listener.local_addr().unwrap());
+    let handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf).to_string();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let len = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if body.len() >= len || n == 0 {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                    return body.to_string();
+                }
+            }
+        }
+    });
+    (url, handle)
+}
+
+/// When the server configuration sets the Teams URL, notifications go there:
+/// Settings says so (without revealing it) and Test uses it, not the
+/// Settings value.
+#[tokio::test]
+async fn server_configured_teams_url_is_reported_and_tested() {
+    let (hook, received) = capture_one().await;
+    let (addr, state, server, _tmp) = fixture_with(true, Some(&hook)).await;
+    state
+        .db
+        .set_state("teams_webhook_url", "http://127.0.0.1:9/settings-only")
+        .unwrap();
+    let read: Value = call(
+        addr,
+        Some(TEST_TOKEN),
+        "GET",
+        "/api/config/notifications",
+        json!(null),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(read["server_config_url_set"], true, "{read}");
+    assert!(!read.to_string().contains(&hook), "{read}");
+    let response = call(
+        addr,
+        Some(TEST_TOKEN),
+        "POST",
+        "/api/config/notifications/test",
+        json!(null),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body = tokio::time::timeout(Duration::from_secs(5), received)
+        .await
+        .expect("Test did not reach the configured URL")
+        .unwrap();
+    assert!(body.contains("Test Notification"), "{body}");
+    server.abort();
+
+    let (addr, _state, server, _tmp) = fixture(true).await;
+    let read: Value = call(
+        addr,
+        Some(TEST_TOKEN),
+        "GET",
+        "/api/config/notifications",
+        json!(null),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(read["server_config_url_set"], false, "{read}");
+    server.abort();
 }
