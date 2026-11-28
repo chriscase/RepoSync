@@ -433,6 +433,38 @@ impl Repository {
             .unwrap_or(0)
             .saturating_mul(1024 * 1024)
     }
+
+    /// Why scheduled sync will refuse this pair as it is stored, or `None`
+    /// when its stored settings are usable. These are the settings the
+    /// scheduler checks before it starts a pair's cycle; a pair saved before
+    /// a check existed can still hold a value that fails it.
+    pub fn sync_configuration_problem(&self) -> Option<String> {
+        if let Some(problem) = crate::git::git_branch_name_problem(&self.git_branch) {
+            return Some(format!("git_branch {problem}"));
+        }
+        if let Err(error) =
+            crate::svn::operand::configured_branch_url(&self.svn_url, &self.svn_branch)
+        {
+            // The URL is built from both settings, so either can be at fault.
+            let detail = match &error {
+                crate::errors::SvnError::WorkingCopyError { detail, .. } => detail.clone(),
+                other => other.to_string(),
+            };
+            return Some(format!(
+                "svn_url or svn_branch is not usable: {}",
+                crate::errors::redact_vcs_error_detail(&detail)
+            ));
+        }
+        for (setting, raw) in [
+            ("allowed_paths", self.allowed_paths.as_deref()),
+            ("blocked_patterns", self.blocked_patterns.as_deref()),
+        ] {
+            if raw.is_some_and(|raw| serde_json::from_str::<Vec<String>>(raw).is_err()) {
+                return Some(format!("{setting} must be a JSON array of strings"));
+            }
+        }
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

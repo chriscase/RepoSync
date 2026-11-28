@@ -1213,6 +1213,14 @@ async fn trigger_sync(
         ));
     }
 
+    // Scheduled sync skips a pair whose stored settings it cannot use.
+    // Say so here instead of reporting a sync that will not run.
+    if let Some(problem) = repo.sync_configuration_problem() {
+        return Err(AppError::BadRequest(format!(
+            "sync cannot run for this repository until its settings are corrected: {problem}"
+        )));
+    }
+
     // Check import progress for this repo to give useful status.
     let progress = state.get_repo_import_progress(&id).await;
     let p = progress.read().await;
