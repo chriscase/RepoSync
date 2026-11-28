@@ -920,10 +920,13 @@ impl Scheduler {
                 self.poll_interval.as_secs() as i64
             };
 
+            // An operator's "sync now" request skips this wait once. Every
+            // hold, pause and ownership check around it still applies.
+            let manual_request = self.db.manual_sync_requested(&repo.id);
             if let Some(ref last_sync) = repo.last_sync_at {
                 if let Ok(last) = chrono::DateTime::parse_from_rfc3339(last_sync) {
                     let elapsed = now.signed_duration_since(last);
-                    if elapsed.num_seconds() < interval_secs {
+                    if elapsed.num_seconds() < interval_secs && !manual_request {
                         debug!(
                             repo_name = %repo.name,
                             elapsed_secs = elapsed.num_seconds(),
@@ -1238,9 +1241,15 @@ impl Scheduler {
                 break;
             }
             let make_sync = || {
+                if manual_request {
+                    if let Err(error) = self.db.clear_manual_sync_request(&repo_id) {
+                        warn!(repo_id = %repo_id, %error, "could not clear the manual sync request");
+                    }
+                }
                 info!(
                     repo_name = %repo_name,
                     repo_id = %repo_id,
+                    manual_request,
                     "starting per-repo sync cycle"
                 );
                 async move {
@@ -2286,6 +2295,10 @@ mod allowed_paths_tests;
 #[cfg(test)]
 #[path = "scheduler/git_branch_guard_tests.rs"]
 mod git_branch_guard_tests;
+
+#[cfg(test)]
+#[path = "scheduler/manual_sync_request_tests.rs"]
+mod manual_sync_request_tests;
 
 #[cfg(test)]
 #[path = "scheduler/pair_engine_config_tests.rs"]

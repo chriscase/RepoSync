@@ -15,7 +15,7 @@ Nothing here was observed on a running installation.
 | --- | --- | --- |
 | Scheduled sync of fast-forward Git pushes to SVN and SVN revisions to Git | **In tree** | [Ordinary sync](ordinary-sync.md) |
 | History gate: inspect before reset or write, hold on rewritten or unproven Git history | **In tree** (contract lists which cases are proven by local fixtures and which are not run) | [Status and reconciliation](status-and-reconciliation.md#why-a-pair-gets-held) |
-| `POST /api/repos/{id}/sync` | **In tree**: records an audit row; we found nothing that starts a cycle from it | [Ordinary sync](ordinary-sync.md#can-i-make-it-sync-now) |
+| `POST /api/repos/{id}/sync` | **In tree**: records an audit row; a change newer than the pin also queues a one-time request for the scheduler | [Ordinary sync](ordinary-sync.md#can-i-make-it-sync-now) |
 | `/webhook/github` and `/webhook/svn` receivers | **In tree**: signature or secret checked before parsing when one is configured; scope to the synced repository and paired branch; delivery-ID dedup for authenticated senders; bursts folded into one inspection; stale events only prompt an inspection | [Ordinary sync](ordinary-sync.md#webhooks-that-already-exist) |
 | Refusing webhooks when no secret is configured; live webhook configuration | **Held** | [Held and unavailable](held-and-unavailable.md) |
 | Status observation (`GET /api/status?repo_id=`) | **In tree, read-only** | [Status and reconciliation](status-and-reconciliation.md#reading-the-status) |
@@ -73,8 +73,9 @@ inspection that polling does decides what happens.
 ### I called `POST /api/repos/{id}/sync` and got "Sync triggered". Did a cycle run?
 
 Not necessarily. At the pinned commit the handler records an audit entry and returns;
-we found no code that starts a cycle from that entry. Your push is picked up by the next
-scheduled poll. Use [status](status-and-reconciliation.md#reading-the-status) to see what happened.
+we found no code that starts a cycle from that entry. A later change queues a request
+that lets the pair skip its poll wait once, but holds, pauses and a busy writer still
+apply. Use [status](status-and-reconciliation.md#reading-the-status) to see what happened.
 
 ### Does an SVN merge rewrite history?
 

@@ -70,20 +70,27 @@ its result literally:
 
 ```bash
 curl --fail-with-body -sS -X POST -H @"$HDR" "$BASE/api/repos/REPO_ID/sync"
-# => {"ok":true,"message":"Sync triggered","repo_name":"…","enabled":…,"import_phase":"…"}
+# => {"ok":true,"message":"Sync triggered","repo_name":"…","enabled":…,"queued":…,"import_phase":"…"}
 ```
 
 At the pinned commit, this handler checks that the repository exists, refuses if
 an import is active or unresolved or if removal is in progress, writes an audit-log
-row, and returns. A later change, newer than that pin, adds one refusal before the
-audit row: 400 if the pair's stored Git branch, SVN URL or branch, allowed paths or
-blocked patterns are ones scheduled sync cannot use. The reply names the setting. **We found no code in the tree that reads that audit row to
-start a cycle.** The reply says the request was recorded; it does not say a
-cycle ran or finished. Your push is picked up by the next scheduled poll. To
-see what happened, read [status](status-and-reconciliation.md#reading-the-status), not this reply.
+row, and returns. At that commit nothing read the audit row, so the request started
+no cycle.
 
-Source: [`trigger_sync`][trigger-sync]. If a later commit wires this to the
-scheduler, this section should be rechecked.
+Two later changes, newer than that pin:
+
+- It refuses with 400 if the pair's stored Git branch, SVN URL or branch, allowed
+  paths or blocked patterns are ones scheduled sync cannot use. The reply names the
+  setting.
+- For a pair with sync turned on, it records a request and wakes the scheduler. The
+  pair's next inspection skips its poll wait once. Every hold, pause and busy check
+  still applies, so the reply's `"queued": true` says the request was recorded, not
+  that a cycle ran or finished. With sync turned off the reply says `"queued": false`.
+
+To see what happened, read [status](status-and-reconciliation.md#reading-the-status), not this reply.
+
+Source: [`trigger_sync`][trigger-sync].
 
 ## Webhooks that already exist
 

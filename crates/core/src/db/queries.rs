@@ -1681,6 +1681,26 @@ impl Database {
         Ok(())
     }
 
+    /// Record that an operator asked for this pair to sync now. The
+    /// scheduler honors it once, at the pair's next inspection.
+    pub fn request_manual_sync(&self, repo_id: &str) -> Result<(), DatabaseError> {
+        self.set_state(&manual_sync_request_key(repo_id), &Utc::now().to_rfc3339())
+    }
+
+    /// Whether a manual sync request is waiting for this pair. A read error
+    /// counts as no request, so the pair keeps its normal schedule.
+    pub fn manual_sync_requested(&self, repo_id: &str) -> bool {
+        matches!(
+            self.get_state(&manual_sync_request_key(repo_id)),
+            Ok(Some(_))
+        )
+    }
+
+    /// Forget this pair's manual sync request once its cycle starts.
+    pub fn clear_manual_sync_request(&self, repo_id: &str) -> Result<(), DatabaseError> {
+        self.delete_kv_state(&manual_sync_request_key(repo_id))
+    }
+
     /// Remove a `kv_state` row. Prefer this over holding a raw `conn()` guard while
     /// computing scoped keys (the connection mutex is not re-entrant).
     pub fn delete_kv_state(&self, key: &str) -> Result<(), DatabaseError> {
@@ -4309,6 +4329,10 @@ impl Database {
             Ok(receipt)
         }
     }
+}
+
+fn manual_sync_request_key(repo_id: &str) -> String {
+    format!("manual_sync_requested_{repo_id}")
 }
 
 #[cfg(test)]

@@ -809,3 +809,58 @@ async fn manual_sync_names_the_stored_setting_that_blocks_sync() {
     assert_eq!(client.post(&url).send().await.unwrap().status(), 200);
     server.abort();
 }
+
+/// A manual sync request is queued for the scheduler only when the pair can
+/// act on it: sync is on and its stored settings are usable.
+#[tokio::test]
+async fn manual_sync_queues_a_request_only_for_a_pair_that_can_sync() {
+    let (addr, state, server, _tmp) = save_fixture(&[]).await;
+    let client = authed_client();
+    let created = create(
+        &client,
+        addr,
+        &create_body(&uuid::Uuid::new_v4().to_string()),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap();
+    let url = format!("http://{addr}/api/repos/{id}/sync");
+    assert!(!state.db.manual_sync_requested(id));
+
+    let body: serde_json::Value = client
+        .post(&url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["queued"], true);
+    assert!(state.db.manual_sync_requested(id));
+    state.db.clear_manual_sync_request(id).unwrap();
+
+    // Sync turned off: the request is acknowledged but not queued.
+    let mut off = state.db.get_repository(id).unwrap().unwrap();
+    off.enabled = false;
+    state.db.update_repository(&off).unwrap();
+    let body: serde_json::Value = client
+        .post(&url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["queued"], false);
+    assert!(!state.db.manual_sync_requested(id));
+
+    // Unusable stored settings: refused, and nothing is queued.
+    let mut broken = off.clone();
+    broken.enabled = true;
+    broken.git_branch = "--force".into();
+    state.db.update_repository(&broken).unwrap();
+    assert_eq!(client.post(&url).send().await.unwrap().status(), 400);
+    assert!(!state.db.manual_sync_requested(id));
+    server.abort();
+}
