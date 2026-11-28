@@ -1,6 +1,9 @@
 //! Setup-wizard busy slot: durable `import_operation_v1` + process-wide busy
 //! admission on `/api/setup/import` start/status/cancel.
 
+#[path = "../../core/tests/fixtures/image_hook.rs"]
+mod image_hook;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -1331,20 +1334,8 @@ async fn candidate_64c07_setup_wizard_reset_reimport_failed_clone_holds() {
     let bin = tmp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let wrapper = bin.join("git");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = \"push\" ]; then\n  exit 0\nfi\nexec {real_git} \"$@\"\n"
-        ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&wrapper).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&wrapper, perms).unwrap();
-    }
+    std::fs::write(bin.join("real-git"), &real_git).unwrap();
+    image_hook::install_program(&bin, "git", image_hook::script::GIT_PUSH_NOOP);
     let prev_path = std::env::var("PATH").unwrap();
     std::env::set_var("PATH", format!("{}:{prev_path}", bin.display()));
     let resolved = Command::new("sh")
