@@ -438,3 +438,117 @@ async fn an_invalid_git_branch_is_refused_before_anything_is_written() {
         "release/2.x"
     );
 }
+
+async fn setup_config(f: &Fixture) -> Value {
+    reqwest::Client::new()
+        .get(format!("http://{}/api/setup/config", f.addr))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Apply stores the pair settings on the repository row, not in the file.
+/// Reopening the wizard must show those saved values, so that applying the
+/// form again unchanged keeps the pair as it is instead of reverting it to
+/// the file's values.
+#[tokio::test]
+async fn the_wizard_reopens_with_the_pair_settings_it_saved() {
+    let f = fixture(None).await;
+    // Before any pair exists, the file's values are shown.
+    let before = setup_config(&f).await;
+    assert_eq!(before["git_repo"], "test/repo", "{before}");
+    assert_eq!(before["git_branch"], "main", "{before}");
+
+    let mut body = apply_body(None, json!([]));
+    for (key, value) in [
+        ("svn_url", json!("https://svn.saved.invalid/repo")),
+        ("svn_username", json!("saved-user")),
+        ("svn_trunk_path", json!("")),
+        ("git_provider", json!("gitea")),
+        ("git_api_url", json!("https://git.saved.invalid/api/v1")),
+        ("git_repo", json!("saved/repo")),
+        ("git_default_branch", json!("release/2026.11")),
+        ("sync_mode", json!("pr")),
+        ("sync_auto_merge", json!(false)),
+        ("daemon_poll_interval", json!(120)),
+        ("lfs_threshold", json!(5 * 1024 * 1024)),
+    ] {
+        body[key] = value;
+    }
+    let (status, json) = apply(&f, body).await;
+    assert_eq!(status, 200, "{json}");
+
+    let cfg = setup_config(&f).await;
+    for (key, expected) in [
+        ("svn_url", json!("https://svn.saved.invalid/repo")),
+        ("svn_username", json!("saved-user")),
+        ("svn_trunk_path", json!("")),
+        ("svn_layout", json!("single")),
+        ("git_provider", json!("gitea")),
+        ("git_api_url", json!("https://git.saved.invalid/api/v1")),
+        ("git_repo", json!("saved/repo")),
+        ("git_branch", json!("release/2026.11")),
+        ("sync_mode", json!("pr")),
+        ("auto_merge", json!(false)),
+        ("poll_interval", json!(120)),
+        ("lfs_threshold", json!(5 * 1024 * 1024)),
+    ] {
+        assert_eq!(cfg[key], expected, "{key}: {cfg}");
+    }
+
+    // Sending the reopened form back unchanged leaves the pair as saved.
+    let saved = f.state.db.list_repositories().unwrap();
+    let mut again = apply_body(None, json!([]));
+    for (to, from) in [
+        ("svn_url", "svn_url"),
+        ("svn_username", "svn_username"),
+        ("svn_trunk_path", "svn_trunk_path"),
+        ("git_provider", "git_provider"),
+        ("git_api_url", "git_api_url"),
+        ("git_repo", "git_repo"),
+        ("git_default_branch", "git_branch"),
+        ("sync_mode", "sync_mode"),
+        ("sync_auto_merge", "auto_merge"),
+        ("daemon_poll_interval", "poll_interval"),
+        ("lfs_threshold", "lfs_threshold"),
+    ] {
+        again[to] = cfg[from].clone();
+    }
+    let (status, json) = apply(&f, again).await;
+    assert_eq!(status, 200, "{json}");
+    let after = f.state.db.list_repositories().unwrap();
+    assert_eq!(after.len(), 1, "{after:?}");
+    let (a, b) = (&saved[0], &after[0]);
+    assert_eq!(
+        (
+            &a.svn_url,
+            &a.svn_username,
+            &a.svn_branch,
+            &a.git_provider,
+            &a.git_api_url,
+            &a.git_repo,
+            &a.git_branch,
+            &a.sync_mode,
+            a.auto_merge,
+            a.poll_interval_secs,
+            a.lfs_threshold_mb,
+        ),
+        (
+            &b.svn_url,
+            &b.svn_username,
+            &b.svn_branch,
+            &b.git_provider,
+            &b.git_api_url,
+            &b.git_repo,
+            &b.git_branch,
+            &b.sync_mode,
+            b.auto_merge,
+            b.poll_interval_secs,
+            b.lfs_threshold_mb,
+        )
+    );
+}
