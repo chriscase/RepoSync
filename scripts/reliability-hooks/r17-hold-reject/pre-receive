@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+cat > offer.tmp
+mv offer.tmp offer
+attempt=0
+while [ ! -f release ]; do
+    [ -f hooks/pre-receive ] || exit 1
+    if [ "$attempt" -ge 600 ]; then
+        echo 'timed out waiting for both R17 pushes' >&2
+        exit 1
+    fi
+    sleep 0.05
+    attempt=$((attempt + 1))
+done
+echo "rejected by $(cat hooks/r17-reject-id)" >&2
+exit 1

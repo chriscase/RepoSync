@@ -1,4 +1,7 @@
 //! Codec/authority assertions; native effects are qualified separately.
+#[path = "fixtures/image_hook.rs"]
+mod image_hook;
+
 use reposync_core::db::managed_remove::{
     completed_for_foreign_journal, validated_foreign_document, DeletionPhase, DeletionReceipt,
     ManagedRemoveRemoteOutcome, ManagedRemoveState, RemovalAdvance, RemovalChoices,
@@ -590,17 +593,11 @@ async fn rs65_git_success_then_svn_rejection_retains_each_side_across_reopen() {
         )
         .await
         .unwrap();
-        let hook = f.root.path().join("svn/hooks/pre-commit");
-        std::fs::write(
-            &hook,
-            "#!/bin/sh\necho 'synthetic rejection after Git success' >&2\nexit 1\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        image_hook::install(
+            &f.root.path().join("svn"),
+            "pre-commit",
+            image_hook::script::SVN_REJECT_AFTER_GIT,
+        );
         let before = native_command(
             f.root.path(),
             "svnlook",

@@ -9,6 +9,8 @@ use uuid::Uuid;
 #[path = "../../tests/fixtures/owned_process_group.rs"]
 #[allow(clippy::duplicate_mod)]
 mod fixture_process;
+#[path = "../../tests/fixtures/image_hook.rs"]
+mod image_hook;
 
 use super::*;
 
@@ -1459,7 +1461,6 @@ async fn original_owner_observes_lost_svn_and_git_receipts_without_republication
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn denied_svn_intent_and_absence_observation_never_authorize_a_retry() {
     use crate::db::pair_refresh_operations::PairRefreshPhase;
-    use std::os::unix::fs::PermissionsExt;
 
     let _serial = SERIAL.lock().await;
     let f = Fixture::new();
@@ -1471,12 +1472,11 @@ async fn denied_svn_intent_and_absence_observation_never_authorize_a_retry() {
     let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
     let parent_before = parent_row(&f);
     let hook = f.temp.path().join("svn-repository/hooks/pre-commit");
-    std::fs::write(
-        &hook,
-        b"#!/bin/sh\nprintf '%s\\n' 'disposable SVN permission refusal' >&2\nexit 1\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    image_hook::install(
+        &f.temp.path().join("svn-repository"),
+        "pre-commit",
+        image_hook::script::SVN_PERMISSION_REFUSAL,
+    );
     assert!(
         super::super::execution::publish_owned_svn_stage_with_client(
             &engine,
@@ -1616,7 +1616,6 @@ fn case_diag(temp: &std::path::Path, hook: &std::path::Path, ready: &std::path::
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn protected_git_ref_retains_the_svn_result_without_retrying_a_push() {
     use crate::db::pair_refresh_operations::PairRefreshPhase;
-    use std::os::unix::fs::PermissionsExt;
 
     let _serial = SERIAL.lock().await;
     let f = Fixture::new();
@@ -1628,12 +1627,11 @@ async fn protected_git_ref_retains_the_svn_result_without_retrying_a_push() {
     let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
     let parent_before = parent_row(&f);
     let hook = f.target.path().join("hooks/pre-receive");
-    std::fs::write(
-        &hook,
-        b"#!/bin/sh\nprintf '%s\\n' 'disposable protected ref refusal' >&2\nexit 1\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    image_hook::install(
+        f.target.path(),
+        "pre-receive",
+        image_hook::script::PROTECTED_REF,
+    );
     let before = f
         .target
         .find_reference("refs/heads/feature")
@@ -3065,7 +3063,6 @@ async fn owned_service_retains_preparation_and_returns_exact_publication_and_noo
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owned_service_finishes_a_disconnected_request_without_republication() {
     use crate::pair_refresh::service::{RefreshAction, RefreshResponse, RefreshService};
-    use std::os::unix::fs::PermissionsExt;
     let _serial = SERIAL.lock().await;
     let f = Fixture::new();
     let engine = std::sync::Arc::new(f.engine());
@@ -3082,22 +3079,11 @@ async fn owned_service_finishes_a_disconnected_request_without_republication() {
         other => panic!("unexpected {other:?}"),
     };
     let hook = f.temp.path().join("svn-repository/hooks/pre-commit");
-    std::fs::write(
-        &hook,
-        r#"#!/usr/bin/env python3
-from pathlib import Path
-import time
-root=Path(__file__).resolve().parents[2]
-(root/'http-disconnect-ready').write_text('ready')
-for _ in range(600):
-    if (root/'http-disconnect-release').exists():
-        raise SystemExit(0)
-    time.sleep(0.05)
-raise SystemExit(1)
-"#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    image_hook::install(
+        &f.temp.path().join("svn-repository"),
+        "pre-commit",
+        image_hook::script::SVN_HOLD_HTTP_DISCONNECT,
+    );
     let _svn_diag = SvnDiag::arm(f.temp.path());
     let handle = approval.preparation_id;
     let digest = approval.approval_digest.clone();
@@ -3689,7 +3675,6 @@ async fn recovery_server_fence_lifetime_preserves_held_epoch_and_cleans_only_ter
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owned_service_shutdown_joins_an_authorized_publication_before_returning() {
     use crate::pair_refresh::service::{RefreshAction, RefreshResponse, RefreshService};
-    use std::os::unix::fs::PermissionsExt;
     let _serial = SERIAL.lock().await;
     let f = Fixture::new();
     let engine = std::sync::Arc::new(f.engine());
@@ -3706,22 +3691,11 @@ async fn owned_service_shutdown_joins_an_authorized_publication_before_returning
         other => panic!("unexpected {other:?}"),
     };
     let hook = f.temp.path().join("svn-repository/hooks/pre-commit");
-    std::fs::write(
-        &hook,
-        r#"#!/usr/bin/env python3
-from pathlib import Path
-import time
-root=Path(__file__).resolve().parents[2]
-(root/'shutdown-ready').write_text('ready')
-for _ in range(600):
-    if (root/'shutdown-release').exists():
-        raise SystemExit(0)
-    time.sleep(0.05)
-raise SystemExit(1)
-"#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    image_hook::install(
+        &f.temp.path().join("svn-repository"),
+        "pre-commit",
+        image_hook::script::SVN_HOLD_SHUTDOWN,
+    );
     let _svn_diag = SvnDiag::arm(f.temp.path());
     let request_service = service.clone();
     let handle = approval.preparation_id;

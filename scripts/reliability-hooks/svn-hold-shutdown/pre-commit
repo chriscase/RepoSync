@@ -1,0 +1,11 @@
+#!/bin/sh
+# Subversion passes the repository path; the control files sit beside it.
+root=$(dirname "$1")
+printf ready > "$root/shutdown-ready"
+attempt=0
+while [ "$attempt" -lt 600 ]; do
+    [ -f "$root/shutdown-release" ] && exit 0
+    sleep 0.05
+    attempt=$((attempt + 1))
+done
+exit 1

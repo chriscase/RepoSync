@@ -5,6 +5,9 @@ use std::process::{Command, Stdio};
 
 #[path = "../../tests/fixtures/owned_process_group.rs"]
 mod fixture_process;
+#[allow(clippy::duplicate_mod)]
+#[path = "../../tests/fixtures/image_hook.rs"]
+mod image_hook;
 use fixture_process::OwnedProcessGroup;
 
 use git2::{Oid, Repository, Signature};
@@ -227,10 +230,8 @@ impl HttpFixture {
         }
     }
 
-    fn hook(&self, script: &str) {
-        let path = self.target.path().join("hooks/pre-receive");
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fn hook(&self, script: (&str, &str)) {
+        image_hook::install(self.target.path(), "pre-receive", script);
     }
 }
 
@@ -275,10 +276,12 @@ fn second_parent_drift(tls: bool) {
 
 fn advertisement_race(tls: bool) {
     let fixture = HttpFixture::new(tls, None);
-    fixture.hook(&format!(
-        "#!/bin/sh\nenv -u GIT_QUARANTINE_PATH git update-ref refs/heads/child {}\n",
-        fixture.initial
-    ));
+    std::fs::write(
+        fixture.target.path().join("hooks/ref-move-target"),
+        fixture.initial.to_string(),
+    )
+    .unwrap();
+    fixture.hook(image_hook::script::REF_MOVE);
     let before = fixture.tip();
     let published = fixture.publish(None);
     let after = fixture.tip();
@@ -657,11 +660,8 @@ fn https_recovery_observes_old_and_published_tips_without_receive_pack_or_token_
         GitPublicationObservation::NotObserved
     );
     assert_eq!(fixture.publish(token).unwrap(), fixture.prepared);
-    let witness = fixture.temp.path().join("receive-pack-witness");
-    fixture.hook(&format!(
-        "#!/bin/sh\nprintf 'retry\\n' > '{}'\nexit 1\n",
-        witness.display()
-    ));
+    let witness = fixture.target.path().join("hooks/witness");
+    fixture.hook(image_hook::script::WITNESS_REJECT);
     for _ in 0..2 {
         assert_eq!(
             fixture.observe_to(&fixture.url, token).unwrap(),

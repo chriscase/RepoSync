@@ -1,0 +1,10 @@
+#!/bin/sh
+printf x >> attempts
+: > ready
+count=0
+while [ ! -f release ]; do
+  count=$((count + 1))
+  [ "$count" -lt 1000 ] || exit 1
+  sleep 0.01
+done
+exit 0
