@@ -1,4 +1,7 @@
 //! Exercise the legacy import caller at actual publication boundaries.
+#[path = "fixtures/image_hook.rs"]
+mod image_hook;
+
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -108,11 +111,8 @@ impl Fixture {
         }
     }
 
-    fn hook(&self, script: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let path = self.dir.path().join("origin.git/hooks/pre-receive");
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fn hook(&self, script: (&str, &str)) {
+        image_hook::install(&self.dir.path().join("origin.git"), "pre-receive", script);
     }
 
     async fn run(&self) -> anyhow::Result<ImportOutcome> {
@@ -161,7 +161,7 @@ impl Fixture {
 #[tokio::test]
 async fn rejected_intermediate_batch_is_an_error_with_one_attempt_and_no_managed_receipt() {
     let f = Fixture::new(51);
-    f.hook("#!/bin/sh\nprintf x >> attempts\nexit 1\n");
+    f.hook(image_hook::script::COUNT_REJECT);
     let outcome = f.run().await;
     let bare = f.dir.path().join("origin.git");
     let witness = format!(
@@ -200,7 +200,7 @@ async fn rejected_intermediate_batch_is_an_error_with_one_attempt_and_no_managed
 #[tokio::test]
 async fn cancellation_during_final_push_confirms_its_exact_tip_and_checkpoints_before_release() {
     let f = Fixture::new(1);
-    f.hook("#!/bin/sh\nprintf x >> attempts\n: > ready\ncount=0\nwhile [ ! -f release ]; do\n  count=$((count + 1))\n  [ \"$count\" -lt 1000 ] || exit 1\n  sleep 0.01\ndone\nexit 0\n");
+    f.hook(image_hook::script::COUNT_HOLD);
     let bare_path = f.dir.path().join("origin.git");
     let monitor_path = bare_path.clone();
     let cancelled = f.cancelled.clone();

@@ -61,3 +61,19 @@ The image has no enrolled immutable hook implementing either behavior. A future
 fixture needs a reviewed image-owned executable and per-repository control data
 under the private fixture. The actual Git push and its effects supply the
 evidence. The writable fixture retains its `noexec` mount. [Issue 213](https://github.com/chriscase/RepoSync/issues/213)
+
+### Image-owned hooks
+
+`scripts/reliability-hooks` now holds one directory per reviewed hook script.
+The image copies it read-only to `/opt/reposync-fixture-hooks` and names it in
+`REPOSYNC_FIXTURE_HOOKS`. The seven cases above select their script through the
+bare repository's `core.hooksPath`. Other suites that need a Git `pre-receive`
+or a Subversion `pre-commit` hook use `crates/core/tests/fixtures/image_hook.rs`:
+it compares the image's bytes with the script the test names, then links the
+repository's hook path to the image's copy. Subversion has no hook-path setting,
+so the link is what lets its hook run. Values a hook needs, such as a ref
+target or a repository name, are read from files in the fixture, so every
+script is fixed. The `image_hook_scripts` test fails if a script and its test
+copy differ or if the directory ships anything no test names. Outside the image
+the tests write the same script into the repository. The writable fixture keeps
+its `noexec` mount.

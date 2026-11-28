@@ -4,7 +4,6 @@
 
 use std::net::TcpListener;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +18,8 @@ use reposync_core::pair_refresh::publication::{
 
 #[path = "fixtures/owned_process_group.rs"]
 mod fixture_process;
+#[path = "fixtures/image_hook.rs"]
+mod image_hook;
 use fixture_process::OwnedProcessGroup;
 
 #[test]
@@ -222,10 +223,8 @@ impl Fixture {
         }
     }
 
-    fn hook(&self, script: &str) {
-        let path = self.target.path().join("hooks/pre-receive");
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fn hook(&self, script: (&str, &str)) {
+        image_hook::install(self.target.path(), "pre-receive", script);
     }
 }
 
@@ -271,10 +270,12 @@ fn second_parent_drift_refuses_even_though_update_is_fast_forward() {
 #[test]
 fn ref_move_after_advertisement_is_rejected_by_receive_pack() {
     let fixture = Fixture::new();
-    fixture.hook(&format!(
-        "#!/bin/sh\nenv -u GIT_QUARANTINE_PATH git update-ref refs/heads/child {}\n",
-        fixture.initial
-    ));
+    std::fs::write(
+        fixture.target.path().join("hooks/ref-move-target"),
+        fixture.initial.to_string(),
+    )
+    .unwrap();
+    fixture.hook(image_hook::script::REF_MOVE);
     let before = fixture.tip();
     let published = fixture.publish();
     let after = fixture.tip();
@@ -290,7 +291,7 @@ fn ref_move_after_advertisement_is_rejected_by_receive_pack() {
 #[test]
 fn receiver_rejection_is_not_a_publication_receipt() {
     let fixture = Fixture::new();
-    fixture.hook("#!/bin/sh\nexit 1\n");
+    fixture.hook(image_hook::script::REJECT);
     let before = fixture.tip();
     let published = fixture.publish();
     let after = fixture.tip();
@@ -514,11 +515,8 @@ impl Fixture {
 #[test]
 fn recovery_old_tip_is_only_not_observed_and_never_runs_receive_pack() {
     let fixture = Fixture::new();
-    let witness = fixture._temp.path().join("receive-pack-witness");
-    fixture.hook(&format!(
-        "#!/bin/sh\nprintf 'write\\n' > '{}'\nexit 1\n",
-        witness.display()
-    ));
+    let witness = fixture.target.path().join("hooks/witness");
+    fixture.hook(image_hook::script::WITNESS_REJECT);
     assert_eq!(
         fixture.observe().unwrap(),
         GitPublicationObservation::NotObserved
@@ -532,11 +530,8 @@ fn recovery_of_missing_receipt_observes_result_without_second_write_or_local_ref
     let fixture = Fixture::new();
     // Ignore the returned publication receipt, then recover only by reading.
     let _ = fixture.publish().unwrap();
-    let witness = fixture._temp.path().join("second-write-witness");
-    fixture.hook(&format!(
-        "#!/bin/sh\nprintf 'retry\\n' > '{}'\nexit 1\n",
-        witness.display()
-    ));
+    let witness = fixture.target.path().join("hooks/witness");
+    fixture.hook(image_hook::script::WITNESS_REJECT);
     let refs = || {
         fixture
             .source

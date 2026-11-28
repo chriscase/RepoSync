@@ -10,7 +10,6 @@ use reposync_core::db::lineage_checkpoints::{
 use reposync_core::models::{Repository, SyncDirection, SyncRecord, SyncRecordStatus};
 use serde_json::{json, Value};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,24 +34,11 @@ fn command(dir: &Path, program: &str, args: &[&str]) -> String {
         .to_owned()
 }
 
-// Git invokes pre-receive in its bare repository before changing the refs.
-// Publish the complete offer atomically and keep the push open until the test
-// has read both active journal entries. The hook also exits if the test dies.
-const HOLD_PUSH: &str = r#"#!/bin/sh
-set -eu
-cat > offer.tmp
-mv offer.tmp offer
-attempt=0
-while [ ! -f release ]; do
-    [ -f hooks/pre-receive ] || exit 1
-    if [ "$attempt" -ge 600 ]; then
-        echo 'timed out waiting for both R17 pushes' >&2
-        exit 1
-    fi
-    sleep 0.05
-    attempt=$((attempt + 1))
-done
-"#;
+// The pre-receive hooks keep each push open until the test has read both active
+// journal entries; their scripts are with the shared installer.
+#[path = "../../../core/tests/fixtures/image_hook.rs"]
+mod image_hook;
+use image_hook::script::{R17_HOLD as HOLD_PUSH, R17_HOLD_REJECT as HOLD_THEN_REJECT};
 
 struct Pair {
     row: Repository,
@@ -174,9 +160,7 @@ impl Pair {
             status: SyncRecordStatus::Applied,
         })
         .unwrap();
-        let hook = bare.join("hooks/pre-receive");
-        fs::write(&hook, HOLD_PUSH).unwrap();
-        fs::set_permissions(hook, fs::Permissions::from_mode(0o700)).unwrap();
+        image_hook::install(&bare, "pre-receive", HOLD_PUSH);
         Self {
             row,
             svn,
@@ -624,11 +608,8 @@ async fn r17_same_tick_rejections_count_one_error_per_repository() {
     let (mut scheduler, pairs) =
         same_tick_fixture(&tmp, ["same-tick-reject-alpha", "same-tick-reject-beta"]);
     for pair in &pairs {
-        let hook = format!(
-            "{HOLD_PUSH}echo 'rejected by {}' >&2\nexit 1\n",
-            pair.row.id
-        );
-        fs::write(pair.bare.join("hooks/pre-receive"), hook).unwrap();
+        fs::write(pair.bare.join("hooks/r17-reject-id"), &pair.row.id).unwrap();
+        image_hook::install(&pair.bare, "pre-receive", HOLD_THEN_REJECT);
     }
     let ([alpha, beta], events) = run_same_tick(&mut scheduler, &pairs).await;
     let reopened = Database::new(tmp.path().join("reposync.db")).unwrap();

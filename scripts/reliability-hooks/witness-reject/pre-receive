@@ -1,0 +1,3 @@
+#!/bin/sh
+printf 'ran\n' > hooks/witness
+exit 1

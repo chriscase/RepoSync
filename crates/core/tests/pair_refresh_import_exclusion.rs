@@ -2,6 +2,9 @@
 #[path = "fixtures/pair_refresh_job.rs"]
 mod job;
 
+#[path = "fixtures/image_hook.rs"]
+mod image_hook;
+
 use reposync_core::{
     config::IdentityConfig,
     db::{
@@ -270,10 +273,7 @@ async fn legacy(f: &job::Fixture, db: &Database, reject: bool) -> anyhow::Result
     let bare = f.dir.path().join("bare.git");
     git2::Repository::init_bare(&bare).unwrap();
     if reject {
-        use std::os::unix::fs::PermissionsExt;
-        let hook = bare.join("hooks/pre-receive");
-        std::fs::write(&hook, "#!/bin/sh\nprintf x >> attempts\nexit 1\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        image_hook::install(&bare, "pre-receive", image_hook::script::COUNT_REJECT);
     }
     let path = f.dir.path().join("legacy-git");
     let repository = git2::Repository::init(&path).unwrap();
