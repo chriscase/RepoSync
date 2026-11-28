@@ -230,7 +230,7 @@ async fn get_setup_config(
         .unwrap_or(false)
         || cfg.github.token.is_some();
 
-    let admin_password_set = crate::api::auth::admin_password(&state).is_some();
+    let admin_password_set = crate::api::auth::admin_password(&state)?.is_some();
 
     Ok(Json(SetupConfigResponse {
         svn_url: cfg.svn.url.clone(),

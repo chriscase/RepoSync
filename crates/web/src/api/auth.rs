@@ -340,7 +340,7 @@ async fn login(
         }))
     } else {
         // Backward-compatible single-password mode
-        let configured_password = admin_password(&state).unwrap_or_default();
+        let configured_password = admin_password(&state)?.unwrap_or_default();
         let configured_password = configured_password.as_str();
 
         if configured_password.is_empty() {
@@ -523,11 +523,16 @@ async fn me(
     Err(AppError::Unauthorized("session expired or invalid".into()))
 }
 
-/// The single administrator password: the server configuration's, or one
-/// saved since startup (the setup wizard stores a bcrypt hash in the
-/// database). Read on every call so a password saved by the wizard applies
-/// without a restart.
-pub(crate) fn admin_password(state: &AppState) -> Option<String> {
+/// The single administrator password: the server configuration's when set,
+/// otherwise the one the setup wizard saved in the database (a bcrypt hash).
+/// The database is read on every call, so a password saved during first run
+/// applies without a restart. A configuration value still wins over the
+/// database until the next restart, so a password changed through the wizard
+/// on a server that already had one takes effect after a restart.
+///
+/// A database read error is returned rather than treated as "no password", so
+/// callers that gate the first-run window fail closed.
+pub(crate) fn admin_password(state: &AppState) -> Result<Option<String>, AppError> {
     if let Some(p) = state
         .config
         .web
@@ -535,25 +540,25 @@ pub(crate) fn admin_password(state: &AppState) -> Option<String> {
         .as_ref()
         .filter(|p| !p.is_empty())
     {
-        return Some(p.clone());
+        return Ok(Some(p.clone()));
     }
-    ["secret_admin_password_hash", "secret_admin_password"]
-        .iter()
-        .find_map(|key| {
-            state
-                .db
-                .get_state(key)
-                .ok()
-                .flatten()
-                .filter(|v| !v.is_empty())
-        })
+    for key in ["secret_admin_password_hash", "secret_admin_password"] {
+        let value = state
+            .db
+            .get_state(key)
+            .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
+        if let Some(v) = value.filter(|v| !v.is_empty()) {
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether sign-in is required: an administrator password exists or any
 /// account does. While neither exists, the setup wizard's first-run window is
 /// open; it closes as soon as either is saved.
 pub(crate) fn sign_in_required(state: &AppState) -> Result<bool, AppError> {
-    if admin_password(state).is_some() {
+    if admin_password(state)?.is_some() {
         return Ok(true);
     }
     Ok(state

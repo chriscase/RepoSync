@@ -551,6 +551,7 @@ async fn first_run_window_closes_once_a_password_is_saved() {
         .get_state("secret_admin_password_hash")
         .unwrap()
         .is_some_and(|h| h.starts_with("$2")));
+    let hash = state.db.get_state("secret_admin_password_hash").unwrap();
 
     // Closed: no unauthenticated setup call is admitted any more.
     for (method, path, body) in [
@@ -573,7 +574,11 @@ async fn first_run_window_closes_once_a_password_is_saved() {
         let status = call(addr, None, method, path, body).await.status();
         assert_eq!(status, 401, "{method} {path}");
     }
-    let hash = state.db.get_state("secret_admin_password_hash").unwrap();
+    assert_eq!(
+        state.db.get_state("secret_admin_password_hash").unwrap(),
+        hash,
+        "a refused apply must not replace the password"
+    );
 
     // The saved password signs in, a wrong one does not, and the session works.
     let wrong = call(
