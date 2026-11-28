@@ -817,3 +817,34 @@ async fn settings_identity_mappings_refuse_a_save_over_a_newer_list() {
     assert_eq!(file["jdoe"].email, "jdoe@example.invalid");
     assert_eq!(file.len(), 2);
 }
+
+// Setup apply keeps the GitHub logins Settings saved, and the entries it did
+// not send.
+#[tokio::test]
+async fn setup_apply_keeps_github_logins_saved_in_settings() {
+    let f = fixture(Some("authors.toml")).await;
+    let list = json!([
+        {"svn_username":"jdoe","name":"John Doe","email":"jdoe@example.invalid","github":"jdoe-gh"},
+        {"svn_username":"ops","name":"Ops","email":"ops@example.invalid","github":"ops-gh"},
+    ]);
+    let (status, _) =
+        settings_call(&f, reqwest::Method::PUT, Some(json!({"mappings": list}))).await;
+    assert_eq!(status, 200);
+    let (status, json) = apply(
+        &f,
+        apply_body(
+            None,
+            json!([{"svn_username":"jdoe","name":"John D.","email":"jd@example.invalid"}]),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{json}");
+    let (_, listed) = settings_call(&f, reqwest::Method::GET, None).await;
+    assert_eq!(
+        listed,
+        json!([
+            {"svn_username":"jdoe","name":"John D.","email":"jd@example.invalid","github":"jdoe-gh"},
+            {"svn_username":"ops","name":"Ops","email":"ops@example.invalid","github":"ops-gh"},
+        ])
+    );
+}
