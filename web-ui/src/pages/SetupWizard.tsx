@@ -35,13 +35,10 @@ interface WizardData {
   git_default_branch: string;
 
   // Sync
-  sync_mode: 'direct' | 'pr';
+  // Carried unchanged from the saved pair; the wizard offers no choice.
+  sync_mode: string;
   sync_auto_merge: boolean;
   sync_tags: boolean;
-  pr_title_prefix: string;
-  pr_labels: string;
-  pr_reviewers: string;
-  pr_auto_merge: boolean;
 
   // File Policy / LFS
   max_file_size_mb: number;
@@ -94,10 +91,6 @@ const DEFAULT_DATA: WizardData = {
   sync_mode: 'direct',
   sync_auto_merge: true,
   sync_tags: true,
-  pr_title_prefix: '[svn-sync]',
-  pr_labels: '',
-  pr_reviewers: '',
-  pr_auto_merge: false,
 
   max_file_size_mb: 0,
   lfs_threshold_mb: 0,
@@ -224,7 +217,7 @@ function savedConfigFields(cfg: WizardSetupConfig): {
   if (cfg.git_repo) merged.git_repo = cfg.git_repo;
   if (cfg.git_branch) merged.git_default_branch = cfg.git_branch;
 
-  if (cfg.sync_mode) merged.sync_mode = cfg.sync_mode as WizardData['sync_mode'];
+  if (cfg.sync_mode) merged.sync_mode = cfg.sync_mode;
   if (cfg.auto_merge !== undefined) merged.sync_auto_merge = cfg.auto_merge;
   if (cfg.sync_tags !== undefined) merged.sync_tags = cfg.sync_tags;
   if (cfg.lfs_threshold > 0) merged.lfs_threshold_mb = cfg.lfs_threshold / (1024 * 1024);

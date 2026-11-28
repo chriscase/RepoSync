@@ -162,7 +162,7 @@ There is no cross-talk between their GitHub mirrors. Conflicts only arise if the
 | **Runs on**         | Your laptop or personal VM     | A shared server or VM              |
 | **Users**           | Single developer               | Entire team                        |
 | **GitHub repo**     | Private, owned by you          | Shared org repo                    |
-| **Git-to-SVN gate** | PR merge on your private repo | Direct sync or PR-gated (configurable) |
+| **Git-to-SVN gate** | PR merge on your private repo | Direct sync |
 | **Identity mapping**| Single developer config        | LDAP or mapping file (all team members) |
 | **Conflict resolution** | CLI only                  | Web dashboard + CLI + notifications |
 | **Web UI**          | None (optional status port)    | Full React dashboard               |

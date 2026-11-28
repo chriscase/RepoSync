@@ -69,12 +69,14 @@ RepoSync is configured via a TOML file, typically at `/etc/reposync/config.toml`
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mode` | string | `"direct"` | Reserved. `"direct"` and `"pr"` are both accepted, but sync always pushes directly today; PR-gated sync is not implemented. The pair page and setup wizard do not offer this choice. |
+| `mode` | string | `"direct"` | Leave this at `"direct"`. PR-gated sync is not implemented: `"pr"` is accepted but does not change how sync pushes, and pair refresh refuses any value other than `"direct"`. The pair page and setup wizard do not offer this choice. |
 | `auto_merge` | boolean | `true` | Attempt 3-way merge for non-overlapping changes. This is the service-wide switch: when it is `false`, no pair auto-merges. When it is `true`, a pair whose own auto-merge setting is off still holds every conflict for review. The pair setting applies to scheduled sync and to publishing a late branch pair; the `sync now` command uses only this service setting. |
 | `sync_branches` | array of strings | `[]` | Branch names to synchronize. An empty list selects all branches. |
 | `sync_tags` | boolean | `true` | Sync tag creation |
 
-### [sync.pr] (only when mode = "pr")
+### [sync.pr] (not applied)
+
+These keys are accepted but have no effect, because PR-gated sync is not implemented.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

@@ -481,9 +481,9 @@ default_branch = "main"`}
       </p>
       <pre className="bg-gray-900 text-gray-100 rounded-lg p-4 overflow-x-auto text-sm">
 {`[sync]
-mode = "direct"       # reserved: sync always pushes directly today
+mode = "direct"       # leave at "direct"; PR-gated sync is not implemented
 auto_merge = true
-sync_branches = true
+sync_branches = []
 sync_tags = true`}
       </pre>
 
