@@ -1,0 +1,114 @@
+{
+  "schema": 1,
+  "description": "Old test identities that passed on a historical baseline and are intentionally absent from the candidate catalog. The comparison accepts an absence only when it is listed here and every successor passed in the same candidate run. A listed identity that still exists in the candidate, or that exists and fails, is never excused.",
+  "retired": {
+    "integration::test_svn_to_git_echo_suppression": {
+      "disposition": "renamed",
+      "successors": [
+        "integration::test_svn_to_git_receipt_backed_echo_suppression"
+      ],
+      "reason": "Same Personal SVN-to-Git echo scenario in crates/personal/tests/integration.rs, renamed when echo suppression became receipt-backed."
+    },
+    "reposync-core::sync_engine::tests::test_delete_always_passes": {
+      "disposition": "superseded",
+      "successors": [
+        "reposync-core::sync_engine::tests::test_delete_out_of_scope_is_excluded",
+        "reposync-core::sync_engine::tests::test_delete_in_scope_passes"
+      ],
+      "reason": "The old test asserted that a delete outside the allowed paths passes validation. Validation now reports that delete as out of scope, and an in-scope delete still passes."
+    },
+    "reposync-core::sync_engine::tests::test_is_echo_commit": {
+      "disposition": "superseded",
+      "successors": [
+        "reposync-core::echo_suppression::tests::personal_mode_marker_echo_unchanged"
+      ],
+      "reason": "The old test only checked that a string contains the sync marker. Marker detection moved to the echo_suppression module, whose test checks the same marker rule through personal_mode_marker_echo."
+    },
+    "reposync-daemon::lockfile::tests::test_acquire_after_drop_succeeds": {
+      "disposition": "moved",
+      "successors": [
+        "reposync_core::data_dir::tests::test_acquire_after_drop_succeeds"
+      ],
+      "reason": "The data-directory lock moved from the daemon's lockfile module to reposync_core::data_dir, and the test moved with it under the same name."
+    },
+    "reposync-daemon::lockfile::tests::test_acquire_blocks_second_instance": {
+      "disposition": "moved",
+      "successors": [
+        "reposync_core::data_dir::tests::test_acquire_blocks_second_instance"
+      ],
+      "reason": "The data-directory lock moved from the daemon's lockfile module to reposync_core::data_dir, and the test moved with it under the same name."
+    },
+    "reposync-daemon::lockfile::tests::test_acquire_creates_lock_with_pid": {
+      "disposition": "moved",
+      "successors": [
+        "reposync_core::data_dir::tests::test_acquire_creates_lock_with_pid"
+      ],
+      "reason": "The data-directory lock moved from the daemon's lockfile module to reposync_core::data_dir, and the test moved with it under the same name."
+    },
+    "reposync-personal::pr_monitor::tests::test_merge_strategy_display": {
+      "disposition": "moved",
+      "successors": [
+        "reposync_personal::pr_monitor::tests::test_merge_strategy_display"
+      ],
+      "reason": "pr_monitor is now compiled only in the reposync_personal library, so the same test runs under the library's identity and no longer under the binary's."
+    },
+    "reposync-personal::pr_monitor::tests::test_merged_pr_struct": {
+      "disposition": "moved",
+      "successors": [
+        "reposync_personal::pr_monitor::tests::test_merged_pr_struct"
+      ],
+      "reason": "pr_monitor is now compiled only in the reposync_personal library, so the same test runs under the library's identity and no longer under the binary's."
+    },
+    "reposync-personal::svn_to_git::tests::test_copy_tree_skips_dotfiles_at_root": {
+      "disposition": "superseded",
+      "successors": [
+        "reposync-personal::svn_to_git::tests::test_copy_tree_skips_reserved_vcs_and_preserves_ordinary_dotfiles"
+      ],
+      "reason": "The old test required every root-level dot entry to be skipped. copy_tree now skips only reserved version-control directories and preserves ordinary dotfiles; the successor asserts both."
+    },
+    "reposync_core::sync_engine::tests::test_delete_always_passes": {
+      "disposition": "superseded",
+      "successors": [
+        "reposync_core::sync_engine::tests::test_delete_out_of_scope_is_excluded",
+        "reposync_core::sync_engine::tests::test_delete_in_scope_passes"
+      ],
+      "reason": "The old test asserted that a delete outside the allowed paths passes validation. Validation now reports that delete as out of scope, and an in-scope delete still passes."
+    },
+    "reposync_core::sync_engine::tests::test_is_echo_commit": {
+      "disposition": "superseded",
+      "successors": [
+        "reposync_core::echo_suppression::tests::personal_mode_marker_echo_unchanged"
+      ],
+      "reason": "The old test only checked that a string contains the sync marker. Marker detection moved to the echo_suppression module, whose test checks the same marker rule through personal_mode_marker_echo."
+    },
+    "reposync_personal::svn_to_git::tests::test_copy_tree_skips_dotfiles_at_root": {
+      "disposition": "superseded",
+      "successors": [
+        "reposync_personal::svn_to_git::tests::test_copy_tree_skips_reserved_vcs_and_preserves_ordinary_dotfiles"
+      ],
+      "reason": "The old test required every root-level dot entry to be skipped. copy_tree now skips only reserved version-control directories and preserves ordinary dotfiles; the successor asserts both."
+    },
+    "startup_schema::ordinary_startup_stays_v12": {
+      "disposition": "renamed",
+      "successors": [
+        "startup_schema::ordinary_startup_stays_v14"
+      ],
+      "reason": "Same ordinary-startup schema check; the operational schema version advanced from 12 to 14."
+    },
+    "team_mode_e2e::candidate_r10_merge_dag_rejected_before_replay": {
+      "disposition": "superseded",
+      "successors": [
+        "team_mode_e2e::candidate_r10_merge_dag_replayed"
+      ],
+      "reason": "Merge DAGs were refused as unsupported_merge_dag. #66 added merge-DAG continuation, so the same pushed merge is now replayed."
+    },
+    "team_mode_e2e::candidate_r10_over_1000_pending_commits_rejected": {
+      "disposition": "superseded",
+      "successors": [
+        "team_mode_e2e::candidate_r10_over_1000_pending_commits_batched",
+        "team_mode_e2e::candidate_r10_over_1000_pending_commits_default_cap"
+      ],
+      "reason": "More than 1000 pending commits were refused. #66 added durable batched continuation, so 1001 pending commits now drain in batches."
+    }
+  }
+}
