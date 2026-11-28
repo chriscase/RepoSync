@@ -859,15 +859,23 @@ mod tests {
         ] {
             tx.send(event).unwrap();
         }
-        for own in ["pair-alpha", "pair-beta", "pair-beta", "pair-alpha"] {
-            let other = if own == "pair-alpha" {
-                "pair-beta"
-            } else {
-                "pair-alpha"
-            };
+        // The listener posts serially, but the capture server hands bodies
+        // over from one task per connection, so arrival order is not fixed.
+        let mut seen = std::collections::BTreeMap::new();
+        for _ in 0..4 {
             let body = next(&mut rx).await;
-            assert!(body.contains(own) && !body.contains(other), "{body}");
+            let alpha = body.contains("pair-alpha");
+            let beta = body.contains("pair-beta");
+            assert!(alpha != beta, "each card names exactly one pair: {body}");
+            let own = if alpha { "pair-alpha" } else { "pair-beta" };
+            let failed = body.contains("Sync failed");
+            assert!(
+                seen.insert((own, failed), ()).is_none(),
+                "one {} card for {own}: {body}",
+                if failed { "failed" } else { "completed" }
+            );
         }
+        assert_eq!(seen.len(), 4, "a completed and a failed card per pair");
         drop(tx);
         tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await
