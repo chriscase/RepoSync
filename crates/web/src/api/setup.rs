@@ -529,6 +529,11 @@ async fn apply_config(
             // Merge into the existing file so entries the operator already
             // maintains there are kept; the wizard's entries win on conflict.
             use reposync_core::identity::mapping_file::MappingFile;
+            // One load-merge-save at a time, so concurrent applies cannot
+            // drop each other's entries.
+            static MAPPING_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _guard = MAPPING_WRITE.lock().unwrap_or_else(|p| p.into_inner());
+            let mut written = false;
             let existing = if mapping_target.exists() {
                 MappingFile::load(&mapping_target).map(Some)
             } else {
@@ -547,6 +552,7 @@ async fn apply_config(
                     if let Err(e) = MappingFile::save(&mapping_target, &merged) {
                         warnings.push(format!("Failed to write identity mapping file: {}", e));
                     } else {
+                        written = true;
                         info!(
                             path = %mapping_target.display(),
                             count = merged.len(),
@@ -555,15 +561,19 @@ async fn apply_config(
                     }
                 }
             }
+            drop(_guard);
 
-            // Also store in DB for the dashboard to display
-            let db = &state.db;
-            let json_val = serde_json::to_string(mappings).unwrap_or_default();
-            let now = chrono::Utc::now().to_rfc3339();
-            let _ = db.conn().execute(
+            // Also store in DB for the dashboard to display, only when the
+            // file the mapper reads holds these entries.
+            if written {
+                let db = &state.db;
+                let json_val = serde_json::to_string(mappings).unwrap_or_default();
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = db.conn().execute(
                 "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('identity_mappings', ?1, ?2)",
                 rusqlite::params![json_val, now],
             );
+            }
         }
     }
 

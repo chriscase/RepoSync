@@ -71,26 +71,65 @@ impl MappingFile {
 
         let toml_str =
             toml::to_string_pretty(&data).map_err(|e| IdentityError::ParseError(e.to_string()))?;
-        // Write a sibling temporary file and rename it into place, so a
-        // failed write never leaves a truncated mapping file behind. A
-        // symlinked mapping file is updated at its target, as a plain write
-        // would, rather than replaced by a regular file.
-        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        // Write a uniquely named sibling temporary file and rename it into
+        // place, so a failed write never leaves a truncated mapping file. A
+        // symlinked mapping file (even a dangling one) is updated at its
+        // target, as a plain write would, rather than replaced by a regular
+        // file, and the existing file's permissions are kept.
+        let resolved = resolve_symlink_target(path);
         let path = resolved.as_path();
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "mappings.toml".into());
-        let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
-        std::fs::write(&tmp, toml_str).map_err(IdentityError::IoError)?;
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(IdentityError::IoError(e));
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let mut tmp = match tempfile::NamedTempFile::new_in(parent) {
+            Ok(tmp) => tmp,
+            // The directory may be writable only by an administrator while
+            // the file itself was handed to the service; write in place then.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::fs::write(path, toml_str).map_err(IdentityError::IoError)?;
+                debug!(count = mappings.len(), "saved author mappings in place");
+                return Ok(());
+            }
+            Err(e) => return Err(IdentityError::IoError(e)),
+        };
+        {
+            use std::io::Write;
+            tmp.write_all(toml_str.as_bytes())
+                .and_then(|_| tmp.as_file().sync_all())
+                .map_err(IdentityError::IoError)?;
         }
+        if let Ok(meta) = std::fs::metadata(path) {
+            std::fs::set_permissions(tmp.path(), meta.permissions())
+                .map_err(IdentityError::IoError)?;
+        }
+        tmp.persist(path)
+            .map_err(|e| IdentityError::IoError(e.error))?;
 
         debug!(count = mappings.len(), "saved author mappings");
         Ok(())
     }
+}
+
+/// Follow symlinks at `path` to the file a plain write would reach,
+/// including the target of a dangling link.
+fn resolve_symlink_target(path: &Path) -> std::path::PathBuf {
+    if let Ok(p) = std::fs::canonicalize(path) {
+        return p;
+    }
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::read_link(&current) {
+            Ok(target) => {
+                current = match current.parent() {
+                    Some(parent) if target.is_relative() => parent.join(target),
+                    _ => target,
+                };
+            }
+            Err(_) => break,
+        }
+    }
+    current
 }
 
 #[cfg(test)]
@@ -170,6 +209,28 @@ email = "alice@example.com"
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_permissions_and_follows_a_dangling_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authors.toml");
+        std::fs::write(&path, "[authors]\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        MappingFile::save(&path, &HashMap::new()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink("missing.toml", &link).unwrap();
+        MappingFile::save(&link, &HashMap::new()).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(dir.path().join("missing.toml").is_file());
     }
 
     #[test]
