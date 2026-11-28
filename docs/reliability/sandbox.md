@@ -77,3 +77,8 @@ script is fixed. The `image_hook_scripts` test fails if a script and its test
 copy differ or if the directory ships anything no test names. Outside the image
 the tests write the same script into the repository. The writable fixture keeps
 its `noexec` mount.
+
+Two suites put a stand-in `git-lfs` or `git` ahead of the real program on
+`PATH`. They use the same installer and directory. Each stand-in is a fixed
+script that defers to the real program named in a `real-<program>` file the
+test writes beside it.

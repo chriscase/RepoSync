@@ -1,0 +1,6 @@
+#!/bin/sh
+if [ "$1" = "clean" ] || [ "$1" = "filter-process" ]; then
+  echo "nothing to commit" >&2
+  exit 1
+fi
+exec "$(cat "$(dirname "$0")/real-git-lfs")" "$@"

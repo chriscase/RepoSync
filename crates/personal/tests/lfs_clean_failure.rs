@@ -3,6 +3,9 @@
 //! This is its own test process so the temporary `git-lfs` wrapper on `PATH`
 //! cannot change clean-filter behavior for the other personal tests.
 
+#[path = "../../core/tests/fixtures/image_hook.rs"]
+mod image_hook;
+
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -67,19 +70,8 @@ fn failing_clean_filter_does_not_advance_the_watermark() {
     svn_commit_file(&svn_wc, "asset.bin", &"Z".repeat(90), "replace asset");
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
-    let wrapper = bin.join("git-lfs");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = \"clean\" ] || [ \"$1\" = \"filter-process\" ]; then\n  echo \"nothing to commit\" >&2\n  exit 1\nfi\nexec {real_lfs} \"$@\"\n"
-        ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    std::fs::write(bin.join("real-git-lfs"), &real_lfs).unwrap();
+    image_hook::install_program(&bin, "git-lfs", image_hook::script::LFS_CLEAN_FAILS);
     let old_path = std::env::var("PATH").unwrap_or_default();
     std::env::set_var("PATH", format!("{}:{old_path}", bin.display()));
     let failed = runtime.block_on(sync.sync());

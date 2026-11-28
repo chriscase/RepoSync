@@ -14,9 +14,16 @@ use std::path::Path;
 
 /// Installs a script as `<repository>/hooks/<hook>`. The script is its
 /// directory name under scripts/reliability-hooks and its exact bytes.
-pub fn install(repository: &Path, hook: &str, (name, body): (&str, &str)) {
+pub fn install(repository: &Path, hook: &str, script: (&str, &str)) {
+    install_program(&repository.join("hooks"), hook, script);
+}
+
+/// Installs a script as `<directory>/<program>`, for a test that puts a
+/// stand-in program ahead of the real one on `PATH`. A stand-in finds the real
+/// program through a `real-<program>` file the test writes beside it.
+pub fn install_program(directory: &Path, hook: &str, (name, body): (&str, &str)) {
     use std::os::unix::fs::PermissionsExt;
-    let path = repository.join("hooks").join(hook);
+    let path = directory.join(hook);
     match std::fs::symlink_metadata(&path) {
         Ok(_) => std::fs::remove_file(&path).unwrap(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -176,6 +183,27 @@ while [ ! -f release ]; do
 done
 echo "rejected by $(cat hooks/r17-reject-id)" >&2
 exit 1
+"#,
+    );
+    // Stand-ins for `git-lfs` and `git`. Each defers to the real program named
+    // in the `real-<program>` file beside it.
+    pub const LFS_CLEAN_FAILS: (&str, &str) = (
+        "lfs-clean-fails",
+        r#"#!/bin/sh
+if [ "$1" = "clean" ] || [ "$1" = "filter-process" ]; then
+  echo "nothing to commit" >&2
+  exit 1
+fi
+exec "$(cat "$(dirname "$0")/real-git-lfs")" "$@"
+"#,
+    );
+    pub const GIT_PUSH_NOOP: (&str, &str) = (
+        "git-push-noop",
+        r#"#!/bin/sh
+if [ "$1" = "push" ]; then
+  exit 0
+fi
+exec "$(cat "$(dirname "$0")/real-git")" "$@"
 "#,
     );
 }

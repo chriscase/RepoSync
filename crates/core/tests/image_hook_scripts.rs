@@ -33,6 +33,8 @@ fn reviewed_hook_scripts_match_the_tests_and_nothing_else_is_shipped() {
         (script::SVN_REJECT_AFTER_GIT, "pre-commit"),
         (script::SVN_HOLD_HTTP_DISCONNECT, "pre-commit"),
         (script::SVN_HOLD_SHUTDOWN, "pre-commit"),
+        (script::LFS_CLEAN_FAILS, "git-lfs"),
+        (script::GIT_PUSH_NOOP, "git"),
     ];
     let root = reviewed_root();
     let mut expected = BTreeSet::new();
