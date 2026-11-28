@@ -51,8 +51,8 @@ async fn handle_socket(
     debug!("WebSocket client connected, awaiting auth");
 
     // Check if auth is required (admin password or users exist)
-    let needs_auth =
-        state.config.web.admin_password.is_some() || state.db.count_users().unwrap_or(0) > 0;
+    // Fail closed: a read error requires sign-in.
+    let needs_auth = crate::api::auth::sign_in_required(&state).unwrap_or(true);
 
     if needs_auth {
         // Wait up to 5 seconds for the first message to contain auth token

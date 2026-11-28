@@ -340,7 +340,8 @@ async fn login(
         }))
     } else {
         // Backward-compatible single-password mode
-        let configured_password = state.config.web.admin_password.as_deref().unwrap_or("");
+        let configured_password = admin_password(&state).unwrap_or_default();
+        let configured_password = configured_password.as_str();
 
         if configured_password.is_empty() {
             return Err(AppError::BadRequest(
@@ -522,6 +523,46 @@ async fn me(
     Err(AppError::Unauthorized("session expired or invalid".into()))
 }
 
+/// The single administrator password: the server configuration's, or one
+/// saved since startup (the setup wizard stores a bcrypt hash in the
+/// database). Read on every call so a password saved by the wizard applies
+/// without a restart.
+pub(crate) fn admin_password(state: &AppState) -> Option<String> {
+    if let Some(p) = state
+        .config
+        .web
+        .admin_password
+        .as_ref()
+        .filter(|p| !p.is_empty())
+    {
+        return Some(p.clone());
+    }
+    ["secret_admin_password_hash", "secret_admin_password"]
+        .iter()
+        .find_map(|key| {
+            state
+                .db
+                .get_state(key)
+                .ok()
+                .flatten()
+                .filter(|v| !v.is_empty())
+        })
+}
+
+/// Whether sign-in is required: an administrator password exists or any
+/// account does. While neither exists, the setup wizard's first-run window is
+/// open; it closes as soon as either is saved.
+pub(crate) fn sign_in_required(state: &AppState) -> Result<bool, AppError> {
+    if admin_password(state).is_some() {
+        return Ok(true);
+    }
+    Ok(state
+        .db
+        .count_users()
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
+        > 0)
+}
+
 /// Middleware helper to validate a session token from the Authorization header.
 ///
 /// Call this from handlers that require authentication. Returns `Ok(())` if
@@ -534,17 +575,10 @@ pub async fn validate_session(
 ) -> Result<(), AppError> {
     // If no admin password is configured AND no users exist, require setup first.
     // Setup endpoints handle their own auth bypass for fresh instances.
-    if state.config.web.admin_password.is_none() {
-        let has_users = state
-            .db
-            .count_users()
-            .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
-            > 0;
-        if !has_users {
-            return Err(AppError::Forbidden(
-                "initial setup required — please complete the setup wizard".into(),
-            ));
-        }
+    if !sign_in_required(state)? {
+        return Err(AppError::Forbidden(
+            "initial setup required — please complete the setup wizard".into(),
+        ));
     }
 
     let token = auth_header
@@ -581,17 +615,10 @@ pub async fn validate_session_with_role(
     auth_header: Option<&str>,
 ) -> Result<(String, String), AppError> {
     // If no admin password is configured AND no users exist, require setup first.
-    if state.config.web.admin_password.is_none() {
-        let has_users = state
-            .db
-            .count_users()
-            .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
-            > 0;
-        if !has_users {
-            return Err(AppError::Forbidden(
-                "initial setup required — please complete the setup wizard".into(),
-            ));
-        }
+    if !sign_in_required(state)? {
+        return Err(AppError::Forbidden(
+            "initial setup required — please complete the setup wizard".into(),
+        ));
     }
 
     let token = auth_header
