@@ -16,7 +16,10 @@ prepare_source() {
   local source="$1" label="$2" context="$contexts/$2"
   mkdir -p "$context" || return $?
   printf '%s\n' archive > "$comparison_dir/$label-setup-stage.txt" || return $?
-  git archive "$source" | tar -x -C "$context" || return $?
+  local archive="$contexts/$label.tar"
+  git archive "$source" > "$archive" || return $?
+  tar -xf "$archive" -C "$context" || return $?
+  rm "$archive" || return $?
   printf '%s\n' lock_staging > "$comparison_dir/$label-setup-stage.txt" || return $?
   python3 scripts/reliability-lock-overlay.py stage "$context" --source "$source" \
     --receipt "$comparison_dir/$label-lock.json" || return $?
@@ -39,6 +42,7 @@ PY
   cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py \
     scripts/reliability-inventory.py scripts/reliability-inventory-probes.py \
     scripts/reliability-copy-consumer.mjs scripts/reliability-scoped-consumer.mjs "$context/scripts/" || return $?
+  cp -R scripts/reliability-hooks "$context/scripts/" || return $?
   mkdir -p "$context/docs/reliability/fixtures" || return $?
   cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$context/docs/reliability/" || return $?
 }
@@ -63,6 +67,7 @@ for index in "${!sources[@]}"; do
   [[ "$status" -eq 0 ]] || aggregate_status=1
 done
 status=0
+REPOSYNC_LOCK_SOURCE=candidate \
 REPOSYNC_SOURCE_HEAD_OVERRIDE="$candidate_sha" \
 REPOSYNC_SOURCE_TREE_OVERRIDE="$candidate_tree" \
 REPOSYNC_ARTIFACT_DIR="$comparison_dir/candidate" \

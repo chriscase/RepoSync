@@ -510,6 +510,11 @@ pub(crate) fn delete_repository_registration_row(
     repo_id: &str,
 ) -> Result<(), DatabaseError> {
     super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(conn, repo_id)?;
+    if super::managed_remove::archived_pair(conn, repo_id)? {
+        return Err(DatabaseError::Other(
+            "archived branch pair and its history cannot be deleted".into(),
+        ));
+    }
     purge_repository_kv_before_row_delete(conn, repo_id)?;
     let changed = conn.execute("DELETE FROM repositories WHERE id = ?1", params![repo_id])?;
     if changed == 0 {

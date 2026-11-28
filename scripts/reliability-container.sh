@@ -51,9 +51,14 @@ phase=lock_staging
 python3 "$repo_root/scripts/reliability-lock-overlay.py" stage "$prepared_context" \
   --source "$lock_source" --receipt "$artifact_dir/build-lock.json"
 cp "$prepared_context/Cargo.lock" "$prepared_context/docs/reliability/fixtures/Cargo.lock"
+phase=runtime_fixture_staging
+python3 "$repo_root/scripts/reliability-prep.py" --stage-fixtures "$prepared_context" \
+  "$repo_root" "$artifact_dir/fixture-inputs.json"
 mkdir "$prepared_context/legacy-old"
 phase=old_source_archive
-git archive 87379741779a6259f7eeb52a68cc6f061174e5ef | tar -x -C "$prepared_context/legacy-old"
+git archive 87379741779a6259f7eeb52a68cc6f061174e5ef > "$prepared_context/legacy-old.tar"
+tar -xf "$prepared_context/legacy-old.tar" -C "$prepared_context/legacy-old"
+rm "$prepared_context/legacy-old.tar"
 python3 "$repo_root/scripts/reliability-lock-overlay.py" stage "$prepared_context/legacy-old" \
   --source 87379741779a6259f7eeb52a68cc6f061174e5ef \
   --receipt "$artifact_dir/old-generator-build-lock.json"
@@ -150,6 +155,7 @@ docker run --rm --network none --read-only --cap-drop ALL \
   --env REPOSYNC_HOST_LISTENER_PORT="$(cat "$listener_info")" \
   --env REPOSYNC_SOURCE_HEAD="$source_head" --env REPOSYNC_SOURCE_TREE="$source_tree" \
   --env REPOSYNC_GOAL_SHA256="$goal_hash" --env REPOSYNC_LOCK_SHA256="$lock_hash" \
+  --env REPOSYNC_LOCK_SOURCE="$lock_source" \
   "$image" "${mode#--}" || runtime_status=$?
 printf '%s\n' "$runtime_status" > "$artifact_dir/runtime-exit-code.txt"
 [[ "$(cat "$host_private/canary")" == 'synthetic host-private file' ]] || {

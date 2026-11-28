@@ -1,15 +1,26 @@
 # Update pair from parent: bounded execution contract
 
-Refs #69. #69 stays open.
+Refs #69.
 
-This contract describes the next execution policy. Implementation is in progress.
-The draft v2 service and explicit recovery workflow are described in
-[69-pair-refresh-v2-api.md](69-pair-refresh-v2-api.md); qualification remains in progress.
-The existing v1 preview and its execution refusal remain active. Standalone
-publication, lineage, Git and SVN preparation components do not authorize execution.
-The endpoint, complete writer exclusion, SVN publication, recovery and real-engine
-evidence below must be implemented and independently reviewed before this policy
-is enabled. Reviewed durable identity landed on main at af394285869bdffa5f156c651cd1104027832749;
+`execute: true` and `reanchor` on the v1 route call `RefreshService`, which calls
+`SyncEngine` through the local file seam in `local_operations`. That seam accepts
+only `file://` SVN repositories and Git directories under the daemon data
+directory. A network URL is refused before any command. The journal is stored
+before each side effect. A completed request with the same id, operation, and
+approval returns the original receipt and does not publish again. A crash after
+the SVN revision is adopted on resume instead of committed twice. Pending pair
+SVN or Git work is refused and left in place. Re-anchor keeps the old SVN path
+and `refs/reposync/pair-refresh/generation/1`. A new path is `{path}-g2` unless
+the request sets `same_name`. Retirement records
+`refs/reposync/pair-refresh/generation/1-retired` and does not delete the path
+or force-push.
+
+The v1 preview stays read-only. Its digest is not an execution approval.
+`approve_current` on that route binds the pins observed by the same call.
+The qualified v2 prepare/execute/reconcile/cancel path is unchanged and is
+described in [69-pair-refresh-v2-api.md](69-pair-refresh-v2-api.md). Standalone
+publication, lineage, Git and SVN preparation components do not authorize that
+path. Reviewed durable identity landed on main at af394285869bdffa5f156c651cd1104027832749;
 the writer branch integrates it through a main merge.
 
 ## Supported operation boundary
@@ -27,7 +38,7 @@ the writer branch integrates it through a main merge.
 | LFS, active Git attribute rules, symlinks or submodules | Refused | Preparation and publication do not run LFS hooks or map these semantics |
 | Unsupported SVN property, projection or tree conflict | Refused | Git file equality alone does not prove SVN correspondence |
 | Uncertain partial publication | Held for reconciliation | Inspect durable evidence; never blindly retry or release the hold |
-| Re-anchor, recreate, retirement or same-name generation reuse | Not implemented | Separate design and approval required |
+| Re-anchor, recreate, retirement or same-name generation reuse | Local file repository through RefreshService | Keeps the old generation ref and SVN path. A new path is `{path}-g2` unless `same_name` is in the approval. Retirement records a retained ref and does not delete the path. No force-push. |
 
 The first case supports regular file bytes, executable bits, the fixed binary
 `svn:mime-type=application/octet-stream` property and directories needed by those

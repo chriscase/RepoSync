@@ -1,0 +1,44 @@
+name: Release archive qualification
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release-archive-qualification.yml
+      - .github/workflows/release.yml
+      - scripts/assemble_release_archive.sh
+      - scripts/install.sh
+      - scripts/qualify_release_artifact.sh
+      - scripts/reposync.service
+      - config.example.toml
+      - authors.example.toml
+      - web-ui/**
+
+permissions:
+  contents: read
+
+jobs:
+  qualify-archive:
+    name: Install and run ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-gnu, os: ubuntu-24.04}
+          - {target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm}
+          - {target: x86_64-apple-darwin, os: macos-15-intel}
+          - {target: aarch64-apple-darwin, os: macos-15}
+    runs-on: ${{ matrix.os }}
+    env:
+      REPOSYNC_EXPECTED_TARGET: ${{ matrix.target }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+      - run: bash scripts/qualify_release_artifact.sh

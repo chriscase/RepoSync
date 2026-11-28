@@ -6,6 +6,7 @@
 
 pub mod auto_reconcile;
 pub mod busy;
+mod commit_message;
 pub mod config;
 pub mod conflict;
 pub mod crypto;
@@ -23,6 +24,7 @@ pub mod import;
 pub mod late_pair;
 pub mod late_pair_publish;
 pub mod ldap_auth;
+pub mod legacy_svn_recovery;
 pub mod lfs;
 pub mod managed_remove;
 pub mod models;

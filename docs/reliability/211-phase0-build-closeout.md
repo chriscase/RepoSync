@@ -7,6 +7,16 @@ This slice restores build/comparison evidence collection. The scenario catalog,
 production crates, workflows, #195 acceptance lab and #204 work remain with
 their existing owners. Deployed-version coverage is **NOT ESTABLISHED**.
 
+## Retired test identities
+
+The historical comparison matches exact test identities. `fixtures/retired-test-identities.json`
+lists each old identity that passed on a baseline and is intentionally absent from
+the candidate, with the tests that cover it now and the reason. The comparison
+accepts an absence only when it is listed and every listed successor passed in the
+same candidate run. It refuses a listed identity that still exists in the candidate
+catalog, and it still reports every unlisted absence and every failing test as before.
+Adding an entry is a reviewed decision about one test, not a waiver.
+
 ## Reviewed dependency inputs
 
 `fixtures/baseline-locks.json` binds every historical source to its source tree,

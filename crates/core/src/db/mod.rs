@@ -6,9 +6,14 @@
 pub mod conflict_repo_attribution;
 pub mod credential_seeding;
 pub mod git_push_operations;
+pub mod historical_enrollment;
+pub mod historical_review_key;
+pub mod historical_transport;
 pub mod import_operations;
 pub mod late_pair_publish_operations;
+pub mod lineage_checkpoints;
 pub mod managed_remove;
+mod offline_snapshot;
 pub mod ordinary_writer_windows;
 mod pair_refresh_competing_journals;
 pub mod pair_refresh_credentials;
@@ -17,8 +22,11 @@ pub mod personal_scope;
 pub mod queries;
 pub mod repo_scope_identity;
 pub mod schema;
+pub(crate) mod startup;
+mod startup_rollback;
 pub mod svn_commit_operations;
 pub mod team_cycle_mapping_operations;
+pub mod upgrade_preflight;
 pub mod watermark_recovery;
 
 pub(crate) mod opened_file;
@@ -51,8 +59,17 @@ use opened_file::OpenedDatabaseFile;
 pub struct Database {
     conn: Mutex<Connection>,
     opened_file: Option<OpenedDatabaseFile>,
+    startup_owner: Option<startup::StartupOwner>,
     #[cfg(test)]
     test_force_echo_split_fail: Mutex<bool>,
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Some(owner) = self.startup_owner.take() {
+            owner.retire(self);
+        }
+    }
 }
 
 impl Database {
@@ -68,11 +85,25 @@ impl Database {
         let conn = Connection::open(path)?;
         let connected_file = OpenedDatabaseFile::attest(&conn, path, prior_file);
 
+        // Refuse an incompatible layout without checkpointing its WAL on close.
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
         // Refuse a future schema before WAL checkpoint or other writes.
         let existing_version: u32 =
             conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         schema::refuse_future_schema(existing_version)?;
+        if schema::installed_team::pending(&conn, existing_version)? {
+            return Err(DatabaseError::Other(
+                "installed team schema requires owned startup".into(),
+            ));
+        }
 
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            false,
+        )?;
         // Enable WAL mode for better concurrent read performance.
         conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -103,6 +134,7 @@ impl Database {
         Ok(Self {
             conn: Mutex::new(conn),
             opened_file,
+            startup_owner: None,
             #[cfg(test)]
             test_force_echo_split_fail: Mutex::new(false),
         })
@@ -115,14 +147,34 @@ impl Database {
         path: impl AsRef<Path>,
     ) -> Result<Self, DatabaseError> {
         let path = path.as_ref();
+        startup_rollback::require_safe_unrecovered_open(path)?;
+        // Resolve platform ancestor aliases before NOFOLLOW; the named final
+        // component was already required to be regular, owned and unaliased.
+        // No SQLite connection/reservation exists during this canonicalization.
+        let canonical_path = path.canonicalize()?;
+        let path = canonical_path.as_path();
+        startup_rollback::require_safe_unrecovered_open(path)?;
         let prior = OpenedDatabaseFile::capture(path).ok_or_else(|| {
             DatabaseError::Other("recovery requires existing native database storage".into())
         })?;
-        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        startup_rollback::require_safe_unrecovered_open(path)?;
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        // Neither a refused inspection nor the returned recovery handle may
+        // checkpoint committed WAL evidence on last-connection close. Keep
+        // this flag enabled for the returned connection's entire lifetime.
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
         let opened_file = OpenedDatabaseFile::attest(&conn, path, Some(prior))
             .ok_or_else(|| DatabaseError::Other("recovery database identity changed".into()))?;
         let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != schema::CURRENT_SCHEMA_VERSION {
+        if version != schema::CURRENT_SCHEMA_VERSION
+            || schema::installed_team::pending(&conn, version)?
+        {
             return Err(DatabaseError::Other(
                 "recovery requires an already current database schema".into(),
             ));
@@ -145,6 +197,7 @@ impl Database {
         Ok(Self {
             conn: Mutex::new(conn),
             opened_file: Some(opened_file),
+            startup_owner: None,
             #[cfg(test)]
             test_force_echo_split_fail: Mutex::new(false),
         })
@@ -157,6 +210,7 @@ impl Database {
         Ok(Self {
             conn: Mutex::new(conn),
             opened_file: None,
+            startup_owner: None,
             #[cfg(test)]
             test_force_echo_split_fail: Mutex::new(false),
         })
@@ -199,36 +253,119 @@ impl Database {
         schema::ensure_v13_migration(&conn)
     }
 
-    /// Ordinary daemon writer startup: exclusive `reposync.lock` owner, durable
-    /// writer-fence lease, then v12 init.
+    /// Ordinary daemon writer startup owns the local lock and durable lease,
+    /// and completes operational scope migration before exposing UUID readers.
     ///
     /// The returned [`crate::data_dir::DataDirOwner`] must be held for the
     /// process lifetime. Additional SQLite connections to the same file are
     /// allowed in-process; a second process cannot take the owner.
     ///
-    /// CLI and personal `Database::new`/`initialize` paths do not take this
-    /// lock. Non-daemon writers stay out of scope until a later slice.
+    /// CLI and Personal writers use the owned `open_cli_writer` and
+    /// `open_personal_writer` entrances. `Database::new` is an unowned handle.
     pub fn open_with_exclusive_owner(
         data_dir: impl AsRef<Path>,
     ) -> Result<(Self, crate::data_dir::DataDirOwner), DatabaseError> {
         let data_dir = data_dir.as_ref();
         std::fs::create_dir_all(data_dir)?;
         let lock = crate::data_dir::acquire(data_dir)?;
+        let canonical_data_dir = data_dir.canonicalize()?;
+        let data_dir = canonical_data_dir.as_path();
         let path = data_dir.join("reposync.db");
+        startup_rollback::require_safe_unrecovered_open(&path)?;
+        let mut installed_team_file = None;
         if path.try_exists()? {
+            let prior = OpenedDatabaseFile::capture(&path);
             // Open read-only before ordinary startup can checkpoint, migrate,
             // seed credentials or claim a replacement lease. The local lock is
             // retained through startup; the lease claim rechecks in its writer
             // transaction before a new epoch can be created.
-            let probe =
-                Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let probe = Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            probe.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )?;
             probe.execute_batch("BEGIN;")?;
             pair_refresh_operations::require_no_authenticated_startup_hold(&probe)?;
+            let version: u32 = probe.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            schema::refuse_future_schema(version)?;
+            let installed = schema::installed_team::pending(&probe, version)?;
+            if installed || version < schema::CURRENT_SCHEMA_VERSION {
+                // Schema changes affect every repository, including disabled
+                // and paused rows. Establish quiet before any checkpoint or
+                // migration; current-schema startup keeps its existing policy.
+                startup::require_quiet(&probe)?;
+            }
+            if installed {
+                installed_team_file = Some(
+                    OpenedDatabaseFile::attest(&probe, &path, prior).ok_or_else(|| {
+                        DatabaseError::Other("installed team database identity changed".into())
+                    })?,
+                );
+            }
+        }
+        startup_rollback::require_safe_unrecovered_open(&path)?;
+        if let Some(prior) = installed_team_file {
+            let db = Self::open_reserved_startup(&path, Some(prior))?;
+            let claim = crate::writer_fence::claim_for_ordinary_startup(&db, &lock, data_dir)?;
+            let owner = crate::data_dir::DataDirOwner {
+                lock,
+                fence: claim.into_daemon_guard(data_dir),
+            };
+            db.conn().execute_batch("PRAGMA journal_mode=WAL;")?;
+            db.initialize()?;
+            return Ok((db, owner));
         }
         let db = Self::new(path)?;
         db.initialize()?;
+        let deferred_scope_upgrade = {
+            let conn = db.conn();
+            schema::v13_migration_deferred_for_engine(&conn)?
+        };
+        if deferred_scope_upgrade {
+            // A failed migration must leave its committed WAL evidence intact
+            // when this connection closes on the error path.
+            db.conn().set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )?;
+        }
         let fence = crate::writer_fence::claim(&db, data_dir)?;
-        Ok((db, crate::data_dir::DataDirOwner { lock, fence }))
+        let owner = crate::data_dir::DataDirOwner { lock, fence };
+        if !deferred_scope_upgrade {
+            return Ok((db, owner));
+        }
+
+        // WriterFenceGuard::drop opens another database and checkpoints it.
+        // Keep exclusion and the lease through process exit if migration fails
+        // or unwinds, rather than running that retirement on uncertain storage.
+        let owner = std::mem::ManuallyDrop::new(owner);
+        let migration = db.immediate_transaction(|tx| {
+            owner.lock.require_current(data_dir)?;
+            db.opened_file()?.require_unaliased_owner(tx)?;
+            crate::writer_fence::require_owned_current_readonly(tx)?;
+            pair_refresh_operations::require_no_authenticated_startup_hold(tx)?;
+            pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
+            ordinary_writer_windows::require_globally_quiet_for_refresh(tx)?;
+            schema::ensure_v13_migration(tx)
+        });
+        if let Err(error) = migration {
+            tracing::warn!(%error, "scope migration refused; retaining startup ownership until process exit");
+            return Err(error);
+        }
+        let owner = std::mem::ManuallyDrop::into_inner(owner);
+        if let Err(error) = db.conn().set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            false,
+        ) {
+            // Migration is already committed and the owner is now ordinary
+            // RAII state. A conservative close policy does not undo startup.
+            tracing::warn!(%error, "scope migration complete; checkpoint-on-close remains disabled");
+        }
+        Ok((db, owner))
     }
 
     /// Obtain a lock on the underlying connection.

@@ -16,6 +16,7 @@ local/offline PASS is not enterprise/live PASS. Record any real run in [`docs/re
 | Git | 2.30+ | `git --version` |
 | curl | 7.x+ | `curl --version` |
 | jq | 1.6+ | `jq --version` |
+| Python | 3.8+ | `python3 --version` |
 
 All tools must be on `$PATH`.
 
@@ -88,7 +89,7 @@ Each cycle executes these scenarios in order:
 | S4b | **SVN→Git sync** | SVN→Git | **Invoke `reposync-personal sync`, pull Git repo (with auth), verify SVN files appear in Git. Fails on pull auth error.** |
 | S5 | Git branch + commit | →Git | Create feature branch via refs API, commit file on branch |
 | S6 | Open + merge PR | →Git | Open PR from feature branch, squash-merge via API |
-| S7 | **Git→SVN sync** | Git→SVN | **Invoke `reposync-personal sync`, verify (a) PR file content in SVN via `svn cat`, (b) SVN log `Git-Commit:` matches exact merge SHA from S6, (c) SVN log `PR:` matches exact PR number from S6** |
+| S7 | **Git→SVN sync** | Git→SVN | **Verify the file bytes, replayed Git commit and PR number on the same new SVN revision.** |
 | S8 | Echo marker | SVN→ | Commit with `[reposync]` marker, verify in `svn log --xml` |
 | S9 | API rate limit | →Git | Check `/rate_limit` endpoint, verify >100 requests remaining |
 | S10 | Log-probe | Local | Spawn `reposync-personal log-probe`, verify `personal.log` written |
@@ -102,13 +103,18 @@ Each cycle executes these scenarios in order:
 > production workflow: create a feature branch, commit via the Contents API, open and squash-merge
 > a PR, then run sync and verify the file content lands in SVN.
 >
-> **S7 exact provenance matching:** S7 requires an **exact** match between the replayed SVN
-> commit metadata and the values recorded in S6. Specifically, the `Git-Commit:` trailer must
-> contain the exact merge SHA from `s6-merge-sha.txt`, and the `PR:` trailer must reference the
-> exact PR number from `s6-pr-number.txt`. A generic "some trailer exists" is insufficient —
-> only an exact match to *this cycle's* PR proves the replay actually occurred. S7 fails if
-> (a) file content doesn't match, (b) expected SHA or PR# is missing from S6 artifacts, or
-> (c) the trailer values don't exactly match.
+> **S7 provenance matching.** S5 records the SVN revision before opening the PR and the
+> single Git commit created on its branch. A missing or malformed SVN baseline stops S5 before
+> any GitHub request. S6 uses only the commit confirmed in the current cycle, including when
+> the artifact directory is reused. It records the PR number and its squash-merge SHA.
+> Personal Mode replays the PR member commit. Its default commit-message trailer block records
+> the member as `Git-SHA:` and the PR as `PR-Number:`. The durable `RepoSync-Git-SHA:` also
+> records the member. The squash-merge SHA is recorded separately in the proof.
+>
+> S7 reads the canary file and its XML log at the same last-changed revision, which must be
+> newer than the S5 baseline. It compares exact bytes and requires one complete value for each
+> trailer in that revision's final Personal replay block. Earlier revisions, mentions in the
+> message body, partial values, duplicate fields and malformed logs fail the check.
 >
 > **Provenance self-test:** Run `scripts/test-s7-provenance.sh` offline to verify the metadata
 > matching logic. This test is also executed in CI (both `ci.yml` and `e2e.yml`).
@@ -242,7 +248,7 @@ If issues are found after an approved run, follow the backup and roll-forward ru
 Both `ci.yml` and `e2e.yml` workflows run:
 
 1. **S7 provenance self-test** (`scripts/test-s7-provenance.sh`) — verifies the exact-match
-   metadata logic offline. Fails the PR if any of the 8 test cases regress.
+   metadata logic offline, including revision selection and malformed or ambiguous trailers.
 
 2. **Large-file & LFS validation** (`scripts/large-file-validation.sh --quick`) — exercises
    file-policy enforcement and LFS utilities. CI installs `git-lfs` so the LFS preflight

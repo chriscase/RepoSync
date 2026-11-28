@@ -6,7 +6,8 @@
 //! `personal` id on upgrade unless a managed repository already owns that id.
 
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::git_push_operations::GitPushOperation;
@@ -41,7 +42,9 @@ pub fn personal_history_block_keys() -> [String; 2] {
         .unwrap()
 }
 
-fn personal_repo_ids_for_read(db: &Database) -> Result<Vec<&'static str>, DatabaseError> {
+pub(super) fn personal_repo_ids_for_read(
+    db: &Database,
+) -> Result<Vec<&'static str>, DatabaseError> {
     let legacy_blocked = db.get_repository(LEGACY_PERSONAL_REPO_ID)?.is_some();
     if legacy_blocked {
         Ok(vec![PERSONAL_SCOPE_KEY])
@@ -255,6 +258,133 @@ impl Database {
         null_commit_map_git_to_svn_has_personal_evidence(&conn, git_sha)
     }
 
+    /// Only an import writer establishes a discovery boundary. Ordinary SVN
+    /// log messages can contain any text, including the importer's old labels.
+    pub fn personal_pr_history_anchor(&self) -> Result<Option<String>, DatabaseError> {
+        let legacy = if self.list_repositories()?.is_empty() {
+            self.get_watermark("git_sha")?.filter(|v| !v.is_empty())
+        } else {
+            None
+        };
+        let scoped = self.get_watermark("personal_pr_import_git_sha")?;
+        if let (Some(current), Some(old)) = (&scoped, &legacy) {
+            if current != old {
+                return Err(DatabaseError::Other(
+                    "Personal import boundary and legacy watermark disagree".into(),
+                ));
+            }
+        }
+        if let Some(current) = legacy {
+            return Ok(Some(current));
+        }
+        let Some(scoped) = scoped else {
+            return Ok(None);
+        };
+        let proven: bool = self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM commit_map m JOIN sync_records r
+             ON r.repo_id=m.repo_id AND r.svn_rev=m.svn_rev AND r.git_sha=m.git_sha
+             WHERE m.repo_id=?1 AND m.git_sha=?2 AND m.direction='svn_to_git'
+             AND r.direction='svn_to_git' AND r.status='applied')",
+            params![PERSONAL_SCOPE_KEY, scoped],
+            |row| row.get(0),
+        )?;
+        Ok(proven.then_some(scoped))
+    }
+
+    pub(crate) fn record_personal_pr_import_boundary_tx(
+        tx: &Connection,
+        sha: &str,
+    ) -> Result<(), DatabaseError> {
+        tx.execute(
+            "INSERT INTO watermarks(source,value,updated_at) VALUES('personal_pr_import_git_sha',?1,?2)
+             ON CONFLICT(source) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            params![sha,Utc::now().to_rfc3339()])?;
+        Ok(())
+    }
+
+    /// The old poller wrote this audit after a confirmed PR member and before
+    /// attempting the next one. Stand-alone writers did not emit this record.
+    pub fn legacy_personal_pr_prefix_matches(
+        &self,
+        id: i64,
+        sha: &str,
+        rev: i64,
+        count: usize,
+    ) -> Result<bool, DatabaseError> {
+        Self::legacy_personal_pr_prefix_matches_tx(&self.conn(), id, sha, rev, count)
+    }
+
+    fn legacy_personal_pr_prefix_matches_tx(
+        conn: &Connection,
+        id: i64,
+        sha: &str,
+        rev: i64,
+        count: usize,
+    ) -> Result<bool, DatabaseError> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pr_sync_log p JOIN audit_log a
+             ON a.action='git_to_svn_commit' AND a.direction='git_to_svn' AND a.success=1
+             AND a.svn_rev=?3 AND a.git_sha=?2
+             AND a.details=printf('PR #%d: replayed commit %s as r%d',p.pr_number,substr(?2,1,8),?3)
+             JOIN commit_map m ON m.git_sha=?2 AND m.svn_rev=?3 AND m.repo_id=?5 AND m.direction='git_to_svn'
+             JOIN sync_records r ON r.git_sha=m.git_sha AND r.svn_rev=m.svn_rev AND r.repo_id=m.repo_id
+             AND r.direction=m.direction AND r.status='applied'
+             WHERE p.id=?1 AND p.status='pending' AND p.commit_count=?4
+             AND p.svn_rev_start IS NULL AND p.svn_rev_end IS NULL
+             AND NOT EXISTS(SELECT 1 FROM kv_state WHERE key=('personal_pr_commits_v1:' || p.id)))",
+            params![id,sha,rev,count as i64,PERSONAL_SCOPE_KEY], |row|row.get(0))?)
+    }
+
+    /// A completed PR's verified applied member can account for an interior
+    /// commit of its exact landed first-parent span on a later scan.
+    pub fn is_completed_personal_pr_member(&self, sha: &str) -> Result<bool, DatabaseError> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM commit_map m JOIN sync_records r
+             ON m.repo_id=r.repo_id AND m.git_sha=r.git_sha AND m.svn_rev=r.svn_rev
+             JOIN kv_state d ON d.key GLOB 'git_to_svn_commit_v1:document:*'
+             JOIN pr_sync_log p ON p.id=json_extract(d.value,'$.personal_pr_sync_id')
+             WHERE m.repo_id=?1 AND m.git_sha=?2 AND m.direction='git_to_svn'
+             AND r.status='applied' AND r.direction=m.direction AND p.status='completed'
+             AND json_extract(d.value,'$.state')='completed' AND json_extract(d.value,'$.repo_id')=m.repo_id
+             AND json_extract(d.value,'$.source_git_sha')=m.git_sha AND json_extract(d.value,'$.last_confirmed_svn_rev')=m.svn_rev)",
+            params![PERSONAL_SCOPE_KEY,sha], |r|r.get(0))?)
+    }
+
+    /// Source members this exact PR already wrote. Earlier PRs may have mapped
+    /// the same Git SHA and must not count as members applied in this PR.
+    pub fn confirmed_personal_pr_members(
+        &self,
+        id: i64,
+    ) -> Result<std::collections::HashSet<String>, DatabaseError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT m.git_sha FROM kv_state d
+             JOIN commit_map m ON m.repo_id=?1 AND m.direction='git_to_svn'
+             JOIN sync_records r ON r.repo_id=m.repo_id AND r.svn_rev=m.svn_rev AND r.git_sha=m.git_sha
+             WHERE r.direction='git_to_svn' AND r.status='applied'
+             AND d.key GLOB 'git_to_svn_commit_v1:document:*'
+             AND d.key=('git_to_svn_commit_v1:document:' || json_extract(d.value,'$.id'))
+             AND json_extract(d.value,'$.version')=1 AND json_extract(d.value,'$.repo_id')=m.repo_id
+             AND json_extract(d.value,'$.operation_type')='git_to_svn_commit'
+             AND json_extract(d.value,'$.state')='completed'
+             AND json_extract(d.value,'$.personal_pr_sync_id')=?2
+             AND json_extract(d.value,'$.source_git_sha')=m.git_sha
+             AND json_extract(d.value,'$.last_confirmed_svn_rev')=m.svn_rev")?;
+        let rows = stmt.query_map(params![PERSONAL_SCOPE_KEY, id], |row| row.get(0))?;
+        let mut members = rows.collect::<Result<std::collections::HashSet<_>, _>>()?;
+        let legacy: Option<String> = conn.query_row(
+            "SELECT m.git_sha FROM kv_state k JOIN pr_sync_log p ON p.id=?1
+             JOIN commit_map m ON m.svn_rev=p.svn_rev_start AND m.git_sha=k.value
+             JOIN sync_records r ON r.repo_id=m.repo_id AND r.svn_rev=m.svn_rev AND r.git_sha=m.git_sha
+             WHERE k.key=('personal_pr_legacy_prefix_v1:' || p.id) AND m.repo_id=?2
+             AND m.direction='git_to_svn' AND r.direction=m.direction AND r.status='applied' LIMIT 1",
+            params![id,PERSONAL_SCOPE_KEY], |row|row.get(0)).optional()?;
+        if let Some(sha) = legacy {
+            members.insert(sha);
+        }
+        Ok(members)
+    }
+
     /// True when personal mode has completed syncing this PR merge SHA.
     pub fn is_personal_pr_synced(&self, merge_sha: &str) -> Result<bool, DatabaseError> {
         let conn = self.conn();
@@ -267,20 +397,129 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// Remove a pending PR sync row left by a defer bail so the PR can retry.
-    pub fn abandon_pending_pr_sync(&self, id: i64) -> Result<(), DatabaseError> {
+    /// Pending PRs that are still owed a completion, including legacy attempts.
+    pub fn unfinished_personal_prs(&self) -> Result<Vec<(i64, String)>, DatabaseError> {
         let conn = self.conn();
-        let changed = conn.execute(
-            "DELETE FROM pr_sync_log WHERE id = ?1 AND status = 'pending'",
-            params![id],
+        let mut stmt=conn.prepare(
+            "SELECT DISTINCT p.pr_number,p.merge_sha FROM pr_sync_log p WHERE p.status='pending'
+             AND NOT EXISTS(SELECT 1 FROM pr_sync_log c WHERE c.status='completed' AND c.merge_sha=p.merge_sha)"
         )?;
-        if changed == 0 {
-            return Err(DatabaseError::NotFound {
-                entity: "pr_sync_log".into(),
-                id: id.to_string(),
-            });
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Pin the first complete ordered list. A zero count on a pending PR means
+    /// the list was unavailable. Legacy nonzero counts still constrain retries.
+    pub fn bind_personal_pr_commits(
+        &self,
+        id: i64,
+        strategy: &str,
+        shas: &[&str],
+        legacy_first_revision: Option<i64>,
+    ) -> Result<(), DatabaseError> {
+        if shas.is_empty()
+            || shas
+                .iter()
+                .any(|sha| sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()))
+            || shas.iter().collect::<std::collections::HashSet<_>>().len() != shas.len()
+        {
+            return Err(DatabaseError::Other(
+                "empty, invalid or duplicate Personal PR commit list".into(),
+            ));
         }
-        Ok(())
+        let mut hash = Sha256::new();
+        for sha in shas {
+            hash.update(sha.as_bytes());
+        }
+        let digest = hex::encode(hash.finalize());
+        let key = format!("personal_pr_commits_v1:{id}");
+        self.immediate_transaction(|tx| {
+            let count: i64 = tx.query_row(
+                "SELECT commit_count FROM pr_sync_log WHERE id=?1 AND status='pending'",
+                [id],
+                |r| r.get(0),
+            )?;
+            let pinned: Option<String> = tx
+                .query_row("SELECT value FROM kv_state WHERE key=?1", [&key], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            if (count != 0 && count != shas.len() as i64)
+                || pinned.as_ref().is_some_and(|old| old != &digest)
+            {
+                return Err(DatabaseError::Other(
+                    "Personal PR commit list changed since its first complete observation".into(),
+                ));
+            }
+            if count > 0 && pinned.is_none() {
+                // The old engine did not persist its range or ordered digest.
+                // A later member can mask missing attribution in the final tree.
+                for (index, sha) in shas.iter().enumerate() {
+                    if index==0 && legacy_first_revision.is_some() { continue; }
+                    let ambiguous: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM (
+                         SELECT repo_id,svn_rev,git_sha FROM commit_map WHERE git_sha=?2 AND direction='git_to_svn'
+                         UNION SELECT repo_id,svn_rev,git_sha FROM sync_records WHERE git_sha=?2 AND direction='git_to_svn' AND status='applied'
+                         ) m WHERE (m.repo_id=?1 OR m.repo_id IS NULL OR (m.repo_id='personal' AND NOT EXISTS(SELECT 1 FROM repositories WHERE id='personal')))
+                         AND NOT EXISTS(
+                         SELECT 1 FROM kv_state d JOIN pr_sync_log other
+                           ON other.id=json_extract(d.value,'$.personal_pr_sync_id')
+                         WHERE d.key GLOB 'git_to_svn_commit_v1:document:*'
+                         AND json_extract(d.value,'$.repo_id')=m.repo_id
+                         AND json_extract(d.value,'$.source_git_sha')=m.git_sha
+                         AND json_extract(d.value,'$.last_confirmed_svn_rev')=m.svn_rev
+                         AND json_extract(d.value,'$.state')='completed'
+                         AND other.id<>?3 AND other.status='completed'))",
+                        params![PERSONAL_SCOPE_KEY, sha,id], |row|row.get(0))?;
+                    if ambiguous {
+                        return Err(DatabaseError::Other("unattributed mapped member in legacy pending Personal PR".into()));
+                    }
+                }
+            }
+            if let Some(rev) = legacy_first_revision {
+                if !Self::legacy_personal_pr_prefix_matches_tx(tx,id,shas[0],rev,shas.len())? {
+                    return Err(DatabaseError::Other("legacy Personal PR attribution is no longer proven".into()));
+                }
+                tx.execute("INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)",
+                    params![format!("personal_pr_legacy_prefix_v1:{id}"),shas[0],Utc::now().to_rfc3339()])?;
+                tx.execute("UPDATE pr_sync_log SET svn_rev_start=?2,svn_rev_end=?2 WHERE id=?1",params![id,rev])?;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)",
+                params![key, digest, Utc::now().to_rfc3339()],
+            )?;
+            tx.execute(
+                "UPDATE pr_sync_log SET commit_count=?2,merge_strategy=CASE WHEN merge_strategy='unknown' THEN ?3 ELSE merge_strategy END WHERE id=?1",
+                params![id, shas.len() as i64, strategy],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Discard an unstarted retry. Once a revision is confirmed, keep its PR
+    /// identity and range for the next attempt.
+    pub fn abandon_pending_pr_sync(&self, id: i64) -> Result<(), DatabaseError> {
+        self.immediate_transaction(|tx| {
+            let start: Option<i64> = tx
+                .query_row(
+                    "SELECT svn_rev_start FROM pr_sync_log WHERE id=?1 AND status='pending'",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| DatabaseError::NotFound {
+                    entity: "pr_sync_log".into(),
+                    id: id.to_string(),
+                })?;
+            if start.is_none() {
+                tx.execute("DELETE FROM pr_sync_log WHERE id=?1", [id])?;
+                tx.execute(
+                    "DELETE FROM kv_state WHERE key=?1",
+                    [format!("personal_pr_commits_v1:{id}")],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// True when this repository has an applied Git→SVN receipt for the emitted SVN revision.
@@ -367,6 +606,7 @@ impl Database {
                  ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 params!["svn_rev", last_svn_rev.to_string(), now],
             )?;
+            Database::record_personal_pr_import_boundary_tx(tx, git_sha)?;
             Database::set_legacy_import_git_sha_watermark_tx(tx, git_sha)?;
             Ok(())
         })
@@ -448,6 +688,7 @@ pub(crate) fn checkpoint_personal_svn_to_git_import_tx(
         )?;
     }
     if update_watermarks {
+        Database::record_personal_pr_import_boundary_tx(tx, git_sha)?;
         let watermark_now = Utc::now().to_rfc3339();
         tx.execute(
             "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)

@@ -2,6 +2,9 @@
 #[path = "fixtures/pair_refresh_job.rs"]
 mod job;
 
+#[path = "fixtures/image_hook.rs"]
+mod image_hook;
+
 use reposync_core::{
     config::IdentityConfig,
     db::{
@@ -270,10 +273,7 @@ async fn legacy(f: &job::Fixture, db: &Database, reject: bool) -> anyhow::Result
     let bare = f.dir.path().join("bare.git");
     git2::Repository::init_bare(&bare).unwrap();
     if reject {
-        use std::os::unix::fs::PermissionsExt;
-        let hook = bare.join("hooks/pre-receive");
-        std::fs::write(&hook, "#!/bin/sh\nprintf x >> attempts\nexit 1\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        image_hook::install(&bare, "pre-receive", image_hook::script::COUNT_REJECT);
     }
     let path = f.dir.path().join("legacy-git");
     let repository = git2::Repository::init(&path).unwrap();
@@ -343,7 +343,18 @@ async fn rejected_legacy_publication_retains_exclusion_without_retry_or_checkpoi
     legacy_db.initialize().unwrap();
     let prior_svn = legacy_db.get_watermark("svn_rev").unwrap();
     let prior_git = legacy_db.get_watermark("git_sha").unwrap();
-    let error = legacy(&f, &legacy_db, true).await.unwrap_err();
+    let outcome = legacy(&f, &legacy_db, true).await;
+    let bare = f.dir.path().join("bare.git");
+    let witness = format!(
+        "{} {} {}",
+        exec_witness("hook", &bare.join("hooks/pre-receive")),
+        file_witness(&bare.join("attempts")),
+        file_witness(&f.dir.path().join("attempts"))
+    );
+    let error = match outcome {
+        Err(error) => error,
+        Ok(completed) => panic!("legacy publication succeeded; {witness}; completed {completed:?}"),
+    };
     assert!(
         format!("{error:#}").contains("writer window retained"),
         "{error:#}"
@@ -478,4 +489,37 @@ async fn corrupt_refresh_evidence_refuses_even_unrelated_reconciliation() {
         .is_err()
     );
     assert_eq!(rows(&f.db), before);
+}
+
+fn exec_witness(label: &str, path: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map(|meta| format!("{:o}", meta.permissions().mode()))
+        .unwrap_or_else(|error| format!("metadata {error}"));
+    let test_x = std::process::Command::new("test")
+        .arg("-x")
+        .arg(path)
+        .status()
+        .map(|status| {
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into())
+        })
+        .unwrap_or_else(|error| format!("spawn {error}"));
+    format!(
+        "{label} path={} mode={mode} test_x={test_x}",
+        path.display()
+    )
+}
+
+fn file_witness(path: &std::path::Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => format!(
+            "{} bytes={}",
+            path.display(),
+            String::from_utf8_lossy(&bytes)
+        ),
+        Err(error) => format!("{} absent ({error})", path.display()),
+    }
 }

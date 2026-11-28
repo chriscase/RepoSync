@@ -1,6 +1,7 @@
 // Browser coverage for safe navigation after deleting the viewed branch pair.
 // Happy-path cases hit a real local API when REPOSYNC_REAL_API is set.
 // Failure, queued, and stale-URL cases use a deterministic in-process API.
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { readFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -129,6 +130,7 @@ function repo(id, name, parent, gitBranch) {
 
 function startMock() {
   const deleted = new Set();
+  const receipts = new Map();
   const records = new Map([
     ['parent-1', repo('parent-1', 'Parent trunk', null, 'main')],
     ['child-stay', repo('child-stay', 'Stay Child', 'parent-1', 'stay-branch')],
@@ -136,6 +138,7 @@ function startMock() {
     ['child-error', repo('child-error', 'Error Child', 'parent-1', 'error-branch')],
     ['child-denied', repo('child-denied', 'Denied Child', 'parent-1', 'denied-branch')],
     ['child-busy', repo('child-busy', 'Busy Child', 'parent-1', 'busy-branch')],
+    ['child-held', repo('child-held', 'Held Child', 'parent-1', 'held-branch')],
     ['child-orphan', repo('child-orphan', 'Orphan Child', 'missing-parent', 'orphan-branch')],
     ['child-queued', repo('child-queued', 'Queued Child', 'parent-1', 'queued-branch')],
     ['child-delayed', repo('child-delayed', 'Delayed Child', 'parent-1', 'delayed-branch')],
@@ -194,9 +197,33 @@ function startMock() {
     }
     const id = decodeURIComponent(repoMatch[1]);
     const rest = repoMatch[2] || '';
-    if (req.method === 'DELETE' && rest === '/branch-pair') {
-      const deleteGit = url.searchParams.get('delete_git') === 'true';
-      const deleteSvn = url.searchParams.get('delete_svn') === 'true';
+    if (rest === '/removal' && req.method === 'GET') {
+      const receipt = receipts.get(id);
+      send(receipt ? 200 : 404, receipt ?? { error: 'no removal operation' });
+      return;
+    }
+    if (req.method === 'POST' && ['/removal/review', '/removal/approve'].includes(rest)) {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const opts = JSON.parse(Buffer.concat(chunks).toString());
+      const record = records.get(id);
+      if (!record || deleted.has(id)) return send(404, { error: 'repository not found' });
+      const { delete_git: deleteGit, delete_svn: deleteSvn, archive_pair: archive } = opts;
+      if (typeof deleteGit !== 'boolean' || typeof deleteSvn !== 'boolean' || archive !== (deleteGit !== deleteSvn)) {
+        return send(400, { error: 'explicit remote choices required' });
+      }
+      const pin = createHash('sha256').update(JSON.stringify([id, deleteGit, deleteSvn, archive])).digest('hex');
+      if (rest === '/removal/review') {
+        return send(200, {
+          protocol: 2, repo_id: id, review_pin: pin, delete_git: deleteGit, delete_svn: deleteSvn, archive_pair: archive,
+          git: deleteGit ? { remote_url: record.git_api_url, reference: `refs/heads/${record.git_branch}`, expected_sha: 'a'.repeat(40) } : null,
+          svn: deleteSvn ? { root_url: record.svn_url, uuid: 'fixture', url: `${record.svn_url}/${record.svn_branch}`, base_revision: 1, expected_present: true } : null,
+          dependency_preview: removalDependencyPreview(record), retention: 'Fixture recovery retained.',
+        });
+      }
+      if (opts.review_pin !== pin || opts.request_id !== `ui-remove-v2-${pin}`) {
+        return send(409, { request_rejected: true, error: 'approval does not match the reviewed choices' });
+      }
       if (id === 'child-error') {
         send(500, { error: 'internal server error' });
         return;
@@ -212,34 +239,25 @@ function startMock() {
       if (id === 'child-delayed') {
         await pause(1500);
       }
-      if (id === 'child-queued') {
-        send(202, {
-          ok: false,
-          state: 'queued',
-          operation_id: 'op-queue-70',
-          message: 'removal queued',
-          registration_listed: true,
-          warnings: [],
-        });
-        return;
-      }
-      if (id === 'child-queued-gone') {
-        deleted.add(id);
-        send(202, {
-          ok: false,
-          state: 'queued',
-          operation_id: 'op-queue-gone-70',
-          message: 'removal queued and the registration is no longer listed',
-          registration_listed: false,
-          warnings: [],
-        });
-        return;
-      }
-      deleted.add(id);
+      const queued = id === 'child-queued' || id === 'child-queued-gone';
+      const held = id === 'child-held';
+      const listed = held || id === 'child-queued';
+      if (!listed) deleted.add(id);
       const warnings = ['child-warn', 'child-stay-warn'].includes(id) && deleteGit
-        ? [`failed to delete Git branch '${records.get(id).git_branch}'`]
+        ? [`failed to delete Git branch '${record.git_branch}'`]
         : [];
-      send(200, { ok: true, message: `Branch pair '${id}' deleted`, warnings });
+      const receipt = {
+        ok: !queued && !held, action: 'managed_remove', protocol: 2,
+        state: held ? 'reconciliation_required' : queued ? 'queued' : 'completed', registration_listed: listed,
+        operation_id: queued ? (listed ? 'op-queue-70' : 'op-queue-gone-70') : `op-${id}`,
+        review_pin: pin, request_id: opts.request_id, archive_pair: archive,
+        remote_git: deleteGit ? (warnings.length ? 'failed' : 'deleted') : 'untouched',
+        remote_svn: deleteSvn ? 'deleted' : 'untouched',
+        message: held ? 'removal held for reconciliation' : queued ? 'removal queued' : `Branch pair '${id}' removed`, warnings,
+        restore_supported: !queued && !held, retryable: queued,
+      };
+      receipts.set(id, receipt);
+      send(held ? 409 : queued ? 202 : 200, receipt);
       return;
     }
     if (deleted.has(id) || id === 'already-removed' || id === 'missing-parent' || !records.has(id)) {
@@ -347,15 +365,15 @@ async function connectChrome() {
     window.fetch = async (...args) => {
       const path = String(args[0]);
       const method = String(args[1]?.method || 'GET').toUpperCase();
-      window.__pairFetches.push({ path, method, started: Date.now() });
-      return originalFetch(...args);
+      const entry = { path, method, started: Date.now() };
+      window.__pairFetches.push(entry);
+      if (method === 'POST' && path.endsWith('/removal/approve')) entry.approval = JSON.parse(args[1].body);
+      const response = await originalFetch(...args);
+      if (method === 'POST' && path.endsWith('/removal/review') && response.ok) entry.review = await response.clone().json();
+      return response;
     };
   ` });
   return { send, evaluate, ws, chrome };
-}
-
-function mentionsId(path, id) {
-  return String(path).split(/[/?=&]/).includes(id);
 }
 
 async function runScenarios(uiOrigin, session, mode) {
@@ -377,21 +395,25 @@ async function runScenarios(uiOrigin, session, mode) {
     }
     throw new Error(`Timed out: ${label}; path=${await pathOf().catch(() => '?')}; body=${(await body().catch(() => last)).slice(0, 500)}`);
   };
-  const click = async (testId) => {
+  const click = async (testId, descendant = '') => {
     const clicked = await evaluate(`(() => {
-      const el = document.querySelector('[data-testid="${testId}"]');
+      const el = document.querySelector(${JSON.stringify(`[data-testid="${testId}"]${descendant}`)});
       if (!el) return false;
       el.click();
       return true;
     })()`);
-    if (!clicked) throw new Error(`Missing [data-testid=${testId}]\n${await body()}`);
+    if (!clicked) throw new Error(`Missing [data-testid=${testId}]${descendant}\n${await body()}`);
   };
   const goto = async (pathname, ready) => {
-    await send('Page.navigate', { url: `${uiOrigin}${pathname}` });
-    await until(async () => (await pathOf()) === pathname && (!ready || await ready()), `open ${pathname}`);
+    const { loaderId, errorText } = await send('Page.navigate', { url: `${uiOrigin}${pathname}` });
+    if (!loaderId || errorText) throw new Error(`Could not load ${pathname}: ${errorText || 'no new document'}`);
+    await until(async () => {
+      // A reload can still show the previous document at the same pathname.
+      const { frameTree } = await send('Page.getFrameTree');
+      return frameTree.frame.loaderId === loaderId && (await pathOf()) === pathname && (!ready || await ready());
+    }, `open ${pathname}`);
   };
   const fill = async (gitBranch) => {
-    await until(async () => Boolean(await evaluate(`!!document.querySelector('[data-testid="delete-branch-confirm-input"]')`)), 'confirm input');
     await evaluate(`(() => {
       const input = document.querySelector('[data-testid="delete-branch-confirm-input"]');
       const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
@@ -422,34 +444,27 @@ async function runScenarios(uiOrigin, session, mode) {
       }
     }
   };
-  const assertDeleteQuery = (path, { deleteGit, deleteSvn }) => {
-    const qs = String(path).split('?')[1] || '';
-    const params = new URLSearchParams(qs);
-    if (params.get('explicit_remote_deletion_opts') !== 'true') {
-      throw new Error(`DELETE missing explicit_remote_deletion_opts=true: ${path}`);
-    }
-    if (params.get('delete_git') !== String(deleteGit)) {
-      throw new Error(`DELETE delete_git expected ${deleteGit}, got ${params.get('delete_git')}: ${path}`);
-    }
-    if (params.get('delete_svn') !== String(deleteSvn)) {
-      throw new Error(`DELETE delete_svn expected ${deleteSvn}, got ${params.get('delete_svn')}: ${path}`);
-    }
-  };
-  const confirmDelete = async (gitBranch, { remote = false } = {}) => {
-    await fill(gitBranch);
+  const removalWrites = () => evaluate(`window.__pairFetches.filter(entry =>
+    entry.method === 'DELETE' || (entry.method === 'POST' && (entry.path.endsWith('/removal/approve') || entry.path.endsWith('/removal/continue'))))`);
+  const confirmDelete = async (id, gitBranch, { remote = false } = {}) => {
+    await until(() => evaluate(`!!document.querySelector('[data-testid="delete-branch-confirm-input"]')`), 'confirmation dialog');
     await setRemoteDeletion(remote);
-    const deletesBefore = (await deleteCalls()).length;
+    await fill(gitBranch);
+    const before = (await removalWrites()).length;
     await click('confirm-delete-branch-pair');
-    await until(async () => (await deleteCalls()).length > deletesBefore, 'branch-pair DELETE recorded');
-    return deletesBefore;
+    await until(async () => (await removalWrites()).length > before, 'reviewed removal approval recorded');
+    const writes = (await removalWrites()).slice(before);
+    const approval = writes[0]?.approval;
+    if (writes.length !== 1 || writes[0].path !== `/api/repos/${id}/removal/approve`
+      || approval?.delete_git !== remote || approval.delete_svn !== remote || approval.archive_pair !== false
+      || !/^[a-f0-9]{64}$/.test(approval.review_pin) || approval.request_id !== `ui-remove-v2-${approval.review_pin}`) {
+      throw new Error(`Unexpected removal request for ${id}: ${JSON.stringify(writes)}`);
+    }
+    const review = await evaluate(`window.__pairFetches.filter(entry => entry.path === ${JSON.stringify(`/api/repos/${id}/removal/review`)} && entry.review).at(-1)?.review`);
+    if (review?.repo_id !== id || review.review_pin !== approval.review_pin || review.delete_git !== remote || review.delete_svn !== remote) {
+      throw new Error(`Approval does not match the displayed review for ${id}`);
+    }
   };
-  const latestDeleteFor = async (repoId, sinceDeleteCount = 0) => {
-    const calls = (await deleteCalls()).slice(sinceDeleteCount);
-    const matches = calls.filter((entry) => mentionsId(entry.path, repoId));
-    if (!matches.length) throw new Error(`No DELETE for ${repoId}: ${JSON.stringify(await deleteCalls())}`);
-    return matches[matches.length - 1];
-  };
-  const deleteCalls = () => evaluate(`window.__pairFetches.filter(entry => entry.method === 'DELETE' && entry.path.includes('/branch-pair'))`);
   const pollsFor = async (id, since) => evaluate(`window.__pairFetches.filter(entry => entry.method === 'GET' && entry.started > ${since} && String(entry.path).split(/[/?=&]/).includes(${JSON.stringify(id)})).map(entry => entry.path)`);
   const notice = () => evaluate(`document.querySelector('[data-testid="branch-pair-removal-notice"]')?.innerText || ''`);
   const heading = () => evaluate(`document.querySelector('[data-testid="repo-detail-heading"]')?.textContent || ''`);
@@ -457,11 +472,9 @@ async function runScenarios(uiOrigin, session, mode) {
   async function expectStay(id, gitBranch, text) {
     await goto(`/repos/${id}`, async () => (await heading()) !== '');
     await click('delete-viewed-branch-pair');
-    const deletesBefore = await confirmDelete(gitBranch);
+    await confirmDelete(id, gitBranch);
     await until(async () => ((await body()).includes(text)), text);
     if ((await pathOf()) !== `/repos/${id}`) throw new Error(`Left ${id} for ${await pathOf()}`);
-    const lastDelete = await latestDeleteFor(id, deletesBefore);
-    assertDeleteQuery(lastDelete.path, { deleteGit: false, deleteSvn: false });
     if ((await body()).includes('Branch pair removed.')) throw new Error(`Failure was presented as removal: ${await body()}`);
   }
 
@@ -472,21 +485,17 @@ async function runScenarios(uiOrigin, session, mode) {
     await goto(`/repos/${parentId}`, async () => (await heading()).length > 0 && (await body()).includes('Listed pair'));
     const pathBeforeChildDelete = await pathOf();
     await click(`delete-child-pair-${listedId}`);
-    await confirmDelete(listedBranch, { remote: false });
+    await confirmDelete(listedId, listedBranch, { remote: false });
     await until(async () => !(await evaluate(`!!document.querySelector('[data-testid="branch-pair-row-${listedId}"]')`)), 'listed pair row removed');
     if ((await pathOf()) !== pathBeforeChildDelete) throw new Error(`Child delete left the parent: ${await pathOf()}`);
     if ((await heading()) === '') throw new Error('Parent heading disappeared');
-    const childDelete = (await deleteCalls()).find((entry) => mentionsId(entry.path, listedId));
-    if (!childDelete?.path.includes('delete_git=false') || !childDelete.path.includes('delete_svn=false')) {
-      throw new Error(`Child delete was not an explicit non-remote request: ${JSON.stringify(childDelete)}`);
-    }
     results.push('real-delete-child-stays-on-parent');
 
-    await click(`branch-pair-row-${viewedId}`);
+    await click(`branch-pair-row-${viewedId}`, ` a[href="/repos/${viewedId}"]`);
     await until(async () => (await pathOf()) === `/repos/${viewedId}` && (await heading()).includes('Viewed pair'), 'open viewed pair');
     await click('delete-viewed-branch-pair');
     const during = Date.now();
-    await confirmDelete(viewedBranch, { remote: false });
+    await confirmDelete(viewedId, viewedBranch, { remote: false });
     await until(async () => (await pathOf()) === `/repos/${parentId}` && (await heading()).includes('Parent trunk'), 'parent after viewed delete', 20000);
     const history = await send('Page.getNavigationHistory');
     const dead = (history.entries || []).filter((entry) => String(entry.url).includes(`/repos/${viewedId}`));
@@ -512,12 +521,12 @@ async function runScenarios(uiOrigin, session, mode) {
   }
 
   await goto('/repos/child-cancel', async () => (await heading()).includes('Cancel Child'));
-  const deletesBeforeCancel = (await deleteCalls()).length;
+  const deletesBeforeCancel = (await removalWrites()).length;
   await click('delete-viewed-branch-pair');
   await until(async () => Boolean(await evaluate(`!!document.querySelector('[data-testid="delete-branch-modal"]')`)), 'delete modal');
   await click('cancel-delete-branch-pair');
   await until(async () => !(await evaluate(`!!document.querySelector('[data-testid="delete-branch-modal"]')`)), 'modal closed');
-  if ((await deleteCalls()).length !== deletesBeforeCancel) throw new Error('Cancel issued a DELETE');
+  if ((await removalWrites()).length !== deletesBeforeCancel) throw new Error('Cancel issued a removal request');
   if ((await pathOf()) !== '/repos/child-cancel') throw new Error('Cancel left the page');
   results.push('cancel-modal');
 
@@ -529,10 +538,13 @@ async function runScenarios(uiOrigin, session, mode) {
   results.push('permission-rejection');
   await expectStay('child-busy', 'busy-branch', 'currently busy');
   results.push('busy-rejection');
+  await expectStay('child-held', 'held-branch', 'removal held for reconciliation');
+  if ((await notice()).includes('Removal is not complete.')) throw new Error('Held operation was presented as queued');
+  results.push('reconciliation-hold');
 
   await goto('/repos/child-orphan', async () => (await heading()).includes('Orphan Child'));
   await click('delete-viewed-branch-pair');
-  await confirmDelete('orphan-branch');
+  await confirmDelete('child-orphan', 'orphan-branch');
   await until(async () => (await pathOf()) === '/repos' && (await body()).includes('Repositories'), 'repository list fallback');
   if ((await pathOf()).includes('missing-parent')) throw new Error('Navigated to the missing parent');
   if (!(await notice()).includes('Branch pair removed.')) throw new Error(`Parent-absent removal notice missing: ${await notice()}`);
@@ -540,18 +552,11 @@ async function runScenarios(uiOrigin, session, mode) {
 
   await goto('/repos/child-warn', async () => (await heading()).includes('Warn Child'));
   await click('delete-viewed-branch-pair');
-  const warnDeletesBefore = await confirmDelete('warn-branch', { remote: true });
-  const warnDelete = await latestDeleteFor('child-warn', warnDeletesBefore);
-  assertDeleteQuery(warnDelete.path, { deleteGit: true, deleteSvn: true });
+  await confirmDelete('child-warn', 'warn-branch', { remote: true });
   await until(async () => (await pathOf()) === '/repos/parent-1', 'parent after warnings');
   await until(async () => (await body()).includes('Parent trunk'), 'parent detail loaded', 20000);
   await until(
-    async () => {
-      const text = await notice();
-      if (text.includes("failed to delete Git branch 'warn-branch'")) return true;
-      const stored = await evaluate(`sessionStorage.getItem('reposync.branchPairRemovalReceipt') || ''`);
-      return String(stored).includes("failed to delete Git branch 'warn-branch'");
-    },
+    async () => (await notice()).includes("failed to delete Git branch 'warn-branch'"),
     'warning visible after navigation',
     20000,
   );
@@ -561,7 +566,7 @@ async function runScenarios(uiOrigin, session, mode) {
 
   await goto('/repos/child-queued', async () => (await heading()).includes('Queued Child'));
   await click('delete-viewed-branch-pair');
-  await confirmDelete('queued-branch');
+  await confirmDelete('child-queued', 'queued-branch');
   await until(async () => (await notice()).includes('Removal is not complete.') && (await notice()).includes('op-queue-70'), 'queued progress');
   if ((await pathOf()) !== '/repos/child-queued') throw new Error(`Queued removal left the pair: ${await pathOf()}`);
   if ((await notice()).includes('Branch pair removed.')) throw new Error('Queued removal was presented as complete');
@@ -570,17 +575,17 @@ async function runScenarios(uiOrigin, session, mode) {
   await goto('/repos/child-delayed', async () => (await heading()).includes('Delayed Child'));
   await click('delete-viewed-branch-pair');
   const delayStart = Date.now();
-  await confirmDelete('delayed-branch');
+  await confirmDelete('child-delayed', 'delayed-branch');
   await pause(400);
   if ((await pathOf()) !== '/repos/child-delayed') throw new Error('Delayed deletion navigated before completion');
-  if (!(await body()).includes('Deleting')) throw new Error('Delayed deletion did not show in-progress UI');
+  if (!(await body()).includes('Removing…')) throw new Error('Delayed deletion did not show in-progress UI');
   await until(async () => (await pathOf()) === '/repos/parent-1' && (await notice()).includes('Branch pair removed.'), 'navigate after delayed completion');
   if (Date.now() - delayStart < 1000) throw new Error('Navigation happened before the delayed API completed');
   results.push('delayed-completion');
 
   await goto('/repos/child-queued-gone', async () => (await heading()).includes('Queued Gone Child'));
   await click('delete-viewed-branch-pair');
-  await confirmDelete('queued-gone-branch');
+  await confirmDelete('child-queued-gone', 'queued-gone-branch');
   await until(async () => (await pathOf()) === '/repos/parent-1' && (await notice()).includes('Removal is not complete.') && (await notice()).includes('op-queue-gone-70'), 'queued departure');
   if ((await notice()).includes('Branch pair removed.')) throw new Error('Unfinished removal was presented as complete');
   const goneSettled = await evaluate('Date.now()');
@@ -589,9 +594,10 @@ async function runScenarios(uiOrigin, session, mode) {
   if (gonePolls.length) throw new Error(`Queued-gone detail kept being fetched: ${JSON.stringify(gonePolls)}`);
   results.push('queued-gone-leaves-without-claiming-completion');
 
-  await goto('/repos/parent-1', async () => (await heading()).includes('Parent trunk'));
+  await goto('/repos/parent-1', async () => (await heading()).includes('Parent trunk')
+    && await evaluate(`!!document.querySelector('[data-testid="delete-child-pair-child-stay"]')`));
   await click('delete-child-pair-child-stay');
-  await confirmDelete('stay-branch');
+  await confirmDelete('child-stay', 'stay-branch');
   await until(async () => !(await evaluate(`!!document.querySelector('[data-testid="branch-pair-row-child-stay"]')`)), 'mock child row removed');
   if ((await pathOf()) !== '/repos/parent-1') throw new Error(`Mock child delete left the parent: ${await pathOf()}`);
   results.push('mock-delete-child-stays-on-parent');
@@ -603,9 +609,7 @@ async function runScenarios(uiOrigin, session, mode) {
   const parentListReads = () => evaluate(`window.__pairFetches.filter(entry => entry.method === 'GET' && entry.path === '/api/repos/parent-1/branches').length`);
   const readsBeforeWarning = await parentListReads();
   await click('delete-child-pair-child-stay-warn');
-  const childWarningDeletesBefore = await confirmDelete('stay-warn-branch', { remote: true });
-  const childWarningDelete = await latestDeleteFor('child-stay-warn', childWarningDeletesBefore);
-  assertDeleteQuery(childWarningDelete.path, { deleteGit: true, deleteSvn: true });
+  await confirmDelete('child-stay-warn', 'stay-warn-branch', { remote: true });
   const childWarningText = "failed to delete Git branch 'stay-warn-branch'";
   await until(async () => (await notice()).includes(childWarningText), 'child cleanup warning visible on parent');
   await until(async () => !(await evaluate(`!!document.querySelector('[data-testid="branch-pair-row-child-stay-warn"]')`)), 'warning child row removed');

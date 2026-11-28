@@ -302,6 +302,12 @@ pub enum GitHubError {
     #[error("GitHub API error (HTTP {status}): {body}")]
     ApiError { status: u16, body: String },
 
+    /// The provider has more closed PR pages than the client can qualify.
+    #[error("incomplete pull-request discovery: additional pages remain after the 10-page limit")]
+    IncompletePrDiscovery,
+    /// The provider returned only a prefix of the PR's commits.
+    #[error("incomplete commit list for PR #{pr_number}: additional provider pages are required")]
+    IncompletePrCommitList { pr_number: u64 },
     /// Authentication token is missing or invalid.
     #[error("GitHub authentication failed: {0}")]
     AuthenticationFailed(String),
@@ -477,6 +483,16 @@ pub enum DatabaseError {
     /// A durable writer-fence lease is held by another host or epoch.
     #[error("{0}")]
     WriterFenced(String),
+
+    /// The import journal still holds this registration.
+    #[error("repository has active or unresolved import work")]
+    ImportBlocksDisable,
+
+    /// The registration no longer identifies the target a managed import inspected.
+    #[error(
+        "repository import target changed before admission; review the current settings and retry"
+    )]
+    ImportTargetChanged,
 
     /// A record was not found.
     #[error("{entity} not found: {id}")]

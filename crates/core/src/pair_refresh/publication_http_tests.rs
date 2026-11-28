@@ -5,6 +5,9 @@ use std::process::{Command, Stdio};
 
 #[path = "../../tests/fixtures/owned_process_group.rs"]
 mod fixture_process;
+#[allow(clippy::duplicate_mod)]
+#[path = "../../tests/fixtures/image_hook.rs"]
+mod image_hook;
 use fixture_process::OwnedProcessGroup;
 
 use git2::{Oid, Repository, Signature};
@@ -220,10 +223,15 @@ impl HttpFixture {
         self.target.refname_to_id("refs/heads/child").unwrap()
     }
 
-    fn hook(&self, script: &str) {
-        let path = self.target.path().join("hooks/pre-receive");
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fn backend_stderr(&self) -> String {
+        match std::fs::read(self.temp.path().join("http-backend-stderr.txt")) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) => format!("stderr unavailable: {error}"),
+        }
+    }
+
+    fn hook(&self, script: (&str, &str)) {
+        image_hook::install(self.target.path(), "pre-receive", script);
     }
 }
 
@@ -268,11 +276,21 @@ fn second_parent_drift(tls: bool) {
 
 fn advertisement_race(tls: bool) {
     let fixture = HttpFixture::new(tls, None);
-    fixture.hook(&format!(
-        "#!/bin/sh\nenv -u GIT_QUARANTINE_PATH git update-ref refs/heads/child {}\n",
-        fixture.initial
-    ));
-    assert!(fixture.publish(None).is_err());
+    std::fs::write(
+        fixture.target.path().join("hooks/ref-move-target"),
+        fixture.initial.to_string(),
+    )
+    .unwrap();
+    fixture.hook(image_hook::script::REF_MOVE);
+    let before = fixture.tip();
+    let published = fixture.publish(None);
+    let after = fixture.tip();
+    assert!(
+        published.is_err(),
+        "publish={published:?} before={before} after={after} {} stderr={}",
+        exec_witness("hook", &fixture.target.path().join("hooks/pre-receive")),
+        fixture.backend_stderr()
+    );
     assert_eq!(fixture.tip(), fixture.initial);
 }
 
@@ -642,11 +660,8 @@ fn https_recovery_observes_old_and_published_tips_without_receive_pack_or_token_
         GitPublicationObservation::NotObserved
     );
     assert_eq!(fixture.publish(token).unwrap(), fixture.prepared);
-    let witness = fixture.temp.path().join("receive-pack-witness");
-    fixture.hook(&format!(
-        "#!/bin/sh\nprintf 'retry\\n' > '{}'\nexit 1\n",
-        witness.display()
-    ));
+    let witness = fixture.target.path().join("hooks/witness");
+    fixture.hook(image_hook::script::WITNESS_REJECT);
     for _ in 0..2 {
         assert_eq!(
             fixture.observe_to(&fixture.url, token).unwrap(),
@@ -737,4 +752,25 @@ fn recovery_refuses_aliases_and_rewrites_before_contact_or_token() {
         .is_err());
     assert!(!fixture.temp.path().join("requests.jsonl").exists());
     assert_eq!(fixture.tip(), fixture.child);
+}
+
+fn exec_witness(label: &str, path: &Path) -> String {
+    let mode = std::fs::metadata(path)
+        .map(|meta| format!("{:o}", meta.permissions().mode()))
+        .unwrap_or_else(|error| format!("metadata {error}"));
+    let test_x = Command::new("test")
+        .arg("-x")
+        .arg(path)
+        .status()
+        .map(|status| {
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into())
+        })
+        .unwrap_or_else(|error| format!("spawn {error}"));
+    format!(
+        "{label} path={} mode={mode} test_x={test_x}",
+        path.display()
+    )
 }

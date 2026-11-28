@@ -64,6 +64,15 @@ pub struct PendingCommitSelection {
     pub batch_tip: String,
 }
 
+/// Outcome of staging and committing through the Git CLI.
+#[derive(Debug)]
+pub enum CliCommitOutcome {
+    /// `git add` and `git commit` both succeeded.
+    Created(Oid),
+    /// `git add` succeeded and the index matches HEAD.
+    Clean,
+}
+
 impl GitClient {
     /// Open an existing Git repository at `repo_path`.
     pub fn new<P: AsRef<Path>>(repo_path: P) -> Result<Self, GitError> {
@@ -452,7 +461,9 @@ impl GitClient {
     /// the LFS clean filter which replaces large files with pointer files,
     /// whereas `git2::Index::add_all()` adds the raw file content as a blob.
     ///
-    /// Returns the commit SHA on success.
+    /// Returns the commit SHA on success. A clean index is an error so existing
+    /// callers keep their previous behavior. Personal sync uses
+    /// [`Self::stage_and_commit`] when a clean index is a successful no-op.
     #[instrument(skip(self, message))]
     pub fn commit_via_cli(
         &self,
@@ -462,6 +473,35 @@ impl GitClient {
         committer_name: &str,
         committer_email: &str,
     ) -> Result<Oid, GitError> {
+        match self.stage_and_commit(
+            message,
+            author_name,
+            author_email,
+            committer_name,
+            committer_email,
+        )? {
+            CliCommitOutcome::Created(oid) => Ok(oid),
+            CliCommitOutcome::Clean => Err(GitError::Git2Error(git2::Error::from_str(
+                "nothing to commit (working tree clean)",
+            ))),
+        }
+    }
+
+    /// Stage with `git add --all`, then commit only when the index changed.
+    ///
+    /// [`CliCommitOutcome::Clean`] is returned only after `git add` succeeds and
+    /// `git diff --cached --quiet` reports an empty index. A failing clean
+    /// filter, hook, or commit is an error even when its stderr contains
+    /// "nothing to commit".
+    #[instrument(skip(self, message))]
+    pub fn stage_and_commit(
+        &self,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+        committer_name: &str,
+        committer_email: &str,
+    ) -> Result<CliCommitOutcome, GitError> {
         let repo_path = self.repo.workdir().unwrap_or_else(|| self.repo.path());
 
         info!(
@@ -506,17 +546,32 @@ impl GitClient {
             .output()
             .map_err(GitError::IoError)?;
 
-        if diff_output.status.success() {
-            // Exit code 0 means no staged changes — nothing to commit.
-            return Err(GitError::Git2Error(git2::Error::from_str(
-                "nothing to commit (working tree clean)",
-            )));
+        match diff_output.status.code() {
+            Some(0) => return Ok(CliCommitOutcome::Clean),
+            Some(1) => {}
+            other => {
+                let stderr = String::from_utf8_lossy(&diff_output.stderr);
+                return Err(GitError::Git2Error(git2::Error::from_str(&format!(
+                    "git diff --cached --quiet failed ({other:?}): {}",
+                    stderr.trim()
+                ))));
+            }
         }
 
         // Build the commit via git CLI with explicit author/committer.
         let author_str = format!("{} <{}>", author_name, author_email);
         let commit_output = std::process::Command::new("git")
-            .args(["commit", "-m", message, "--author", &author_str])
+            .args([
+                "commit",
+                "--file",
+                "-",
+                "--cleanup=verbatim",
+                "--author",
+                &author_str,
+            ])
+            .stdin(std::process::Stdio::from(crate::commit_message::input(
+                message,
+            )?))
             .current_dir(repo_path)
             .env("GIT_COMMITTER_NAME", committer_name)
             .env("GIT_COMMITTER_EMAIL", committer_email)
@@ -557,7 +612,7 @@ impl GitClient {
         }
 
         info!(sha = %oid, "created commit via CLI (LFS-aware)");
-        Ok(oid)
+        Ok(CliCommitOutcome::Created(oid))
     }
 
     /// Push a local branch to a remote.
@@ -960,6 +1015,59 @@ impl GitClient {
             None
         };
         Ok((parent, tree))
+    }
+
+    /// Compare replay of the ordered first-parent deltas with the outer merge.
+    /// This reads Git trees only. Checking paths absent from the outer diff also
+    /// catches siblings that temporarily diverged and resolved back to the base.
+    pub fn first_parent_replay_matches_merge(
+        &self,
+        merge_sha: &str,
+        ordered: &[&str],
+    ) -> Result<bool, GitError> {
+        let changes = |commit: &git2::Commit<'_>| -> Result<_, GitError> {
+            let tree = commit.tree()?;
+            let parent = commit.parents().next().map(|p| p.tree()).transpose()?;
+            let diff = self
+                .repo
+                .diff_tree_to_tree(parent.as_ref(), Some(&tree), None)?;
+            let mut edits = std::collections::HashMap::new();
+            // Rename detection is off: removal of the old path and addition
+            // of the new one are independent entries in the composed tree.
+            for delta in diff.deltas() {
+                let new = delta.new_file();
+                let path = new
+                    .path()
+                    .or_else(|| delta.old_file().path())
+                    .ok_or_else(|| GitError::ApplyFailed("missing path in Git tree diff".into()))?;
+                let state = (delta.status() != git2::Delta::Deleted)
+                    .then(|| (new.id(), i32::from(new.mode())));
+                edits.insert(path.to_owned(), state);
+            }
+            Ok(edits)
+        };
+        let mut replayed = std::collections::HashMap::new();
+        for sha in ordered {
+            replayed.extend(changes(&self.repo.find_commit(Oid::from_str(sha)?)?)?);
+        }
+        let merge = self.repo.find_commit(Oid::from_str(merge_sha)?)?;
+        for (path, expected) in changes(&merge)? {
+            if replayed.remove(&path) != Some(expected) {
+                return Ok(false);
+            }
+        }
+        let merged_tree = merge.tree()?;
+        for (path, state) in replayed {
+            let expected = match merged_tree.get_path(&path) {
+                Ok(entry) => Some((entry.id(), entry.filemode())),
+                Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+                Err(e) => return Err(e.into()),
+            };
+            if state != expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Get the list of changed files for a specific commit.
@@ -1396,5 +1504,44 @@ mod tests {
             .get_file_content_at_commit(&oid1.to_string(), "nonexistent.txt")
             .unwrap();
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn candidate_228_cli_commit_preserves_oversized_verbatim_utf8() {
+        let root = tempfile::tempdir().unwrap();
+        let client = GitClient::init(root.path()).unwrap();
+        client
+            .repo
+            .config()
+            .unwrap()
+            .set_bool("commit.gpgsign", false)
+            .unwrap();
+        std::fs::write(root.path().join("message.txt"), "synthetic content\n").unwrap();
+        let message = format!(
+            "{}\n\n[reposync]\nquotes: '\"\\\n\n",
+            "é中文😀 multiline\n".repeat(16_384)
+        );
+        assert!(message.len() >= 256 * 1024);
+        let oid = client
+            .commit_via_cli(
+                &message,
+                "Fixture User",
+                "fixture@example.invalid",
+                "Fixture User",
+                "fixture@example.invalid",
+            )
+            .unwrap();
+        let commit = client.repo.find_commit(oid).unwrap();
+        assert_eq!(commit.message_bytes(), message.as_bytes());
+        assert!(client
+            .commit_via_cli(
+                "quiet repeat",
+                "Fixture User",
+                "fixture@example.invalid",
+                "Fixture User",
+                "fixture@example.invalid"
+            )
+            .is_err());
+        assert_eq!(client.repo.head().unwrap().target(), Some(oid));
     }
 }

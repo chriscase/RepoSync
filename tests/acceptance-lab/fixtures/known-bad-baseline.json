@@ -1,0 +1,20 @@
+{
+  "id": "known-bad-baseline",
+  "note": "Synthetic corrupted fixture. It is not a product repository and contains no credentials.",
+  "expected_tree": {
+    "trunk/README.txt": "alpha",
+    "trunk/keep.txt": "keep"
+  },
+  "actual_tree": {
+    "trunk/README.txt": "beta",
+    "trunk/extra.txt": "unexpected"
+  },
+  "mappings": [
+    {"repo_id": "repo-a", "svn_rev": 2, "git_sha": "aaa", "direction": "svn_to_git"},
+    {"repo_id": "repo-a", "svn_rev": 2, "git_sha": "bbb", "direction": "svn_to_git"}
+  ],
+  "expected_mappings": [
+    {"repo_id": "repo-a", "svn_rev": 2, "git_sha": "aaa"},
+    {"repo_id": "repo-a", "svn_rev": 3, "git_sha": "ccc"}
+  ]
+}

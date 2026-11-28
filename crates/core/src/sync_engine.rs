@@ -12,12 +12,13 @@
 //! A lock mechanism prevents concurrent sync cycles.
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use rusqlite::OptionalExtension;
@@ -150,6 +151,16 @@ pub struct SyncStats {
 struct TeamHistoryAdmission {
     checkpoint: String,
     remote_tip: String,
+    local_tip: String,
+    local_ref: String,
+}
+
+fn bridge_symbolic_head(git: &GitClient) -> Result<Option<String>, SyncError> {
+    let reference = git
+        .repo()
+        .find_reference("HEAD")
+        .map_err(crate::errors::GitError::from)?;
+    Ok(reference.symbolic_target().map(str::to_owned))
 }
 
 /// Git changes selected for one sync cycle, including continuation metadata.
@@ -212,6 +223,17 @@ pub struct SyncEngine {
     git_blob_reads_recorded: std::sync::Mutex<Vec<String>>,
     #[cfg(debug_assertions)]
     git_blob_read_recording_enabled: std::sync::Mutex<bool>,
+    /// Fixture-only: fail credential reload before any authenticated transport.
+    #[cfg(debug_assertions)]
+    credential_reload_fault: std::sync::Mutex<Option<CredentialReloadTestFault>>,
+}
+
+/// Per-engine credential reload fault (debug builds only).
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Copy)]
+enum CredentialReloadTestFault {
+    ReadFailure,
+    ApplyFailure,
 }
 
 /// Per-engine Git blob read fault (debug builds only).
@@ -231,30 +253,379 @@ struct SvnApplyTestFault {
     bridge: String,
 }
 
+const GIT_PROBE_MAX_OUTPUT: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbePipe {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+enum ProbePipeSetupError {
+    GetFlags(ProbePipe),
+    SetFlags(ProbePipe),
+    #[cfg(not(unix))]
+    NoInterruptibleBackend,
+}
+
+#[cfg(unix)]
+fn configure_probe_pipe_nonblocking(
+    fd: std::os::unix::io::RawFd,
+    pipe: ProbePipe,
+) -> Result<(), ProbePipeSetupError> {
+    #[cfg(test)]
+    if pr245_probe_cleanup_tests::fail_getfl(pipe) {
+        return Err(ProbePipeSetupError::GetFlags(pipe));
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(ProbePipeSetupError::GetFlags(pipe));
+    }
+    #[cfg(test)]
+    if pr245_probe_cleanup_tests::fail_setfl(pipe) {
+        return Err(ProbePipeSetupError::SetFlags(pipe));
+    }
+    let updated = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if updated < 0 {
+        return Err(ProbePipeSetupError::SetFlags(pipe));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn configure_probe_pipe_nonblocking(pipe: ProbePipe) -> Result<(), ProbePipeSetupError> {
+    let _ = pipe;
+    Err(ProbePipeSetupError::NoInterruptibleBackend)
+}
+
+fn reap_owned_probe_child(child: &mut std::process::Child) {
+    kill_git_probe_group(child);
+    let reap_deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < reap_deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn release_unready_probe(
+    error: ProbePipeSetupError,
+    child: &mut std::process::Child,
+    stdout: std::process::ChildStdout,
+    stderr: std::process::ChildStderr,
+) -> Option<std::process::Output> {
+    #[cfg(test)]
+    {
+        let running = matches!(child.try_wait(), Ok(None));
+        pr245_probe_cleanup_tests::note_child_running_before_reap(running);
+        pr245_probe_cleanup_tests::record_setup_error(error);
+    }
+    #[cfg(not(test))]
+    let _ = error;
+    drop(stdout);
+    drop(stderr);
+    reap_owned_probe_child(child);
+    None
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn drain_limited(
+    mut pipe: impl Read,
+    max: usize,
+    stop: &AtomicBool,
+    #[cfg(test)] entered: Option<Arc<AtomicBool>>,
+) -> (Vec<u8>, bool) {
+    #[cfg(test)]
+    if let Some(entered) = entered {
+        entered.store(true, Ordering::Relaxed);
+    }
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return (bytes, false);
+        }
+        match pipe.read(&mut chunk) {
+            Ok(0) => return (bytes, true),
+            Ok(n) => {
+                if bytes.len() < max {
+                    let take = n.min(max - bytes.len());
+                    bytes.extend_from_slice(&chunk[..take]);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return (bytes, false),
+        }
+    }
+}
+fn kill_git_probe_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
+fn remaining_until(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
 fn sync_git_command_output(
     repo_path: &Path,
     args: &[&str],
     timeout: Duration,
     http_auth_token: Option<String>,
 ) -> Option<std::process::Output> {
-    let repo_path = repo_path.to_path_buf();
-    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let output = crate::git::subprocess_auth::git_cli_output(
-            &repo_path,
-            &arg_refs,
-            http_auth_token.as_deref(),
-        );
-        let _ = tx.send(output);
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(output)) => Some(output),
-        _ => None,
-    }
+    sync_git_command_output_with_index(repo_path, args, timeout, http_auth_token, None)
 }
 
+/// As `sync_git_command_output`, optionally against a private index file
+/// instead of the repository's own.
+fn sync_git_command_output_with_index(
+    repo_path: &Path,
+    args: &[&str],
+    timeout: Duration,
+    http_auth_token: Option<String>,
+    index_file: Option<&Path>,
+) -> Option<std::process::Output> {
+    let arg_refs: Vec<&str> = args.to_vec();
+    let mut command = crate::git::subprocess_auth::build_git_cli_command(
+        repo_path,
+        &arg_refs,
+        http_auth_token.as_deref(),
+    );
+    if let Some(index_file) = index_file {
+        command.env("GIT_INDEX_FILE", index_file);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return None,
+    };
+    #[cfg(test)]
+    pr245_probe_cleanup_tests::note_child_pid(child.id());
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (stdout, stderr) = match (stdout, stderr) {
+        (Some(stdout), Some(stderr)) => (stdout, stderr),
+        (stdout, stderr) => {
+            drop(stdout);
+            drop(stderr);
+            reap_owned_probe_child(&mut child);
+            return None;
+        }
+    };
+    #[cfg(not(unix))]
+    {
+        return release_unready_probe(
+            ProbePipeSetupError::NoInterruptibleBackend,
+            &mut child,
+            stdout,
+            stderr,
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Err(error) = configure_probe_pipe_nonblocking(stdout.as_raw_fd(), ProbePipe::Stdout)
+        {
+            return release_unready_probe(error, &mut child, stdout, stderr);
+        }
+        if let Err(error) = configure_probe_pipe_nonblocking(stderr.as_raw_fd(), ProbePipe::Stderr)
+        {
+            return release_unready_probe(error, &mut child, stdout, stderr);
+        }
+        let stop_stdout = Arc::new(AtomicBool::new(false));
+        let stop_stderr = Arc::new(AtomicBool::new(false));
+        let (tx_out, rx_out) = mpsc::channel();
+        let (tx_err, rx_err) = mpsc::channel();
+        let stop_stdout_reader = Arc::clone(&stop_stdout);
+        let stop_stderr_reader = Arc::clone(&stop_stderr);
+        #[cfg(test)]
+        let stdout_entered = pr245_probe_cleanup_tests::drain_entered_flag(ProbePipe::Stdout);
+        #[cfg(test)]
+        let stderr_entered = pr245_probe_cleanup_tests::drain_entered_flag(ProbePipe::Stderr);
+        #[cfg(test)]
+        pr245_probe_cleanup_tests::mark_reader_started(ProbePipe::Stdout);
+        let stdout_reader = std::thread::spawn(move || {
+            let _ = tx_out.send(drain_limited(
+                stdout,
+                GIT_PROBE_MAX_OUTPUT,
+                &stop_stdout_reader,
+                #[cfg(test)]
+                stdout_entered,
+            ));
+        });
+        #[cfg(test)]
+        pr245_probe_cleanup_tests::mark_reader_started(ProbePipe::Stderr);
+        let stderr_reader = std::thread::spawn(move || {
+            let _ = tx_err.send(drain_limited(
+                stderr,
+                GIT_PROBE_MAX_OUTPUT,
+                &stop_stderr_reader,
+                #[cfg(test)]
+                stderr_entered,
+            ));
+        });
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if !remaining_until(deadline).is_zero() => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => break None,
+            }
+        };
+        let mut killed_group = false;
+        if status.is_none() {
+            reap_owned_probe_child(&mut child);
+            killed_group = true;
+        }
+        let mut stdout_drain = None;
+        let mut stderr_drain = None;
+        let pull = |stdout_drain: &mut Option<(Vec<u8>, bool)>,
+                    stderr_drain: &mut Option<(Vec<u8>, bool)>| {
+            if stdout_drain
+                .as_ref()
+                .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+            {
+                if let Ok(value) = rx_out.try_recv() {
+                    *stdout_drain = Some(value);
+                }
+            }
+            if stderr_drain
+                .as_ref()
+                .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+            {
+                if let Ok(value) = rx_err.try_recv() {
+                    *stderr_drain = Some(value);
+                }
+            }
+        };
+        let collect_deadline = if Instant::now() < deadline {
+            deadline
+        } else {
+            Instant::now() + Duration::from_millis(200)
+        };
+        while Instant::now() < collect_deadline
+            && (stdout_drain
+                .as_ref()
+                .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+                || stderr_drain
+                    .as_ref()
+                    .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1))
+        {
+            pull(&mut stdout_drain, &mut stderr_drain);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let clean_eof = !killed_group
+            && stdout_drain
+                .as_ref()
+                .is_some_and(|drain: &(Vec<u8>, bool)| drain.1)
+            && stderr_drain
+                .as_ref()
+                .is_some_and(|drain: &(Vec<u8>, bool)| drain.1);
+        if !clean_eof && !killed_group {
+            reap_owned_probe_child(&mut child);
+            killed_group = true;
+            let after_kill = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < after_kill
+                && (stdout_drain
+                    .as_ref()
+                    .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+                    || stderr_drain
+                        .as_ref()
+                        .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1))
+            {
+                pull(&mut stdout_drain, &mut stderr_drain);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        } else if killed_group {
+            let after_kill = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < after_kill
+                && (stdout_drain
+                    .as_ref()
+                    .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+                    || stderr_drain
+                        .as_ref()
+                        .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1))
+            {
+                pull(&mut stdout_drain, &mut stderr_drain);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        if stdout_drain
+            .as_ref()
+            .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+        {
+            stop_stdout.store(true, Ordering::Relaxed);
+        }
+        if stderr_drain
+            .as_ref()
+            .is_none_or(|drain: &(Vec<u8>, bool)| !drain.1)
+        {
+            stop_stderr.store(true, Ordering::Relaxed);
+        }
+        let join_reader = |handle: std::thread::JoinHandle<()>| -> bool {
+            let join_deadline = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < join_deadline && !handle.is_finished() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            handle.join().is_ok()
+        };
+        let stdout_joined = join_reader(stdout_reader);
+        let stderr_joined = join_reader(stderr_reader);
+        pull(&mut stdout_drain, &mut stderr_drain);
+        let stdout_eof = stdout_drain
+            .as_ref()
+            .is_some_and(|drain: &(Vec<u8>, bool)| drain.1);
+        let stderr_eof = stderr_drain
+            .as_ref()
+            .is_some_and(|drain: &(Vec<u8>, bool)| drain.1);
+        #[cfg(test)]
+        pr245_probe_cleanup_tests::record_probe_drains(
+            stdout_eof,
+            stderr_eof,
+            stdout_joined,
+            stderr_joined,
+        );
+        if clean_eof && stdout_joined && stderr_joined {
+            let status = status.expect("clean probe completion has the leader status");
+            let (stdout, _) = stdout_drain.expect("clean stdout drain");
+            let (stderr, _) = stderr_drain.expect("clean stderr drain");
+            return Some(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        let _ = (
+            killed_group,
+            stdout_eof,
+            stderr_eof,
+            stdout_joined,
+            stderr_joined,
+        );
+        None
+    }
+}
 impl SyncEngine {
     /// Create a new sync engine with all required dependencies.
     pub fn new(
@@ -292,7 +663,23 @@ impl SyncEngine {
             git_blob_reads_recorded: std::sync::Mutex::new(Vec::new()),
             #[cfg(debug_assertions)]
             git_blob_read_recording_enabled: std::sync::Mutex::new(false),
+            #[cfg(debug_assertions)]
+            credential_reload_fault: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Force credential reload to fail before authenticated transport (fixture tests).
+    #[cfg(debug_assertions)]
+    pub fn set_credential_reload_read_fault(&self) {
+        *self.credential_reload_fault.lock().unwrap() =
+            Some(CredentialReloadTestFault::ReadFailure);
+    }
+
+    /// Force credential apply/clear to fail before authenticated transport (fixture tests).
+    #[cfg(debug_assertions)]
+    pub fn set_credential_reload_apply_fault(&self) {
+        *self.credential_reload_fault.lock().unwrap() =
+            Some(CredentialReloadTestFault::ApplyFailure);
     }
 
     /// Install a per-engine replay batch cap for fixture tests.
@@ -567,7 +954,8 @@ impl SyncEngine {
         };
 
         // Hot-reload credentials from DB (changed via Setup Wizard).
-        self.reload_credentials();
+        // Read/apply/revocation failures refuse this cycle's transport.
+        self.reload_credentials()?;
 
         self.db
             .ensure_repository_scope_schema_upgrade()
@@ -1003,6 +1391,19 @@ impl SyncEngine {
             } else {
                 false
             };
+            if let Some(handled) = kv.as_deref() {
+                if column.as_deref() == Some(handled)
+                    && crate::db::late_pair_publish_operations::verified_reconciliation_frontier(
+                        &self.db.conn(),
+                        rid,
+                        handled,
+                        &self.no_target_projection(),
+                    )?
+                {
+                    self.reject_missing_checkpoint_object(handled)?;
+                    return Ok(Some(handled.to_owned()));
+                }
+            }
             if column.is_some() && kv.is_some() && column != kv {
                 let (applied_outbound, svn_origin) = {
                     let conn = self.db.conn();
@@ -1030,7 +1431,13 @@ impl SyncEngine {
                     self.allowed_paths.is_empty() && self.blocked_patterns.is_empty();
                 let kv_handled_proved = applied_outbound > 0
                     || (old_import_projection && svn_origin > 0)
-                    || kv_no_target;
+                    || kv_no_target
+                    || crate::db::late_pair_publish_operations::verified_reconciliation_frontier(
+                        &self.db.conn(),
+                        rid,
+                        kv.as_deref().unwrap(),
+                        &self.no_target_projection(),
+                    )?;
                 let column_sha = column.as_deref().unwrap();
                 let column_emit_proved = self.proved_svn_emitted_column_git_sha(rid, column_sha)?;
                 let column_stale_receipt_only =
@@ -1495,6 +1902,33 @@ impl SyncEngine {
         if !is_full_git_oid(sha) {
             return Ok(false);
         }
+        {
+            let conn = self.db.conn();
+            if crate::db::ordinary_writer_windows::OrdinaryWriterWindow::emitted_frontier_recorded(
+                &conn, rid, sha,
+            )
+            .map_err(SyncError::DatabaseError)?
+            {
+                // Historical proof cannot repair missing or split current
+                // copies through the predicate's KV-only/column-only callers.
+                let emitted: String = conn
+                    .query_row(
+                        "SELECT last_git_sha FROM repositories WHERE id=?1",
+                        [rid],
+                        |row| row.get(0),
+                    )
+                    .map_err(crate::errors::DatabaseError::from)?;
+                let inbound =
+                    crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv_tx(&conn, rid)
+                        .map_err(SyncError::DatabaseError)?;
+                if emitted != sha || inbound.as_deref() != Some(sha) {
+                    return Ok(false);
+                }
+                return crate::db::ordinary_writer_windows::OrdinaryWriterWindow::verified_emitted_git_frontier(
+                    &conn,&self.db,rid,sha,&self.no_target_projection(),
+                ).map_err(SyncError::DatabaseError);
+            }
+        }
         let (applied_outbound, applied_inbound, any_applied_outbound) = {
             let conn = self.db.conn();
             let applied_outbound: i64 = conn
@@ -1524,7 +1958,11 @@ impl SyncEngine {
             return Ok(true);
         }
         if applied_inbound > 0 && any_applied_outbound == 0 {
-            return Ok(true);
+            let conn = self.db.conn();
+            if !crate::db::ordinary_writer_windows::OrdinaryWriterWindow::emitted_frontier_needs_retained_history(&conn,rid,sha)
+                .map_err(SyncError::DatabaseError)? {
+                return Ok(true);
+            }
         }
         let projection = self.no_target_projection();
         if stored_git_no_target_receipt_exists(&self.db, rid, sha, &projection)
@@ -1995,11 +2433,21 @@ impl SyncEngine {
             .git_client
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let local_ref = format!("refs/heads/{}", self.config.github.default_branch);
+        if bridge_symbolic_head(&git)?.as_deref() != Some(local_ref.as_str()) {
+            return Err(self.record_history_block(
+                "checkout_branch_mismatch",
+                "managed bridge HEAD is not on the configured branch",
+                p.as_deref(),
+                None,
+                None,
+                None,
+            ));
+        }
+        let local_tip = git.head_sha()?;
         let http_token = git.stored_http_auth_token();
         let refresh = match (self.effective_repo_id(), p.as_deref()) {
-            (Some(id), Some(checkpoint))
-                if git.head_sha().map_err(SyncError::GitError)? != checkpoint =>
-            {
+            (Some(id), Some(checkpoint)) if local_tip != checkpoint => {
                 // A refusal here grants no exception; the ordinary inspector
                 // remains authoritative for all other local-history shapes.
                 crate::pair_refresh::engine_checkout::CompletedRefreshCheckout::capture(
@@ -2020,10 +2468,26 @@ impl SyncEngine {
             http_token.as_deref(),
             refresh.as_ref(),
         ) {
-            Ok(admission) => Ok(TeamHistoryAdmission {
-                checkpoint: admission.checkpoint,
-                remote_tip: admission.remote_tip,
-            }),
+            Ok(admission) => {
+                if bridge_symbolic_head(&git)?.as_deref() != Some(local_ref.as_str())
+                    || git.head_sha()? != local_tip
+                {
+                    return Err(self.record_history_block(
+                        "checkout_drift",
+                        "managed bridge branch or tip changed during Git admission",
+                        Some(&admission.checkpoint),
+                        None,
+                        Some(&admission.remote_tip),
+                        Some(&local_tip),
+                    ));
+                }
+                Ok(TeamHistoryAdmission {
+                    checkpoint: admission.checkpoint,
+                    remote_tip: admission.remote_tip,
+                    local_tip,
+                    local_ref,
+                })
+            }
             Err(reject) => Err(self.record_history_block(
                 &reject.reason,
                 &reject.detail,
@@ -2079,21 +2543,6 @@ impl SyncEngine {
         // before that call, not merely before the later destructive reset.
         let admission = tokio::task::block_in_place(|| self.inspect_team_history())?;
 
-        // On a pinned old import, both legacy copies point to the imported
-        // SVN mapping. Materialize that verified baseline before diagnostics
-        // can expire; never derive it from a later retained row.
-        if let Some(rid) = self.effective_repo_id() {
-            let (revision, column) = self
-                .db
-                .get_repo_watermark(rid)
-                .map_err(SyncError::DatabaseError)?;
-            let kv = crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&self.db, rid)
-                .map_err(SyncError::DatabaseError)?;
-            if column == admission.checkpoint && kv.as_deref() == Some(column.as_str()) {
-                self.materialize_git_baseline(&column, revision)?;
-            }
-        }
-
         // 1. Fetch changes from both sides.
         let svn_changes = self.fetch_svn_changes().await?;
         let git_fetch = self.fetch_git_changes(&admission, &svn_changes).await?;
@@ -2112,6 +2561,9 @@ impl SyncEngine {
             return Ok(());
         }
 
+        self.refuse_ambiguous_svn_publication(&admission, &svn_changes, &git_fetch)
+            .await?;
+
         let batch_continuation =
             git_fetch
                 .continuation_to_persist
@@ -2124,10 +2576,6 @@ impl SyncEngine {
                         .map(|change| change.sha.clone())
                         .collect(),
                 });
-        if let Some(continuation) = batch_continuation.as_ref() {
-            self.persist_pre_batch_git_replay_continuation(continuation)?;
-        }
-
         // 2. Detect conflicts against the full admitted P→R path, not only the replay batch.
         self.ensure_conflict_coverage_before_detection(
             git_fetch.has_more,
@@ -2181,13 +2629,78 @@ impl SyncEngine {
 
         self.refuse_apply_while_persisted_conflicts_block()?;
 
+        // On a pinned old import, both legacy copies point to the imported
+        // SVN mapping. Materialize that verified baseline before diagnostics
+        // can expire; never derive it from a later retained row.
+        if let Some(rid) = self.effective_repo_id() {
+            let (revision, column) = self
+                .db
+                .get_repo_watermark(rid)
+                .map_err(SyncError::DatabaseError)?;
+            let kv = crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&self.db, rid)
+                .map_err(SyncError::DatabaseError)?;
+            if column == admission.checkpoint && kv.as_deref() == Some(column.as_str()) {
+                self.materialize_git_baseline(&column, revision)?;
+            }
+        }
+
+        if let Some(continuation) = batch_continuation.as_ref() {
+            self.persist_pre_batch_git_replay_continuation(continuation)?;
+        }
+        tokio::task::block_in_place(|| {
+            self.checkout_admitted_git_batch(&admission, &git_fetch.reset_target)
+        })?;
+
         // 3. Apply SVN -> Git.
+        let convergence = if git_fetch.replay_batch.is_empty()
+            && !git_fetch.has_more
+            && self.allowed_paths.is_empty()
+            && self.blocked_patterns.is_empty()
+            && (svn_changes.is_empty()
+                || (git_fetch.pending_total == 0 && admission.checkpoint == admission.remote_tip))
+        {
+            if let Some(rid) = self.effective_repo_id() {
+                let origin = {
+                    let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                    let repo = git2::Repository::open(git.repo_path())
+                        .map_err(crate::errors::GitError::from)
+                        .map_err(SyncError::GitError)?;
+                    let remote = repo
+                        .find_remote("origin")
+                        .map_err(crate::errors::GitError::from)
+                        .map_err(SyncError::GitError)?;
+                    remote
+                        .url()
+                        .ok_or_else(|| {
+                            SyncError::GitError(crate::errors::GitError::RefNotFound(
+                                "origin URL is missing".into(),
+                            ))
+                        })?
+                        .to_owned()
+                };
+                writer_window
+                    .prepare_emitted_git_convergence(
+                        rid,
+                        &self.config.github.default_branch,
+                        &origin,
+                        &admission.checkpoint,
+                        &admission.remote_tip,
+                        &self.no_target_projection(),
+                    )
+                    .map_err(SyncError::DatabaseError)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let _ = self.persist_sync_state("applying");
         self.sync_svn_to_git(&svn_changes, &mut stats.svn_to_git_count, writer_window)
             .await?;
 
-        // The exact remote Git tip had no pending commits before this SVN
-        // publication, so its newly mapped tip is a handled frontier.
+        // Keep the durable mapped baseline distinct from the inbound cursor.
+        // Convergence below additionally requires the captured old state and
+        // a freshly observed complete chain of actual completed publications.
         if git_fetch.replay_batch.is_empty()
             && !git_fetch.has_more
             && admission.checkpoint == admission.remote_tip
@@ -2211,41 +2724,92 @@ impl SyncEngine {
             )
             .await?;
 
-        // Receipt filtering must eventually advance the inbound cursor too.
-        // Only a complete range consisting entirely of our emitted commits is
-        // eligible, in a cycle with no source work or opposite publication.
-        if svn_changes.is_empty()
-            && !git_fetch.has_more
-            && git_fetch.replay_batch.is_empty()
-            && git_fetch.pending_total > 0
-            && self.allowed_paths.is_empty()
-            && self.blocked_patterns.is_empty()
-        {
-            if let Some(rid) = self.effective_repo_id() {
-                let selection = {
+        if let Some(converge) = convergence {
+            // An unused bootstrap capture must not manufacture an empty-range
+            // cursor after metadata-only SVN work. A quiet observation may
+            // settle only a complete, genuinely emitted nonempty Git range.
+            if stats.svn_to_git_count > 0 || svn_changes.is_empty() {
+                let (observed, origin, chain) = tokio::task::block_in_place(|| {
                     let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
-                    git.pending_commits_between(
-                        &admission.checkpoint,
-                        &admission.remote_tip,
-                        self.replay_batch_cap(),
+                    let branch = &self.config.github.default_branch;
+                    let token = git.stored_http_auth_token();
+                    let fresh = crate::history_inspect::inspect_fetched_history(
+                        git.repo_path(),
+                        branch,
+                        Some(admission.checkpoint.clone()),
+                        token.as_deref(),
                     )
-                    .map_err(SyncError::GitError)?
-                };
-                if !selection.has_more && selection.total == selection.commits.len() {
-                    let shas = selection
-                        .commits
-                        .iter()
-                        .map(|commit| commit.sha.as_str())
-                        .collect::<Vec<_>>();
-                    writer_window
-                        .settle_emitted_git_echoes(
-                            rid,
-                            &admission.checkpoint,
-                            &admission.remote_tip,
-                            &shas,
+                    .map_err(|error| {
+                        self.record_history_block(
+                            &error.reason,
+                            &error.detail,
+                            Some(&admission.checkpoint),
+                            error.o.as_deref(),
+                            error.r.as_deref(),
+                            error.l.as_deref(),
                         )
-                        .map_err(SyncError::DatabaseError)?;
-                }
+                    })?;
+                    let selection = git
+                        .pending_commits_between(
+                            &admission.checkpoint,
+                            &fresh.remote_tip,
+                            self.replay_batch_cap(),
+                        )
+                        .map_err(SyncError::GitError)?;
+                    if selection.has_more || selection.total != selection.commits.len() {
+                        return Err(SyncError::DatabaseError(
+                            crate::errors::DatabaseError::Other(
+                                "emitted convergence requires complete selection".into(),
+                            ),
+                        ));
+                    }
+                    let repo = git2::Repository::open(git.repo_path())
+                        .map_err(crate::errors::GitError::from)
+                        .map_err(SyncError::GitError)?;
+                    let remote = repo
+                        .find_remote("origin")
+                        .map_err(crate::errors::GitError::from)
+                        .map_err(SyncError::GitError)?;
+                    let origin = remote
+                        .url()
+                        .ok_or_else(|| {
+                            SyncError::GitError(crate::errors::GitError::RefNotFound(
+                                "origin URL is missing".into(),
+                            ))
+                        })?
+                        .to_owned();
+                    let mut previous = admission.checkpoint.clone();
+                    let mut chain = Vec::with_capacity(selection.commits.len());
+                    for selected in selection.commits {
+                        let commit = repo
+                            .find_commit(
+                                git2::Oid::from_str(&selected.sha)
+                                    .map_err(crate::errors::GitError::from)
+                                    .map_err(SyncError::GitError)?,
+                            )
+                            .map_err(crate::errors::GitError::from)
+                            .map_err(SyncError::GitError)?;
+                        if commit.parent_count() != 1
+                            || commit
+                                .parent_id(0)
+                                .map_err(crate::errors::GitError::from)
+                                .map_err(SyncError::GitError)?
+                                .to_string()
+                                != previous
+                        {
+                            return Err(SyncError::DatabaseError(
+                                crate::errors::DatabaseError::Other(
+                                    "emitted convergence requires exact linear producer topology"
+                                        .into(),
+                                ),
+                            ));
+                        }
+                        chain.push((selected.sha.clone(), commit.tree_id().to_string()));
+                        previous = selected.sha;
+                    }
+                    Ok::<_, SyncError>((fresh.remote_tip, origin, chain))
+                })?;
+                converge(&observed, &origin, &chain).map_err(SyncError::DatabaseError)?;
             }
         }
 
@@ -2618,10 +3182,7 @@ impl SyncEngine {
 
             // 3. Commit with identity and sync marker, persist durable intent,
             // push, then confirm only with observed Git ref/tree evidence.
-            let commit_message = format!(
-                "{}\n\n{} synced from SVN r{}",
-                change.message, SYNC_MARKER, change.revision
-            );
+            let commit_message = svn_to_git_commit_message(&change.message, change.revision);
             let branch = self.config.github.default_branch.clone();
             let remote = "origin".to_string();
             let repo_id = self.effective_repo_id().map(str::to_owned);
@@ -3334,7 +3895,8 @@ impl SyncEngine {
         let projection = self.no_target_projection();
         let fingerprint =
             svn_commit_target_fingerprint(rid, &info.uuid, svn.url(), &info.url, &projection);
-        let identity = crate::path_projection::svn_path_identity(&info.root_url, &info.url);
+        let identity = crate::path_projection::svn_path_identity(&info.root_url, &info.url)
+            .map_err(SyncError::SvnError)?;
         let op = self
             .db
             .begin_git_to_svn_commit(SvnCommitIntent {
@@ -3534,9 +4096,104 @@ impl SyncEngine {
                     item.content = Some(read.map_err(SyncError::GitError)?.ok_or_else(|| {
                         SyncError::GitError(crate::errors::GitError::RefNotFound(item.path.clone()))
                     })?);
+                    if item.content.as_deref().is_some_and(|bytes| {
+                        bytes.starts_with(b"version https://git-lfs.github.com/spec/v1")
+                    }) {
+                        // Checkout may intentionally skip smudging. The SVN
+                        // writer below consumes committed blobs, not hydrated
+                        // worktree bytes, so it must never publish an LFS
+                        // pointer as the actual file. Inspect this exact source
+                        // commit, not HEAD/index (which may be a later commit).
+                        // Higher-priority local overrides make that evidence
+                        // ambiguous; ordinary literal pointer text remains
+                        // supported when its source has no filter.
+                        if !matches!(std::fs::symlink_metadata(git.repo().path().join("info/attributes")),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                        {
+                            return Err(self.record_history_block("unsupported_git_semantics",
+                                "LFS pointer filter is ambiguous because local attribute overrides exist",
+                                Some(&change.sha), None, None, None));
+                        }
+                        // `check-attr --source` needs Git 2.40. Reading the
+                        // source commit into a private index and querying
+                        // that index answers the same question on older Git.
+                        // The repository's own index and worktree are not
+                        // touched.
+                        let attributes = tempfile::Builder::new()
+                            .prefix("reposync-attr-index-")
+                            .tempdir_in(git.repo().path())
+                            .ok()
+                            .and_then(|scratch| {
+                                let index = scratch.path().join("index");
+                                // Some Git releases skip index attribute
+                                // files outside a sparse cone. The private
+                                // index always holds the whole commit.
+                                const WHOLE: [&str; 4] = ["-c", "core.sparseCheckout=false",
+                                    "-c", "index.sparse=false"];
+                                let read_tree = [&WHOLE[..], &["read-tree", &change.sha]].concat();
+                                sync_git_command_output_with_index(git.repo_path(),
+                                    &read_tree,
+                                    Duration::from_secs(30), None, Some(&index))
+                                    .filter(|output| output.status.success())?;
+                                // An absent index would read as "no
+                                // attributes", so require the one just built.
+                                if !index.is_file() {
+                                    return None;
+                                }
+                                let check = [&WHOLE[..], &["check-attr", "-z", "--cached",
+                                    "--all", "--", &item.path]].concat();
+                                sync_git_command_output_with_index(git.repo_path(),
+                                    &check,
+                                    Duration::from_secs(5), None, Some(&index))
+                            })
+                            .filter(|output| output.status.success())
+                            .ok_or_else(|| self.record_history_block("unsupported_git_semantics",
+                                "LFS pointer source attributes could not be verified; no SVN publication is permitted",
+                                Some(&change.sha), None, None, None))?;
+                        let fields: Vec<_> = attributes.stdout.split(|byte| *byte == 0).collect();
+                        if attributes.stdout.len() > 65_536
+                            || fields.len() % 3 != 1
+                            || !fields.last().is_some_and(|field| field.is_empty())
+                            || fields[..fields.len() - 1]
+                                .as_chunks::<3>()
+                                .0
+                                .iter()
+                                .any(|record| {
+                                    record[0] != item.path.as_bytes() || record[1].is_empty()
+                                })
+                        {
+                            return Err(self.record_history_block(
+                                "unsupported_git_semantics",
+                                "LFS pointer source attribute response is incomplete or malformed",
+                                Some(&change.sha),
+                                None,
+                                None,
+                                None,
+                            ));
+                        }
+                        // A single-attribute query prints both absence and a
+                        // driver literally named "unspecified" identically.
+                        // --all omits an absent attribute, proving that no
+                        // filter applies without trusting those sentinel words.
+                        // Explicit definitions (including ambiguous "unset")
+                        // remain held until qualified typed handling exists.
+                        if fields[..fields.len() - 1]
+                            .as_chunks::<3>()
+                            .0
+                            .iter()
+                            .any(|record| record[1] == b"filter")
+                        {
+                            return Err(self.record_history_block("unsupported_git_semantics",
+                                "Git LFS or filtered pointer content requires qualified object hydration; pointer text cannot be written to SVN",
+                                Some(&change.sha), None, None, None));
+                        }
+                    }
                 }
             }
             let file_contents = projected.into_file_contents();
+            for (_, path, _) in &file_contents {
+                crate::svn::operand::validate_relative_path(path).map_err(SyncError::SvnError)?;
+            }
             if let Err(violations) = validate_file_paths_impl(
                 &self.allowed_paths,
                 &self.blocked_patterns,
@@ -3647,6 +4304,16 @@ impl SyncEngine {
                 }
             }
 
+            let svn_write_client = self
+                .svn_client
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            svn_write_client
+                .require_supported_working_copy(svn_wc_dir.path())
+                .await
+                .map_err(SyncError::SvnError)?;
+
             // 3. Copy changed files from Git into the SVN working copy.
             //    If a file is marked as modified ("M") in Git but does not
             //    exist in the SVN working copy, treat it as an add so that
@@ -3655,19 +4322,27 @@ impl SyncEngine {
             let mut added_files = Vec::new();
             let mut deleted_files = Vec::new();
 
+            let confined = crate::svn::working_copy::ConfinedWorkingCopy::open(svn_wc_dir.path())
+                .map_err(|e| SyncError::GitError(crate::errors::GitError::IoError(e)))?;
+            confined
+                .preflight(file_contents.iter().map(|(_, path, _)| path.as_str()))
+                .map_err(|e| SyncError::GitError(crate::errors::GitError::IoError(e)))?;
             for (action, file_path, content) in &file_contents {
                 let dst = svn_wc_dir.path().join(file_path);
+                let existed = confined
+                    .inspect_file(file_path)
+                    .map_err(|e| SyncError::GitError(crate::errors::GitError::IoError(e)))?;
                 debug!(
                     sha = %change.sha,
                     action = %action,
                     file_path = %file_path,
                     dst = %dst.display(),
-                    dst_exists = dst.exists(),
+                    dst_exists = existed,
                     "processing file change"
                 );
                 match action.as_str() {
                     "D" => {
-                        if dst.exists() {
+                        if existed {
                             deleted_files.push(file_path.as_str());
                         } else {
                             debug!(
@@ -3678,12 +4353,7 @@ impl SyncEngine {
                     }
                     "A" => {
                         if let Some(content) = content {
-                            if let Some(parent) = dst.parent() {
-                                std::fs::create_dir_all(parent).map_err(|e| {
-                                    SyncError::GitError(crate::errors::GitError::IoError(e))
-                                })?;
-                            }
-                            std::fs::write(&dst, content).map_err(|e| {
+                            confined.write_file(file_path, content).map_err(|e| {
                                 SyncError::GitError(crate::errors::GitError::IoError(e))
                             })?;
                             added_files.push(file_path.as_str());
@@ -3692,13 +4362,8 @@ impl SyncEngine {
                     _ => {
                         // Modified: overwrite content.
                         if let Some(content) = content {
-                            let file_is_new = !dst.exists();
-                            if let Some(parent) = dst.parent() {
-                                std::fs::create_dir_all(parent).map_err(|e| {
-                                    SyncError::GitError(crate::errors::GitError::IoError(e))
-                                })?;
-                            }
-                            std::fs::write(&dst, content).map_err(|e| {
+                            let file_is_new = !existed;
+                            confined.write_file(file_path, content).map_err(|e| {
                                 SyncError::GitError(crate::errors::GitError::IoError(e))
                             })?;
                             // If the file didn't exist in the SVN working copy,
@@ -3759,15 +4424,9 @@ impl SyncEngine {
                 // Add each directory individually, shallowest first.
                 // --force makes it a no-op for already-versioned dirs.
                 for dir in &dirs_to_add {
-                    let full = svn_wc_dir.path().join(dir);
-                    if full.is_dir() {
-                        svn.run_svn_in_dir_public(
-                            svn_wc_dir.path(),
-                            &["add", "--force", "--depth", "empty", dir],
-                        )
+                    svn.add_directory(svn_wc_dir.path(), dir)
                         .await
                         .map_err(SyncError::SvnError)?;
-                    }
                 }
 
                 // Now add the actual files — parents are guaranteed registered.
@@ -3796,7 +4455,7 @@ impl SyncEngine {
                             },
                         ));
                     }
-                    svn.run_svn_in_dir_public(svn_wc_dir.path(), &["add", "--force", file])
+                    svn.add(svn_wc_dir.path(), &[*file])
                         .await
                         .map_err(SyncError::SvnError)?;
                 }
@@ -3812,20 +4471,20 @@ impl SyncEngine {
             //     If SVN sees no modifications, skip this commit gracefully
             //     instead of failing to parse an empty commit output.
             let svn_status = svn
-                .status(svn_wc_dir.path())
+                .status_entries(svn_wc_dir.path())
                 .await
                 .map_err(SyncError::SvnError)?;
-            let has_changes = svn_status.lines().any(|line| {
-                let trimmed = line.trim();
-                !trimmed.is_empty()
-                    && !trimmed.starts_with('?')  // unversioned
-                    && !trimmed.starts_with('X') // externals
+            let has_changes = svn_status.iter().any(|entry| {
+                matches!(
+                    entry.item.as_str(),
+                    "added" | "modified" | "deleted" | "replaced"
+                ) || entry.properties == "modified"
             });
             if !has_changes {
                 warn!(
                     sha = %change.sha,
                     svn_url = %svn_url_for_log,
-                    svn_status = %svn_status,
+                    svn_status = ?svn_status,
                     file_count = file_contents.len(),
                     added = added_files.len(),
                     deleted = deleted_files.len(),
@@ -3868,7 +4527,7 @@ impl SyncEngine {
 
             debug!(
                 sha = %change.sha,
-                svn_status = %svn_status,
+                svn_status = ?svn_status,
                 "SVN working copy has pending changes, committing"
             );
 
@@ -4306,6 +4965,19 @@ impl SyncEngine {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let svn_info = svn.info().await.map_err(SyncError::SvnError)?;
+        if let Some(rid) = self.effective_repo_id() {
+            if self
+                .db
+                .get_repository(rid)
+                .map_err(SyncError::DatabaseError)?
+                .is_some()
+            {
+                crate::db::lineage_checkpoints::verify_or_pin_live_svn_identity(
+                    &self.db, rid, &svn, &svn_info,
+                )
+                .await?;
+            }
+        }
         let head_rev = svn_info.latest_rev;
 
         if head_rev <= last_rev {
@@ -4674,29 +5346,6 @@ impl SyncEngine {
             admission.remote_tip.clone()
         };
 
-        // Reset only through the replay batch tip while continuation is
-        // incomplete. A hard reset to the full admitted R would leave unreplayed
-        // Git history on the bridge and invite unsafe opposite-direction writes.
-        let reset = tokio::task::block_in_place(|| {
-            Command::new("git")
-                .args(["reset", "--hard", &reset_target])
-                .current_dir(git.repo_path())
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .output()
-        })
-        .map_err(crate::errors::GitError::IoError)?;
-        if !reset.status.success() {
-            return Err(SyncError::GitError(crate::errors::GitError::Git2Error(
-                git2::Error::from_str("git reset to replay target failed"),
-            )));
-        }
-        if git.head_sha().map_err(SyncError::GitError)? != reset_target {
-            return Err(SyncError::HistoryBlocked {
-                reason: "post_reset_tip_mismatch".into(),
-                detail: "bridge did not reach the replay checkout target".into(),
-            });
-        }
-
         let replay_batch = self.git_change_sets_from_commits(&git, &selection.commits)?;
         let conflict_coverage = self.git_change_sets_from_commits(&git, &conflict_commits)?;
         let conflict_coverage_skipped = conflict_commits.len() - conflict_coverage.len();
@@ -4720,6 +5369,311 @@ impl SyncEngine {
             continuation_to_persist,
             clear_continuation,
         })
+    }
+
+    /// Corroborate a narrow unreceipted publication without asserting provenance.
+    async fn refuse_ambiguous_svn_publication(
+        &self,
+        admission: &TeamHistoryAdmission,
+        svn_changes: &[SvnChangeSet],
+        git_fetch: &GitFetchResult,
+    ) -> Result<(), SyncError> {
+        use crate::db::lineage_checkpoints::{
+            load_canonical_lineage, load_directional_checkpoint, svn_source_key,
+            CheckpointDirection, MappingOutcome,
+        };
+        let (Some(repo_id), [svn_change], [git_change]) = (
+            self.effective_repo_id(),
+            svn_changes,
+            git_fetch.conflict_coverage.as_slice(),
+        ) else {
+            return Ok(());
+        };
+        if !self.allowed_paths.is_empty()
+            || !self.blocked_patterns.is_empty()
+            || git_fetch.has_more
+            || git_fetch.pending_total != 1
+            || git_change.sha != admission.remote_tip
+        {
+            return Ok(());
+        }
+        let ([svn_file], [git_file]) = (
+            svn_change.changed_files.as_slice(),
+            git_change.changed_files.as_slice(),
+        ) else {
+            return Ok(());
+        };
+        if svn_file.action != "A"
+            || git_file.action != "A"
+            || svn_file.rename_from.is_some()
+            || git_file.rename_from.is_some()
+            || svn_file.path != git_file.path
+        {
+            return Ok(());
+        }
+        let expected = svn_to_git_commit_message(&svn_change.message, svn_change.revision);
+        let message = git_change.message.as_str();
+        if message != expected.as_str() && message.strip_suffix('\n') != Some(expected.as_str()) {
+            return Ok(());
+        }
+
+        let Some(lineage) =
+            load_canonical_lineage(&self.db, repo_id).map_err(SyncError::DatabaseError)?
+        else {
+            return Ok(());
+        };
+        let (prior, checkpoint_sha) = self
+            .db
+            .get_repo_watermark(repo_id)
+            .map_err(SyncError::DatabaseError)?;
+        if prior <= 0
+            || prior.checked_add(1) != Some(svn_change.revision)
+            || checkpoint_sha != admission.checkpoint
+            || !self
+                .db
+                .has_repo_emitted_git_commit(repo_id, &checkpoint_sha)
+                .map_err(SyncError::DatabaseError)?
+        {
+            return Ok(());
+        }
+        let branch = self.config.github.default_branch.as_str();
+        if !matches!(lineage.git_ref.as_deref(), Some(value)
+            if value == branch || value == admission.local_ref.as_str())
+        {
+            return Ok(());
+        }
+        let Some(retained) = self
+            .db
+            .latest_git_push_operation(repo_id)
+            .map_err(SyncError::DatabaseError)?
+        else {
+            return Ok(());
+        };
+        if retained.state != GitPushOperationState::Completed
+            || retained.repo_id != repo_id
+            || retained.initiator_id != "team_worker"
+            || retained.source_svn_rev != prior
+            || retained.pre_push_git_remote != "origin"
+            || retained.pre_push_git_branch != branch
+            || retained.target_fingerprint != git_push_target_fingerprint(repo_id, "origin", branch)
+            || retained.intended_local_git_sha != checkpoint_sha
+            || retained.last_confirmed_git_sha.as_deref() != Some(checkpoint_sha.as_str())
+        {
+            return Ok(());
+        }
+
+        let checkpoint = load_directional_checkpoint(
+            &self.db.conn(),
+            &lineage.scope_uuid,
+            lineage.generation,
+            CheckpointDirection::SvnToGit,
+        )
+        .map_err(SyncError::DatabaseError)?;
+        if !checkpoint.is_some_and(|checkpoint| {
+            checkpoint.handled_source_key == svn_source_key(prior)
+                && checkpoint.outcome == MappingOutcome::AppliedAndVerified
+                && checkpoint.target_git_sha.as_deref() == Some(checkpoint_sha.as_str())
+        }) {
+            return Ok(());
+        }
+
+        let path = git_file.path.as_str();
+        let git_bytes = {
+            let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+            let repo = git.repo();
+            let (prior_parent, prior_tree) = git.commit_parent_and_tree(&checkpoint_sha)?;
+            if prior_parent.as_deref() != Some(retained.pre_push_git_sha.as_str())
+                || retained.intended_local_git_parent != prior_parent
+                || retained.intended_local_git_tree != prior_tree
+                || retained.last_confirmed_git_tree.as_deref() != Some(prior_tree.as_str())
+            {
+                return Ok(());
+            }
+            let oid =
+                git2::Oid::from_str(&git_change.sha).map_err(crate::errors::GitError::from)?;
+            let commit = repo
+                .find_commit(oid)
+                .map_err(crate::errors::GitError::from)?;
+            if commit.parent_count() != 1
+                || commit
+                    .parent_id(0)
+                    .map_err(crate::errors::GitError::from)?
+                    .to_string()
+                    != admission.checkpoint
+                || commit.committer().name() != Some("reposync")
+                || commit.committer().email() != Some("sync@reposync.local")
+                || git.changed_entry_modes(&git_change.sha, path)? != (None, Some(0o100644))
+            {
+                return Ok(());
+            }
+            let Some(bytes) = git.get_file_content_at_commit(&git_change.sha, path)? else {
+                return Ok(());
+            };
+            bytes
+        };
+
+        // Re-observe the pinned SVN UUID/path at the exact revision, rather
+        // than interpreting the remote Git object's public text as authority.
+        let svn = self
+            .svn_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        for revision in [prior, svn_change.revision] {
+            let source = svn.info_at_rev(revision).await?;
+            let Some(identity) = checked_svn_path_identity(&source.root_url, &source.url) else {
+                return Ok(());
+            };
+            if source.uuid != lineage.svn_uuid
+                || identity.root_url != lineage.svn_root_url
+                || identity.branch_path != lineage.svn_branch_path
+                || crate::path_projection::normalize_svn_url(&source.url) != lineage.svn_url
+            {
+                return Ok(());
+            }
+        }
+        // The old journal does not carry a UUID. Pair both independently
+        // pinned SVN snapshots with the retained journal's own prior log entry.
+        let prior_log = svn.log(prior, prior).await?;
+        if !matches!(prior_log.as_slice(), [entry]
+            if entry.revision == prior
+                && entry.author == retained.source_svn_author
+                && entry.message == retained.source_svn_message)
+        {
+            return Ok(());
+        }
+        let props = svn
+            .file_properties_at_rev(path, svn_change.revision)
+            .await?;
+        if props.contains("<property ") || props.contains("<property>") {
+            return Ok(());
+        }
+        let svn_text = svn.cat(path, svn_change.revision).await?;
+        // The text API can decode lossy; never corroborate on replacement bytes.
+        if svn_text.contains('\u{fffd}') || svn_text.as_bytes() != git_bytes.as_slice() {
+            return Ok(());
+        }
+
+        // Re-prove each cycle. No public signature is authority to mint a
+        // receipt or to create an irreversible block that cannot be corrected.
+        Err(self.record_history_block(
+            "unreceipted_svn_publication",
+            "a published Git child matches the verified SVN change but has no scoped receipt; reconcile repository state before sync",
+            Some(&admission.checkpoint),
+            None,
+            Some(&admission.remote_tip),
+            Some(&admission.local_tip),
+        ))
+    }
+
+    fn checkout_admitted_git_batch(
+        &self,
+        admission: &TeamHistoryAdmission,
+        reset_target: &str,
+    ) -> Result<(), SyncError> {
+        let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+        let local = git.head_sha()?;
+        let reject = |reason, detail| {
+            self.record_history_block(
+                reason,
+                detail,
+                Some(&admission.checkpoint),
+                None,
+                Some(&admission.remote_tip),
+                Some(&local),
+            )
+        };
+        let verify_admitted_checkout = || {
+            if admission.local_ref != format!("refs/heads/{}", self.config.github.default_branch)
+                || bridge_symbolic_head(&git)?.as_deref() != Some(admission.local_ref.as_str())
+                || git.head_sha()? != admission.local_tip
+            {
+                Err(reject(
+                    "checkout_drift",
+                    "managed bridge branch or tip changed since Git admission",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        verify_admitted_checkout()?;
+        let run = |args: &[&str]| {
+            crate::git::subprocess_auth::git_cli_output(git.repo_path(), args, None)
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| out.stdout)
+        };
+        // The cycle may have performed SVN I/O since inspecting the bridge.
+        let status = run(&[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ])
+        .ok_or_else(|| {
+            reject(
+                "local_status_error",
+                "bridge index/worktree could not be inspected",
+            )
+        })?;
+        if !status.is_empty() {
+            return Err(reject(
+                "local_dirty",
+                "bridge index or worktree has unpublished changes",
+            ));
+        }
+        let ignored = run(&[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ])
+        .ok_or_else(|| {
+            reject(
+                "local_status_error",
+                "ignored bridge paths could not be inspected",
+            )
+        })?;
+        let target =
+            run(&["ls-tree", "-r", "--name-only", "-z", reset_target]).ok_or_else(|| {
+                reject(
+                    "inspection_command_failed",
+                    "incoming batch tree could not be inspected",
+                )
+            })?;
+        if crate::history_inspect::ignored_checkout_path_collision(&ignored, &target) {
+            return Err(reject(
+                "ignored_path_collision",
+                "incoming tracked paths overlap ignored bridge data",
+            ));
+        }
+
+        // Use the preflighted object and exact symbolic branch; never refetch
+        // or reset to a moving ref at the mutation boundary.
+        verify_admitted_checkout()?;
+        // Reset only through the selected replay batch, never past unhandled work.
+        let reset = Command::new("git")
+            .args(["reset", "--hard", reset_target])
+            .current_dir(git.repo_path())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(crate::errors::GitError::IoError)?;
+        if !reset.status.success() {
+            return Err(SyncError::GitError(crate::errors::GitError::Git2Error(
+                git2::Error::from_str("git reset to replay target failed"),
+            )));
+        }
+        if bridge_symbolic_head(&git)?.as_deref() != Some(admission.local_ref.as_str())
+            || git.head_sha()? != reset_target
+        {
+            return Err(reject(
+                "post_reset_tip_mismatch",
+                "managed bridge branch or tip does not match the replay checkout target",
+            ));
+        }
+        Ok(())
     }
 
     fn git_change_sets_from_commits(
@@ -4936,18 +5890,50 @@ impl SyncEngine {
     /// saved via the repo detail page take effect without a daemon restart.
     /// Uses the same scoped resolver as the scheduler: repo → parent chain →
     /// global, with explicit per-repo revocation blocking broader fallback.
-    fn reload_credentials(&self) {
+    ///
+    /// Read, apply, and revocation failures refuse subsequent authenticated
+    /// transport for this cycle. In-memory secrets may remain for recovery
+    /// but are not treated as current authority.
+    fn reload_credentials(&self) -> Result<(), SyncError> {
         use crate::db::queries::CredentialChainState;
+
+        #[cfg(debug_assertions)]
+        if let Some(fault) = self.credential_reload_fault.lock().unwrap().take() {
+            return Err(match fault {
+                CredentialReloadTestFault::ReadFailure => {
+                    SyncError::DatabaseError(crate::errors::DatabaseError::Other(
+                        "credential chain read failed; refusing transport with untrusted secrets"
+                            .into(),
+                    ))
+                }
+                CredentialReloadTestFault::ApplyFailure => {
+                    SyncError::DatabaseError(crate::errors::DatabaseError::Other(
+                        "credential chain apply failed; refusing transport with untrusted secrets"
+                            .into(),
+                    ))
+                }
+            });
+        }
 
         let svn_state = match self.repo_id.as_deref() {
             Some(rid) => self
                 .db
-                .resolve_credential_chain_state(rid, "secret_svn_password"),
+                .try_resolve_credential_chain_state(rid, "secret_svn_password")
+                .map_err(SyncError::DatabaseError)?,
             None => match self.db.get_state("secret_svn_password") {
                 Ok(Some(pw)) if !pw.is_empty() => CredentialChainState::resolved(pw),
-                Ok(Some(_)) | Ok(None) | Err(_) => CredentialChainState::not_found(),
+                Ok(Some(_)) | Ok(None) => CredentialChainState::not_found(),
+                Err(error) => return Err(SyncError::DatabaseError(error)),
             },
         };
+        if svn_state.is_read_failure() {
+            return Err(SyncError::DatabaseError(
+                crate::errors::DatabaseError::Other(
+                    "credential chain read failed; refusing transport with untrusted secrets"
+                        .into(),
+                ),
+            ));
+        }
         {
             let mut svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(pw) = svn_state.value {
@@ -4962,12 +5948,22 @@ impl SyncEngine {
         let git_state = match self.repo_id.as_deref() {
             Some(rid) => self
                 .db
-                .resolve_credential_chain_state(rid, "secret_git_token"),
+                .try_resolve_credential_chain_state(rid, "secret_git_token")
+                .map_err(SyncError::DatabaseError)?,
             None => match self.db.get_state("secret_git_token") {
                 Ok(Some(tok)) if !tok.is_empty() => CredentialChainState::resolved(tok),
-                Ok(Some(_)) | Ok(None) | Err(_) => CredentialChainState::not_found(),
+                Ok(Some(_)) | Ok(None) => CredentialChainState::not_found(),
+                Err(error) => return Err(SyncError::DatabaseError(error)),
             },
         };
+        if git_state.is_read_failure() {
+            return Err(SyncError::DatabaseError(
+                crate::errors::DatabaseError::Other(
+                    "credential chain read failed; refusing transport with untrusted secrets"
+                        .into(),
+                ),
+            ));
+        }
         {
             let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
             let apply = if self.git_credential_apply_clean.load(Ordering::Acquire) {
@@ -4983,9 +5979,16 @@ impl SyncEngine {
                     debug!("cleared embedded git credentials after explicit revocation");
                 }
                 Ok(()) => {}
-                Err(e) => warn!("failed to apply git credential chain state: {e}"),
+                Err(e) => {
+                    return Err(SyncError::DatabaseError(
+                        crate::errors::DatabaseError::Other(format!(
+                            "credential chain apply failed; refusing transport: {e}"
+                        )),
+                    ));
+                }
             }
         }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -5114,6 +6117,10 @@ impl SyncEngine {
 // ---------------------------------------------------------------------------
 // SVN diff → git diff conversion
 // ---------------------------------------------------------------------------
+
+fn svn_to_git_commit_message(message: &str, revision: i64) -> String {
+    format!("{message}\n\n{SYNC_MARKER} synced from SVN r{revision}")
+}
 
 /// Convert SVN unified diff format to git-compatible format.
 ///
@@ -5347,6 +6354,151 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    fn init_git_probe_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap()
+            .success());
+        tmp
+    }
+
+    #[test]
+    fn git_probe_timeout_kills_hung_child() {
+        let tmp = init_git_probe_repo();
+        let started = Instant::now();
+        let result = sync_git_command_output(
+            tmp.path(),
+            &["-c", "alias.hang=!exec /bin/sleep 30", "hang"],
+            Duration::from_millis(250),
+            None,
+        );
+        assert!(result.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timed-out git probe must kill the child rather than wait out sleep 30"
+        );
+    }
+
+    #[test]
+    fn git_probe_drains_stdout_beyond_pipe_capacity() {
+        let tmp = init_git_probe_repo();
+        let output = sync_git_command_output(
+            tmp.path(),
+            &[
+                "-c",
+                "alias.big=!dd if=/dev/zero bs=1024 count=200 status=none",
+                "big",
+            ],
+            Duration::from_secs(5),
+            None,
+        )
+        .expect("large probe output must succeed while pipes are drained");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 200 * 1024);
+    }
+
+    #[test]
+    fn git_probe_drains_stdout_and_stderr_concurrently() {
+        let tmp = init_git_probe_repo();
+        let output = sync_git_command_output(
+            tmp.path(),
+            &[
+                "-c",
+                "alias.both=!sh -c 'dd if=/dev/zero bs=1024 count=80 status=none; dd if=/dev/zero bs=1024 count=80 status=none >&2'",
+                "both",
+            ],
+            Duration::from_secs(5),
+            None,
+        )
+        .expect("concurrent stdout/stderr must be drained");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 80 * 1024);
+        assert_eq!(output.stderr.len(), 80 * 1024);
+    }
+
+    #[test]
+    fn git_probe_timeout_during_output_pressure_and_retained_pipe() {
+        let tmp = init_git_probe_repo();
+        let started = Instant::now();
+        let flooded = sync_git_command_output(
+            tmp.path(),
+            &[
+                "-c",
+                "alias.flood=!sh -c 'while true; do dd if=/dev/zero bs=65536 count=1 status=none; done'",
+                "flood",
+            ],
+            Duration::from_millis(250),
+            None,
+        );
+        assert!(
+            flooded.is_none(),
+            "never-ending stdout must time out while drains stay live"
+        );
+        let retained = sync_git_command_output(
+            tmp.path(),
+            &[
+                "-c",
+                "alias.hold=!sh -c 'sleep 30 >/dev/stdout & exec sleep 60'",
+                "hold",
+            ],
+            Duration::from_millis(250),
+            None,
+        );
+        assert!(
+            retained.is_none(),
+            "a grandchild retaining stdout must not hang past the deadline"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "output-pressure and retained-pipe probes must stay inside the deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_read_failure_refuses_sync_cycle_transport() {
+        let engine = team_echo_engine("pair");
+        engine.set_credential_reload_read_fault();
+        let err = engine.run_sync_cycle().await.unwrap_err();
+        assert!(
+            err.to_string().contains("credential chain read failed"),
+            "{err}"
+        );
+        assert_eq!(
+            engine
+                .db()
+                .get_repository("pair")
+                .unwrap()
+                .unwrap()
+                .sync_status,
+            "idle",
+            "failed reload must not claim a running worker or advance transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_apply_failure_refuses_sync_cycle_transport() {
+        let engine = team_echo_engine("pair");
+        engine.set_credential_reload_apply_fault();
+        let err = engine.run_sync_cycle().await.unwrap_err();
+        assert!(
+            err.to_string().contains("credential chain apply failed"),
+            "{err}"
+        );
+        assert_eq!(
+            engine
+                .db()
+                .get_repository("pair")
+                .unwrap()
+                .unwrap()
+                .sync_status,
+            "idle"
+        );
+    }
+
     use crate::config::IdentityConfig;
     use crate::db::git_push_operations::{git_push_target_fingerprint, GitPushIntent};
     use crate::db::svn_commit_operations::{svn_commit_target_fingerprint, SvnCommitIntent};
@@ -6930,6 +8082,70 @@ repo = "test/test-repo"
     }
 
     #[test]
+    fn team_checkout_refuses_same_sha_branch_switch_or_detach() {
+        let (engine, git_dir) = team_echo_engine_with_git_dir("pair");
+        let branch = format!("refs/heads/{}", engine.config.github.default_branch);
+        engine
+            .git_client
+            .lock()
+            .unwrap()
+            .ensure_head_on_branch(&engine.config.github.default_branch)
+            .unwrap();
+        let parent = git_fixture_commit(git_dir.path(), "base.txt", "base\n", "base");
+        let child = git_fixture_commit(git_dir.path(), "child.txt", "child\n", "child");
+        let repo = git2::Repository::open(git_dir.path()).unwrap();
+        let parent_oid = git2::Oid::from_str(&parent).unwrap();
+        let child_oid = git2::Oid::from_str(&child).unwrap();
+        repo.reset(
+            repo.find_commit(parent_oid).unwrap().as_object(),
+            git2::ResetType::Hard,
+            None,
+        )
+        .unwrap();
+        let unrelated_branch = "refs/heads/other";
+        repo.reference(unrelated_branch, parent_oid, false, "fixture")
+            .unwrap();
+        let admission = TeamHistoryAdmission {
+            checkpoint: parent.clone(),
+            remote_tip: child.clone(),
+            local_tip: parent,
+            local_ref: branch.clone(),
+        };
+        for detach in [false, true] {
+            if detach {
+                repo.set_head_detached(parent_oid).unwrap();
+            } else {
+                repo.set_head(unrelated_branch).unwrap();
+            }
+            assert_eq!(repo.head().unwrap().target(), Some(parent_oid));
+            assert!(matches!(
+                engine.checkout_admitted_git_batch(&admission, &child),
+                Err(SyncError::HistoryBlocked { reason, .. }) if reason == "checkout_drift"
+            ));
+            assert_eq!(repo.head().unwrap().target(), Some(parent_oid));
+            assert_eq!(repo.head_detached().unwrap(), detach);
+            assert_eq!(
+                repo.find_reference("HEAD").unwrap().symbolic_target(),
+                if detach { None } else { Some(unrelated_branch) },
+            );
+            assert_eq!(repo.refname_to_id(&branch).unwrap(), parent_oid);
+            assert_eq!(repo.refname_to_id(unrelated_branch).unwrap(), parent_oid);
+            assert!(!git_dir.path().join("child.txt").exists());
+        }
+
+        repo.set_head(&branch).unwrap();
+        engine
+            .checkout_admitted_git_batch(&admission, &child)
+            .unwrap();
+        assert_eq!(repo.refname_to_id(&branch).unwrap(), child_oid);
+        assert_eq!(repo.refname_to_id(unrelated_branch).unwrap(), parent_oid);
+        assert_eq!(
+            std::fs::read(git_dir.path().join("child.txt")).unwrap(),
+            b"child\n",
+        );
+    }
+
+    #[test]
     fn incomplete_conflict_coverage_fails_closed() {
         let engine = team_echo_engine("pair");
         let err = engine.ensure_conflict_coverage_before_detection(true, 4, 3);
@@ -7026,5 +8242,437 @@ repo = "test/test-repo"
         assert_eq!(git_changes.len(), 1);
         assert_eq!(git_changes[0].path, "team/old.txt");
         assert!(matches!(git_changes[0].change_kind, ChangeKind::Deleted));
+    }
+}
+
+#[cfg(test)]
+mod pr245_probe_cleanup_tests {
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{sync_git_command_output, ProbePipe, ProbePipeSetupError};
+
+    thread_local! {
+        static PROBE_DRAIN_NOTE: RefCell<Option<Arc<ProbeDrainNote>>> = RefCell::new(None);
+        static PROBE_SETUP_FAULT: Cell<Option<ProbeSetupFault>> = Cell::new(None);
+        static PROBE_SETUP_TRACE: RefCell<Option<Arc<ProbeSetupTrace>>> = RefCell::new(None);
+    }
+
+    pub(super) struct ProbeDrainNote {
+        stdout_eof: AtomicBool,
+        stderr_eof: AtomicBool,
+        stdout_joined: AtomicBool,
+        stderr_joined: AtomicBool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ProbeSetupFault {
+        GetFlags(ProbePipe),
+        SetFlags(ProbePipe),
+    }
+
+    struct ProbeSetupTrace {
+        gets: [AtomicUsize; 2],
+        sets: [AtomicUsize; 2],
+        drains: [Arc<AtomicBool>; 2],
+        readers: [AtomicBool; 2],
+        child_pid: AtomicI32,
+        running_before_reap: AtomicBool,
+        error_code: AtomicU8,
+    }
+
+    struct SetupFaultGuard {
+        trace: Arc<ProbeSetupTrace>,
+    }
+
+    impl Drop for SetupFaultGuard {
+        fn drop(&mut self) {
+            PROBE_SETUP_FAULT.with(|slot| slot.set(None));
+            PROBE_SETUP_TRACE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn pipe_index(pipe: ProbePipe) -> usize {
+        match pipe {
+            ProbePipe::Stdout => 0,
+            ProbePipe::Stderr => 1,
+        }
+    }
+
+    fn fresh_trace() -> Arc<ProbeSetupTrace> {
+        Arc::new(ProbeSetupTrace {
+            gets: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            sets: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            drains: [
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ],
+            readers: [AtomicBool::new(false), AtomicBool::new(false)],
+            child_pid: AtomicI32::new(0),
+            running_before_reap: AtomicBool::new(false),
+            error_code: AtomicU8::new(0),
+        })
+    }
+
+    fn arm_setup_fault(fault: ProbeSetupFault) -> SetupFaultGuard {
+        let trace = fresh_trace();
+        PROBE_SETUP_FAULT.with(|slot| slot.set(Some(fault)));
+        PROBE_SETUP_TRACE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&trace)));
+        SetupFaultGuard { trace }
+    }
+
+    pub(super) fn record_probe_drains(
+        stdout_eof: bool,
+        stderr_eof: bool,
+        stdout_joined: bool,
+        stderr_joined: bool,
+    ) {
+        PROBE_DRAIN_NOTE.with(|slot| {
+            let Some(note) = slot.borrow().clone() else {
+                return;
+            };
+            note.stdout_eof.store(stdout_eof, Ordering::Relaxed);
+            note.stderr_eof.store(stderr_eof, Ordering::Relaxed);
+            note.stdout_joined.store(stdout_joined, Ordering::Relaxed);
+            note.stderr_joined.store(stderr_joined, Ordering::Relaxed);
+        });
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn fail_getfl(pipe: ProbePipe) -> bool {
+        let index = pipe_index(pipe);
+        PROBE_SETUP_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow().as_ref() {
+                trace.gets[index].fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        PROBE_SETUP_FAULT.with(|slot| slot.get() == Some(ProbeSetupFault::GetFlags(pipe)))
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn fail_setfl(pipe: ProbePipe) -> bool {
+        let index = pipe_index(pipe);
+        PROBE_SETUP_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow().as_ref() {
+                trace.sets[index].fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        PROBE_SETUP_FAULT.with(|slot| slot.get() == Some(ProbeSetupFault::SetFlags(pipe)))
+    }
+
+    pub(super) fn note_child_pid(pid: u32) {
+        PROBE_SETUP_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow().as_ref() {
+                trace.child_pid.store(pid as i32, Ordering::Relaxed);
+            }
+        });
+    }
+
+    pub(super) fn note_child_running_before_reap(running: bool) {
+        PROBE_SETUP_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow().as_ref() {
+                trace.running_before_reap.store(running, Ordering::Relaxed);
+            }
+        });
+    }
+
+    pub(super) fn record_setup_error(error: ProbePipeSetupError) {
+        let code = match error {
+            ProbePipeSetupError::GetFlags(ProbePipe::Stdout) => 1,
+            ProbePipeSetupError::SetFlags(ProbePipe::Stdout) => 2,
+            ProbePipeSetupError::GetFlags(ProbePipe::Stderr) => 3,
+            ProbePipeSetupError::SetFlags(ProbePipe::Stderr) => 4,
+            #[cfg(not(unix))]
+            ProbePipeSetupError::NoInterruptibleBackend => 5,
+        };
+        PROBE_SETUP_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow().as_ref() {
+                trace.error_code.store(code, Ordering::Relaxed);
+            }
+        });
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn mark_reader_started(pipe: ProbePipe) {
+        let index = pipe_index(pipe);
+        PROBE_SETUP_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow().as_ref() {
+                trace.readers[index].store(true, Ordering::Relaxed);
+            }
+        });
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn drain_entered_flag(pipe: ProbePipe) -> Option<Arc<AtomicBool>> {
+        let index = pipe_index(pipe);
+        PROBE_SETUP_TRACE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|trace| Arc::clone(&trace.drains[index]))
+        })
+    }
+
+    #[cfg(unix)]
+    fn owned_unix_process_is_absent(pid: i32) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == 0 {
+            return false;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    #[cfg(unix)]
+    fn assert_setup_fault_refuses_before_read(
+        fault: ProbeSetupFault,
+        index: usize,
+        error_code: u8,
+        set_attempted: bool,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap()
+            .success());
+        let guard = arm_setup_fault(fault);
+        let started = Instant::now();
+        let result = sync_git_command_output(
+            tmp.path(),
+            &["-c", "alias.hold=!exec sleep 30", "hold"],
+            Duration::from_secs(5),
+            None,
+        );
+        assert!(
+            result.is_none(),
+            "setup failure must not return probe output"
+        );
+        let trace = &guard.trace;
+        assert_eq!(trace.error_code.load(Ordering::Relaxed), error_code);
+        assert_eq!(trace.gets[index].load(Ordering::Relaxed), 1);
+        assert_eq!(
+            trace.sets[index].load(Ordering::Relaxed),
+            usize::from(set_attempted)
+        );
+        if index == 1 {
+            assert_eq!(trace.gets[0].load(Ordering::Relaxed), 1);
+            assert_eq!(trace.sets[0].load(Ordering::Relaxed), 1);
+        } else {
+            assert_eq!(trace.gets[1].load(Ordering::Relaxed), 0);
+            assert_eq!(trace.sets[1].load(Ordering::Relaxed), 0);
+        }
+        assert!(!trace.readers[0].load(Ordering::Relaxed));
+        assert!(!trace.readers[1].load(Ordering::Relaxed));
+        assert!(!trace.drains[0].load(Ordering::Relaxed));
+        assert!(!trace.drains[1].load(Ordering::Relaxed));
+        assert!(
+            trace.running_before_reap.load(Ordering::Relaxed),
+            "owned child must still be running when setup fails"
+        );
+        let pid = trace.child_pid.load(Ordering::Relaxed);
+        assert!(pid > 0, "owned child pid must be recorded");
+        let observed = Instant::now();
+        let absent = loop {
+            if owned_unix_process_is_absent(pid) {
+                break true;
+            }
+            if observed.elapsed() >= Duration::from_millis(200) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            absent,
+            "owned child {pid} must be reaped after setup failure"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "setup failure returned in {:?}; cleanup must stay bounded",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_getfl_failure_on_stdout_refuses_without_a_reader() {
+        assert_setup_fault_refuses_before_read(
+            ProbeSetupFault::GetFlags(ProbePipe::Stdout),
+            0,
+            1,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_setfl_failure_on_stdout_refuses_without_a_reader() {
+        assert_setup_fault_refuses_before_read(
+            ProbeSetupFault::SetFlags(ProbePipe::Stdout),
+            0,
+            2,
+            true,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_getfl_failure_on_stderr_refuses_without_a_reader() {
+        assert_setup_fault_refuses_before_read(
+            ProbeSetupFault::GetFlags(ProbePipe::Stderr),
+            1,
+            3,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_setfl_failure_on_stderr_refuses_without_a_reader() {
+        assert_setup_fault_refuses_before_read(
+            ProbeSetupFault::SetFlags(ProbePipe::Stderr),
+            1,
+            4,
+            true,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_proc_state_is_exited(pid: i32) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+            Ok(text) => {
+                let state = text
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .unwrap_or("");
+                matches!(state, "Z" | "X")
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn leader_exited_descendant_retains(pipe: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap()
+            .success());
+        let script_path = tmp.path().join("hold.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\necho $$ > leader.pid\nsleep 30 >/dev/{pipe} &\necho $! > hold.pid\nawk '{{print $5}}' /proc/$!/stat > hold.pgid\nawk '{{print $5}}' /proc/$$/stat > leader.pgid\necho exited > leader.exited\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        let alias = format!("alias.hold=!sh {}", script_path.display());
+        let note = Arc::new(ProbeDrainNote {
+            stdout_eof: AtomicBool::new(false),
+            stderr_eof: AtomicBool::new(false),
+            stdout_joined: AtomicBool::new(false),
+            stderr_joined: AtomicBool::new(false),
+        });
+        PROBE_DRAIN_NOTE.with(|slot| *slot.borrow_mut() = Some(note.clone()));
+        let started = Instant::now();
+        let result = sync_git_command_output(
+            tmp.path(),
+            &["-c", &alias, "hold"],
+            Duration::from_millis(400),
+            None,
+        );
+        PROBE_DRAIN_NOTE.with(|slot| *slot.borrow_mut() = None);
+        assert!(
+            result.is_none(),
+            "{pipe} descendant must not become a successful probe"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{pipe} probe returned in {:?}; cleanup must stay bounded",
+            started.elapsed()
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("leader.exited")).unwrap(),
+            "exited\n",
+            "{pipe} leader must have reached its own exit"
+        );
+        let leader: i32 = std::fs::read_to_string(tmp.path().join("leader.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let hold: i32 = std::fs::read_to_string(tmp.path().join("hold.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let leader_pgid: i32 = std::fs::read_to_string(tmp.path().join("leader.pgid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let hold_pgid: i32 = std::fs::read_to_string(tmp.path().join("hold.pgid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            leader_pgid, hold_pgid,
+            "{pipe} descendant must share the leader group"
+        );
+        assert!(leader > 0, "{pipe} leader pid must be recorded");
+        assert!(hold > 0, "{pipe} descendant pid must be recorded");
+        assert!(leader_pgid > 0, "{pipe} group id must be recorded");
+        assert!(hold_pgid > 0, "{pipe} descendant group id must be recorded");
+        assert!(
+            linux_proc_state_is_exited(leader),
+            "{pipe} leader {leader} must have exited"
+        );
+        assert!(
+            linux_proc_state_is_exited(hold),
+            "{pipe} descendant {hold} must have exited"
+        );
+        assert!(
+            linux_proc_state_is_exited(leader_pgid),
+            "{pipe} group {leader_pgid} must have exited"
+        );
+        assert!(
+            note.stdout_eof.load(Ordering::Relaxed),
+            "{pipe} stdout drain must reach EOF"
+        );
+        assert!(
+            note.stderr_eof.load(Ordering::Relaxed),
+            "{pipe} stderr drain must reach EOF"
+        );
+        assert!(
+            note.stdout_joined.load(Ordering::Relaxed),
+            "{pipe} stdout reader must join"
+        );
+        assert!(
+            note.stderr_joined.load(Ordering::Relaxed),
+            "{pipe} stderr reader must join"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leader_exited_descendant_retains_stdout_is_terminated_and_drained() {
+        leader_exited_descendant_retains("stdout");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leader_exited_descendant_retains_stderr_is_terminated_and_drained() {
+        leader_exited_descendant_retains("stderr");
     }
 }

@@ -1,5 +1,5 @@
 /** Visual category for sync lifecycle states in status dots and nav badges. */
-export type SyncStateVisual = 'healthy' | 'active' | 'attention' | 'error' | 'disabled';
+export type SyncStateVisual = 'healthy' | 'active' | 'attention' | 'error' | 'disabled' | 'unknown';
 
 export function syncStateVisual(state?: string, enabled = true): SyncStateVisual {
   if (!enabled) {
@@ -21,6 +21,6 @@ export function syncStateVisual(state?: string, enabled = true): SyncStateVisual
     case 'conflict_found':
       return 'attention';
     default:
-      return 'active';
+      return 'unknown';
   }
 }

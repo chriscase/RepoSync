@@ -27,6 +27,7 @@ use crate::pair_refresh::svn_preparation::PreparedCleanChildSvn;
 
 const PREFIX: &str = "pair_refresh_execution_v2:";
 const FAMILY: &str = "pair_refresh_execution_";
+const LOCAL_HOLD_PREFIX: &str = "pair_refresh_local_hold:";
 
 #[path = "pair_refresh_authenticated.rs"]
 mod authenticated;
@@ -578,7 +579,7 @@ fn journal(tx: &Connection) -> Result<Vec<PairRefreshOperation>, DatabaseError> 
 
 /// Shared guard for all production writer entrances. A global writer without a
 /// registered repository ID refuses while any refresh owns either scope.
-pub fn require_no_pair_refresh_hold(
+pub(crate) fn require_no_versioned_pair_refresh_hold(
     tx: &Connection,
     repo_id: Option<&str>,
 ) -> Result<(), DatabaseError> {
@@ -590,6 +591,71 @@ pub fn require_no_pair_refresh_hold(
     });
     if held {
         return Err(refused("a durable pair refresh owns this writer scope"));
+    }
+    Ok(())
+}
+
+pub fn require_no_pair_refresh_hold(
+    tx: &Connection,
+    repo_id: Option<&str>,
+) -> Result<(), DatabaseError> {
+    require_no_versioned_pair_refresh_hold(tx, repo_id)?;
+    if local_hold_blocks(tx, repo_id)? {
+        return Err(refused("a durable pair refresh owns this writer scope"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalHold {
+    child: String,
+    parent: String,
+    request_id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    operation_id: String,
+}
+
+fn local_holds(tx: &Connection) -> Result<Vec<LocalHold>, DatabaseError> {
+    let mut stmt =
+        tx.prepare("SELECT value FROM kv_state WHERE substr(key, 1, ?1) = ?2 ORDER BY key")?;
+    let rows = stmt.query_map(params![LOCAL_HOLD_PREFIX.len(), LOCAL_HOLD_PREFIX], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut holds = Vec::new();
+    for row in rows {
+        let raw = row?;
+        let hold: LocalHold = serde_json::from_str(&raw)
+            .map_err(|_| refused("durable local reservation is unreadable"))?;
+        holds.push(hold);
+    }
+    Ok(holds)
+}
+
+fn local_hold_blocks(tx: &Connection, repo_id: Option<&str>) -> Result<bool, DatabaseError> {
+    Ok(local_holds(tx)?
+        .into_iter()
+        .any(|hold| repo_id.is_none_or(|id| id == hold.child || id == hold.parent)))
+}
+
+/// The request that owns the local reservation may continue. Every other
+/// request that overlaps either repository is refused.
+pub(crate) fn require_no_foreign_local_hold(
+    tx: &Connection,
+    child: &str,
+    parent: &str,
+    request_id: &str,
+) -> Result<(), DatabaseError> {
+    for hold in local_holds(tx)? {
+        let same_owner =
+            hold.request_id == request_id && hold.child == child && hold.parent == parent;
+        let overlaps = hold.child == child
+            || hold.parent == child
+            || hold.child == parent
+            || hold.parent == parent;
+        if overlaps && !same_owner {
+            return Err(refused("a durable pair refresh owns this writer scope"));
+        }
     }
     Ok(())
 }
@@ -833,18 +899,14 @@ fn require_other_journals_quiet(tx: &Connection, repo_id: &str) -> Result<(), Da
                     repo_id,
                     ["team_cycle_mapping"]
                 ),
-                "late_pair_publish_v1" => completed!(
-                    late_pair_publish_operations,
-                    LatePairPublishOperation,
-                    parent_repo_id,
-                    ["late_pair_publish"]
-                ),
-                "managed_remove_v1" => completed!(
-                    managed_remove,
-                    ManagedRemoveOperation,
-                    repo_id,
-                    ["managed_remove"]
-                ),
+                "late_pair_publish_v1" => {
+                    super::late_pair_publish_operations::completed_for_foreign_journal(
+                        &raw, &id, repo_id,
+                    )?
+                }
+                "managed_remove_v1" => {
+                    super::managed_remove::completed_for_foreign_journal(&raw, &id, repo_id)?
+                }
                 _ => return Err(refused("unsupported competing journal")),
             };
             if !completed {
@@ -1559,5 +1621,642 @@ impl Database {
             write_op(tx, &op)?;
             Ok(op)
         })
+    }
+}
+
+/// Read-only, authenticated *stored history* plus a current registration
+/// snapshot. Private construction is deliberately not a baseline-applicability,
+/// current-mapping, actor-approval, resource or publication capability. In
+/// particular, historical parent and integrated-child anchors remain distinct.
+/// This type has no Deserialize/Serialize/Clone implementation or public fields.
+pub struct ChangedChildProvenanceReview {
+    historical: PairRefreshOperation,
+    historical_document: String,
+    historical_authority_digest: String,
+    historical_child_revision: i64,
+    current: crate::pair_refresh::execution_configuration::ExecutionConfigurationPin,
+    snapshot_digest: String,
+}
+
+impl ChangedChildProvenanceReview {
+    pub fn historical_operation(&self) -> &PairRefreshOperation {
+        &self.historical
+    }
+
+    /// Exact original document bytes, not a rewritten/deserialized substitute.
+    pub fn historical_document(&self) -> &str {
+        &self.historical_document
+    }
+
+    pub fn historical_authority_digest(&self) -> &str {
+        &self.historical_authority_digest
+    }
+
+    /// The prior parent's P1 anchor, not the child's integration commit R.
+    pub fn historical_parent_anchor(&self) -> (&str, i64) {
+        (
+            &self.historical.pins.parent.last_git_sha,
+            self.historical.pins.parent.last_svn_rev,
+        )
+    }
+
+    /// The prior integrated child's R anchor and its observed SVN receipt.
+    pub fn historical_child_anchor(&self) -> (&str, i64) {
+        (
+            &self.historical.pins.git.prepared_sha,
+            self.historical_child_revision,
+        )
+    }
+
+    pub fn current_configuration(
+        &self,
+    ) -> &crate::pair_refresh::execution_configuration::ExecutionConfigurationPin {
+        &self.current
+    }
+
+    /// Unkeyed identity of this captured review, not an execution approval.
+    pub fn snapshot_digest(&self) -> &str {
+        &self.snapshot_digest
+    }
+
+    pub fn execution_eligible(&self) -> bool {
+        false
+    }
+
+    pub fn unverified_gates(&self) -> &'static [&'static str] {
+        &[
+            "historical_baseline_applicability",
+            "live_git_graphs_and_remote_freshness",
+            "current_mapping_provenance",
+            "live_svn_tree_property_mergeinfo_correspondence",
+            "current_actor_session_authorization",
+            "authenticated_resolution_freshness",
+            "exclusive_changed_child_execution_admission",
+        ]
+    }
+}
+
+impl Database {
+    /// Capture one explicitly named, authenticated completed operation and the
+    /// expected current registration in one read transaction. The selector is
+    /// never a claim that this operation is the applicable live baseline.
+    /// Current checkpoints may differ from historical receipt checkpoints; no
+    /// ancestry, synchronization or correspondence is inferred from that fact.
+    /// Existing execution readers/writers and their strict equality stay intact.
+    pub fn capture_changed_child_provenance_review(
+        &self,
+        expected: &crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        historical_id: Uuid,
+    ) -> Result<ChangedChildProvenanceReview, DatabaseError> {
+        if historical_id.is_nil() {
+            return Err(refused(
+                "historical review requires an explicit operation ID",
+            ));
+        }
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let current =
+            crate::pair_refresh::execution_configuration::capture_execution_configuration(
+                &tx,
+                &expected.pin().child.repo_id,
+            )?;
+        if current.pin() != expected.pin() {
+            return Err(refused("current provenance-review context changed"));
+        }
+
+        // This validates *all* documents, authority MACs/storage identity,
+        // duplicate/orphan ownership, receipt consistency and key history.
+        // Do not replace with deserialization of the selected raw document.
+        let operations = journal(&tx)?;
+        let mut selected = operations.iter().filter(|op| op.id == historical_id);
+        let historical = selected
+            .next()
+            .ok_or_else(|| refused("historical review operation is missing"))?;
+        if selected.next().is_some()
+            || historical.version != 3
+            || historical.phase != PairRefreshPhase::Completed
+            || historical.reconciliation_detail.is_some()
+        {
+            return Err(refused(
+                "historical review requires one authenticated completed receipt",
+            ));
+        }
+        let receipt = historical
+            .svn_receipt
+            .as_ref()
+            .ok_or_else(|| refused("historical review SVN receipt is missing"))?;
+        if historical.git_receipt_sha.as_deref() != Some(historical.pins.git.prepared_sha.as_str())
+        {
+            return Err(refused(
+                "historical review Git receipt is missing or differs",
+            ));
+        }
+        let pin = current.pin();
+        let same_incarnation = |a: &RefreshRegistrationPin, b: &RefreshRegistrationPin| {
+            a.repo_id == b.repo_id
+                && a.scope_uuid == b.scope_uuid
+                && a.configuration_digest == b.configuration_digest
+                && a.echo_generation == b.echo_generation
+        };
+        let lineage = &historical.pins.svn.pins.lineage.pins;
+        if !same_incarnation(&historical.pins.child, &pin.child)
+            || !same_incarnation(&historical.pins.parent, &pin.parent)
+            || historical.pins.git_remote_url != pin.git_remote_url
+            || historical.pins.git_branch != pin.child_git_branch
+            || historical.pins.transport_policy != pin.transport_policy
+            || lineage.child_url != pin.child_svn_url
+            || lineage.parent_url != pin.parent_svn_url
+        {
+            return Err(refused(
+                "historical review belongs to another registration or policy",
+            ));
+        }
+        // Current credential chains were independently resolved above. A valid
+        // rotation must not revive historical credentials or invalidate a signed
+        // receipt: retain old/current context digests separately, never adopt one.
+        for registration in [&pin.child, &pin.parent] {
+            require_no_pair_refresh_hold(&tx, Some(&registration.repo_id))?;
+            require_other_journals_quiet(&tx, &registration.repo_id)?;
+            super::ordinary_writer_windows::require_quiet_for_refresh(
+                &tx,
+                &registration.repo_id,
+                &registration.scope_uuid,
+            )?;
+        }
+        require_execution_conflicts_quiet(&tx, &historical.pins)?;
+        for id in super::personal_scope::personal_repo_ids_for_journal_read() {
+            require_other_journals_quiet(&tx, id)?;
+        }
+        let document = read(
+            &tx,
+            &operation_key(3, "document", &historical_id.to_string()),
+        )?
+        .ok_or_else(|| refused("historical review document disappeared"))?;
+        let authority = read(
+            &tx,
+            &operation_key(3, "authority", &historical_id.to_string()),
+        )?
+        .ok_or_else(|| refused("historical review authority disappeared"))?;
+        let authority_digest = hex::encode(Sha256::digest(authority.as_bytes()));
+        let snapshot_digest = digest(&(
+            "changed_child_provenance_review_v1",
+            historical_id,
+            pin,
+            &document,
+            &authority_digest,
+        ))?;
+        let snapshot = ChangedChildProvenanceReview {
+            historical: historical.clone(),
+            historical_document: document,
+            historical_authority_digest: authority_digest,
+            historical_child_revision: receipt.revision,
+            current: pin.clone(),
+            snapshot_digest,
+        };
+        tx.commit()?;
+        Ok(snapshot)
+    }
+}
+
+/// Conservative stored-candidate closure for review, not semantic baseline
+/// applicability. Construction authenticates the entire journal and requires
+/// exactly one same-incarnation completed v3 receipt. No caller selects its ID.
+/// Private fields and no Deserialize/Clone prevent caller-minted proof values.
+pub struct ChangedChildBaselineCandidateReview {
+    selected: ChangedChildProvenanceReview,
+    candidate_set_digest: String,
+}
+
+impl ChangedChildBaselineCandidateReview {
+    pub fn selected_review(&self) -> &ChangedChildProvenanceReview {
+        &self.selected
+    }
+
+    /// Unkeyed capture identity, not a signature or an execution capability.
+    pub fn candidate_set_digest(&self) -> &str {
+        &self.candidate_set_digest
+    }
+
+    pub fn execution_eligible(&self) -> bool {
+        false
+    }
+}
+
+impl Database {
+    /// Read-only supported subset: one authenticated completed receipt matching
+    /// both current incarnations/endpoints/policy. Legitimate multi-receipt
+    /// chains are refused too; there is no newest/ancestry/equal-tree tie-break.
+    pub fn capture_changed_child_baseline_candidate_review(
+        &self,
+        expected: &crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+    ) -> Result<ChangedChildBaselineCandidateReview, DatabaseError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let current =
+            crate::pair_refresh::execution_configuration::capture_execution_configuration(
+                &tx,
+                &expected.pin().child.repo_id,
+            )?;
+        if current.pin() != expected.pin() {
+            return Err(refused("baseline candidate current context changed"));
+        }
+        // Global integrity validation is mandatory even for unrelated or
+        // otherwise ineligible entries. Never read a filtered raw SQL journal.
+        let operations = journal(&tx)?;
+        let pin = current.pin();
+        let same_incarnation = |a: &RefreshRegistrationPin, b: &RefreshRegistrationPin| {
+            a.repo_id == b.repo_id
+                && a.scope_uuid == b.scope_uuid
+                && a.configuration_digest == b.configuration_digest
+                && a.echo_generation == b.echo_generation
+        };
+        let candidates = operations
+            .iter()
+            .filter(|op| {
+                let lineage = &op.pins.svn.pins.lineage.pins;
+                op.version == 3
+                    && op.phase == PairRefreshPhase::Completed
+                    && op.reconciliation_detail.is_none()
+                    && same_incarnation(&op.pins.child, &pin.child)
+                    && same_incarnation(&op.pins.parent, &pin.parent)
+                    && op.pins.git_remote_url == pin.git_remote_url
+                    && op.pins.git_branch == pin.child_git_branch
+                    && op.pins.transport_policy == pin.transport_policy
+                    && lineage.child_url == pin.child_svn_url
+                    && lineage.parent_url == pin.parent_svn_url
+            })
+            .collect::<Vec<_>>();
+        let historical = match candidates.as_slice() {
+            [only] => *only,
+            [] => {
+                return Err(refused(
+                    "no authenticated same-incarnation receipt candidate",
+                ))
+            }
+            _ => return Err(refused("ambiguous authenticated receipt candidates")),
+        };
+        for registration in [&pin.child, &pin.parent] {
+            require_no_pair_refresh_hold(&tx, Some(&registration.repo_id))?;
+            require_other_journals_quiet(&tx, &registration.repo_id)?;
+            super::ordinary_writer_windows::require_quiet_for_refresh(
+                &tx,
+                &registration.repo_id,
+                &registration.scope_uuid,
+            )?;
+        }
+        require_execution_conflicts_quiet(&tx, &historical.pins)?;
+        for id in super::personal_scope::personal_repo_ids_for_journal_read() {
+            require_other_journals_quiet(&tx, id)?;
+        }
+        let document = read(
+            &tx,
+            &operation_key(3, "document", &historical.id.to_string()),
+        )?
+        .ok_or_else(|| refused("baseline candidate document disappeared"))?;
+        let authority = read(
+            &tx,
+            &operation_key(3, "authority", &historical.id.to_string()),
+        )?
+        .ok_or_else(|| refused("baseline candidate authority disappeared"))?;
+        let authority_digest = hex::encode(Sha256::digest(authority.as_bytes()));
+        let receipt = historical
+            .svn_receipt
+            .as_ref()
+            .ok_or_else(|| refused("baseline candidate SVN receipt is missing"))?;
+        let snapshot_digest = digest(&(
+            "changed_child_provenance_review_v1",
+            historical.id,
+            pin,
+            &document,
+            &authority_digest,
+        ))?;
+        // Count is explicit; successful construction has inspected the entire
+        // authenticated journal, not just this document. Current credentials
+        // are independently resolved, never compared to historical secrets.
+        let candidate_set_digest = digest(&(
+            "changed_child_baseline_candidate_set_v1",
+            pin,
+            candidates.len(),
+            historical.id,
+            &document,
+            &authority_digest,
+        ))?;
+        let result = ChangedChildBaselineCandidateReview {
+            selected: ChangedChildProvenanceReview {
+                historical: historical.clone(),
+                historical_document: document,
+                historical_authority_digest: authority_digest,
+                historical_child_revision: receipt.revision,
+                current: pin.clone(),
+                snapshot_digest,
+            },
+            candidate_set_digest,
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+}
+
+// Scoped applied rows are existing storage provenance, not signed receipts.
+// Keep every original column in the snapshot identity; no recency tie-break.
+#[derive(Serialize)]
+struct ChangedChildAppliedRow {
+    id: String,
+    repo_id: Option<String>,
+    svn_revision: Option<i64>,
+    git_sha: Option<String>,
+    direction: String,
+    author: String,
+    message: String,
+    timestamp: String,
+    synced_at: String,
+    status: String,
+}
+
+/// Transaction-local applied correspondence plus current registration and an
+/// authenticated singleton-candidate identity. Private construction does not
+/// make legacy sync_records MAC-authenticated or prove live SVN content.
+pub struct ChangedChildMappingReview {
+    current: crate::pair_refresh::execution_configuration::ExecutionConfigurationPin,
+    candidate_set_digest: String,
+    child_rows: Vec<ChangedChildAppliedRow>,
+    parent_rows: Vec<ChangedChildAppliedRow>,
+    snapshot_digest: String,
+}
+
+impl ChangedChildMappingReview {
+    pub fn current_configuration(
+        &self,
+    ) -> &crate::pair_refresh::execution_configuration::ExecutionConfigurationPin {
+        &self.current
+    }
+
+    pub fn candidate_set_digest(&self) -> &str {
+        &self.candidate_set_digest
+    }
+
+    pub fn mapping_row_counts(&self) -> [usize; 2] {
+        [self.child_rows.len(), self.parent_rows.len()]
+    }
+
+    pub fn snapshot_digest(&self) -> &str {
+        &self.snapshot_digest
+    }
+
+    pub fn execution_eligible(&self) -> bool {
+        false
+    }
+}
+
+fn changed_child_applied_rows(
+    tx: &Connection,
+    registration: &RefreshRegistrationPin,
+) -> Result<Vec<ChangedChildAppliedRow>, DatabaseError> {
+    // An unscoped row with either coordinate is ambiguous, never adoptable.
+    // Other repositories' rows cannot supply this registration's evidence.
+    let mut query = tx.prepare(
+        "SELECT id,repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status
+         FROM sync_records WHERE (repo_id=?1 OR repo_id IS NULL OR repo_id='')
+         AND (git_sha=?2 OR svn_rev=?3) ORDER BY id",
+    )?;
+    let rows = query
+        .query_map(
+            params![
+                registration.repo_id,
+                registration.last_git_sha,
+                registration.last_svn_rev
+            ],
+            |row| {
+                Ok(ChangedChildAppliedRow {
+                    id: row.get(0)?,
+                    repo_id: row.get(1)?,
+                    svn_revision: row.get(2)?,
+                    git_sha: row.get(3)?,
+                    direction: row.get(4)?,
+                    author: row.get(5)?,
+                    message: row.get(6)?,
+                    timestamp: row.get(7)?,
+                    synced_at: row.get(8)?,
+                    status: row.get(9)?,
+                })
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        return Err(refused("current scoped applied correspondence is missing"));
+    }
+    for row in &rows {
+        if row.id.is_empty()
+            || row.repo_id.as_deref() != Some(registration.repo_id.as_str())
+            || row.git_sha.as_deref() != Some(registration.last_git_sha.as_str())
+            || row.svn_revision != Some(registration.last_svn_rev)
+            || !matches!(row.direction.as_str(), "svn_to_git" | "git_to_svn")
+            || row.status != "applied"
+            || chrono::DateTime::parse_from_rfc3339(&row.timestamp).is_err()
+            || chrono::DateTime::parse_from_rfc3339(&row.synced_at).is_err()
+        {
+            return Err(refused(
+                "current applied correspondence is foreign or contradictory",
+            ));
+        }
+    }
+    Ok(rows)
+}
+
+impl Database {
+    /// Read current scoped correspondence in one transaction, tied to the
+    /// actual registration and opaque M2c candidate. Never establish a key,
+    /// adopt a checkpoint, infer an import completion or repair a mapping.
+    pub fn capture_changed_child_mapping_review(
+        &self,
+        expected: &crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        candidate: &ChangedChildBaselineCandidateReview,
+    ) -> Result<ChangedChildMappingReview, DatabaseError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let current =
+            crate::pair_refresh::execution_configuration::capture_execution_configuration(
+                &tx,
+                &expected.pin().child.repo_id,
+            )?;
+        let pin = current.pin();
+        if pin != expected.pin() || pin != candidate.selected.current_configuration() {
+            return Err(refused("current mapping-review registration changed"));
+        }
+        let operations = journal(&tx)?;
+        let same_incarnation = |a: &RefreshRegistrationPin, b: &RefreshRegistrationPin| {
+            a.repo_id == b.repo_id
+                && a.scope_uuid == b.scope_uuid
+                && a.configuration_digest == b.configuration_digest
+                && a.echo_generation == b.echo_generation
+        };
+        let candidates = operations
+            .iter()
+            .filter(|op| {
+                let lineage = &op.pins.svn.pins.lineage.pins;
+                op.version == 3
+                    && op.phase == PairRefreshPhase::Completed
+                    && op.reconciliation_detail.is_none()
+                    && same_incarnation(&op.pins.child, &pin.child)
+                    && same_incarnation(&op.pins.parent, &pin.parent)
+                    && op.pins.git_remote_url == pin.git_remote_url
+                    && op.pins.git_branch == pin.child_git_branch
+                    && op.pins.transport_policy == pin.transport_policy
+                    && lineage.child_url == pin.child_svn_url
+                    && lineage.parent_url == pin.parent_svn_url
+            })
+            .collect::<Vec<_>>();
+        let historical = match candidates.as_slice() {
+            [only] if only.id == candidate.selected.historical.id => *only,
+            _ => return Err(refused("mapping-review candidate closure changed")),
+        };
+        let document = read(
+            &tx,
+            &operation_key(3, "document", &historical.id.to_string()),
+        )?
+        .ok_or_else(|| refused("mapping-review candidate document disappeared"))?;
+        let authority = read(
+            &tx,
+            &operation_key(3, "authority", &historical.id.to_string()),
+        )?
+        .ok_or_else(|| refused("mapping-review candidate authority disappeared"))?;
+        let authority_digest = hex::encode(Sha256::digest(authority.as_bytes()));
+        let candidate_digest = digest(&(
+            "changed_child_baseline_candidate_set_v1",
+            pin,
+            candidates.len(),
+            historical.id,
+            &document,
+            &authority_digest,
+        ))?;
+        if candidate_digest != candidate.candidate_set_digest {
+            return Err(refused("mapping-review candidate identity changed"));
+        }
+        for registration in [&pin.child, &pin.parent] {
+            require_no_pair_refresh_hold(&tx, Some(&registration.repo_id))?;
+            require_other_journals_quiet(&tx, &registration.repo_id)?;
+            super::ordinary_writer_windows::require_quiet_for_refresh(
+                &tx,
+                &registration.repo_id,
+                &registration.scope_uuid,
+            )?;
+        }
+        require_execution_conflicts_quiet(&tx, &historical.pins)?;
+        for id in super::personal_scope::personal_repo_ids_for_journal_read() {
+            require_other_journals_quiet(&tx, id)?;
+        }
+        let child_rows = changed_child_applied_rows(&tx, &pin.child)?;
+        let parent_rows = changed_child_applied_rows(&tx, &pin.parent)?;
+        let snapshot_digest = digest(&(
+            "changed_child_mapping_review_v1",
+            pin,
+            &candidate_digest,
+            &child_rows,
+            &parent_rows,
+        ))?;
+        let result = ChangedChildMappingReview {
+            current: pin.clone(),
+            candidate_set_digest: candidate_digest,
+            child_rows,
+            parent_rows,
+            snapshot_digest,
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod rs65_foreign_reader_tests {
+    use super::*;
+    use crate::db::managed_remove::{native_completed_reader_fixture, reader_fixture_snapshot};
+
+    fn read_only(db: &Database, repo: &str, quiet: bool) {
+        let conn = db.conn();
+        let before = reader_fixture_snapshot(&conn);
+        let result = require_other_journals_quiet(&conn, repo);
+        assert_eq!(result.is_ok(), quiet, "{result:?}");
+        assert_eq!(
+            reader_fixture_snapshot(&conn),
+            before,
+            "local quiet reader must not repair, adopt or delete evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn rs65_local_reader_preserves_native_tombstone_hold_and_allows_supported_restore() {
+        for version in [1, 2] {
+            let (db, op, _owned) = native_completed_reader_fixture(version).await;
+            let raw = db
+                .get_state(&format!("managed_remove_v1:document:{}", op.id))
+                .unwrap()
+                .unwrap();
+            read_only(&db, &op.repo_id, false);
+            let refusal = require_other_journals_quiet(&db.conn(), &op.repo_id)
+                .unwrap_err()
+                .to_string();
+            assert!(refusal.contains("managed removal owns the repository"),"the valid native document passes its family decoder before the independent tombstone hold: {refusal}");
+            assert_eq!(
+                db.get_state(&format!("managed_remove_v1:document:{}", op.id))
+                    .unwrap()
+                    .unwrap(),
+                raw
+            );
+            assert!(db.get_repository(&op.repo_id).unwrap().is_none());
+            db.restore_managed_registration(&op.repo_id).unwrap();
+            assert!(!db.get_repository(&op.repo_id).unwrap().unwrap().enabled);
+            read_only(&db, &op.repo_id, true);
+            assert_eq!(
+                db.get_state(&format!("managed_remove_v1:document:{}", op.id))
+                    .unwrap()
+                    .unwrap(),
+                raw,
+                "supported restore retains the original completed native evidence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rs65_local_reader_refuses_corrupt_identity_active_and_partial_evidence() {
+        let (db, op, _owned) = native_completed_reader_fixture(2).await;
+        let key = format!("managed_remove_v1:document:{}", op.id);
+        let original = db.get_state(&key).unwrap().unwrap();
+        let mut future = op.clone();
+        future.version = 3;
+        let mut blended = op.clone();
+        blended.version = 1;
+        let mut partial = op.clone();
+        partial.reviewed.as_mut().unwrap().cleanup_completed = false;
+        let mut wrong_owner = op.clone();
+        wrong_owner.repo_id = "foreign-owner".into();
+        let mut wrong_type = op.clone();
+        wrong_type.operation_type = "foreign_operation".into();
+        for raw in ["{malformed".into(),serde_json::to_string(&future).unwrap(),serde_json::to_string(&blended).unwrap(),serde_json::to_string(&partial).unwrap(),serde_json::to_string(&wrong_owner).unwrap(),serde_json::to_string(&wrong_type).unwrap(),original.replacen("\"policy\":","\"unrecognized_nested\":true,\"policy\":",1),original.replacen("\"policy\":\"reviewed_managed_removal_v2\"","\"policy\":\"reviewed_managed_removal_v2\",\"policy\":\"reviewed_managed_removal_v2\"",1),original.replacen("\"version\":2","\"version\":2,\"unrecognized\":true",1)] {
+            db.set_state(&key,&raw).unwrap();read_only(&db,&op.repo_id,false);
+        }
+        db.set_state(&key, &original).unwrap();
+        let active = format!("managed_remove_v1:active:{}", op.repo_id);
+        db.set_state(&active, &op.id).unwrap();
+        read_only(&db, &op.repo_id, false);
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key=?1", [&active])
+            .unwrap();
+        let latest = format!("managed_remove_v1:latest:{}", op.repo_id);
+        db.set_state(&latest, "missing-document").unwrap();
+        read_only(&db, &op.repo_id, false);
+        db.set_state("managed_remove_v1:document:foreign-key", &original)
+            .unwrap();
+        db.set_state(&latest, "foreign-key").unwrap();
+        read_only(&db, &op.repo_id, false);
+        db.set_state(&latest, &op.id).unwrap();
+        read_only(&db, &op.repo_id, false);
+        db.conn()
+            .execute(
+                "DELETE FROM kv_state WHERE key='managed_remove_v1:document:foreign-key'",
+                [],
+            )
+            .unwrap();
+        db.restore_managed_registration(&op.repo_id).unwrap();
+        read_only(&db, &op.repo_id, true);
     }
 }

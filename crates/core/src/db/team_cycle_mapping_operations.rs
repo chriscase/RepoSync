@@ -277,6 +277,21 @@ fn finalize_tx(
                 "projection": op.projection,
             });
             advance_svn_with_receipt_tx(tx, &op.repo_id, svn_rev, receipt)?;
+            let source_key = super::lineage_checkpoints::svn_source_key(svn_rev);
+            super::lineage_checkpoints::try_persist_directional_checkpoint_tx(
+                tx,
+                &op.repo_id,
+                super::lineage_checkpoints::MappingWrite {
+                    direction: super::lineage_checkpoints::CheckpointDirection::SvnToGit,
+                    source_key: &source_key,
+                    outcome:
+                        super::lineage_checkpoints::MappingOutcome::IntentionallyFilteredNoTarget,
+                    target_git_sha: None,
+                    target_svn_rev: None,
+                    reason: Some("no_git_content"),
+                    policy_snapshot: Some(op.projection.as_str()),
+                },
+            )?;
         }
         (
             TeamCycleMappingDirection::GitToSvn,
@@ -298,6 +313,21 @@ fn finalize_tx(
                 "projection": op.projection,
             });
             advance_git_with_receipt_tx(tx, &op.repo_id, git_sha, receipt)?;
+            let source_key = super::lineage_checkpoints::git_source_key(git_sha);
+            super::lineage_checkpoints::try_persist_directional_checkpoint_tx(
+                tx,
+                &op.repo_id,
+                super::lineage_checkpoints::MappingWrite {
+                    direction: super::lineage_checkpoints::CheckpointDirection::GitToSvn,
+                    source_key: &source_key,
+                    outcome:
+                        super::lineage_checkpoints::MappingOutcome::IntentionallyFilteredNoTarget,
+                    target_git_sha: None,
+                    target_svn_rev: None,
+                    reason: Some(outcome),
+                    policy_snapshot: Some(op.projection.as_str()),
+                },
+            )?;
         }
         (TeamCycleMappingDirection::GitToSvn, TeamCycleMappingOutcome::GitNoSvnDelta) => {
             let git_sha = op.source_git_sha.as_deref().ok_or_else(|| {
@@ -318,6 +348,21 @@ fn finalize_tx(
                 "target": target,
             });
             advance_git_with_receipt_tx(tx, &op.repo_id, git_sha, receipt)?;
+            let source_key = super::lineage_checkpoints::git_source_key(git_sha);
+            super::lineage_checkpoints::try_persist_directional_checkpoint_tx(
+                tx,
+                &op.repo_id,
+                super::lineage_checkpoints::MappingWrite {
+                    direction: super::lineage_checkpoints::CheckpointDirection::GitToSvn,
+                    source_key: &source_key,
+                    outcome:
+                        super::lineage_checkpoints::MappingOutcome::IntentionallyFilteredNoTarget,
+                    target_git_sha: None,
+                    target_svn_rev: None,
+                    reason: Some("no_svn_delta"),
+                    policy_snapshot: Some(op.projection.as_str()),
+                },
+            )?;
         }
         _ => {
             return Err(DatabaseError::Other(
@@ -626,8 +671,10 @@ mod tests {
         let receipt = crate::echo_receipt_scope::read_svn_no_target_receipt(&db, "pair", 2)
             .unwrap()
             .unwrap();
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), "pair").unwrap();
         assert_eq!(
-            verify_svn_no_target_receipt(&receipt, "pair", 2, "unfiltered", 1),
+            verify_svn_no_target_receipt(&receipt, "pair", 2, "unfiltered", 1, Some(&scope)),
             NoTargetReceiptVerdict::Accepted
         );
         let echo_ctx = TeamEchoContext {

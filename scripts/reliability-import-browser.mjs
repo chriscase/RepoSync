@@ -1,10 +1,13 @@
 // Drives the shipped ImportProgressCard in a real headless Chrome against the
-// disposable Rust API. CDP uses Node built-ins, keeping the UI lock unchanged.
-import { spawn } from 'node:child_process';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+// disposable Rust API. Reuses the existing sandbox-enabled Playwright runtime;
+// no browser install, public debugging port or user profile is involved.
+import { createRequire } from 'node:module';
+import { writeFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+const require = createRequire(new URL('../web-ui/package.json', import.meta.url));
+const { chromium } = require('playwright-core');
 
 const { REPOSYNC_UI_URL: url, REPOSYNC_UI_MODE: mode,
   REPOSYNC_UI_BARRIER: barrier, REPOSYNC_UI_ARTIFACTS: artifacts,
@@ -15,10 +18,8 @@ const chrome = process.env.CHROME_BIN || (process.platform === 'darwin'
 const profile = join(tmpdir(), `reposync-chrome-${process.pid}`);
 await mkdir(profile, { recursive: true });
 await mkdir(artifacts, { recursive: true });
-const child = spawn(chrome, ['--headless=new', '--no-sandbox', '--disable-gpu',
-  '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=0',
-  '--remote-allow-origins=*', `--user-data-dir=${profile}`], { stdio: 'ignore' });
 const pause = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const browserErrors = [];
 async function until(fn, label, ms = 30000) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
@@ -26,32 +27,23 @@ async function until(fn, label, ms = 30000) {
     if (result) return result;
     await pause(100);
   }
-  throw new Error(`Timed out: ${label}`);
+  throw new Error(`Timed out: ${label}; browser exceptions: ${JSON.stringify(browserErrors)}`);
 }
-let ws;
+const context = await chromium.launchPersistentContext(profile, {
+  executablePath: chrome, headless: true, chromiumSandbox: true, timeout: 15000,
+});
+let session;
 try {
-  const portFile = join(profile, 'DevToolsActivePort');
-  await until(() => existsSync(portFile), 'Chrome DevTools port');
-  const [port] = (await readFile(portFile, 'utf8')).split('\n');
-  const target = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' }).then(r => r.json());
-  ws = new WebSocket(target.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
-  const pending = new Map();
-  let serial = 0;
-  ws.onmessage = ({ data }) => {
-    const message = JSON.parse(data);
-    if (!message.id) return;
-    const pair = pending.get(message.id);
-    if (!pair) return;
-    pending.delete(message.id);
-    if (message.error) pair.reject(new Error(JSON.stringify(message.error)));
-    else pair.resolve(message.result);
-  };
-  const send = (method, params = {}) => new Promise((resolve, reject) => {
-    const id = ++serial;
-    pending.set(id, { resolve, reject });
-    ws.send(JSON.stringify({ id, method, params }));
+  const origin = new URL(url).origin;
+  await context.route('**/*', route => new URL(route.request().url()).origin === origin
+    ? route.continue() : route.abort());
+  const page = context.pages()[0] || await context.newPage();
+  session = await context.newCDPSession(page);
+  session.on('Runtime.exceptionThrown', ({ exceptionDetails }) => {
+    browserErrors.push(String(exceptionDetails.exception?.description || exceptionDetails.text).slice(0, 2000));
+    if (browserErrors.length > 8) browserErrors.shift();
   });
+  const send = (method, params = {}) => session.send(method, params);
   const evaluate = async (expression) => {
     const response = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
     if (response.exceptionDetails) throw new Error(JSON.stringify(response.exceptionDetails));
@@ -59,6 +51,12 @@ try {
   };
   const body = () => evaluate('document.body?.innerText || ""');
   const button = (label) => evaluate(`Array.from(document.querySelectorAll('button')).some(b => b.textContent.trim() === ${JSON.stringify(label)})`);
+  // #264 G04.13: "Stop import" opens a confirmation whose confirm button carries this test id.
+  const confirmStop = async () => {
+    await until(() => evaluate(`!!document.querySelector('[data-testid="confirm-stop-import"]')`), 'stop confirmation');
+    const clicked = await evaluate(`(() => { const b = document.querySelector('[data-testid="confirm-stop-import"]'); if (!b || b.disabled) return false; b.click(); return true; })()`);
+    if (!clicked) throw new Error('stop confirmation button was not clickable');
+  };
   const click = async (label) => {
     const clicked = await evaluate(`(() => { const b = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === ${JSON.stringify(label)}); if (!b) return false; b.click(); return true; })()`);
     if (!clicked) throw new Error(`Button missing: ${label}; ${await body()}`);
@@ -211,6 +209,7 @@ try {
     await until(() => existsSync(join(barrier, 'failure_ready')), 'durable write fault installed');
     await until(() => button('Stop import'), 'stop action');
     await click('Stop import');
+    await confirmStop();
     const failed = await until(async () => (await calls()).find(c => c.method === 'POST' && c.path.endsWith(`/${operation}/cancel`) && c.status === 500), 'failed durable cancel response');
     result.failed_cancel = failed.status;
     const feedback = failed.payload?.error || 'Cancellation failed (500)';
@@ -220,6 +219,7 @@ try {
     await writeFile(join(barrier, 'failure_seen'), 'seen');
     await until(() => existsSync(join(barrier, 'failure_release')), 'failed-write inspection');
     await click('Stop import');
+    await confirmStop();
     const accepted = await until(async () => (await calls()).find(c => c.method === 'POST' && c.path.endsWith(`/${operation}/cancel`) && c.status === 200), 'exact ID accepted cancel');
     if (accepted.payload?.lifecycle !== 'cancel_requested') throw new Error(`Wrong cancel receipt: ${JSON.stringify(accepted)}`);
     result.accepted_cancel = accepted.payload.lifecycle;
@@ -250,6 +250,6 @@ try {
   }
   }
 } finally {
-  ws?.close();
-  child.kill();
+  try { await session?.detach(); }
+  finally { await context.close(); }
 }

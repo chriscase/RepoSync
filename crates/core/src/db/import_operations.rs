@@ -13,6 +13,116 @@ use crate::errors::DatabaseError;
 use crate::models::Repository;
 
 const PREFIX: &str = "import_operation_v1:";
+const SETUP_OWNER_KEY: &str = "import_operation_v1:setup_owner";
+
+enum ImportEnrollment<'a> {
+    Journal,
+    Managed {
+        workdir: &'a Path,
+        svn_username: &'a str,
+    },
+    Setup {
+        data_dir: &'a Path,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct SetupImportIdentity {
+    repo_id: String,
+    operation_id: String,
+}
+
+pub struct SetupImportOwner {
+    pub operation: ImportOperation,
+    /// Terminal operations may still hold their repository's active slot.
+    pub holds_slot: bool,
+}
+
+impl SetupImportOwner {
+    pub fn blocks_admission(&self) -> bool {
+        self.holds_slot || !self.operation.state.is_terminal()
+    }
+}
+
+pub enum SetupImportOwnership {
+    Unclaimed,
+    Owned(Box<SetupImportOwner>),
+    Ambiguous,
+}
+
+fn observe_setup_import_owner(
+    conn: &Connection,
+    data_dir: &Path,
+) -> Result<SetupImportOwnership, DatabaseError> {
+    if let Some(owner) = read_setup_import_owner(conn)? {
+        return Ok(SetupImportOwnership::Owned(Box::new(owner)));
+    }
+    // Pre-pointer builds shared a checkout across registrations. A different
+    // repository sorting first cannot release a legacy active/terminal hold.
+    let mut stmt = conn
+        .prepare("SELECT key,value FROM kv_state WHERE key GLOB 'import_operation_v1:active:*'")?;
+    let pointers = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut owner = None;
+    for pointer in pointers {
+        let (active, id) = pointer?;
+        let repo_id = active.strip_prefix("import_operation_v1:active:").unwrap();
+        let Some(raw) = read_value(conn, &key("document", &id))? else {
+            return Ok(SetupImportOwnership::Ambiguous);
+        };
+        let op = parse(&raw)?;
+        if op.id != id || op.repo_id != repo_id {
+            return Ok(SetupImportOwnership::Ambiguous);
+        }
+        if op.operation_type == "snapshot_import" {
+            continue;
+        }
+        let matches = |workdir: &Path| -> Result<bool, DatabaseError> {
+            Ok(transaction_target_fingerprint(conn, repo_id, workdir)?
+                .is_some_and(|(fingerprint, _)| fingerprint == op.target_fingerprint))
+        };
+        if op.operation_type != "full_import" {
+            return Ok(SetupImportOwnership::Ambiguous);
+        }
+        if matches(&data_dir.join("repos").join(repo_id).join("git-repo"))? {
+            continue;
+        }
+        if owner.is_some() || !matches(&data_dir.join("git-repo"))? {
+            return Ok(SetupImportOwnership::Ambiguous);
+        }
+        owner = Some(Box::new(SetupImportOwner {
+            operation: op,
+            holds_slot: true,
+        }));
+    }
+    Ok(owner.map_or(SetupImportOwnership::Unclaimed, SetupImportOwnership::Owned))
+}
+
+fn read_setup_import_owner(conn: &Connection) -> Result<Option<SetupImportOwner>, DatabaseError> {
+    let Some(raw) = read_value(conn, SETUP_OWNER_KEY)? else {
+        return Ok(None);
+    };
+    let identity: SetupImportIdentity = serde_json::from_str(&raw)
+        .map_err(|_| DatabaseError::Other("invalid setup import identity".into()))?;
+    let raw = read_value(conn, &key("document", &identity.operation_id))?
+        .ok_or_else(|| DatabaseError::Other("missing owned setup import document".into()))?;
+    let operation = parse(&raw)?;
+    if operation.id != identity.operation_id
+        || operation.repo_id != identity.repo_id
+        || operation.operation_type != "full_import"
+    {
+        return Err(DatabaseError::Other(
+            "setup import identity mismatch".into(),
+        ));
+    }
+    let holds_slot = read_value(conn, &key("active", &operation.repo_id))?.as_deref()
+        == Some(operation.id.as_str());
+    Ok(Some(SetupImportOwner {
+        operation,
+        holds_slot,
+    }))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -231,6 +341,22 @@ pub fn resolve_repo_import_baseline(
     db: &Database,
     repo_id: &str,
 ) -> Result<RepoImportBaseline, DatabaseError> {
+    resolve_repo_import_baseline_inner(db, repo_id, true)
+}
+
+/// Check admission for a status response without repairing legacy checkpoint copies.
+pub fn repo_import_baseline_is_pending_read_only(
+    db: &Database,
+    repo_id: &str,
+) -> Result<bool, DatabaseError> {
+    Ok(resolve_repo_import_baseline_inner(db, repo_id, false)?.is_pending())
+}
+
+fn resolve_repo_import_baseline_inner(
+    db: &Database,
+    repo_id: &str,
+    backfill_missing_svn_cursor: bool,
+) -> Result<RepoImportBaseline, DatabaseError> {
     let repo = db
         .get_repository(repo_id)?
         .ok_or_else(|| DatabaseError::Other("repository not found".into()))?;
@@ -284,12 +410,6 @@ pub fn resolve_repo_import_baseline(
     }
 
     let scoped_svn_key = format!("last_svn_rev_{repo_id}");
-    let scoped_svn = db
-        .get_state(&format!("last_svn_rev_{repo_id}"))?
-        .and_then(|value| value.parse::<i64>().ok());
-    let has_scoped_git =
-        crate::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)?.is_some();
-    let has_scoped_svn = scoped_svn.is_some_and(|rev| rev > 0);
 
     // Team sync checkpoints columns plus scoped `last_svn_rev_<repo>` without always
     // setting `last_sync_at` or `last_git_sha_<repo>`.
@@ -306,13 +426,25 @@ pub fn resolve_repo_import_baseline(
                 return Ok(RepoImportBaseline::Pending);
             }
 
-            let mut scoped_svn_rev =
-                kv_state_value_tx(tx, &scoped_svn_key)?.and_then(|value| value.parse::<i64>().ok());
-            let has_scoped_svn = scoped_svn_rev.is_some_and(|rev| rev > 0);
-            if !has_scoped_svn {
+            let scoped_value = kv_state_value_tx(tx, &scoped_svn_key)?;
+            let mut scoped_svn_rev = scoped_value
+                .as_deref()
+                .and_then(|value| value.parse::<i64>().ok());
+            if scoped_svn_rev.is_none_or(|rev| rev <= 0) && backfill_missing_svn_cursor {
                 super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
                     tx, repo_id,
                 )?;
+                if scoped_value.is_none() {
+                    let finalized = super::git_push_operations::later_finalized_svn_checkpoint(
+                        tx, repo_id, column_svn_rev,
+                    )?;
+                    if let Some(finalized) = finalized {
+                        return Ok(RepoImportBaseline::ReconciliationRequired {
+                            reason: "conflicting_finalized_svn_checkpoint".into(),
+                            detail: format!("repository column is r{column_svn_rev}, but the completed SVN-to-Git push and scoped mapping record r{finalized}; reconcile before recreating the missing SVN cursor"),
+                        });
+                    }
+                }
                 let now = Utc::now().to_rfc3339();
                 tx.execute(
                     "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
@@ -337,6 +469,12 @@ pub fn resolve_repo_import_baseline(
         });
     }
 
+    let has_scoped_git =
+        crate::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)?.is_some();
+    let has_scoped_svn = db
+        .get_state(&scoped_svn_key)?
+        .and_then(|value| value.parse::<i64>().ok())
+        .is_some_and(|rev| rev > 0);
     if has_scoped_git {
         return Ok(RepoImportBaseline::ReconciliationRequired {
             reason: "orphan_scoped_import_checkpoint".into(),
@@ -357,6 +495,29 @@ pub fn resolve_repo_import_baseline(
 
     // Global watermarks and singleton import progress are display references only.
     Ok(RepoImportBaseline::Pending)
+}
+
+/// True when this journal already has durable local or published effects.
+/// A live `svn.info` UUID must not become historical authority over them.
+pub fn import_operation_has_retained_effects(op: &ImportOperation) -> bool {
+    op.processed_revisions > 0
+        || op.local_commits > 0
+        || op.confirmed_batches > 0
+        || op.last_local_svn_rev.is_some_and(|rev| rev > 0)
+        || op.last_confirmed_svn_rev.is_some_and(|rev| rev > 0)
+        || op
+            .last_local_git_sha
+            .as_deref()
+            .is_some_and(|sha| !sha.is_empty())
+        || op
+            .last_confirmed_git_sha
+            .as_deref()
+            .is_some_and(|sha| !sha.is_empty())
+        || op
+            .intended_git_sha
+            .as_deref()
+            .is_some_and(|sha| !sha.is_empty())
+        || !op.pending_commit_maps.is_empty()
 }
 
 /// A partial import may resume only when the confirmed SVN/Git prefix matches
@@ -493,6 +654,20 @@ fn complete_import_tx(
             "import cannot complete with unflushed commit mappings".into(),
         ));
     }
+    let now = Utc::now().to_rfc3339();
+    if op.operation_type == "snapshot_import" {
+        snapshot_hold_is_honest(&op).map_err(DatabaseError::Other)?;
+        // The ordinary engine consumes an applied, repository-scoped origin
+        // record as provenance for its first handled Git frontier. A snapshot
+        // produces only one such baseline, and only after exact-ref publication
+        // confirmation. Commit it atomically with both checkpoint copies and
+        // operation completion; a failed finalizer must leave no applied proof.
+        tx.execute(
+            "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+             VALUES (?1, ?2, ?3, ?4, 'svn_to_git', '', 'Verified SVN snapshot baseline', ?5, ?5, 'applied')",
+            params![format!("snapshot-import:{op_id}"), repo_id, svn_rev, sha, now],
+        )?;
+    }
     if tx.execute(
         "UPDATE repositories SET last_svn_rev=?1,last_git_sha=?2,last_sync_at=datetime('now') WHERE id=?3",
         params![svn_rev, sha, repo_id],
@@ -502,7 +677,6 @@ fn complete_import_tx(
         ));
     }
     write_value(tx, &format!("last_svn_rev_{repo_id}"), &svn_rev.to_string())?;
-    let now = Utc::now().to_rfc3339();
     crate::echo_receipt_scope::write_scoped_last_git_sha_kv(tx, repo_id, sha, &now)?;
     op.state = ImportOperationState::Completed;
     op.updated_at = Utc::now().to_rfc3339();
@@ -519,6 +693,15 @@ fn complete_import_tx(
 }
 
 impl Database {
+    /// The legacy singleton progress row predates durable, per-operation ownership.
+    pub fn has_any_import_operation_history(&self) -> Result<bool, DatabaseError> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key GLOB 'import_operation_v1:latest:*')",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn has_any_active_import_operation(&self) -> Result<bool, DatabaseError> {
         let conn = self.conn();
         Ok(conn.query_row(
@@ -527,6 +710,25 @@ impl Database {
             |r| r.get::<_, i64>(0),
         )? != 0)
     }
+    pub fn observe_setup_import_ownership(
+        &self,
+        data_dir: &Path,
+    ) -> Result<SetupImportOwnership, DatabaseError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let owner = observe_setup_import_owner(&tx, data_dir)?;
+        tx.commit()?;
+        Ok(owner)
+    }
+
+    pub fn setup_import_owner(&self) -> Result<Option<SetupImportOwner>, DatabaseError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let owner = read_setup_import_owner(&tx)?;
+        tx.commit()?;
+        Ok(owner)
+    }
+
     pub fn create_import_operation(
         &self,
         repo_id: &str,
@@ -534,13 +736,108 @@ impl Database {
         request_id: &str,
         fingerprint: &str,
     ) -> Result<ImportOperation, DatabaseError> {
-        self.transaction(|tx| {
+        self.enroll_import(
+            repo_id,
+            initiator_id,
+            request_id,
+            fingerprint,
+            ImportEnrollment::Journal,
+        )
+    }
+
+    /// Bind a managed import to the registration used to prepare its target.
+    pub fn create_managed_import_operation(
+        &self,
+        repo: &Repository,
+        initiator_id: &str,
+        request_id: &str,
+        workdir: &Path,
+    ) -> Result<ImportOperation, DatabaseError> {
+        self.enroll_import(
+            &repo.id,
+            initiator_id,
+            request_id,
+            &import_target_fingerprint(repo, workdir),
+            ImportEnrollment::Managed {
+                workdir,
+                svn_username: &repo.svn_username,
+            },
+        )
+    }
+
+    /// Publish the immutable wizard identity in the same transaction as the
+    /// repository admission. Managed full/snapshot imports never claim this slot.
+    pub fn create_setup_import_operation(
+        &self,
+        repo: &Repository,
+        initiator_id: &str,
+        request_id: &str,
+        data_dir: &Path,
+    ) -> Result<ImportOperation, DatabaseError> {
+        self.enroll_import(
+            &repo.id,
+            initiator_id,
+            request_id,
+            &import_target_fingerprint(repo, &data_dir.join("git-repo")),
+            ImportEnrollment::Setup { data_dir },
+        )
+    }
+
+    fn enroll_import(
+        &self,
+        repo_id: &str,
+        initiator_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+        target: ImportEnrollment<'_>,
+    ) -> Result<ImportOperation, DatabaseError> {
+        // Reserve the writer before reading admission state. An idle pause can
+        // commit first; a deferred read-to-write upgrade could lose that race
+        // with SQLITE_BUSY instead of admitting the explicit import.
+        self.immediate_transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             if super::managed_remove::new_work_blocked(tx, repo_id)? {
                 return Err(DatabaseError::Other(
                     "repository removal blocks a new import".into(),
                 ));
+            }
+            if let ImportEnrollment::Setup { data_dir } = target {
+                match observe_setup_import_owner(tx, data_dir)? {
+                    SetupImportOwnership::Unclaimed => {}
+                    SetupImportOwnership::Owned(owner) if !owner.blocks_admission() => {}
+                    _ => {
+                        return Err(DatabaseError::Other(
+                            "another setup import is active, held or ambiguous".into(),
+                        ))
+                    }
+                }
+                let current =
+                    transaction_target_fingerprint(tx, repo_id, &data_dir.join("git-repo"))?
+                        .ok_or_else(|| DatabaseError::Other("missing setup repository".into()))?
+                        .0;
+                if current != fingerprint {
+                    return Err(DatabaseError::Other(
+                        "setup registration changed before admission".into(),
+                    ));
+                }
+            }
+            if let ImportEnrollment::Managed {
+                workdir,
+                svn_username,
+            } = target
+            {
+                let current = transaction_target_fingerprint(tx, repo_id, workdir)?;
+                // The durable v1 fingerprint predates this check. Compare the
+                // prepared SVN login here without storing it in the journal.
+                let same_login: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM repositories WHERE id = ?1 AND svn_username = ?2)",
+                    params![repo_id, svn_username],
+                    |row| row.get(0),
+                )?;
+                if !same_login || !current.is_some_and(|(current, _)| current == fingerprint) {
+                    return Err(DatabaseError::ImportTargetChanged);
+                }
             }
             let active = key("active", repo_id);
             if read_value(tx, &active)?.is_some() {
@@ -583,6 +880,17 @@ impl Database {
             )?;
             write_value(tx, &active, &op.id)?;
             write_value(tx, &key("latest", repo_id), &op.id)?;
+            if matches!(target, ImportEnrollment::Setup { .. }) {
+                let identity = SetupImportIdentity {
+                    repo_id: repo_id.into(),
+                    operation_id: op.id.clone(),
+                };
+                write_value(
+                    tx,
+                    SETUP_OWNER_KEY,
+                    &serde_json::to_string(&identity).unwrap(),
+                )?;
+            }
             Ok(op)
         })
     }
@@ -1148,6 +1456,46 @@ mod tests {
     use super::*;
     use crate::db::watermark_recovery::recover_repo_watermark_from_global_migration;
     use rusqlite::params;
+
+    mod finalized_svn_checkpoint;
+
+    #[test]
+    fn retained_effects_require_local_or_published_prefix() {
+        let empty = ImportOperation {
+            version: 1,
+            id: "op".into(),
+            repo_id: "pair".into(),
+            operation_type: "full_import".into(),
+            initiator_id: "admin".into(),
+            request_id: "req".into(),
+            target_fingerprint: "fp".into(),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            state: ImportOperationState::Running,
+            cancel_requested: false,
+            processed_revisions: 0,
+            total_revisions: Some(3),
+            local_commits: 0,
+            confirmed_batches: 0,
+            last_local_svn_rev: None,
+            last_local_git_sha: None,
+            last_confirmed_svn_rev: None,
+            last_confirmed_git_sha: None,
+            intended_ref: None,
+            intended_git_sha: None,
+            outcome_detail: None,
+            resume_authorized: false,
+            snapshot_pin: None,
+            pending_commit_maps: Vec::new(),
+        };
+        assert!(!import_operation_has_retained_effects(&empty));
+        let mut prefix = empty.clone();
+        prefix.last_confirmed_svn_rev = Some(1);
+        prefix.last_confirmed_git_sha = Some("a".repeat(40));
+        prefix.processed_revisions = 1;
+        prefix.confirmed_batches = 1;
+        assert!(import_operation_has_retained_effects(&prefix));
+    }
 
     #[test]
     fn exact_identity_cancel_and_reopen_hold() {

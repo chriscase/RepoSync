@@ -200,10 +200,43 @@ fn record_engine_lfs_pattern(repo_root: &Path, pattern: &str) -> std::io::Result
 
 fn gitattributes_line_attributes(line: &str) -> Option<&str> {
     let trimmed = line.trim();
-    trimmed
-        .find(|c: char| c.is_whitespace())
-        .map(|idx| trimmed[idx..].trim_start())
-        .filter(|attrs| !attrs.is_empty())
+    let rest = if let Some(after_quotes) = quoted_attribute_pattern_rest(trimmed) {
+        after_quotes
+    } else {
+        let idx = trimmed.find(|c: char| c.is_whitespace())?;
+        &trimmed[idx..]
+    };
+    let attrs = rest.trim_start();
+    if attrs.is_empty() {
+        None
+    } else {
+        Some(attrs)
+    }
+}
+
+/// Text after a leading C-style quoted pattern, not including the closing quote.
+///
+/// Git attributes splits an unquoted pattern at whitespace. A quoted pattern
+/// may contain spaces, so the attribute list starts after the closing quote.
+fn quoted_attribute_pattern_rest(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut index = 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                index += 2;
+                if index > bytes.len() {
+                    return None;
+                }
+            }
+            b'"' => return Some(&line[index + 1..]),
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 fn gitattributes_line_has_exact_attribute(line: &str, attribute: &str) -> bool {
@@ -384,11 +417,10 @@ pub fn ensure_lfs_tracked(repo_root: &Path, pattern: &str) -> std::io::Result<bo
     // Read existing content through an O_NOFOLLOW fd so a swapped-in symlink is not followed.
     let existing = read_gitattributes_existing_nofollow(repo_root)?;
 
-    // Check if already tracked.
+    // Check if already tracked. The pattern must end at the attribute
+    // separator so `/model.bin` does not count as `/model.binary`.
     for line in existing.lines() {
-        let trimmed = line.trim();
-        // Match on the pattern part before the attributes.
-        if trimmed.starts_with(pattern) && trimmed.contains("filter=lfs") {
+        if attributes_line_tracks_pattern(line, pattern) {
             debug!(pattern, "LFS pattern already tracked in .gitattributes");
             return Ok(false);
         }
@@ -514,12 +546,120 @@ fn read_gitattributes_existing_nofollow(repo_root: &Path) -> std::io::Result<Str
 ///
 /// For example, `assets/model.bin` produces `*.bin` (extension-based).
 /// If the file has no extension, the exact path is used.
+///
+/// Personal Mode does not use this for new tracking. The clean filter would
+/// then convert every file of that extension. Use [`exact_lfs_pattern`].
 pub fn pattern_for_path(rel_path: &str) -> String {
     if let Some(ext) = Path::new(rel_path).extension() {
         format!("*.{}", ext.to_string_lossy())
     } else {
         rel_path.to_string()
     }
+}
+
+/// Anchor one repository path so the LFS clean filter matches only that file.
+///
+/// The leading slash keeps a root file from matching the same name in a
+/// subdirectory. Glob metacharacters are escaped for Git's pattern matcher.
+/// A path that contains whitespace or a double quote is then wrapped in Git's
+/// C-style double quotes. A backslash before a space is not a quoted pattern,
+/// and Git would still split the line at that space.
+pub fn exact_lfs_pattern(rel_path: &str) -> String {
+    let mut pattern = String::from("/");
+    for ch in rel_path.chars() {
+        if matches!(ch, '\\' | '*' | '?' | '[' | ']') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    if pattern.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+        quote_gitattributes_pattern(&pattern)
+    } else {
+        pattern
+    }
+}
+
+/// C-style quoting used by Git attributes when a pattern contains whitespace
+/// or a double quote. Glob escapes already in `pattern` are escaped again so
+/// they survive unquoting.
+fn quote_gitattributes_pattern(pattern: &str) -> String {
+    let mut quoted = String::from("\"");
+    for ch in pattern.chars() {
+        match ch {
+            '\\' | '"' => {
+                quoted.push('\\');
+                quoted.push(ch);
+            }
+            '\t' => quoted.push_str("\\t"),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn attributes_line_tracks_pattern(line: &str, pattern: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(rest) = trimmed.strip_prefix(pattern) else {
+        return false;
+    };
+    rest.starts_with(|ch: char| ch.is_whitespace()) && trimmed.contains("filter=lfs")
+}
+
+/// Replace the engine LFS marker with exactly the patterns selected by this copy.
+///
+/// Passing an empty list removes the marker. Stale-remove then drops engine
+/// rules that no longer qualify, including after a file shrinks under the
+/// threshold or LFS is disabled.
+pub(crate) fn replace_engine_lfs_patterns(
+    repo_root: &Path,
+    patterns: &[String],
+) -> std::io::Result<()> {
+    for pattern in patterns {
+        if !is_single_line_pattern(pattern) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to record a .gitattributes LFS pattern that is empty or contains a newline",
+            ));
+        }
+    }
+    let Some(git_dir) = git_metadata_dir(repo_root) else {
+        return Ok(());
+    };
+    let path = git_dir.join(ENGINE_LFS_PATTERN_MARKER);
+    if patterns.is_empty() {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
+                std::fs::remove_file(&path)?;
+            }
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "engine LFS pattern marker is not a file",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        return Ok(());
+    }
+    let mut seen = Vec::new();
+    let mut body = String::new();
+    for pattern in patterns {
+        if seen.iter().any(|existing| existing == pattern) {
+            continue;
+        }
+        seen.push(pattern.clone());
+        body.push_str(pattern);
+        body.push('\n');
+    }
+    if std::fs::symlink_metadata(&path)
+        .map(|meta| !meta.file_type().is_file())
+        .unwrap_or(false)
+    {
+        std::fs::remove_file(&path)?;
+    }
+    std::fs::write(path, body)
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +773,62 @@ pub fn install_lfs_hooks(repo_root: &Path) -> Result<(), String> {
     }
 
     info!(path = %repo_root.display(), "git lfs install completed");
+    Ok(())
+}
+
+/// The repository has local Git LFS clean/smudge filters.
+pub fn repo_lfs_ready(repo_root: &Path) -> Result<String, String> {
+    if !repo_root.join(".git").exists() {
+        return Err("git repository is not initialized".to_string());
+    }
+    let output = Command::new("git")
+        .args(["config", "--local", "--get", "filter.lfs.clean"])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| format!("failed to read Git LFS filter config: {e}"))?;
+    if !output.status.success() {
+        return Err(
+            "Git LFS filters are not installed in this repository. Run: git lfs install --local"
+                .to_string(),
+        );
+    }
+    let clean = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if clean.is_empty() {
+        return Err("Git LFS clean filter is empty. Run: git lfs install --local".to_string());
+    }
+    Ok(clean)
+}
+
+/// The named commit stores each path as an LFS pointer with a local object.
+pub fn require_committed_lfs_pointers(
+    repo_root: &Path,
+    sha: &str,
+    paths: &[String],
+) -> Result<(), String> {
+    for path in paths {
+        let spec = format!("{sha}:{path}");
+        let output = Command::new("git")
+            .args(["cat-file", "-p", &spec])
+            .current_dir(repo_root)
+            .output()
+            .map_err(|e| format!("failed to read committed blob {spec}: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "committed blob {spec} is missing: {}",
+                stderr.trim()
+            ));
+        }
+        let pointer = parse_lfs_pointer(&output.stdout).ok_or_else(|| {
+            format!("{path} was committed as a regular blob, not a Git LFS pointer")
+        })?;
+        if !local_lfs_object_available(repo_root, &pointer.oid) {
+            return Err(format!(
+                "LFS object {} for {path} is missing from local storage",
+                pointer.oid
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -761,6 +957,108 @@ mod tests {
     fn test_pattern_for_path_without_extension() {
         assert_eq!(pattern_for_path("Makefile"), "Makefile");
         assert_eq!(pattern_for_path("scripts/build"), "scripts/build");
+    }
+
+    #[test]
+    fn test_exact_lfs_pattern_does_not_broaden_by_extension() {
+        assert_eq!(exact_lfs_pattern("large.bin"), "/large.bin");
+        assert_eq!(exact_lfs_pattern("models/large.bin"), "/models/large.bin");
+        assert_eq!(exact_lfs_pattern("my file.bin"), "\"/my file.bin\"");
+        assert_eq!(exact_lfs_pattern("glob*.bin"), "/glob\\*.bin");
+        assert_eq!(exact_lfs_pattern("both *.bin"), "\"/both \\\\*.bin\"");
+        assert_ne!(
+            exact_lfs_pattern("large.bin"),
+            pattern_for_path("large.bin")
+        );
+    }
+
+    #[test]
+    fn test_quoted_engine_line_is_still_a_full_lfs_rule() {
+        let line = "\"/my file.bin\" filter=lfs diff=lfs merge=lfs -text";
+        assert!(gitattributes_line_is_full_engine_lfs(line));
+    }
+
+    #[test]
+    fn test_exact_lfs_pattern_matches_only_the_selected_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", dir.path().to_str().unwrap()])
+            .status()
+            .unwrap();
+        let selected = [
+            "my file.bin",
+            "tab\tname.bin",
+            "quote\"name.bin",
+            "back\\slash.bin",
+            "glob*.bin",
+        ];
+        let nearby = [
+            "near file.bin",
+            "tab\tother.bin",
+            "quoteXname.bin",
+            "backXslash.bin",
+            "globX.bin",
+        ];
+        for name in selected.iter().chain(nearby.iter()) {
+            let path = dir.path().join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut body = String::new();
+        for name in &selected {
+            body.push_str(&lfs_tracking_line(&exact_lfs_pattern(name)));
+            body.push('\n');
+        }
+        std::fs::write(dir.path().join(".gitattributes"), body).unwrap();
+        for name in &selected {
+            let value = git_check_attr_filter(dir.path(), name);
+            assert_eq!(value, "lfs", "{name} must be selected, got {value}");
+        }
+        for name in &nearby {
+            let value = git_check_attr_filter(dir.path(), name);
+            assert_eq!(
+                value, "unspecified",
+                "{name} must stay unselected, got {value}"
+            );
+        }
+    }
+
+    fn git_check_attr_filter(repo: &std::path::Path, path: &str) -> String {
+        let output = std::process::Command::new("git")
+            .args(["check-attr", "filter", "--", path])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git check-attr failed for {path}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.rsplit(':').next().unwrap_or("").trim().to_string()
+    }
+
+    #[test]
+    fn test_replace_engine_lfs_patterns_drops_previous_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", dir.path().to_str().unwrap()])
+            .status()
+            .unwrap();
+        ensure_lfs_tracked(dir.path(), "*.bin").unwrap();
+        replace_engine_lfs_patterns(dir.path(), &["/large.bin".to_string()]).unwrap();
+        let marker =
+            std::fs::read_to_string(dir.path().join(".git").join(ENGINE_LFS_PATTERN_MARKER))
+                .unwrap();
+        assert_eq!(marker, "/large.bin\n");
+        replace_engine_lfs_patterns(dir.path(), &[]).unwrap();
+        assert!(!dir
+            .path()
+            .join(".git")
+            .join(ENGINE_LFS_PATTERN_MARKER)
+            .exists());
     }
 
     #[test]
@@ -1018,6 +1316,20 @@ mod tests {
         assert!(path
             .ends_with("4d/7a/4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393"));
         assert!(!local_lfs_object_available(dir.path(), oid));
+    }
+
+    #[test]
+    fn test_repo_lfs_ready_requires_local_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        std::process::Command::new("git")
+            .args(["init", repo.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(repo_lfs_ready(repo).is_err());
+        install_lfs_hooks(repo).unwrap();
+        let clean = repo_lfs_ready(repo).unwrap();
+        assert!(clean.contains("git-lfs"), "{clean}");
     }
 
     #[test]

@@ -5,10 +5,10 @@
 //! - Trigger full SVN→Git history import with progress tracking
 //! - Poll import status
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -16,10 +16,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use reposync_core::busy::BusyGuard;
+use reposync_core::busy::PairBusyGuard;
 use reposync_core::config::AppConfig;
 use reposync_core::db::import_operations::{
-    import_target_fingerprint, resolve_repo_import_baseline, ImportOperation, ImportOperationState,
+    import_target_fingerprint, repo_import_baseline_is_pending_read_only, ImportOperation,
+    ImportOperationState, SetupImportOwnership,
 };
 use reposync_core::db::Database;
 use reposync_core::errors::{redact_vcs_error_detail, DatabaseError};
@@ -280,48 +281,22 @@ async fn test_svn_connection(
         }));
     }
 
-    let mut args = vec!["info", "--non-interactive", "--username", &username];
     let password = body.password.as_deref().unwrap_or("");
-    if !password.is_empty() {
-        args.push("--password");
-        args.push(password);
-    }
-    args.push(&url);
-    let result = tokio::process::Command::new("svn")
-        .args(&args)
-        .output()
+    let result = reposync_core::svn::SvnClient::new(&url, &username, password)
+        .info()
         .await;
 
     match result {
-        Ok(output) => {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let info = stdout
-                    .lines()
-                    .find(|l| l.starts_with("Repository Root:") || l.starts_with("URL:"))
-                    .map(|l| l.trim().to_string())
-                    .unwrap_or_else(|| "SVN server responded successfully".into());
-                Ok(Json(TestConnectionResponse {
-                    ok: true,
-                    message: info,
-                }))
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let msg = stderr
-                    .lines()
-                    .find(|l| l.contains("E1") || l.contains("Unable"))
-                    .unwrap_or("SVN command failed")
-                    .trim()
-                    .to_string();
-                Ok(Json(TestConnectionResponse {
-                    ok: false,
-                    message: redact_vcs_error_detail(&msg),
-                }))
-            }
-        }
+        Ok(info) => Ok(Json(TestConnectionResponse {
+            ok: true,
+            message: format!("Repository Root: {}", info.root_url),
+        })),
         Err(e) => Ok(Json(TestConnectionResponse {
             ok: false,
-            message: format!("Failed to run svn command: {}", e),
+            message: format!(
+                "Failed to run svn command: {}",
+                redact_vcs_error_detail(&e.to_string())
+            ),
         })),
     }
 }
@@ -645,6 +620,60 @@ fn setup_repository(db: &Database) -> Result<Repository, AppError> {
         .ok_or_else(|| AppError::BadRequest("apply configuration before starting import".into()))
 }
 
+const AMBIGUOUS_SETUP: &str = "A previous import holds a repository and its setup ownership cannot be verified. Review the held import before starting or stopping setup.";
+const TARGET_MISMATCH: &str = "The selected registration does not uniquely match the service configuration and checkout. Review the SVN branch, Git target and existing origin before starting setup.";
+
+fn setup_workdir_key(state: &AppState) -> String {
+    format!(
+        "setup-workdir:{}",
+        state.config.daemon.data_dir.join("git-repo").display()
+    )
+}
+
+/// Parse only the file configuration. Secret resolution stays in the worker.
+fn setup_config(state: &AppState) -> Result<AppConfig, AppError> {
+    AppConfig::load_from_file(&state.config_path)
+        .map_err(|_| AppError::Internal("could not read setup service configuration".into()))
+}
+
+fn target_matches(
+    state: &AppState,
+    repo: &Repository,
+    config: &AppConfig,
+) -> Result<bool, AppError> {
+    let svn_target = |url: &str, branch: &str| {
+        reposync_core::svn::operand::configured_branch_url(
+            url,
+            if branch.is_empty() { "trunk" } else { branch },
+        )
+        .ok()
+    };
+    let service_svn = svn_target(&config.svn.url, &config.svn.trunk_path);
+    let registered = |r: &Repository| {
+        r.parent_id.is_none()
+            && service_svn.is_some()
+            && svn_target(&r.svn_url, &r.svn_branch) == service_svn
+            && r.git_repo == config.github.repo
+            && r.git_branch == config.github.default_branch
+            && r.git_api_url.trim_end_matches('/') == config.github.api_url.trim_end_matches('/')
+    };
+    let repositories = state.db.list_repositories().map_err(import_read_error)?;
+    let mut candidates = repositories.iter().filter(|r| registered(r));
+    Ok(config.daemon.data_dir == state.config.daemon.data_dir
+        && registered(repo)
+        && repositories
+            .first()
+            .is_some_and(|selected| selected.id == repo.id)
+        && candidates
+            .next()
+            .is_some_and(|selected| selected.id == repo.id)
+        && candidates.next().is_none()
+        && import::setup_checkout_matches(
+            &config.daemon.data_dir.join("git-repo"),
+            &config.github.clone_url(),
+        ))
+}
+
 fn import_write_error(error: DatabaseError) -> AppError {
     match error {
         DatabaseError::Other(message) => AppError::BadRequest(message),
@@ -803,7 +832,8 @@ enum SetupAdmission {
     Ready {
         repo: Box<Repository>,
         operation: Box<ImportOperation>,
-        busy_guard: BusyGuard,
+        busy_guard: PairBusyGuard,
+        config: Box<AppConfig>,
     },
     AlreadyRecorded(Box<ImportOperation>),
     Busy {
@@ -818,9 +848,16 @@ async fn admit_setup_import(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     user_id: &str,
+    expected_repository_id: Option<&str>,
 ) -> Result<SetupAdmission, AppError> {
     let db = &state.db;
     let repo = setup_repository(db)?;
+    if expected_repository_id.is_some_and(|expected| expected != repo.id) {
+        return Ok(SetupAdmission::Busy {
+            message: "Setup repository selection changed; refresh before starting an import".into(),
+            operation: None,
+        });
+    }
     let request_id = headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
@@ -828,6 +865,30 @@ async fn admit_setup_import(
         .map(str::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+    let owner = match db
+        .observe_setup_import_ownership(&state.config.daemon.data_dir)
+        .map_err(import_read_error)?
+    {
+        SetupImportOwnership::Owned(owner) => Some(owner),
+        SetupImportOwnership::Unclaimed => None,
+        SetupImportOwnership::Ambiguous => {
+            return Ok(SetupAdmission::Busy {
+                message: AMBIGUOUS_SETUP.into(),
+                operation: None,
+            })
+        }
+    };
+    if let Some(owner) = owner {
+        if owner.operation.request_id == request_id && owner.operation.initiator_id == user_id {
+            return Ok(SetupAdmission::AlreadyRecorded(Box::new(owner.operation)));
+        }
+        if owner.blocks_admission() {
+            return Ok(SetupAdmission::Busy {
+                message: "A setup import is active or held".into(),
+                operation: Some(Box::new(owner.operation)),
+            });
+        }
+    }
     if let Some(previous) = db
         .latest_import_operation(&repo.id)
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -845,10 +906,7 @@ async fn admit_setup_import(
             operation: Some(Box::new(active)),
         });
     }
-    if !resolve_repo_import_baseline(db, &repo.id)
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .is_pending()
-    {
+    if !repo_import_baseline_is_pending_read_only(db, &repo.id).map_err(import_read_error)? {
         return Ok(SetupAdmission::Busy {
             message: "repository import baseline is not pending; refusing implicit full replay"
                 .into(),
@@ -884,9 +942,17 @@ async fn admit_setup_import(
                     operation: Some(Box::new(active)),
                 });
             }
-            if let Some(g) = reposync_core::busy::try_acquire(&repo.id) {
+            if let Some(g) =
+                reposync_core::busy::try_acquire_pair(&repo.id, &setup_workdir_key(state))
+            {
                 guard = Some(g);
                 break;
+            }
+            if reposync_core::busy::is_busy(&setup_workdir_key(state)) {
+                return Ok(SetupAdmission::Busy {
+                    message: "Another setup operation is using the shared checkout".into(),
+                    operation: None,
+                });
             }
             if attempt == 0 {
                 info!(repo_id = %repo.id, "waiting for in-flight writer before setup import");
@@ -904,15 +970,21 @@ async fn admit_setup_import(
         }
     };
 
-    let workdir = state.config.daemon.data_dir.join("git-repo");
-    let fingerprint = import_target_fingerprint(&repo, &workdir);
+    let config = setup_config(state)?;
+    if !target_matches(state, &repo, &config)? {
+        return Ok(SetupAdmission::Busy {
+            message: TARGET_MISMATCH.into(),
+            operation: None,
+        });
+    }
     let operation = db
-        .create_import_operation(&repo.id, user_id, &request_id, &fingerprint)
+        .create_setup_import_operation(&repo, user_id, &request_id, &config.daemon.data_dir)
         .map_err(import_write_error)?;
     Ok(SetupAdmission::Ready {
         repo: Box::new(repo),
         operation: Box::new(operation),
         busy_guard,
+        config: Box::new(config),
     })
 }
 
@@ -959,12 +1031,25 @@ impl Drop for SetupPreparationGuard<'_> {
     }
 }
 
+#[derive(Deserialize)]
+struct StartImportQuery {
+    expected_repository_id: Option<String>,
+}
+
 async fn start_import(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<StartImportQuery>,
 ) -> Result<Json<ImportActionResponse>, AppError> {
     let user_id = setup_auth(&state, &headers).await?;
-    match admit_setup_import(&state, &headers, &user_id).await? {
+    match admit_setup_import(
+        &state,
+        &headers,
+        &user_id,
+        query.expected_repository_id.as_deref(),
+    )
+    .await?
+    {
         SetupAdmission::AlreadyRecorded(operation) => Ok(Json(ImportActionResponse {
             ok: true,
             message: "Import request already recorded".into(),
@@ -978,6 +1063,7 @@ async fn start_import(
             repo,
             operation,
             busy_guard,
+            config,
         } => {
             let operation_id = operation.id.clone();
             let mut preparation_guard = SetupPreparationGuard {
@@ -987,15 +1073,24 @@ async fn start_import(
                 armed: true,
             };
 
-            {
+            let signal = {
                 let mut p = state.import_progress.write().await;
                 *p = ImportProgress::default();
+                p.setup_operation_id = Some(operation_id.clone());
                 p.phase = ImportPhase::Importing;
                 p.started_at = Some(chrono::Utc::now().to_rfc3339());
-            }
+                p.cancel_signal.clone()
+            };
 
-            if let Err(e) =
-                spawn_import_task(&state, repo.id.clone(), operation_id.clone(), busy_guard).await
+            if let Err(e) = spawn_import_task(
+                &state,
+                repo.id.clone(),
+                operation_id.clone(),
+                busy_guard,
+                signal,
+                *config,
+            )
+            .await
             {
                 {
                     let mut p = state.import_progress.write().await;
@@ -1018,75 +1113,283 @@ async fn start_import(
     }
 }
 
+// Repository imports use a different workdir even when the repository and actor
+// are the same. Old setup operations have the global workdir in their fingerprint.
+fn is_setup_operation(
+    state: &AppState,
+    repo: &Repository,
+    op: &ImportOperation,
+    live: &ImportProgress,
+) -> bool {
+    op.operation_type == "full_import"
+        && (live.setup_operation_id.as_deref() == Some(op.id.as_str())
+            || op.target_fingerprint
+                == import_target_fingerprint(repo, &state.config.daemon.data_dir.join("git-repo")))
+}
+
+fn import_read_error(error: DatabaseError) -> AppError {
+    AppError::Internal(format!("could not read setup import state: {error}"))
+}
+
 async fn import_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
     setup_auth(&state, &headers).await?;
-    let mut progress = state.import_progress.read().await.clone();
-    if progress.phase == ImportPhase::Idle {
-        if let Ok(Some(db_progress)) = state.db.load_import_progress() {
-            if db_progress.phase != ImportPhase::Idle {
-                progress = db_progress;
-            }
-        }
-    }
-    let repo = state
+    let live = state.import_progress.read().await;
+    let owner = match state
         .db
-        .list_repositories()
-        .ok()
-        .and_then(|repos| repos.into_iter().next());
-    let op = repo.as_ref().and_then(|repo| {
+        .observe_setup_import_ownership(&state.config.daemon.data_dir)
+        .map_err(import_read_error)?
+    {
+        SetupImportOwnership::Owned(owner) => Some(owner),
+        SetupImportOwnership::Unclaimed => None,
+        SetupImportOwnership::Ambiguous => {
+            let mut status = overlay_setup_import_status(&ImportProgress::default(), None, None);
+            status["busy"] = true.into();
+            status["can_start"] = false.into();
+            status["can_cancel"] = false.into();
+            status["has_worker_progress"] = false.into();
+            status["start_blocked_reason"] = AMBIGUOUS_SETUP.into();
+            return Ok(Json(status));
+        }
+    };
+    let setup_held = owner.as_ref().is_some_and(|owner| owner.blocks_admission());
+    let repo = if let Some(owner) = owner.as_ref().filter(|_| setup_held) {
+        state
+            .db
+            .get_repository(&owner.operation.repo_id)
+            .map_err(import_read_error)?
+    } else {
+        state
+            .db
+            .list_repositories()
+            .map_err(import_read_error)?
+            .into_iter()
+            .next()
+    };
+    let active = if let Some(repo) = &repo {
         state
             .db
             .active_import_operation(&repo.id)
-            .ok()
-            .flatten()
-            .or_else(|| state.db.latest_import_operation(&repo.id).ok().flatten())
-    });
-    Ok(Json(overlay_setup_import_status(
+            .map_err(import_read_error)?
+    } else {
+        None
+    };
+    let mut start_blocked_reason = None;
+    let can_start = match &repo {
+        Some(repo)
+            if !setup_held
+                && active.is_none()
+                && !setup_import_phase_busy(&live.phase)
+                && !reposync_core::busy::is_busy(&repo.id)
+                && !reposync_core::busy::is_busy(&setup_workdir_key(&state)) =>
+        {
+            if !repo_import_baseline_is_pending_read_only(&state.db, &repo.id)
+                .map_err(import_read_error)?
+            {
+                false
+            } else if target_matches(&state, repo, &setup_config(&state)?)? {
+                true
+            } else {
+                start_blocked_reason = Some(TARGET_MISMATCH);
+                false
+            }
+        }
+        _ => false,
+    };
+    let fallback_active = active.is_some();
+    let observed = match (owner.as_ref(), active, &repo) {
+        (Some(_), _, _) => None,
+        (None, None, Some(repo)) => state
+            .db
+            .latest_import_operation(&repo.id)
+            .map_err(import_read_error)?,
+        (None, active, _) => active,
+    };
+    let (setup, holds_slot) = if let Some(owner) = &owner {
+        (Some(&owner.operation), owner.holds_slot)
+    } else {
+        let fallback = observed.as_ref().filter(|op| {
+            repo.as_ref()
+                .is_some_and(|repo| is_setup_operation(&state, repo, op, &live))
+        });
+        (fallback, fallback_active)
+    };
+    let can_cancel = holds_slot
+        && setup.is_some_and(|op| {
+            matches!(
+                op.state,
+                ImportOperationState::Queued | ImportOperationState::Running
+            )
+        });
+    // A singleton progress row can outlive its worker. Only attach counters or
+    // errors to a durable operation when their in-process owner matches.
+    let has_worker_progress =
+        setup.is_some_and(|op| live.setup_operation_id.as_deref() == Some(&op.id));
+    let mut historical_phase = None;
+    let progress = match setup.or(observed.as_ref()) {
+        Some(_) if has_worker_progress => live.clone(),
+        Some(_) => ImportProgress::default(),
+        None if live.setup_operation_id.is_some()
+            || (!setup_import_phase_busy(&live.phase)
+                && state
+                    .db
+                    .has_any_import_operation_history()
+                    .map_err(import_read_error)?) =>
+        {
+            ImportProgress::default()
+        }
+        None if live.phase == ImportPhase::Idle => {
+            let saved = state
+                .db
+                .load_import_progress()
+                .map_err(import_read_error)?
+                .unwrap_or_default();
+            if setup_import_phase_busy(&saved.phase) {
+                // The pre-journal singleton records a previous phase. It cannot
+                // establish a live worker or supply current progress after restart.
+                historical_phase = Some(saved.phase);
+                ImportProgress::default()
+            } else {
+                saved
+            }
+        }
+        None => live.clone(),
+    };
+    let mut status = overlay_setup_import_status(
         &progress,
-        op.as_ref(),
-        repo.as_ref().map(|r| r.id.as_str()),
-    )))
+        setup,
+        setup
+            .map(|op| op.repo_id.as_str())
+            .or_else(|| repo.as_ref().map(|r| r.id.as_str())),
+    );
+    if setup_import_phase_busy(&live.phase)
+        || observed.as_ref().is_some_and(|op| !op.state.is_terminal())
+    {
+        status["busy"] = true.into();
+    }
+    if let Some(phase) = historical_phase {
+        status["historical_phase"] = serde_json::json!(phase);
+    }
+    if let Some(reason) = start_blocked_reason {
+        status["start_blocked_reason"] = reason.into();
+    }
+    if let Some(op) = setup {
+        status["operation_repository_id"] = op.repo_id.as_str().into();
+    }
+    if let Some(target) = repo.as_ref().filter(|_| can_start) {
+        status["start_repository_id"] = target.id.as_str().into();
+        status["start_repository_name"] = target.name.as_str().into();
+    }
+    status["has_worker_progress"] = has_worker_progress.into();
+    status["can_start"] = can_start.into();
+    status["can_cancel"] = can_cancel.into();
+    Ok(Json(status))
+}
+
+#[derive(Deserialize)]
+struct CancelImportQuery {
+    operation_id: Option<String>,
 }
 
 async fn cancel_import(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<CancelImportQuery>,
 ) -> Result<Json<ImportActionResponse>, AppError> {
     setup_auth(&state, &headers).await?;
-    if let Ok(repo) = setup_repository(&state.db) {
-        if let Some(active) = state
+    // A successor cannot install its signal while this guard is held. The
+    // database separately compares the requested ID inside its write transaction.
+    let mut live = state.import_progress.write().await;
+    let owner = match state
+        .db
+        .observe_setup_import_ownership(&state.config.daemon.data_dir)
+        .map_err(import_read_error)?
+    {
+        SetupImportOwnership::Owned(owner) => Some(owner),
+        SetupImportOwnership::Unclaimed => None,
+        SetupImportOwnership::Ambiguous => {
+            return Ok(action_response(false, AMBIGUOUS_SETUP, None))
+        }
+    };
+    let op = if let Some(owner) = owner {
+        // An explicit pointer remains authoritative even if the repository
+        // was renamed, reordered or edited since registration.
+        Some(owner.operation)
+    } else if let Some(repo) = state
+        .db
+        .list_repositories()
+        .map_err(import_read_error)?
+        .into_iter()
+        .next()
+    {
+        let active = state
             .db
             .active_import_operation(&repo.id)
-            .map_err(|e| AppError::Internal(e.to_string()))?
-        {
-            let op = state
+            .map_err(import_read_error)?;
+        let observed = match (active, &query.operation_id) {
+            (None, Some(_)) => state
                 .db
-                .request_import_cancel(&repo.id, &active.id)
-                .map_err(import_write_error)?;
-            if !op.state.is_terminal() {
-                let mut p = state.import_progress.write().await;
-                p.cancel_requested = true;
-                p.cancel_signal.store(true, Ordering::Release);
-            }
-            return Ok(Json(ImportActionResponse {
-                ok: true,
-                message: if op.state.is_terminal() {
-                    "terminal outcome retained; published history is not undone".into()
-                } else {
-                    "cancellation durably requested; worker still stopping; published history is not undone".into()
-                },
-                operation_id: Some(op.id.clone()),
-                lifecycle: Some(op.state),
-            }));
+                .latest_import_operation(&repo.id)
+                .map_err(import_read_error)?
+                .filter(|op| op.state.is_terminal()),
+            (active, _) => active,
+        };
+        if observed
+            .as_ref()
+            .is_some_and(|op| !is_setup_operation(&state, &repo, op, &live))
+        {
+            return Ok(action_response(
+                false,
+                "The selected setup import is not current",
+                None,
+            ));
         }
+        observed
+    } else {
+        None
+    };
+    if let Some(op) = op {
+        if query.operation_id.as_ref().is_some_and(|id| id != &op.id) {
+            return Ok(action_response(
+                false,
+                "The selected setup import is not current",
+                None,
+            ));
+        }
+        let op = if op.state.is_terminal() || op.cancel_requested {
+            op
+        } else {
+            state
+                .db
+                .request_import_cancel(&op.repo_id, &op.id)
+                .map_err(import_write_error)?
+        };
+        if op.state.is_terminal() {
+            return Ok(action_response(
+                true,
+                "terminal outcome retained; published history is not undone",
+                Some(&op),
+            ));
+        }
+        if live.setup_operation_id.as_deref() == Some(&op.id) {
+            live.cancel_signal.store(true, Ordering::Release);
+        }
+        return Ok(action_response(
+            true,
+            "cancellation durably requested; published history is not undone",
+            Some(&op),
+        ));
     }
-    let mut p = state.import_progress.write().await;
-    if setup_import_phase_busy(&p.phase) {
-        p.cancel_requested = true;
-        p.cancel_signal.store(true, Ordering::Release);
+    // Older clients could cancel a pre-journal setup phase. Never use this
+    // unbound fallback for a request carrying a durable operation ID.
+    if query.operation_id.is_none()
+        && live.setup_operation_id.is_none()
+        && setup_import_phase_busy(&live.phase)
+    {
+        live.cancel_requested = true;
+        live.cancel_signal.store(true, Ordering::Release);
         Ok(action_response(
             true,
             "Cancellation requested; published history is not undone",
@@ -1095,7 +1398,7 @@ async fn cancel_import(
     } else {
         Ok(action_response(
             false,
-            "No import is currently running",
+            "No matching setup import is currently running",
             None,
         ))
     }
@@ -1114,13 +1417,10 @@ async fn spawn_import_task(
     state: &Arc<AppState>,
     repo_id: String,
     operation_id: String,
-    busy_guard: BusyGuard,
+    busy_guard: PairBusyGuard,
+    cancel_signal: Arc<AtomicBool>,
+    mut config: AppConfig,
 ) -> Result<(), AppError> {
-    // Load config from file
-    let config_content = std::fs::read_to_string(&state.config_path)
-        .map_err(|e| AppError::Internal(format!("failed to read config: {}", e)))?;
-    let mut config: AppConfig = toml::from_str(&config_content)
-        .map_err(|e| AppError::Internal(format!("failed to parse config: {}", e)))?;
     config
         .resolve_env_vars()
         .map_err(|e| AppError::Internal(format!("failed to resolve env vars: {}", e)))?;
@@ -1144,21 +1444,16 @@ async fn spawn_import_task(
         .clone()
         .or(db_svn_password)
         .unwrap_or_default();
-    let svn_import_url = {
-        let base = config.svn.url.trim_end_matches('/');
-        let trunk = if config.svn.trunk_path.is_empty() {
+    let svn_import_url = reposync_core::svn::operand::configured_branch_url(
+        &config.svn.url,
+        if config.svn.trunk_path.is_empty() {
             "trunk"
         } else {
             &config.svn.trunk_path
-        };
-        if trunk.is_empty() || trunk == "/" {
-            base.to_string()
-        } else {
-            format!("{}/{}", base, trunk.trim_start_matches('/'))
-        }
-    };
+        },
+    )
+    .map_err(|error| AppError::BadRequest(redact_vcs_error_detail(&error.to_string())))?;
     info!(svn_import_url = %svn_import_url, "SVN import URL");
-    let cancel_signal = state.import_progress.read().await.cancel_signal.clone();
     let svn_client = SvnClient::new(&svn_import_url, &config.svn.username, &svn_password)
         .with_cancel_signal(cancel_signal.clone());
 
@@ -1218,36 +1513,38 @@ async fn spawn_import_task(
         let import_db = &worker_state.db;
         let _busy_guard = busy_guard;
         let mut unpersisted_detail = None;
-        let current = import_db.get_import_operation(&worker_repo_id, &worker_operation_id);
-        let result = match current {
-            Ok(Some(op)) if op.cancel_requested => {
-                Ok(import::ImportOutcome::Cancelled { commits: 0 })
+        let result = match import_db.start_import_operation(&worker_repo_id, &worker_operation_id) {
+            Ok(_) => {
+                import::run_full_import(
+                    &svn_client,
+                    &git_client,
+                    &identity_mapper,
+                    import_db,
+                    &file_policy,
+                    &import_config,
+                    import::ImportRunState {
+                        progress: progress.clone(),
+                        ws_broadcast: ws_broadcast.clone(),
+                        repo_id: Some(worker_repo_id.clone()),
+                        operation_id: Some(worker_operation_id.clone()),
+                        cancel_signal: Some(worker_cancel),
+                    },
+                )
+                .await
             }
-            Ok(Some(_)) => {
-                match import_db.start_import_operation(&worker_repo_id, &worker_operation_id) {
-                    Ok(_) => {
-                        import::run_full_import(
-                            &svn_client,
-                            &git_client,
-                            &identity_mapper,
-                            import_db,
-                            &file_policy,
-                            &import_config,
-                            import::ImportRunState {
-                                progress: progress.clone(),
-                                ws_broadcast: ws_broadcast.clone(),
-                                repo_id: Some(worker_repo_id.clone()),
-                                operation_id: Some(worker_operation_id.clone()),
-                                cancel_signal: Some(worker_cancel),
-                            },
-                        )
-                        .await
-                    }
-                    Err(e) => Err(e.into()),
+            Err(error) => match import_db
+                .get_import_operation(&worker_repo_id, &worker_operation_id)
+            {
+                Ok(Some(op))
+                    if matches!(
+                        op.state,
+                        ImportOperationState::CancelRequested | ImportOperationState::Cancelling
+                    ) =>
+                {
+                    Ok(import::ImportOutcome::Cancelled { commits: 0 })
                 }
-            }
-            Ok(None) => Err(anyhow::anyhow!("operation disappeared before start")),
-            Err(e) => Err(e.into()),
+                _ => Err(error.into()),
+            },
         };
 
         let terminal = match result {
@@ -1382,35 +1679,51 @@ async fn reset_and_reimport(
     let user_id = require_admin(&state, &headers).await?;
 
     let repo = setup_repository(&state.db)?;
-    if let Some(active) = state
+    // Reserve the shared checkout before inspecting holds or performing any
+    // preparation. Keep both guards through terminal worker cleanup.
+    let reservation = reposync_core::busy::try_acquire_pair(&repo.id, &setup_workdir_key(&state));
+    match state
+        .db
+        .observe_setup_import_ownership(&state.config.daemon.data_dir)
+        .map_err(import_read_error)?
+    {
+        SetupImportOwnership::Ambiguous => {
+            return Ok(action_response(false, AMBIGUOUS_SETUP, None))
+        }
+        SetupImportOwnership::Owned(owner) if owner.blocks_admission() => {
+            return Ok(action_response(
+                false,
+                "setup import is active or held; inspect or cancel before reset",
+                Some(&owner.operation),
+            ))
+        }
+        _ => {}
+    }
+    if let Some(op) = state
         .db
         .active_import_operation(&repo.id)
-        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_err(import_read_error)?
     {
         return Ok(action_response(
             false,
             "import is active or held; inspect or cancel before reset",
-            Some(&active),
+            Some(&op),
         ));
     }
-    {
-        let p = state.import_progress.read().await;
-        if setup_import_phase_busy(&p.phase) || reposync_core::busy::is_busy(&repo.id) {
-            return Ok(action_response(false, "An import is already running", None));
-        }
-    }
-
-    let busy_guard = match reposync_core::busy::try_acquire(&repo.id) {
-        Some(guard) => guard,
-        None => {
-            return Ok(action_response(
-                false,
-                "A sync cycle is currently running for this repository. Please retry in a moment.",
-                None,
-            ));
-        }
+    let Some(busy_guard) = reservation else {
+        return Ok(action_response(
+            false,
+            "Another writer is using the setup checkout or repository",
+            None,
+        ));
     };
-
+    if setup_import_phase_busy(&state.import_progress.read().await.phase) {
+        return Ok(action_response(false, "An import is already running", None));
+    }
+    let mut config = setup_config(&state)?;
+    if !target_matches(&state, &repo, &config)? {
+        return Ok(action_response(false, TARGET_MISMATCH, None));
+    }
     // Set phase to Connecting immediately — this pauses the scheduler
     {
         let mut p = state.import_progress.write().await;
@@ -1421,10 +1734,6 @@ async fn reset_and_reimport(
     }
 
     // Load config to find paths and git remote info
-    let config_content = std::fs::read_to_string(&state.config_path)
-        .map_err(|e| AppError::Internal(format!("failed to read config: {}", e)))?;
-    let mut config: AppConfig = toml::from_str(&config_content)
-        .map_err(|e| AppError::Internal(format!("failed to parse config: {}", e)))?;
     config
         .resolve_env_vars()
         .map_err(|e| AppError::Internal(format!("failed to resolve env vars: {}", e)))?;
@@ -1543,10 +1852,9 @@ async fn reset_and_reimport(
 
     // 5. Enroll a durable operation after destructive prep, then spawn.
     let request_id = format!("setup-reset-{}", Uuid::new_v4());
-    let fingerprint = import_target_fingerprint(&repo, &git_repo_path);
     let operation = state
         .db
-        .create_import_operation(&repo.id, &user_id, &request_id, &fingerprint)
+        .create_setup_import_operation(&repo, &user_id, &request_id, &config.daemon.data_dir)
         .map_err(import_write_error)?;
     let operation_id = operation.id.clone();
     let mut preparation_guard = SetupPreparationGuard {
@@ -1555,14 +1863,23 @@ async fn reset_and_reimport(
         operation_id: operation_id.clone(),
         armed: true,
     };
-    {
+    let signal = {
         let mut p = state.import_progress.write().await;
+        p.setup_operation_id = Some(operation_id.clone());
         p.phase = ImportPhase::Importing;
         p.push_log("[info] Starting full SVN import from revision 0...".into());
-    }
+        p.cancel_signal.clone()
+    };
 
-    if let Err(e) =
-        spawn_import_task(&state, repo.id.clone(), operation_id.clone(), busy_guard).await
+    if let Err(e) = spawn_import_task(
+        &state,
+        repo.id.clone(),
+        operation_id.clone(),
+        busy_guard,
+        signal,
+        config,
+    )
+    .await
     {
         {
             let mut p = state.import_progress.write().await;
@@ -1783,14 +2100,24 @@ mod setup_import_failure_tests {
             repo_import_progress: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             login_attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
             import_handles: tokio::sync::Mutex::new(Vec::new()),
+            scheduler_service: std::sync::Mutex::new(crate::SchedulerServiceState::running()),
         });
         let opens = Arc::new(AtomicUsize::new(0));
         let _tracing = tracing::subscriber::set_default(OpenSubscriber {
             opens: opens.clone(),
         });
-        let busy = reposync_core::busy::try_acquire("setup-repo").unwrap();
-        if let Err(error) =
-            spawn_import_task(&state, "setup-repo".into(), operation.id.clone(), busy).await
+        let busy =
+            reposync_core::busy::try_acquire_pair("setup-repo", &super::setup_workdir_key(&state))
+                .unwrap();
+        if let Err(error) = spawn_import_task(
+            &state,
+            "setup-repo".into(),
+            operation.id.clone(),
+            busy,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            super::setup_config(&state).unwrap_or_else(|error| panic!("{}", app_error_text(error))),
+        )
+        .await
         {
             panic!(
                 "setup import worker was not started: {}",

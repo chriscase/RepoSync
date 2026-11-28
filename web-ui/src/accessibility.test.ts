@@ -1,0 +1,19 @@
+import { describe, it, expect } from 'vitest';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { ConfirmModal } from './components/ConfirmModal';
+import ImportProgressMeter from './components/ImportProgressMeter';
+import { importProgressView } from './importProgress';
+import ImportModeFields from './components/ImportModeFields';
+
+const input={phase:'importing' as const,current_rev:21,total_revs:100,lifecycle:'running' as const};
+describe('#121 meaningful progress and error semantics (browser focus is separately tested)',()=>{
+ it.each([0,-1,NaN,Infinity])('leaves total %s indeterminate rather than fabricating zero progress',total=>{const view=importProgressView({...input,total_revs:total});expect(view.percent).toBeUndefined();expect(view.description).toContain('not yet measurable')});
+ it.each([-1,101,NaN])('does not clamp an unsupported current revision %s into a measured claim',current=>expect(importProgressView({...input,current_rev:current}).percent).toBeUndefined());
+ it('does not announce every revision or log update, but does announce coarse progress and cancellation',()=>{expect(importProgressView(input).announcement).toBe(importProgressView({...input,current_rev:29}).announcement);expect(importProgressView({...input,current_rev:30}).announcement).not.toBe(importProgressView(input).announcement);expect(importProgressView({...input,lifecycle:'cancelling'}).announcement).toContain('cancelling')});
+ it('announces an import phase change even while its lifecycle remains running',()=>{expect(importProgressView({...input,phase:'verifying'}).announcement).not.toBe(importProgressView(input).announcement)});
+ it('reports exact bounded integer percentages without floating-point undercount',()=>{expect(importProgressView({...input,current_rev:29}).percent).toBe(29);expect(importProgressView({...input,current_rev:Number.MAX_SAFE_INTEGER,total_revs:Number.MAX_SAFE_INTEGER}).percent).toBe(100);expect(importProgressView({...input,current_rev:Number.MAX_SAFE_INTEGER-1,total_revs:Number.MAX_SAFE_INTEGER}).percent).toBe(99)});
+ it('renders a named native meter with state and a separate polite coarse status',()=>{const html=renderToStaticMarkup(createElement(ImportProgressMeter,{status:input,name:'Fixture'}));expect(html).toContain('<progress');expect(html).toContain('value="21"');expect(html).toContain('SVN import progress — Fixture');expect(html).toContain('aria-valuetext="running — importing: 21%"');expect(html).toContain('role="status"');expect(html).toContain('20% of reported revisions')});
+ it('binds the revision error to the actual labelled control',()=>{const html=renderToStaticMarkup(createElement(ImportModeFields,{mode:'snapshot',svnRevision:'not-a-revision',onModeChange:()=>{},onRevisionChange:()=>{}}));const control=html.match(/<input[^>]*aria-invalid="true"[^>]*>/)?.[0];expect(control).toBeTruthy();const errorId=control?.match(/aria-describedby="([^"]+)"/)?.[1];expect(errorId).toBeTruthy();expect(html).toContain(`id="${errorId}" role="alert"`);expect(html).toContain(`for="${control?.match(/ id="([^"]+)"/)?.[1]}"`)});
+ it('uses independent title/description identities and disables both busy actions',()=>{const html=renderToStaticMarkup(createElement('div',null,...['One','Two'].map(title=>createElement(ConfirmModal,{key:title,isOpen:true,title,message:'Synthetic only',busy:true,onConfirm:()=>{},onCancel:()=>{}}))));const labels=[...html.matchAll(/aria-labelledby="([^"]+)"/g)].map(m=>m[1]);expect(labels).toHaveLength(2);expect(new Set(labels).size).toBe(2);for(const label of labels)expect(html).toContain(`id="${label}"`);expect((html.match(/aria-describedby=/g)||[])).toHaveLength(2);expect((html.match(/disabled=""/g)||[])).toHaveLength(4);expect(html).not.toContain(' open=')});
+});

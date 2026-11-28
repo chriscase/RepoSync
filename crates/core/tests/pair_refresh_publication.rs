@@ -4,7 +4,6 @@
 
 use std::net::TcpListener;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +18,8 @@ use reposync_core::pair_refresh::publication::{
 
 #[path = "fixtures/owned_process_group.rs"]
 mod fixture_process;
+#[path = "fixtures/image_hook.rs"]
+mod image_hook;
 use fixture_process::OwnedProcessGroup;
 
 #[test]
@@ -91,6 +92,11 @@ impl Daemon {
                         // Keep the reserved listener for the entire fixture.
                         // Each connection runs real Git's smart protocol with
                         // the same receive-pack hooks and old-tip checks.
+                        let stderr = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(root.join("receive-pack-stderr.txt"))
+                            .unwrap();
                         let child = OwnedProcessGroup::spawn(
                             Command::new("git")
                                 .args([
@@ -103,7 +109,7 @@ impl Daemon {
                                 .arg(&root)
                                 .stdin(Stdio::from(input))
                                 .stdout(Stdio::from(output))
-                                .stderr(Stdio::null()),
+                                .stderr(Stdio::from(stderr)),
                         )
                         .unwrap();
                         children.push(child);
@@ -210,10 +216,15 @@ impl Fixture {
         self.target.refname_to_id("refs/heads/child").unwrap()
     }
 
-    fn hook(&self, script: &str) {
-        let path = self.target.path().join("hooks/pre-receive");
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fn receive_pack_stderr(&self) -> String {
+        match std::fs::read(self._temp.path().join("receive-pack-stderr.txt")) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) => format!("stderr unavailable: {error}"),
+        }
+    }
+
+    fn hook(&self, script: (&str, &str)) {
+        image_hook::install(self.target.path(), "pre-receive", script);
     }
 }
 
@@ -259,19 +270,37 @@ fn second_parent_drift_refuses_even_though_update_is_fast_forward() {
 #[test]
 fn ref_move_after_advertisement_is_rejected_by_receive_pack() {
     let fixture = Fixture::new();
-    fixture.hook(&format!(
-        "#!/bin/sh\nenv -u GIT_QUARANTINE_PATH git update-ref refs/heads/child {}\n",
-        fixture.initial
-    ));
-    assert!(fixture.publish().is_err());
+    std::fs::write(
+        fixture.target.path().join("hooks/ref-move-target"),
+        fixture.initial.to_string(),
+    )
+    .unwrap();
+    fixture.hook(image_hook::script::REF_MOVE);
+    let before = fixture.tip();
+    let published = fixture.publish();
+    let after = fixture.tip();
+    assert!(
+        published.is_err(),
+        "publish={published:?} before={before} after={after} {} stderr={}",
+        exec_witness("hook", &fixture.target.path().join("hooks/pre-receive")),
+        fixture.receive_pack_stderr()
+    );
     assert_eq!(fixture.tip(), fixture.initial);
 }
 
 #[test]
 fn receiver_rejection_is_not_a_publication_receipt() {
     let fixture = Fixture::new();
-    fixture.hook("#!/bin/sh\nexit 1\n");
-    assert!(fixture.publish().is_err());
+    fixture.hook(image_hook::script::REJECT);
+    let before = fixture.tip();
+    let published = fixture.publish();
+    let after = fixture.tip();
+    assert!(
+        published.is_err(),
+        "publish={published:?} before={before} after={after} {} stderr={}",
+        exec_witness("hook", &fixture.target.path().join("hooks/pre-receive")),
+        fixture.receive_pack_stderr()
+    );
     assert_eq!(fixture.tip(), fixture.child);
 }
 
@@ -486,11 +515,8 @@ impl Fixture {
 #[test]
 fn recovery_old_tip_is_only_not_observed_and_never_runs_receive_pack() {
     let fixture = Fixture::new();
-    let witness = fixture._temp.path().join("receive-pack-witness");
-    fixture.hook(&format!(
-        "#!/bin/sh\nprintf 'write\\n' > '{}'\nexit 1\n",
-        witness.display()
-    ));
+    let witness = fixture.target.path().join("hooks/witness");
+    fixture.hook(image_hook::script::WITNESS_REJECT);
     assert_eq!(
         fixture.observe().unwrap(),
         GitPublicationObservation::NotObserved
@@ -504,11 +530,8 @@ fn recovery_of_missing_receipt_observes_result_without_second_write_or_local_ref
     let fixture = Fixture::new();
     // Ignore the returned publication receipt, then recover only by reading.
     let _ = fixture.publish().unwrap();
-    let witness = fixture._temp.path().join("second-write-witness");
-    fixture.hook(&format!(
-        "#!/bin/sh\nprintf 'retry\\n' > '{}'\nexit 1\n",
-        witness.display()
-    ));
+    let witness = fixture.target.path().join("hooks/witness");
+    fixture.hook(image_hook::script::WITNESS_REJECT);
     let refs = || {
         fixture
             .source
@@ -623,4 +646,26 @@ fn recovery_invalid_pins_are_refused_before_dialing() {
         );
         assert_eq!(fixture.tip(), fixture.child);
     }
+}
+
+fn exec_witness(label: &str, path: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map(|meta| format!("{:o}", meta.permissions().mode()))
+        .unwrap_or_else(|error| format!("metadata {error}"));
+    let test_x = std::process::Command::new("test")
+        .arg("-x")
+        .arg(path)
+        .status()
+        .map(|status| {
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into())
+        })
+        .unwrap_or_else(|error| format!("spawn {error}"));
+    format!(
+        "{label} path={} mode={mode} test_x={test_x}",
+        path.display()
+    )
 }

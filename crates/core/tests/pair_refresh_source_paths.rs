@@ -118,12 +118,44 @@ async fn real_svn_aliases_are_not_admitted_as_distinct_nodes() {
             .info()
             .await
             .unwrap();
-        let aliased = reposync_core::svn::SvnClient::new(format!("{root}/{alias}"), "", "")
-            .info()
-            .await
+        // Independent SVN CLI control proves these spellings really alias the
+        // same node. The shared client intentionally refuses empty components;
+        // it must not be used to manufacture this noncanonical witness.
+        let alias_url = format!("{root}/{alias}@");
+        let output = std::process::Command::new("svn")
+            .args([
+                "info",
+                "--xml",
+                "--non-interactive",
+                "--no-auth-cache",
+                "--",
+                &alias_url,
+            ])
+            .output()
             .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let aliased =
+            reposync_core::svn::parse_svn_info(std::str::from_utf8(&output.stdout).unwrap())
+                .unwrap();
         assert_eq!(original.url, aliased.url);
         assert_eq!(original.uuid, aliased.uuid);
+        let guarded = reposync_core::svn::SvnClient::new(format!("{root}/{alias}"), "", "")
+            .info()
+            .await;
+        if alias.contains("//") {
+            assert!(
+                matches!(guarded, Err(reposync_core::errors::SvnError::WorkingCopyError { ref detail, .. }) if detail == "empty SVN URL path component"),
+                "client must refuse the alias before command dispatch: {guarded:?}"
+            );
+        } else {
+            let observed = guarded.unwrap();
+            assert_eq!(observed.url, original.url);
+            assert_eq!(observed.uuid, original.uuid);
+        }
         let f = job::Fixture::new();
         f.db.set_state("encryption_key", &"41".repeat(32)).unwrap();
         f.db.conn().execute("UPDATE repositories SET git_repo='owner/repo',git_api_url='https://git.example/api/v1',svn_url=?1,svn_branch=CASE WHEN id='child' THEN ?2 ELSE ?3 END",[root.as_str(),alias,canonical]).unwrap();

@@ -1,0 +1,63 @@
+/* RepoSync #263 option "guide": shell arrangement and component styling.
+   Concept: a task-led layout for people who visit occasionally. Four large workspace
+   destinations, everything else behind one "Account and admin" control that sits at the end of
+   the same row, plain-language cards, large targets, and a bottom bar on a phone.
+   Tab order equals reading order: the four destinations, the control, then what it opens. */
+[data-rs-layout='guide'] .shell-nav { position: sticky; top: 0; z-index: 4; border-bottom-width: 1px; }
+[data-rs-layout='guide'] .shell-nav-inner { max-width: 1080px; margin: 0 auto; padding-block: 10px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+[data-rs-layout='guide'] .shell-nav-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+[data-rs-layout='guide'] .shell-nav-row::after { content: ""; flex-basis: 100%; height: 0; order: 5; }
+[data-rs-layout='guide'] .shell-brand, [data-rs-layout='guide'] .shell-links, [data-rs-layout='guide'] .shell-account { display: contents; }
+[data-rs-layout='guide'] .shell-logo { order: 1; }
+[data-rs-layout='guide'] .shell-brand-name { order: 2; font-size: 1.1em; }
+[data-rs-layout='guide'] .shell-group[data-group='workspace'] { order: 3; margin: 0 auto; }
+[data-rs-layout='guide'] .shell-group[data-group='workspace'] .shell-group-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+[data-rs-layout='guide'] .shell-group[data-group='workspace'] .shell-group-links { display: flex; align-items: center; gap: 4px; background: var(--rs-shell-hover); padding: 4px; border-radius: 999px; }
+[data-rs-layout='guide'] .rs-shell-link { padding: 0.5em 1.05em; border-radius: 999px; }
+[data-rs-layout='guide'] .rs-shell-link--active, [data-rs-layout='guide'] .rs-shell-link--active:hover { background: var(--rs-shell-accent); color: var(--rs-shell-accent-text); }
+[data-rs-layout='guide'] .shell-menu { display: inline-flex; border-radius: 999px; padding: 0.5em 0.9em; background: var(--rs-shell-chrome); }
+[data-rs-layout='guide'] .shell-status { order: 4; }
+[data-rs-layout='guide'] .shell-group[data-group='account'], [data-rs-layout='guide'] .shell-group[data-group='administration'],
+[data-rs-layout='guide'] .shell-user, [data-rs-layout='guide'] .shell-chooser, [data-rs-layout='guide'] .shell-logout { display: none; }
+[data-rs-layout='guide'][data-nav-open] .shell-group[data-group='account'] { display: grid; order: 6; flex: 1 1 200px; align-content: start; gap: 6px; padding-top: 12px; border-top: 1px solid var(--rs-shell-border); }
+[data-rs-layout='guide'][data-nav-open] .shell-group[data-group='administration'] { display: grid; order: 7; flex: 2 1 320px; align-content: start; gap: 6px; padding-top: 12px; border-top: 1px solid var(--rs-shell-border); }
+[data-rs-layout='guide'][data-nav-open] .shell-group[data-group='account'] .shell-group-links, [data-rs-layout='guide'][data-nav-open] .shell-group[data-group='administration'] .shell-group-links { display: grid; gap: 2px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); }
+[data-rs-layout='guide'][data-nav-open] .shell-group[data-group='account'] .rs-shell-link, [data-rs-layout='guide'][data-nav-open] .shell-group[data-group='administration'] .rs-shell-link { border-radius: var(--rs-radius); padding: 0.6em 0.7em; }
+[data-rs-layout='guide'][data-nav-open] .shell-group[data-group='account'] .rs-shell-link:hover, [data-rs-layout='guide'][data-nav-open] .shell-group[data-group='administration'] .rs-shell-link:hover { background: var(--rs-shell-hover); }
+[data-rs-layout='guide'][data-nav-open] .shell-user { display: block; order: 8; flex-basis: 100%; padding-top: 10px; border-top: 1px solid var(--rs-shell-border); }
+[data-rs-layout='guide'][data-nav-open] .shell-chooser { display: flex; order: 9; }
+[data-rs-layout='guide'][data-nav-open] .shell-logout { display: inline-block; order: 10; margin-left: auto; }
+[data-rs-layout='guide'] .shell-main { max-width: 1080px; margin: 0 auto; padding-block: 28px 72px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+@media (max-width: 760px) {
+  /* Top bar: logo, name, status. Bottom bar: the four destinations and "More". "More" opens the rest under the top bar. */
+  [data-rs-layout='guide'] .shell-group[data-group='workspace'] { position: fixed; left: 0; right: 0; bottom: 0; z-index: 5; margin: 0; background: var(--rs-shell-chrome); border-top: 1px solid var(--rs-shell-border); padding: 6px max(8px, env(safe-area-inset-right, 0px)) calc(6px + env(safe-area-inset-bottom, 0px)) max(8px, env(safe-area-inset-left, 0px)); }
+  [data-rs-layout='guide'] .shell-group[data-group='workspace'] .shell-group-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  [data-rs-layout='guide'] .shell-group[data-group='workspace'] .shell-group-links { display: flex; gap: 0; background: none; padding: 0; border-radius: 0; }
+  [data-rs-layout='guide'] .shell-group[data-group='workspace'] .rs-shell-link, [data-rs-layout='guide'] .shell-menu { position: relative; flex: 1 1 0; min-width: 0; display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-size: 0.68em; padding: 0.45em 0; }
+  [data-rs-layout='guide'] .shell-menu { border-color: transparent; background: none; }
+  [data-rs-layout='guide'] .shell-group[data-group='workspace'] .nav-ic, [data-rs-layout='guide'] .shell-menu .ic { display: block; width: 1.9em; height: 1.9em; }
+  [data-rs-layout='guide'] .shell-menu .lbl-long { display: none; }
+  [data-rs-layout='guide'] .shell-menu .lbl-short { display: inline; }
+  [data-rs-layout='guide'] .shell-group[data-group='workspace'] .shell-count { position: absolute; top: 1px; left: calc(50% + 0.5em); margin: 0; }
+  [data-rs-layout='guide'] .shell-group[data-group='workspace'] .rs-shell-link, [data-rs-layout='guide'] .shell-menu { border-radius: 12px; }
+  [data-rs-layout='guide'] .shell-status { margin-left: auto; }
+  [data-rs-layout='guide'] .shell-main { padding-bottom: 104px; }
+}
+
+/* components */
+[data-rs-layout='guide'] .btn { border-radius: 999px; }
+[data-rs-layout='guide'] .seg, [data-rs-layout='guide'] .seg button { border-radius: 999px; }
+[data-rs-layout='guide'] .seg { padding: 3px; gap: 2px; background: var(--rs-surface-3); border-color: transparent; }
+[data-rs-layout='guide'] .seg button { border-left: 0; background: transparent; }
+[data-rs-layout='guide'] .seg button[aria-pressed="true"] { background: var(--rs-accent); }
+[data-rs-layout='guide'] .bn { border-color: transparent; border-radius: var(--rs-radius-lg); padding: 14px 16px; }
+[data-rs-layout='guide'] .tbl th { text-transform: none; letter-spacing: 0; font-size: 0.86em; border-bottom-color: var(--rs-line); }
+[data-rs-layout='guide'] .pg-sections { gap: 8px; padding-bottom: 2px; }
+[data-rs-layout='guide'] .pg-sections a { border: 1px solid var(--rs-line-strong); border-radius: 999px; background: var(--rs-surface); padding: 0.45em 1em; }
+[data-rs-layout='guide'] .pg-sections a[aria-current] { background: var(--rs-accent); border-color: var(--rs-accent); color: var(--rs-accent-text); }
+[data-rs-layout='guide'] .pg-status { background: var(--rs-surface); border: 1px solid var(--rs-line); border-radius: var(--rs-radius-lg); padding: var(--rs-pad); }
+[data-rs-layout='guide'] .statline .v { font-weight: 700; }
+[data-rs-layout='guide'] .dash > [data-b='attn'] .attn-list { display: grid; gap: var(--rs-gap); grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); }
+[data-rs-layout='guide'] .fleet h2 { font-size: 1.35rem; }
+/* the two opened groups start at the same height */
+[data-rs-layout='guide'][data-nav-open] .shell-group[data-group='account'], [data-rs-layout='guide'][data-nav-open] .shell-group[data-group='administration'] { align-self: flex-start; }

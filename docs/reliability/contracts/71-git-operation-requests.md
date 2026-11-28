@@ -1,8 +1,8 @@
 # #71 slice: manual operation request and workflow docs
 
-This is the smallest product slice of issue #71. It does **not** close #71 or
-#61. Auto-triggered refresh, live webhooks, hook installation, and live branch
-rules are not in this change.
+The manual client and opt-in workflow implement the request and status portion
+of [#71](https://github.com/chriscase/RepoSync/issues/71). The operator guide
+includes commands for [checking status](../git-workflows.md#checking-status).
 
 ## What shipped
 
@@ -13,29 +13,44 @@ rules are not in this change.
 | Manual client | `scripts/git_operation_request.py` calls the authenticated API |
 | Manual workflow | `.github/workflows/git-operation-request.yml` is `workflow_dispatch` only |
 | Branch policy | Recommendation text only. No ruleset was applied |
-| Refresh execute | Not invented. Client reports `refresh_execute_not_implemented` |
-| Webhooks, hook install, push trigger | Not delivered |
+| Refresh execute | The client checks the v1 preview and its eligibility before submission. Local execution approved through RepoSync has a separate [execution contract](69-pair-refresh-execution-v2.md). |
+| Optional local hooks | Preview, install, inspect or remove the two clone-local guards using the [operator guide](../git-workflows.md#local-hooks). |
+| Webhooks and push trigger | Not delivered |
 
-The client pins `repo_id`, `pair_id`, expected tips, `plan_digest`, and an
-idempotency key. It polls only an existing same-origin `/api/` status path
-that contains the pinned id. Import cancel and import/SVN-commit status use
-the routes that already exist. Refresh cancel authenticates and then reports
-that no durable refresh job exists.
+The preview uses the parent and child IDs, expected tips, plan digest and
+idempotency key. For a named operation, status checks the identity and state
+returned by the server. Import exposes the latest journal for a repository.
+SVN commit and Git push expose individual journals. For a v2 refresh, use
+the original request ID and child ID. The response contains a separate
+operation UUID. A refresh status request without either ID repeats a preview.
+
+Loss of the submission acknowledgement leaves acceptance unknown. A generic
+HTTP error can also follow partial publication. The client reports the
+attempted request and its original pins and key. A supplied operation pin is
+reported separately from an ID confirmed by the server.
+Polling after an accepted submission requires a recognized route in the
+pinned repository or pair and the same operation ID in the reply. A failed
+lookup or polling limit exits nonzero and preserves the accepted ID. A
+verified terminal failure, cancellation or reconciliation hold also exits
+nonzero. A direct status read can succeed and report any of those states.
+Import cancellation uses the existing cancellation route. The manual client
+reports `cancel_not_applicable` for refresh.
 
 ## Tests
 
-`python3 scripts/test_git_operation_request.py` uses a loopback HTTP stub.
+`python3 scripts/test_git_operation_request.py` runs the client against a
+loopback HTTP stub. It covers named status, a superseded import, receipt and
+operation ID mismatches, malformed replies, interrupted polling and terminal
+states. It also exercises the existing preview pins, import cancellation,
+connection failures and redaction. The workflow is checked statically for
+manual dispatch, input wiring and read-only repository permissions.
 
-Covered: authorized preview, import status, and import cancel; wrong repo,
-pair, and token; stale approval; repeated request and a moved digest; an
-idempotency key reused for another pair; untrusted branch text with zero HTTP
-calls; a refused connection; a redirect that must not receive the bearer
-token; redaction of the token and of URLs.
-
-Not run: live GitHub Actions secrets, a self-hosted enterprise runner, or a
-production RepoSync. The workflow file is checked statically for
-`workflow_dispatch`, `contents: read`, and the absence of a pull-request
-trigger. Hosted-runner network policy is documented, not exercised.
+`cargo test -p reposync-web --test truthful_status rs71_operator_status_reads_named_journals -- --exact`
+runs the Python command against the regular import, Git-push and SVN-commit
+HTTP routes on loopback. The fixture creates two successive import journals,
+a held Git push and a running SVN commit in disposable SQLite storage. It
+checks the process exit code, returned ID and state, and compares stored
+journal values before and after the reads.
 
 ## Authority
 

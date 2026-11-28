@@ -114,15 +114,8 @@ pub async fn reconcile_held_external_writes_with_resolved_credentials(
             "automatic reconciliation SVN credential explicitly revoked".into(),
         ));
     }
-    let url = if repo.svn_branch.is_empty() {
-        repo.svn_url.clone()
-    } else {
-        format!(
-            "{}/{}",
-            repo.svn_url.trim_end_matches('/'),
-            repo.svn_branch.trim_start_matches('/')
-        )
-    };
+    let url = crate::svn::operand::configured_branch_url(&repo.svn_url, &repo.svn_branch)
+        .map_err(|error| DatabaseError::Other(error.to_string()))?;
     let svn = SvnClient::new(
         &url,
         &repo.svn_username,

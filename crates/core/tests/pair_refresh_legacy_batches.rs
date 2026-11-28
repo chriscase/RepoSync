@@ -1,4 +1,7 @@
 //! Exercise the legacy import caller at actual publication boundaries.
+#[path = "fixtures/image_hook.rs"]
+mod image_hook;
+
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -108,11 +111,8 @@ impl Fixture {
         }
     }
 
-    fn hook(&self, script: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let path = self.dir.path().join("origin.git/hooks/pre-receive");
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fn hook(&self, script: (&str, &str)) {
+        image_hook::install(&self.dir.path().join("origin.git"), "pre-receive", script);
     }
 
     async fn run(&self) -> anyhow::Result<ImportOutcome> {
@@ -161,8 +161,19 @@ impl Fixture {
 #[tokio::test]
 async fn rejected_intermediate_batch_is_an_error_with_one_attempt_and_no_managed_receipt() {
     let f = Fixture::new(51);
-    f.hook("#!/bin/sh\nprintf x >> attempts\nexit 1\n");
-    let error = f.run().await.unwrap_err();
+    f.hook(image_hook::script::COUNT_REJECT);
+    let outcome = f.run().await;
+    let bare = f.dir.path().join("origin.git");
+    let witness = format!(
+        "{} {} {}",
+        exec_witness("hook", &bare.join("hooks/pre-receive")),
+        file_witness(&bare.join("attempts")),
+        file_witness(&bare.join("ready"))
+    );
+    let error = match outcome {
+        Err(error) => error,
+        Ok(completed) => panic!("intermediate batch completed; {witness}; completed {completed:?}"),
+    };
     assert!(
         format!("{error:#}")
             .contains("legacy Git publication outcome uncertain; writer window retained"),
@@ -189,7 +200,7 @@ async fn rejected_intermediate_batch_is_an_error_with_one_attempt_and_no_managed
 #[tokio::test]
 async fn cancellation_during_final_push_confirms_its_exact_tip_and_checkpoints_before_release() {
     let f = Fixture::new(1);
-    f.hook("#!/bin/sh\nprintf x >> attempts\n: > ready\ncount=0\nwhile [ ! -f release ]; do\n  count=$((count + 1))\n  [ \"$count\" -lt 1000 ] || exit 1\n  sleep 0.01\ndone\nexit 0\n");
+    f.hook(image_hook::script::COUNT_HOLD);
     let bare_path = f.dir.path().join("origin.git");
     let monitor_path = bare_path.clone();
     let cancelled = f.cancelled.clone();
@@ -198,7 +209,10 @@ async fn cancellation_during_final_push_confirms_its_exact_tip_and_checkpoints_b
         while !monitor_path.join("ready").exists() {
             assert!(
                 Instant::now() < deadline,
-                "publication barrier was never reached"
+                "publication barrier was never reached; {} {} {}",
+                exec_witness("hook", &monitor_path.join("hooks/pre-receive")),
+                file_witness(&monitor_path.join("ready")),
+                file_witness(&monitor_path.join("attempts"))
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -206,7 +220,15 @@ async fn cancellation_during_final_push_confirms_its_exact_tip_and_checkpoints_b
         std::fs::write(monitor_path.join("release"), b"release").unwrap();
     });
     let outcome = f.run().await;
-    monitor.join().unwrap();
+    let witness = format!(
+        "{} {} {}",
+        exec_witness("hook", &bare_path.join("hooks/pre-receive")),
+        file_witness(&bare_path.join("ready")),
+        file_witness(&bare_path.join("attempts"))
+    );
+    if let Err(panic) = monitor.join() {
+        panic!("monitor join failed; outcome={outcome:?}; {witness}; monitor_panic={panic:?}");
+    }
     let ImportOutcome::Completed {
         svn_rev,
         git_sha,
@@ -231,4 +253,37 @@ async fn cancellation_during_final_push_confirms_its_exact_tip_and_checkpoints_b
     assert_eq!(std::fs::read(bare_path.join("attempts")).unwrap(), b"x");
     assert!(f.windows().is_empty());
     drop(f.db.begin_ordinary_writer_window(None).unwrap());
+}
+
+fn exec_witness(label: &str, path: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map(|meta| format!("{:o}", meta.permissions().mode()))
+        .unwrap_or_else(|error| format!("metadata {error}"));
+    let test_x = std::process::Command::new("test")
+        .arg("-x")
+        .arg(path)
+        .status()
+        .map(|status| {
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into())
+        })
+        .unwrap_or_else(|error| format!("spawn {error}"));
+    format!(
+        "{label} path={} mode={mode} test_x={test_x}",
+        path.display()
+    )
+}
+
+fn file_witness(path: &std::path::Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => format!(
+            "{} bytes={}",
+            path.display(),
+            String::from_utf8_lossy(&bytes)
+        ),
+        Err(error) => format!("{} absent ({error})", path.display()),
+    }
 }

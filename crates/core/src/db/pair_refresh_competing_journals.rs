@@ -144,9 +144,7 @@ pub(crate) fn require_globally_quiet(tx: &Connection) -> Result<(), DatabaseErro
                     "late_pair_publish_v1:" => {
                         typed::<super::late_pair_publish_operations::LatePairPublishOperation>(raw)?
                     }
-                    "managed_remove_v1:" => {
-                        typed::<super::managed_remove::ManagedRemoveOperation>(raw)?
-                    }
+                    "managed_remove_v1:" => super::managed_remove::validated_foreign_document(raw)?,
                     _ => return Err(refused("unsupported competing family")),
                 };
                 let owner_key = if kind == "late_pair_publish_v1:" {
@@ -170,7 +168,8 @@ pub(crate) fn require_globally_quiet(tx: &Connection) -> Result<(), DatabaseErro
                     "managed_remove_v1:" => operation_type == "managed_remove",
                     _ => false,
                 };
-                if document["version"] != 1
+                if (document["version"] != 1
+                    && !(kind == "managed_remove_v1:" && document["version"] == 2))
                     || document["id"] != id
                     || id.is_empty()
                     || !expected_type
@@ -361,5 +360,96 @@ mod tests {
             &serde_json::to_string(&op).unwrap(),
         );
         assert!(require_globally_quiet(&conn).is_err());
+    }
+}
+
+#[cfg(test)]
+mod rs65_global_reader_tests {
+    use super::*;
+    use crate::db::managed_remove::{
+        native_completed_reader_fixture, reader_fixture_snapshot, ManagedRemoveState,
+    };
+    use crate::db::Database;
+
+    fn read_only(db: &Database, quiet: bool) {
+        let conn = db.conn();
+        let before = reader_fixture_snapshot(&conn);
+        let result = require_globally_quiet(&conn);
+        assert_eq!(result.is_ok(), quiet, "{result:?}");
+        assert_eq!(
+            reader_fixture_snapshot(&conn),
+            before,
+            "global quiet reader must not repair, adopt or erase evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn rs65_global_reader_accepts_genuine_v2_and_legacy_v1_without_mutation() {
+        for version in [1, 2] {
+            let (db, op, _owned) = native_completed_reader_fixture(version).await;
+            read_only(&db, true);
+            assert!(db.get_repository(&op.repo_id).unwrap().is_none());
+            assert!(
+                db.removal_tombstone(&op.repo_id).unwrap().is_some(),
+                "the real producer's tombstone must remain present"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rs65_global_reader_refuses_malformed_history_pointer_and_tombstone_correspondence() {
+        let (db, op, _owned) = native_completed_reader_fixture(2).await;
+        let key = format!("managed_remove_v1:document:{}", op.id);
+        let original = db.get_state(&key).unwrap().unwrap();
+        for raw in ["{malformed".into(),original.replacen("\"version\":2","\"version\":3",1),original.replacen("\"version\":2","\"version\":1",1),original.replacen("\"policy\":","\"unknown_nested\":true,\"policy\":",1),original.replacen("\"policy\":\"reviewed_managed_removal_v2\"","\"policy\":\"reviewed_managed_removal_v2\",\"policy\":\"reviewed_managed_removal_v2\"",1)] {
+            db.set_state(&key,&raw).unwrap();read_only(&db,false);
+        }
+        db.set_state(&key, &original).unwrap();
+        let active = format!("managed_remove_v1:active:{}", op.repo_id);
+        db.set_state(&active, &op.id).unwrap();
+        read_only(&db, false);
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key=?1", [&active])
+            .unwrap();
+        let latest = format!("managed_remove_v1:latest:{}", op.repo_id);
+        db.set_state(&latest, "missing-document").unwrap();
+        read_only(&db, false);
+        db.set_state(&latest, &op.id).unwrap();
+        let mut unfinished = op.clone();
+        unfinished.id = uuid::Uuid::new_v4().to_string();
+        unfinished.state = ManagedRemoveState::Running;
+        let progress = unfinished.reviewed.as_mut().unwrap();
+        progress.cleanup_completed = false;
+        progress.git.operation_marker = format!("{}:git", unfinished.id);
+        progress.svn.operation_marker = format!("{}:svn", unfinished.id);
+        let orphan = format!("managed_remove_v1:document:{}", unfinished.id);
+        db.set_state(&orphan, &serde_json::to_string(&unfinished).unwrap())
+            .unwrap();
+        read_only(&db, false);
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key=?1", [&orphan])
+            .unwrap();
+        let tombstone = format!("managed_remove_v1:tombstone:{}", op.repo_id);
+        let original_tombstone = db.get_state(&tombstone).unwrap().unwrap();
+        let mut wrong: serde_json::Value = serde_json::from_str(&original_tombstone).unwrap();
+        wrong["operation_id"] = serde_json::json!("missing-document");
+        db.set_state(&tombstone, &wrong.to_string()).unwrap();
+        read_only(&db, false);
+        db.set_state(&tombstone, &original_tombstone).unwrap();
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key=?1", [&key])
+            .unwrap();
+        read_only(&db, false);
+        db.set_state(&key, &original).unwrap();
+        read_only(&db, true);
+        // Only the managed-removal family gained v2 support. A separately typed
+        // legacy import document still refuses if its version alone becomes 2.
+        let foreign = serde_json::json!({"version":2,"id":"foreign-import","repo_id":"foreign-owner","operation_type":"full_import","initiator_id":"admin","request_id":"request","target_fingerprint":"a".repeat(64),"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","state":"completed","cancel_requested":false});
+        db.set_state(
+            "import_operation_v1:document:foreign-import",
+            &foreign.to_string(),
+        )
+        .unwrap();
+        read_only(&db, false);
     }
 }

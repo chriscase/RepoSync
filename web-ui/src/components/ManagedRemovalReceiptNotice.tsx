@@ -13,10 +13,11 @@ export default function ManagedRemovalReceiptNotice({ receipt }: { receipt: Mana
       className={`border rounded-lg p-4 text-sm ${tone}`}
       role="status"
     >
-      <p className="font-medium">{managedRemovalStateLabel(receipt.state)}</p>
+      <p className="font-medium">{receipt.archive_pair ? (completed ? 'Pair archived; survivor and history retained' : 'Pair archival in progress') : managedRemovalStateLabel(receipt.state, receipt.protocol)}</p>
       {receipt.message && <p className="mt-1">{receipt.message}</p>}
       <p className="mt-1 font-mono text-xs">Operation {receipt.operationId}</p>
-      {receipt.partial_cleanup && (
+      <a className="mt-2 inline-block underline" href={`/repos/${encodeURIComponent(receipt.repoId)}`}>{receipt.archive_pair ? 'View archived pair and history' : 'View removal status and recovery'}</a>
+      {!receipt.archive_pair && receipt.partial_cleanup && (
         <div
           data-testid="managed-removal-receipt-partial-cleanup"
           className="mt-2 text-xs border border-current/30 rounded p-2 space-y-1"

@@ -51,7 +51,7 @@ fn recovery_open_refuses_schema_or_journal_conversion_and_symlink_aliases() {
     db.ensure_repository_scope_schema_upgrade().unwrap();
     db.set_state("marker", "preserve").unwrap();
     let saved = state(&db);
-    for version in [12, 14] {
+    for version in [12, 13, 15] {
         db.conn()
             .pragma_update(None, "user_version", version)
             .unwrap();
@@ -64,7 +64,7 @@ fn recovery_open_refuses_schema_or_journal_conversion_and_symlink_aliases() {
         );
         assert_eq!(state(&db), saved);
     }
-    db.conn().pragma_update(None, "user_version", 13).unwrap();
+    db.conn().pragma_update(None, "user_version", 14).unwrap();
     let alias = temp.path().join("alias.db");
     std::os::unix::fs::symlink(&path, &alias).unwrap();
     assert!(Database::open_existing_for_pair_refresh_recovery(&alias).is_err());

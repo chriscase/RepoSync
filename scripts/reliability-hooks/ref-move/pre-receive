@@ -1,0 +1,2 @@
+#!/bin/sh
+env -u GIT_QUARANTINE_PATH git update-ref refs/heads/child "$(cat hooks/ref-move-target)"

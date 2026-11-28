@@ -3,6 +3,7 @@
 use anyhow::Result;
 
 use reposync_core::db::Database;
+use reposync_core::file_policy::FilePolicy;
 use reposync_core::personal_config::PersonalConfig;
 
 use super::style;
@@ -49,19 +50,24 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
     // 3. Database
     let db_path = data_dir.join("personal.db");
     if db_path.exists() {
-        match Database::new(&db_path) {
-            Ok(db) => {
-                let schema_ok = db.get_watermark("svn_rev").is_ok();
-                if schema_ok {
-                    println!("  {}", style::success("Database          OK"));
-                } else {
-                    println!("  {}", style::error("Database          Schema outdated"));
-                    issues.push("Re-run import to update database schema".to_string());
+        match Database::open_existing_read_only(&db_path) {
+            Ok(db) => match db.get_watermark("svn_rev") {
+                Ok(_) => println!("  {}", style::success("Database          OK")),
+                Err(error) => {
+                    println!(
+                        "  {}",
+                        style::error(&format!("Database          Read failed: {}", error))
+                    );
+                    issues.push(
+                        "Preserve storage and diagnose the failed database read.".to_string(),
+                    );
                 }
-            }
+            },
             Err(e) => {
                 println!("  {}", style::error(&format!("Database          {}", e)));
-                issues.push("Database is corrupted. Delete and re-import.".to_string());
+                issues.push(
+                    "Preserve storage and diagnose the refused database inspection.".to_string(),
+                );
             }
         }
     } else {
@@ -99,10 +105,17 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
     }
 
     // 6. Daemon status
-    match reposync_personal::daemon::is_running(data_dir) {
-        Ok(Some(pid)) => println!(
+    match reposync_personal::daemon::inspect_pid_file(data_dir) {
+        Ok(Some((pid, true))) => println!(
             "  {}",
             style::success(&format!("Daemon            Running (PID {})", pid))
+        ),
+        Ok(Some((pid, false))) => println!(
+            "  {}",
+            style::warn(&format!(
+                "Daemon            Not running (stale PID {})",
+                pid
+            ))
         ),
         Ok(None) => {
             println!("  {}", style::warn("Daemon            Not running"));
@@ -118,12 +131,12 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
 
     // 7. Watermark consistency
     let db_path = data_dir.join("personal.db");
-    if let Ok(db) = Database::new(&db_path) {
-        let svn_wm = db.get_watermark("svn_rev").ok().flatten();
-        let git_wm = db.get_watermark("git_sha").ok().flatten();
+    if let Ok(db) = Database::open_existing_read_only(&db_path) {
+        let svn_wm = db.get_watermark("svn_rev");
+        let git_wm = db.get_watermark("git_sha");
 
         match (svn_wm, git_wm) {
-            (Some(svn), Some(git)) => {
+            (Ok(Some(svn)), Ok(Some(git))) => {
                 let git_short = if git.len() > 7 { &git[..7] } else { &git };
                 println!(
                     "  {}",
@@ -133,16 +146,56 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
                     ))
                 );
             }
-            (None, None) => {
+            (Ok(None), Ok(None)) => {
                 println!(
                     "  {}",
                     style::dim("  ○ Watermarks        Not set (run import first)")
                 );
             }
+            (Err(error), _) | (_, Err(error)) => {
+                println!(
+                    "  {}",
+                    style::error(&format!("Watermarks        Read failed: {}", error))
+                );
+                issues.push("Preserve storage and diagnose the failed watermark read.".to_string());
+            }
             _ => {
                 println!("  {}", style::warn("Watermarks        Inconsistent"));
                 issues.push("Watermarks are out of sync. Run import to reset.".to_string());
             }
+        }
+    }
+
+    // 8. Git LFS, only when a threshold or pattern enables it.
+    let lfs = FilePolicy::from(&config.options);
+    if !lfs.lfs_enabled() {
+        println!("  {}", style::dim("  ○ Git LFS          Disabled"));
+    } else {
+        match reposync_core::lfs::preflight_check() {
+            Ok(version) => println!(
+                "  {}",
+                style::success(&format!("Git LFS           {version}"))
+            ),
+            Err(error) => {
+                println!("  {}", style::error(&format!("Git LFS           {error}")));
+                issues.push("Install git-lfs and confirm `git lfs version` succeeds.".to_string());
+            }
+        }
+        if git_path.join(".git").exists() {
+            match reposync_core::lfs::repo_lfs_ready(&git_path) {
+                Ok(clean) => println!(
+                    "  {}",
+                    style::success(&format!("LFS Repository    Ready ({clean})"))
+                ),
+                Err(error) => {
+                    println!("  {}", style::error(&format!("LFS Repository    {error}")));
+                    issues.push(
+                        "In the personal Git repository run: git lfs install --local".to_string(),
+                    );
+                }
+            }
+        } else {
+            println!("  {}", style::warn("LFS Repository    Not cloned yet"));
         }
     }
 

@@ -48,6 +48,34 @@ def load_pins(fixtures=FIXTURES):
     return pins
 
 
+def load_retired(fixtures=FIXTURES):
+    """Reviewed old identities that are intentionally absent from the candidate."""
+    def unique(pairs):
+        # A repeated key would silently replace a reviewed entry.
+        keys = [key for key, _ in pairs]
+        require(len(set(keys)) == len(keys), "duplicate key in retired-identity registry")
+        return dict(pairs)
+    data = json.loads((fixtures / "retired-test-identities.json").read_text(), object_pairs_hook=unique)
+    require(isinstance(data, dict) and data.get("schema") == 1, "unknown retired-identity schema")
+    retired = data.get("retired")
+    require(isinstance(retired, dict), "retired-identity registry is not an object")
+    for name, entry in retired.items():
+        require(isinstance(entry, dict) and set(entry) == {"disposition", "successors", "reason"},
+                f"malformed retired identity: {name}")
+        require(entry["disposition"] in ("moved", "renamed", "superseded", "duplicate_dropped"),
+                f"unknown retired disposition: {name}")
+        successors = entry["successors"]
+        require(isinstance(successors, list) and successors
+                and all(isinstance(s, str) and s for s in successors)
+                and len(set(successors)) == len(successors),
+                f"retired identity needs distinct successors: {name}")
+        require(name not in successors and not set(successors) & retired.keys(),
+                f"retired identity names a retired successor: {name}")
+        require(isinstance(entry["reason"], str) and entry["reason"].strip(),
+                f"retired identity needs a reason: {name}")
+    return retired
+
+
 def stage(root, source, fixtures=FIXTURES):
     pins = load_pins(fixtures)
     require(source in pins["sources"], f"no pinned lock mapping for {source}")
@@ -94,8 +122,20 @@ def compare(base_path, candidate_path, source, candidate_sha, output, fixtures=F
             require(report["source_tree"] == pin["source_tree"], "baseline execution tree mismatch")
     require(base["goal_sha256"] == candidate["goal_sha256"], "goal contract differs")
     old, new = base["tests"], candidate["tests"]
-    regressions = sorted(name for name, status in old.items()
-                         if status == "ok" and new.get(name) != "ok")
+    retired = load_retired(fixtures)
+    # A retired identity must really be gone; one that still runs is compared as usual.
+    stale = sorted(retired.keys() & new.keys())
+    require(not stale, f"retired identity is still in the candidate catalog: {stale}")
+    accounted, regressions = {}, []
+    for name, status in sorted(old.items()):
+        if status != "ok" or new.get(name) == "ok":
+            continue
+        entry = retired.get(name)
+        # Only an absence can be accounted for, and only by successors that passed in this run.
+        if entry and name not in new and all(new.get(s) == "ok" for s in entry["successors"]):
+            accounted[name] = {"disposition": entry["disposition"], "successors": entry["successors"]}
+        else:
+            regressions.append(name)
     candidate_failures = sorted(name for name, status in new.items() if status == "FAILED")
     report = {
         "outcome": "FAIL" if regressions or candidate_failures else "PASS",
@@ -108,9 +148,10 @@ def compare(base_path, candidate_path, source, candidate_sha, output, fixtures=F
         "base_catalog_count": len(old), "candidate_catalog_count": len(new),
         "newly_added_test_count": len(new.keys() - old.keys()),
         "regressions": regressions, "candidate_failures": candidate_failures,
+        "retired_identities_accounted": accounted,
         "known_base_failures": {n: new.get(n, "MISSING") for n, s in old.items() if s == "FAILED"},
         "known_base_ignored": {n: new.get(n, "MISSING") for n, s in old.items() if s == "ignored"},
-        "limitation": "Exact test identities only; no renamed-assertion equivalence or complete scenario qualification inferred.",
+        "limitation": "Exact test identities only. A reviewed retired identity is accepted when its listed successors passed; no other renamed-assertion equivalence or complete scenario qualification is inferred.",
     }
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps({k: report[k] for k in ("outcome", "base_head", "candidate_head", "regressions", "candidate_failures")}))
@@ -161,6 +202,61 @@ def self_test():
         require(not compare(old, new, source, "candidate-source", output), "candidate-only failure escaped")
         candidate["tests"] = {"different::test": "ok"}; new.write_text(json.dumps(candidate))
         require(not compare(old, new, source, "candidate-source", output), "missing old test escaped")
+
+        # Retired identities: only a listed absence whose successors all passed is accepted.
+        load_retired()
+        fixtures = root / "retired-fixtures"
+        shutil.copytree(FIXTURES, fixtures)
+        registry = fixtures / "retired-test-identities.json"
+        def retire(entries):
+            registry.write_text(json.dumps({"schema": 1, "retired": entries}))
+        def entry(*successors, disposition="renamed", reason="fixture"):
+            return {"disposition": disposition, "successors": list(successors), "reason": reason}
+        def run(tests):
+            candidate["tests"] = tests; new.write_text(json.dumps(candidate))
+            passed = compare(old, new, source, "candidate-source", output, fixtures)
+            return passed, json.loads(output.read_text())
+        retire({"ordinary::positive": entry("renamed::positive", "second::positive")})
+        passed, report = run({"renamed::positive": "ok", "second::positive": "ok"})
+        require(passed and report["regressions"] == [] and report["retired_identities_accounted"] == {
+            "ordinary::positive": {"disposition": "renamed", "successors": ["renamed::positive", "second::positive"]}},
+                "accounted retired identity was not accepted")
+        for description, tests in (
+                ("retired identity with a missing successor", {"renamed::positive": "ok"}),
+                ("retired identity with a failed successor", {"renamed::positive": "ok", "second::positive": "FAILED"}),
+                ("retired identity with an ignored successor", {"renamed::positive": "ok", "second::positive": "ignored"})):
+            passed, report = run(tests)
+            require(not passed and report["regressions"] == ["ordinary::positive"]
+                    and report["retired_identities_accounted"] == {}, f"accepted {description}")
+            print(f"PASS: rejected {description}")
+        for status in ("ok", "FAILED", "ignored"):
+            rejected(lambda: run({"ordinary::positive": status, "renamed::positive": "ok", "second::positive": "ok"}),
+                     f"retired identity still present as {status}")
+        retire({"unrelated::old": entry("renamed::positive")})
+        passed, report = run({"renamed::positive": "ok"})
+        require(not passed and report["regressions"] == ["ordinary::positive"], "unlisted missing old test escaped")
+        print("PASS: rejected unlisted missing old test beside an unrelated retired entry")
+        for description, entries in (
+                ("retired identity without successors", {"ordinary::positive": entry()}),
+                ("retired identity succeeding itself", {"ordinary::positive": entry("ordinary::positive")}),
+                ("retired identity with a retired successor", {"ordinary::positive": entry("other::old"), "other::old": entry("renamed::positive")}),
+                ("retired identity with duplicate successors", {"ordinary::positive": entry("renamed::positive", "renamed::positive")}),
+                ("retired identity without a reason", {"ordinary::positive": entry("renamed::positive", reason=" ")}),
+                ("retired identity with an unknown disposition", {"ordinary::positive": entry("renamed::positive", disposition="waived")}),
+                ("retired identity with an extra field", {"ordinary::positive": {**entry("renamed::positive"), "waive": True}}),
+                ("retired identity with non-list successors", {"ordinary::positive": {**entry(), "successors": "renamed::positive"}}),
+                ("retired identity that is not an object", {"ordinary::positive": ["renamed::positive"]})):
+            retire(entries)
+            rejected(lambda: load_retired(fixtures), description)
+        registry.write_text(json.dumps({"schema": 1, "retired": []}))
+        rejected(lambda: load_retired(fixtures), "retired-identity registry that is not an object")
+        one = json.dumps(entry("renamed::positive"))
+        registry.write_text('{"schema": 1, "retired": {"ordinary::positive": %s, "ordinary::positive": %s}}' % (one, one))
+        rejected(lambda: load_retired(fixtures), "duplicate retired identity")
+        registry.write_text(json.dumps({"schema": 2, "retired": {}}))
+        rejected(lambda: load_retired(fixtures), "unknown retired-identity schema")
+        registry.unlink()
+        rejected(lambda: load_retired(fixtures), "missing retired-identity registry")
     driver_self_test()
     print("Pinned-lock and driver controls: PASS (Docker stub only; no Cargo compilation)")
 

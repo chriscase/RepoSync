@@ -1,0 +1,12 @@
+# Parses, then AppConfig::validate rejects daemon.poll_interval_secs = 0.
+[daemon]
+poll_interval_secs = 0
+log_level = "info"
+data_dir = "/var/lib/reposync"
+
+[svn]
+url = "file:///var/lib/reposync/no-such-repo"
+username = "synthetic"
+
+[github]
+repo = "local/synthetic"

@@ -12,6 +12,7 @@ use crate::errors::DatabaseError;
 use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
 
 const PREFIX: &str = "svn_to_git_push_v1:";
+const MANAGED_PUSH_CONFIRMED: &str = "SVN-to-Git push verified and recorded";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +107,161 @@ pub fn git_push_target_fingerprint(repo_id: &str, git_remote: &str, git_branch: 
     })
     .to_string();
     hex::encode(Sha256::digest(source.as_bytes()))
+}
+
+/// Strong local evidence may veto copying a stale column. It cannot establish a replacement baseline.
+pub(super) fn later_finalized_svn_checkpoint(
+    tx: &Connection,
+    repo_id: &str,
+    column_revision: i64,
+) -> Result<Option<i64>, DatabaseError> {
+    use super::lineage_checkpoints::{
+        load_directional_checkpoint, load_mapping_outcome, svn_source_key, CheckpointDirection,
+        MappingOutcome,
+    };
+    use super::personal_scope::PERSONAL_SCOPE_KEY;
+    use super::repo_scope_identity::{
+        legacy_repo_echo_generation_kv_key, repo_echo_generation_kv_key,
+        LEGACY_REPO_ID_KV_READS_KEY,
+    };
+
+    if repo_id == PERSONAL_SCOPE_KEY {
+        return Ok(None);
+    }
+    let canonical_tables: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('canonical_lineage','canonical_checkpoints','canonical_mapping_outcomes')",
+        [], |r| r.get(0),
+    )?;
+    match canonical_tables {
+        0 => return Ok(None),
+        3 => (),
+        _ => {
+            return Err(DatabaseError::Other(
+                "cannot backfill SVN cursor: canonical checkpoint schema is incomplete".into(),
+            ))
+        }
+    }
+    let Some(id) = read_value(tx, &key("latest", repo_id))? else {
+        return Ok(None);
+    };
+    let raw = read_value(tx, &key("document", &id))?.ok_or_else(|| {
+        DatabaseError::Other(
+            "cannot backfill SVN cursor: latest SVN-to-Git push document is missing".into(),
+        )
+    })?;
+    let op = parse(&raw)?;
+    if op.repo_id != repo_id || op.id != id {
+        return Err(DatabaseError::Other(
+            "cannot backfill SVN cursor: latest SVN-to-Git push identity differs from its pointer"
+                .into(),
+        ));
+    }
+    if op.state != GitPushOperationState::Completed || op.source_svn_rev <= column_revision {
+        return Ok(None);
+    }
+    let registration: Option<(Option<String>, String, bool)> = tx
+        .query_row(
+            "SELECT scope_uuid, git_branch, EXISTS (
+             SELECT 1 FROM repositories other WHERE other.id<>r.id AND
+                (other.scope_uuid=r.scope_uuid OR other.id=r.scope_uuid OR other.scope_uuid=r.id))
+         FROM repositories r WHERE id=?1",
+            [repo_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((scope, branch, conflicting_owner)) = registration else {
+        return Ok(None);
+    };
+    if op.pre_push_git_remote.is_empty()
+        || op.pre_push_git_branch.is_empty()
+        || op.target_fingerprint
+            != git_push_target_fingerprint(
+                repo_id,
+                &op.pre_push_git_remote,
+                &op.pre_push_git_branch,
+            )
+    {
+        return Err(DatabaseError::Other(
+            "cannot backfill SVN cursor: completed SVN-to-Git push target fingerprint differs"
+                .into(),
+        ));
+    }
+    // Late-pair publications share the push journal but pin an explicit remote URL.
+    if op.pre_push_git_remote != "origin" || op.pre_push_git_branch != branch {
+        return Ok(None);
+    }
+    if read_value(tx, &key("active", repo_id))?.is_some() {
+        return Err(DatabaseError::Other("cannot backfill SVN cursor: latest completed SVN-to-Git push still has an active pointer".into()));
+    }
+    let scope = scope.ok_or_else(|| {
+        DatabaseError::Other("cannot backfill SVN cursor: repository scope UUID is missing".into())
+    })?;
+    if conflicting_owner
+        || !Uuid::parse_str(&scope).is_ok_and(|id| !id.is_nil() && id.to_string() == scope)
+    {
+        return Err(DatabaseError::Other(
+            "cannot backfill SVN cursor: repository scope UUID is invalid or ambiguous".into(),
+        ));
+    }
+    // Match the SHA-1 commit and tree supported by the managed finalizer.
+    let full_oid = |s: &str| {
+        s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) && s.bytes().any(|b| b != b'0')
+    };
+    if op.resume_authorized
+        || !full_oid(&op.intended_local_git_sha)
+        || !full_oid(&op.intended_local_git_tree)
+        || op.last_confirmed_git_sha.as_deref() != Some(&op.intended_local_git_sha)
+        || op.last_confirmed_git_tree.as_deref() != Some(&op.intended_local_git_tree)
+    {
+        return Err(DatabaseError::Other("cannot backfill SVN cursor: completed SVN-to-Git push has inconsistent target or confirmation".into()));
+    }
+    // Read the same active generation without allocating scope IDs or revoking legacy keys.
+    let generation: Option<String> = tx.query_row(
+        "SELECT COALESCE((SELECT value FROM kv_state WHERE key=?1),
+            (SELECT value FROM kv_state WHERE key=?2 AND (SELECT COUNT(*) FROM repositories)=1
+             AND (SELECT value FROM kv_state WHERE key=?3)='1'))",
+        params![
+            repo_echo_generation_kv_key(&scope),
+            legacy_repo_echo_generation_kv_key(repo_id),
+            LEGACY_REPO_ID_KV_READS_KEY
+        ],
+        |r| r.get(0),
+    )?;
+    let generation = match generation {
+        None => crate::pair_refresh::PAIR_GENERATION,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(generation) if generation > 0 => generation,
+            _ => {
+                return Err(DatabaseError::Other(
+                    "cannot backfill SVN cursor: invalid repository echo generation".into(),
+                ))
+            }
+        },
+    };
+    let direction = CheckpointDirection::SvnToGit;
+    let source = svn_source_key(op.source_svn_rev);
+    let checkpoint = load_directional_checkpoint(tx, &scope, generation, direction)?
+        .filter(|checkpoint| checkpoint.handled_source_key == source);
+    let mapping = load_mapping_outcome(tx, &scope, generation, direction, &source)?;
+    if (checkpoint.is_some() || mapping.is_some())
+        && (op.initiator_id != "team_worker"
+            || op.request_id != format!("svn-r{}", op.source_svn_rev)
+            || op.outcome_detail.as_deref() != Some(MANAGED_PUSH_CONFIRMED))
+    {
+        return Err(DatabaseError::Other("cannot backfill SVN cursor: completed SVN-to-Git push owner or confirmation conflicts with managed evidence".into()));
+    }
+    let applied = MappingOutcome::AppliedAndVerified;
+    match (checkpoint, mapping) {
+        (None, None) => Ok(None),
+        (Some(checkpoint), Some(mapping))
+            if checkpoint.outcome == applied && mapping.outcome == applied
+                && checkpoint.target_git_sha.as_deref() == Some(op.intended_local_git_sha.as_str())
+                && mapping.target_git_sha == checkpoint.target_git_sha
+                && checkpoint.target_svn_rev.is_none() && mapping.target_svn_rev.is_none() => Ok(Some(op.source_svn_rev)),
+        _ => Err(DatabaseError::Other(format!(
+            "cannot backfill SVN cursor: canonical checkpoint and mapping do not both corroborate the completed SVN-to-Git push at r{}", op.source_svn_rev
+        ))),
+    }
 }
 
 fn write_op(tx: &Connection, op: &GitPushOperation) -> Result<(), DatabaseError> {
@@ -218,6 +374,21 @@ fn finalize_tx(
             &svn_rev.to_string(),
         )?;
     }
+    if !removed {
+        crate::db::lineage_checkpoints::try_persist_directional_checkpoint_tx(
+            tx,
+            &op.repo_id,
+            crate::db::lineage_checkpoints::MappingWrite {
+                direction: crate::db::lineage_checkpoints::CheckpointDirection::SvnToGit,
+                source_key: &crate::db::lineage_checkpoints::svn_source_key(svn_rev),
+                outcome: crate::db::lineage_checkpoints::MappingOutcome::AppliedAndVerified,
+                target_git_sha: Some(git_sha),
+                target_svn_rev: None,
+                reason: None,
+                policy_snapshot: None,
+            },
+        )?;
+    }
     if removed {
         op.outcome_detail =
             Some("recorded after repository removal; registration was not restored".into());
@@ -228,7 +399,7 @@ fn finalize_tx(
     op.resume_authorized = false;
     op.updated_at = now;
     if !removed {
-        op.outcome_detail = Some("SVN-to-Git push verified and recorded".into());
+        op.outcome_detail = Some(MANAGED_PUSH_CONFIRMED.into());
     }
     write_op(tx, &op)?;
     clear_active(tx, &op.repo_id, &op.id)?;
@@ -354,6 +525,46 @@ impl Database {
         })
     }
 
+    /// Prove a direct first-parent step for bounded Personal PR discovery.
+    /// Match the original publisher, its confirmed target, mapping and receipt.
+    pub fn is_confirmed_personal_push(
+        &self,
+        branch: &str,
+        sha: &str,
+        tree: &str,
+        parent: &str,
+    ) -> Result<bool, DatabaseError> {
+        let scopes = super::personal_scope::personal_repo_ids_for_read(self)?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT d.key, d.value FROM kv_state d
+             JOIN commit_map m ON m.git_sha=?1 AND m.direction='svn_to_git'
+             JOIN sync_records r ON r.repo_id=m.repo_id AND r.svn_rev=m.svn_rev AND r.git_sha=m.git_sha
+             WHERE m.repo_id IN (?2,?3) AND r.direction='svn_to_git' AND r.status='applied'
+             AND d.key GLOB 'svn_to_git_push_v1:document:*'
+             AND json_extract(d.value,'$.repo_id')=m.repo_id
+             AND json_extract(d.value,'$.source_svn_rev')=m.svn_rev
+             AND json_extract(d.value,'$.last_confirmed_git_sha')=m.git_sha"
+        )?;
+        let mut rows = stmt.query(params![sha, scopes[0], scopes.get(1)])?;
+        let Some(row) = rows.next()? else {
+            return Ok(false);
+        };
+        let op = parse(&row.get::<_, String>(1)?)?;
+        let matching = row.get::<_, String>(0)? == key("document", &op.id)
+            && op.state == GitPushOperationState::Completed
+            && op.initiator_id == "personal_worker"
+            && op.pre_push_git_remote == "origin"
+            && op.pre_push_git_branch == branch
+            && op.target_fingerprint == git_push_target_fingerprint(&op.repo_id, "origin", branch)
+            && op.pre_push_git_sha == parent
+            && op.intended_local_git_parent.as_deref() == Some(parent)
+            && op.intended_local_git_sha == sha
+            && op.intended_local_git_tree == tree
+            && op.last_confirmed_git_tree.as_deref() == Some(tree);
+        Ok(matching && rows.next()?.is_none())
+    }
+
     pub fn latest_git_push_operation(
         &self,
         repo_id: &str,
@@ -406,7 +617,9 @@ impl Database {
         &self,
         intent: GitPushIntent<'_>,
     ) -> Result<GitPushOperation, DatabaseError> {
-        self.transaction(|tx| {
+        // Wait for the WAL writer before reading the fences and active intent.
+        // A deferred read transaction can fail immediately on the journal insert.
+        self.immediate_transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
                 tx,
                 intent.repo_id,
@@ -617,7 +830,9 @@ impl Database {
         observed_git_sha: &str,
         observed_git_tree: &str,
     ) -> Result<GitPushOperation, DatabaseError> {
-        self.transaction(|tx| {
+        // The Git ref has already advanced. Reserve the writer before reading
+        // the active operation and recording its receipt and checkpoints.
+        self.immediate_transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
@@ -704,7 +919,7 @@ impl Database {
     where
         F: FnOnce(&mut GitPushOperation) -> Result<(), DatabaseError>,
     {
-        self.transaction(|tx| {
+        self.immediate_transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             crate::writer_fence::require_current(tx)?;
             let active = key("active", repo_id);
@@ -821,6 +1036,8 @@ impl GitPushOperation {
 mod tests {
     use super::*;
 
+    mod contention_tests;
+
     fn sample_intent<'a>() -> GitPushIntent<'a> {
         GitPushIntent {
             repo_id: "pair",
@@ -917,6 +1134,74 @@ mod tests {
             None,
             "team-mode svn-to-git finalize must not write global last_git_hash"
         );
+        let conn = db.conn();
+        let scope = crate::db::repo_scope_identity::repository_scope_uuid(&conn, "pair").unwrap();
+        let generation = crate::echo_receipt_scope::repo_echo_generation_tx(&conn, "pair").unwrap();
+        let checkpoint = crate::db::lineage_checkpoints::load_directional_checkpoint(
+            &conn,
+            &scope,
+            generation,
+            crate::db::lineage_checkpoints::CheckpointDirection::SvnToGit,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            checkpoint.outcome,
+            crate::db::lineage_checkpoints::MappingOutcome::AppliedAndVerified
+        );
+        assert_eq!(
+            checkpoint.handled_source_key,
+            crate::db::lineage_checkpoints::svn_source_key(3)
+        );
+    }
+
+    #[test]
+    fn malformed_generation_refuses_finalize_without_legacy_advancement() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES ('pair','p','file:///svn','','','local','','repo','main','team',5,0,0,1,'t','t',2,'old','idle',0,0)",
+                [],
+            )
+            .unwrap();
+        crate::db::repo_scope_identity::migrate_v13_scope_uuid(&db.conn()).unwrap();
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), "pair").unwrap();
+        db.set_state(
+            &crate::db::repo_scope_identity::repo_echo_generation_kv_key(&scope),
+            "not-a-number",
+        )
+        .unwrap();
+        let op = db.begin_svn_to_git_push(sample_intent()).unwrap();
+        let err = db.confirm_svn_to_git_push(
+            "pair",
+            &op.id,
+            "dddddddddddddddddddddddddddddddddddddddd",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        );
+        assert!(err.is_err());
+        let still = db.get_git_push_operation("pair", &op.id).unwrap().unwrap();
+        assert_eq!(still.state, GitPushOperationState::Running);
+        assert_eq!(db.get_repo_watermark("pair").unwrap().0, 2);
+        let conn = db.conn();
+        assert!(crate::db::lineage_checkpoints::load_directional_checkpoint(
+            &conn,
+            &scope,
+            1,
+            crate::db::lineage_checkpoints::CheckpointDirection::SvnToGit,
+        )
+        .unwrap()
+        .is_none());
+        let maps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id='pair' AND svn_rev=3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(maps, 0);
     }
 
     #[test]
@@ -1000,5 +1285,873 @@ mod tests {
             .unwrap();
         assert_eq!(receipt, 1);
         assert_eq!(db.get_watermark("svn_rev").unwrap().as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn pr245_3_canonical_write_failure_is_atomic_after_reopen() {
+        let _writer_fence_test_lock = crate::writer_fence::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fx = pr245_3_prepare();
+        let (db, owner) =
+            Database::open_with_exclusive_owner(&fx.data_dir).expect("owned file-backed database");
+        pr245_3_assert_owned_file(&db, &fx.data_dir);
+        pr245_3_register(&db, &fx.repo_id, &fx.svn_root);
+        crate::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            &db,
+            &fx.repo_id,
+            &fx.svn_uuid,
+        )
+        .expect("svn uuid recorded before any revision");
+        let (scope, generation) = pr245_3_scope(&db, &fx.repo_id);
+        assert_eq!(generation, crate::pair_refresh::PAIR_GENERATION);
+        assert_eq!(pr245_3_canonical_tables(&db), 3);
+        assert_eq!(pr245_3_repo_row(&db, &fx.repo_id), (0, String::new(), 0));
+        assert!(pr245_3_scoped_git(&db, &fx.repo_id).is_none());
+        let native = pr245_3_native_effect(&fx);
+        assert_eq!(native.svn_rev, 1);
+        assert_eq!(native.bare_count, 2);
+        assert_eq!(native.effect_parent, native.baseline_sha);
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+            &db.conn(),
+            &fx.repo_id,
+            &native.baseline_sha,
+            &Utc::now().to_rfc3339(),
+        )
+        .expect("pre-push inbound cursor");
+        let op = db
+            .begin_svn_to_git_push(GitPushIntent {
+                repo_id: &fx.repo_id,
+                initiator_id: "pr245-3",
+                request_id: &native.request_id,
+                target_fingerprint: &native.fingerprint,
+                source_svn_rev: native.svn_rev,
+                source_svn_author: &native.svn_author,
+                source_svn_message: &native.svn_message,
+                pre_push_git_remote: "origin",
+                pre_push_git_branch: "main",
+                pre_push_git_sha: &native.baseline_sha,
+                pre_push_git_tree: Some(&native.baseline_tree),
+                intended_local_git_sha: &native.effect_sha,
+                intended_local_git_parent: Some(&native.effect_parent),
+                intended_local_git_tree: &native.effect_tree,
+            })
+            .expect("journal the observed push");
+        Uuid::parse_str(&op.id).expect("operation id is a real uuid");
+        assert_ne!(op.id, fx.repo_id);
+        let held = db
+            .hold_svn_to_git_reconciliation(
+                &fx.repo_id,
+                &op.id,
+                "native git result retained; canonical write not recorded",
+            )
+            .expect("hold for reconciliation");
+        assert_eq!(held.state, GitPushOperationState::ReconciliationRequired);
+        let source_key = crate::db::lineage_checkpoints::svn_source_key(native.svn_rev);
+        pr245_3_install_abort(
+            &db,
+            "pr245_3_svn_to_git_canonical_write",
+            &scope,
+            generation,
+            "svn_to_git",
+            &source_key,
+            "pr245-3-svn-to-git-canonical-write-abort",
+        );
+        let failed = db.finalize_verified_svn_to_git_push(
+            &fx.repo_id,
+            &op.id,
+            &native.effect_sha,
+            &native.effect_tree,
+            &native.fingerprint,
+        );
+        let failed = match failed {
+            Ok(done) => panic!(
+                "canonical write was not aborted: {:?}",
+                done.operation.state
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            failed
+                .to_string()
+                .contains("pr245-3-svn-to-git-canonical-write-abort"),
+            "{failed}"
+        );
+        pr245_3_assert_native(&fx, &native);
+        pr245_3_assert_unresolved(&db, &fx.repo_id, &op.id, &native, &scope, generation);
+        let (db, owner) = pr245_3_reopen(&fx.data_dir, db, owner);
+        pr245_3_assert_owned_file(&db, &fx.data_dir);
+        pr245_3_assert_native(&fx, &native);
+        pr245_3_assert_unresolved(&db, &fx.repo_id, &op.id, &native, &scope, generation);
+        assert_eq!(
+            pr245_3_trigger_count(&db, "pr245_3_svn_to_git_canonical_write"),
+            2,
+            "named fault must still be the persisted trigger after reopen"
+        );
+        pr245_3_drop_abort(&db, "pr245_3_svn_to_git_canonical_write");
+        assert_eq!(
+            pr245_3_trigger_count(&db, "pr245_3_svn_to_git_canonical_write"),
+            0
+        );
+        let done = db
+            .finalize_verified_svn_to_git_push(
+                &fx.repo_id,
+                &op.id,
+                &native.effect_sha,
+                &native.effect_tree,
+                &native.fingerprint,
+            )
+            .expect("same observed push finalizes after the named fault is gone");
+        assert!(done.finalized);
+        assert!(!done.resume_authorized);
+        pr245_3_assert_native(&fx, &native);
+        pr245_3_assert_resolved(&db, &fx.repo_id, &op.id, &native, &scope, generation);
+        let (db, owner) = pr245_3_reopen(&fx.data_dir, db, owner);
+        pr245_3_assert_native(&fx, &native);
+        pr245_3_assert_resolved(&db, &fx.repo_id, &op.id, &native, &scope, generation);
+        let repeated = db.finalize_verified_svn_to_git_push(
+            &fx.repo_id,
+            &op.id,
+            &native.effect_sha,
+            &native.effect_tree,
+            &native.fingerprint,
+        );
+        let repeated = match repeated {
+            Ok(done) => panic!("repeat finalized a second time: {:?}", done.operation.id),
+            Err(error) => error,
+        };
+        let repeated = repeated.to_string();
+        assert!(
+            repeated.contains("inactive"),
+            "repeat must be the inactive-operation refusal: {repeated}"
+        );
+        assert!(!repeated.contains("pr245-3-svn-to-git-canonical-write-abort"));
+        pr245_3_assert_native(&fx, &native);
+        pr245_3_assert_resolved(&db, &fx.repo_id, &op.id, &native, &scope, generation);
+        drop(db);
+        drop(owner);
+    }
+
+    struct Pr2453Fixture {
+        _root: tempfile::TempDir,
+        data_dir: std::path::PathBuf,
+        home: std::path::PathBuf,
+        svn_config: std::path::PathBuf,
+        svn_repo: std::path::PathBuf,
+        svn_root: String,
+        svn_uuid: String,
+        bare: std::path::PathBuf,
+        work: std::path::PathBuf,
+        repo_id: String,
+    }
+
+    struct Pr2453Native {
+        request_id: String,
+        svn_rev: i64,
+        svn_author: String,
+        svn_message: String,
+        baseline_sha: String,
+        baseline_tree: String,
+        effect_sha: String,
+        effect_tree: String,
+        effect_parent: String,
+        fingerprint: String,
+        bare_count: i64,
+        feature: Vec<u8>,
+    }
+
+    fn pr245_3_prepare() -> Pr2453Fixture {
+        let root = tempfile::tempdir().expect("private fixture root");
+        let repo_id = format!("pr245-{}", Uuid::new_v4());
+        let data_dir = root.path().join("data");
+        let home = root.path().join("home");
+        let svn_config = root.path().join("svn-config");
+        let svn_repo = root.path().join("svn");
+        let bare = root.path().join("bare.git");
+        let work = root.path().join("work");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&svn_config).unwrap();
+        std::fs::write(
+            svn_config.join("config"),
+            "[auth]\npassword-stores =\nstore-passwords = no\nstore-auth-creds = no\n",
+        )
+        .unwrap();
+        std::fs::write(
+            svn_config.join("servers"),
+            "[global]\nstore-passwords = no\nstore-plaintext-passwords = no\n",
+        )
+        .unwrap();
+        pr245_3_run(
+            "svnadmin",
+            &["create", svn_repo.to_str().unwrap()],
+            None,
+            &home,
+        );
+        let svn_uuid = pr245_3_run(
+            "svnlook",
+            &["uuid", svn_repo.to_str().unwrap()],
+            None,
+            &home,
+        );
+        assert!(Uuid::parse_str(&svn_uuid).is_ok());
+        assert!(Uuid::parse_str(&repo_id).is_err());
+        assert_eq!(
+            pr245_3_run(
+                "svnlook",
+                &["youngest", svn_repo.to_str().unwrap()],
+                None,
+                &home
+            ),
+            "0",
+            "svn identity is recorded before the source revision"
+        );
+        let svn_root = format!("file://{}", svn_repo.display());
+        Pr2453Fixture {
+            _root: root,
+            data_dir,
+            home,
+            svn_config,
+            svn_repo,
+            svn_root,
+            svn_uuid,
+            bare,
+            work,
+            repo_id,
+        }
+    }
+
+    fn pr245_3_native_effect(fx: &Pr2453Fixture) -> Pr2453Native {
+        let feature = b"feature\n".to_vec();
+        let seed = fx._root.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        std::fs::write(seed.join("feature.txt"), &feature).unwrap();
+        let trunk = format!("{}/trunk", fx.svn_root);
+        pr245_3_svn(
+            fx,
+            &["import", seed.to_str().unwrap(), &trunk, "-m", "feature"],
+        );
+        let svn_rev: i64 = pr245_3_run(
+            "svnlook",
+            &["youngest", fx.svn_repo.to_str().unwrap()],
+            None,
+            &fx.home,
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(svn_rev, 1);
+        let svn_author = pr245_3_run(
+            "svnlook",
+            &["author", "-r", "1", fx.svn_repo.to_str().unwrap()],
+            None,
+            &fx.home,
+        );
+        let svn_message = pr245_3_run(
+            "svnlook",
+            &["log", "-r", "1", fx.svn_repo.to_str().unwrap()],
+            None,
+            &fx.home,
+        );
+        let cat = pr245_3_stdout(
+            "svnlook",
+            &[
+                "cat",
+                "-r",
+                "1",
+                fx.svn_repo.to_str().unwrap(),
+                "trunk/feature.txt",
+            ],
+            None,
+            &fx.home,
+        );
+        assert_eq!(cat, feature);
+        assert!(!svn_author.is_empty());
+        assert_eq!(svn_message, "feature");
+        pr245_3_run(
+            "git",
+            &[
+                "init",
+                "--bare",
+                "--initial-branch",
+                "main",
+                fx.bare.to_str().unwrap(),
+            ],
+            None,
+            &fx.home,
+        );
+        pr245_3_run(
+            "git",
+            &[
+                "init",
+                "--initial-branch",
+                "main",
+                fx.work.to_str().unwrap(),
+            ],
+            None,
+            &fx.home,
+        );
+        pr245_3_run(
+            "git",
+            &["config", "user.name", "Fixture"],
+            Some(&fx.work),
+            &fx.home,
+        );
+        pr245_3_run(
+            "git",
+            &["config", "user.email", "fixture@example.invalid"],
+            Some(&fx.work),
+            &fx.home,
+        );
+        std::fs::write(fx.work.join("base.txt"), b"base\n").unwrap();
+        pr245_3_run("git", &["add", "base.txt"], Some(&fx.work), &fx.home);
+        pr245_3_run(
+            "git",
+            &["commit", "-m", "baseline"],
+            Some(&fx.work),
+            &fx.home,
+        );
+        let baseline_sha = pr245_3_run("git", &["rev-parse", "HEAD"], Some(&fx.work), &fx.home);
+        let baseline_tree = pr245_3_run(
+            "git",
+            &["rev-parse", "HEAD^{tree}"],
+            Some(&fx.work),
+            &fx.home,
+        );
+        std::fs::write(fx.work.join("feature.txt"), &feature).unwrap();
+        pr245_3_run("git", &["add", "feature.txt"], Some(&fx.work), &fx.home);
+        pr245_3_run(
+            "git",
+            &["commit", "-m", "feature"],
+            Some(&fx.work),
+            &fx.home,
+        );
+        let effect_sha = pr245_3_run("git", &["rev-parse", "HEAD"], Some(&fx.work), &fx.home);
+        let effect_tree = pr245_3_run(
+            "git",
+            &["rev-parse", "HEAD^{tree}"],
+            Some(&fx.work),
+            &fx.home,
+        );
+        let effect_parent = pr245_3_run("git", &["rev-parse", "HEAD^"], Some(&fx.work), &fx.home);
+        assert_eq!(effect_parent, baseline_sha);
+        assert_ne!(effect_sha, baseline_sha);
+        pr245_3_run(
+            "git",
+            &["remote", "add", "origin", fx.bare.to_str().unwrap()],
+            Some(&fx.work),
+            &fx.home,
+        );
+        pr245_3_run(
+            "git",
+            &["push", "-u", "origin", "main"],
+            Some(&fx.work),
+            &fx.home,
+        );
+        let bare_tip = pr245_3_run(
+            "git",
+            &[
+                "--git-dir",
+                fx.bare.to_str().unwrap(),
+                "rev-parse",
+                "refs/heads/main",
+            ],
+            None,
+            &fx.home,
+        );
+        assert_eq!(bare_tip, effect_sha);
+        let bare_count: i64 = pr245_3_run(
+            "git",
+            &[
+                "--git-dir",
+                fx.bare.to_str().unwrap(),
+                "rev-list",
+                "--count",
+                "refs/heads/main",
+            ],
+            None,
+            &fx.home,
+        )
+        .parse()
+        .unwrap();
+        let fingerprint = hex::encode(Sha256::digest(
+            format!("{}\n{}", fx.svn_uuid, fx.bare.display()).as_bytes(),
+        ));
+        Pr2453Native {
+            request_id: Uuid::new_v4().to_string(),
+            svn_rev,
+            svn_author,
+            svn_message,
+            baseline_sha,
+            baseline_tree,
+            effect_sha,
+            effect_tree,
+            effect_parent,
+            fingerprint,
+            bare_count,
+            feature,
+        }
+    }
+
+    fn pr245_3_assert_owned_file(db: &Database, data_dir: &std::path::Path) {
+        let opened = db.opened_file().expect("file-backed owner");
+        let data_dir = data_dir.canonicalize().expect("data dir");
+        assert!(opened.path.ends_with("reposync.db"));
+        assert!(opened.path.starts_with(&data_dir));
+        assert!(!opened.aliased);
+    }
+
+    fn pr245_3_register(db: &Database, repo_id: &str, svn_url: &str) {
+        let now = Utc::now().to_rfc3339();
+        db.insert_repository(&crate::models::Repository {
+            id: repo_id.into(),
+            name: repo_id.into(),
+            svn_url: svn_url.into(),
+            svn_branch: "trunk".into(),
+            svn_username: "fixture".into(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: "bare.git".into(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 30,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 0,
+            last_git_sha: String::new(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .expect("managed repository");
+    }
+
+    fn pr245_3_scope(db: &Database, repo_id: &str) -> (String, i64) {
+        let conn = db.conn();
+        let scope = crate::db::repo_scope_identity::repository_scope_uuid(&conn, repo_id)
+            .expect("managed scope");
+        let generation = crate::echo_receipt_scope::repo_echo_generation_tx(&conn, repo_id)
+            .expect("managed generation");
+        assert!(!scope.is_empty());
+        (scope, generation)
+    }
+
+    fn pr245_3_repo_row(db: &Database, repo_id: &str) -> (i64, String, i64) {
+        db.conn()
+            .query_row(
+                "SELECT last_svn_rev, last_git_sha, total_syncs FROM repositories WHERE id=?1",
+                [repo_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    fn pr245_3_scoped_git(db: &Database, repo_id: &str) -> Option<String> {
+        crate::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id).unwrap()
+    }
+
+    fn pr245_3_canonical_tables(db: &Database) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
+                 ('canonical_lineage','canonical_checkpoints','canonical_mapping_outcomes')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn pr245_3_mapping_count(db: &Database, repo_id: &str, sha: &str, rev: i64) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_records \
+                 WHERE repo_id=?1 AND git_sha=?2 AND svn_rev=?3 AND direction='svn_to_git'",
+                params![repo_id, sha, rev],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn pr245_3_install_abort(
+        db: &Database,
+        name: &str,
+        scope: &str,
+        generation: i64,
+        direction: &str,
+        source_key: &str,
+        marker: &str,
+    ) {
+        for value in [name, scope, direction, source_key, marker] {
+            assert!(
+                value
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':')),
+                "{value}"
+            );
+        }
+        let sql = format!(
+            r#"CREATE TRIGGER {name}_insert
+BEFORE INSERT ON canonical_checkpoints
+WHEN NEW.scope_uuid = '{scope}'
+ AND NEW.generation = {generation}
+ AND NEW.direction = '{direction}'
+ AND NEW.handled_source_key = '{source_key}'
+ AND NEW.outcome = 'applied_and_verified'
+BEGIN
+ SELECT RAISE(ABORT, '{marker}');
+END;
+CREATE TRIGGER {name}_update
+BEFORE UPDATE ON canonical_checkpoints
+WHEN NEW.scope_uuid = '{scope}'
+ AND NEW.generation = {generation}
+ AND NEW.direction = '{direction}'
+ AND NEW.handled_source_key = '{source_key}'
+ AND NEW.outcome = 'applied_and_verified'
+BEGIN
+ SELECT RAISE(ABORT, '{marker}');
+END;"#
+        );
+        db.conn()
+            .execute_batch(&sql)
+            .expect("named canonical-write trigger");
+    }
+
+    fn pr245_3_drop_abort(db: &Database, name: &str) {
+        assert!(name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'));
+        db.conn()
+            .execute_batch(&format!(
+                "DROP TRIGGER IF EXISTS {name}_insert; DROP TRIGGER IF EXISTS {name}_update;"
+            ))
+            .unwrap();
+    }
+
+    fn pr245_3_trigger_count(db: &Database, name: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND (name=?1 OR name=?2)",
+                params![format!("{name}_insert"), format!("{name}_update")],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn pr245_3_reopen(
+        data_dir: &std::path::Path,
+        db: Database,
+        owner: crate::data_dir::DataDirOwner,
+    ) -> (Database, crate::data_dir::DataDirOwner) {
+        drop(db);
+        drop(owner);
+        Database::open_with_exclusive_owner(data_dir).expect("reopen owned file")
+    }
+
+    fn pr245_3_assert_native(fx: &Pr2453Fixture, native: &Pr2453Native) {
+        assert_eq!(
+            pr245_3_run(
+                "svnlook",
+                &["youngest", fx.svn_repo.to_str().unwrap()],
+                None,
+                &fx.home
+            ),
+            native.svn_rev.to_string()
+        );
+        assert_eq!(
+            pr245_3_stdout(
+                "svnlook",
+                &[
+                    "cat",
+                    "-r",
+                    "1",
+                    fx.svn_repo.to_str().unwrap(),
+                    "trunk/feature.txt"
+                ],
+                None,
+                &fx.home
+            ),
+            native.feature
+        );
+        assert_eq!(
+            pr245_3_run(
+                "git",
+                &[
+                    "--git-dir",
+                    fx.bare.to_str().unwrap(),
+                    "rev-parse",
+                    "refs/heads/main"
+                ],
+                None,
+                &fx.home
+            ),
+            native.effect_sha
+        );
+        assert_eq!(
+            pr245_3_run(
+                "git",
+                &[
+                    "--git-dir",
+                    fx.bare.to_str().unwrap(),
+                    "rev-list",
+                    "--count",
+                    "refs/heads/main"
+                ],
+                None,
+                &fx.home
+            ),
+            native.bare_count.to_string()
+        );
+        assert_eq!(
+            pr245_3_run(
+                "git",
+                &[
+                    "--git-dir",
+                    fx.bare.to_str().unwrap(),
+                    "rev-parse",
+                    "refs/heads/main^"
+                ],
+                None,
+                &fx.home
+            ),
+            native.baseline_sha
+        );
+        assert_eq!(
+            pr245_3_run(
+                "git",
+                &[
+                    "--git-dir",
+                    fx.bare.to_str().unwrap(),
+                    "rev-parse",
+                    "refs/heads/main^{tree}"
+                ],
+                None,
+                &fx.home
+            ),
+            native.effect_tree
+        );
+    }
+
+    fn pr245_3_assert_unresolved(
+        db: &Database,
+        repo_id: &str,
+        op_id: &str,
+        native: &Pr2453Native,
+        scope: &str,
+        generation: i64,
+    ) {
+        let op = db
+            .get_git_push_operation(repo_id, op_id)
+            .unwrap()
+            .expect("held operation");
+        assert_eq!(op.state, GitPushOperationState::ReconciliationRequired);
+        assert!(!op.resume_authorized);
+        assert_eq!(op.intended_local_git_sha, native.effect_sha);
+        assert_eq!(op.source_svn_rev, native.svn_rev);
+        assert!(op.last_confirmed_git_sha.is_none());
+        assert_eq!(
+            db.active_git_push_operation(repo_id).unwrap().unwrap().id,
+            op_id
+        );
+        assert_eq!(pr245_3_repo_row(db, repo_id), (0, String::new(), 0));
+        assert_eq!(
+            pr245_3_mapping_count(db, repo_id, &native.effect_sha, native.svn_rev),
+            0
+        );
+        assert_eq!(
+            pr245_3_scoped_git(db, repo_id).as_deref(),
+            Some(native.baseline_sha.as_str())
+        );
+        assert!(db.get_state("last_git_hash").unwrap().is_none());
+        let source_key = crate::db::lineage_checkpoints::svn_source_key(native.svn_rev);
+        let conn = db.conn();
+        assert!(crate::db::lineage_checkpoints::load_directional_checkpoint(
+            &conn,
+            scope,
+            generation,
+            crate::db::lineage_checkpoints::CheckpointDirection::SvnToGit,
+        )
+        .unwrap()
+        .is_none());
+        assert!(crate::db::lineage_checkpoints::load_mapping_outcome(
+            &conn,
+            scope,
+            generation,
+            crate::db::lineage_checkpoints::CheckpointDirection::SvnToGit,
+            &source_key,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    fn pr245_3_assert_resolved(
+        db: &Database,
+        repo_id: &str,
+        op_id: &str,
+        native: &Pr2453Native,
+        scope: &str,
+        generation: i64,
+    ) {
+        let op = db
+            .get_git_push_operation(repo_id, op_id)
+            .unwrap()
+            .expect("completed operation");
+        assert_eq!(op.state, GitPushOperationState::Completed);
+        assert!(!op.resume_authorized);
+        assert_eq!(
+            op.last_confirmed_git_sha.as_deref(),
+            Some(native.effect_sha.as_str())
+        );
+        assert_eq!(
+            op.last_confirmed_git_tree.as_deref(),
+            Some(native.effect_tree.as_str())
+        );
+        assert_eq!(op.source_svn_rev, native.svn_rev);
+        assert!(db.active_git_push_operation(repo_id).unwrap().is_none());
+        assert_eq!(
+            pr245_3_repo_row(db, repo_id),
+            (native.svn_rev, native.effect_sha.clone(), 1)
+        );
+        assert_eq!(
+            pr245_3_mapping_count(db, repo_id, &native.effect_sha, native.svn_rev),
+            1
+        );
+        assert_eq!(
+            db.get_state(&format!("last_svn_rev_{repo_id}"))
+                .unwrap()
+                .as_deref(),
+            Some(native.svn_rev.to_string().as_str())
+        );
+        assert_eq!(
+            pr245_3_scoped_git(db, repo_id).as_deref(),
+            Some(native.baseline_sha.as_str())
+        );
+        assert!(db.get_state("last_git_hash").unwrap().is_none());
+        let source_key = crate::db::lineage_checkpoints::svn_source_key(native.svn_rev);
+        let conn = db.conn();
+        let checkpoint = crate::db::lineage_checkpoints::load_directional_checkpoint(
+            &conn,
+            scope,
+            generation,
+            crate::db::lineage_checkpoints::CheckpointDirection::SvnToGit,
+        )
+        .unwrap()
+        .expect("directional checkpoint");
+        assert_eq!(checkpoint.scope_uuid, scope);
+        assert_eq!(checkpoint.generation, generation);
+        assert_eq!(
+            checkpoint.direction,
+            crate::db::lineage_checkpoints::CheckpointDirection::SvnToGit
+        );
+        assert_eq!(checkpoint.handled_source_key, source_key);
+        assert_eq!(
+            checkpoint.outcome,
+            crate::db::lineage_checkpoints::MappingOutcome::AppliedAndVerified
+        );
+        assert_eq!(
+            checkpoint.target_git_sha.as_deref(),
+            Some(native.effect_sha.as_str())
+        );
+        let mapping = crate::db::lineage_checkpoints::load_mapping_outcome(
+            &conn,
+            scope,
+            generation,
+            crate::db::lineage_checkpoints::CheckpointDirection::SvnToGit,
+            &source_key,
+        )
+        .unwrap()
+        .expect("mapping outcome");
+        assert_eq!(
+            mapping.outcome,
+            crate::db::lineage_checkpoints::MappingOutcome::AppliedAndVerified
+        );
+        assert_eq!(
+            mapping.target_git_sha.as_deref(),
+            Some(native.effect_sha.as_str())
+        );
+        drop(conn);
+        // The fixture is re-read by the caller through pr245_3_assert_native; this
+        // assertion is the repository-side half of the same native identity.
+        assert_eq!(op.source_svn_author, native.svn_author);
+        assert_eq!(op.source_svn_message, native.svn_message);
+    }
+
+    fn pr245_3_svn(fx: &Pr2453Fixture, args: &[&str]) {
+        let config = fx.svn_config.to_str().unwrap();
+        let mut full = vec![
+            "--config-dir",
+            config,
+            "--non-interactive",
+            "--no-auth-cache",
+            "--username",
+            "fixture",
+            "--password",
+            "fixture",
+        ];
+        full.extend_from_slice(args);
+        pr245_3_run("svn", &full, None, &fx.home);
+    }
+
+    fn pr245_3_run(
+        program: &str,
+        args: &[&str],
+        dir: Option<&std::path::Path>,
+        home: &std::path::Path,
+    ) -> String {
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args)
+            .env("HOME", home)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE");
+        if let Some(dir) = dir {
+            cmd.current_dir(dir);
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{program} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn pr245_3_stdout(
+        program: &str,
+        args: &[&str],
+        dir: Option<&std::path::Path>,
+        home: &std::path::Path,
+    ) -> Vec<u8> {
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args)
+            .env("HOME", home)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE");
+        if let Some(dir) = dir {
+            cmd.current_dir(dir);
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{program} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
     }
 }

@@ -1,6 +1,8 @@
+import { accountStorageKey, RetiredSessionError } from './session';
 /** UI-only classification for an existing branch-pair DELETE response. */
 
 export interface BranchPairRemovalResult {
+  archive_pair?: boolean;
   ok?: boolean;
   message?: string;
   warnings?: string[];
@@ -47,6 +49,12 @@ export function branchPairRemovalOutcome(result: BranchPairRemovalResult): Branc
   if (result.ok === true) return 'completed';
   if (result.operation_id) return 'in_progress';
   return 'rejected';
+}
+
+/** A terminal archive stays inspectable; never retire its detail route. */
+export function shouldRetireBranchPair(result: BranchPairRemovalResult): boolean {
+  if (result.archive_pair || result.registration_listed === true) return false;
+  return result.registration_listed === false || branchPairRemovalOutcome(result) === 'completed';
 }
 
 /**
@@ -99,7 +107,7 @@ function normalizeBranchPairRemovalNotice(notice: BranchPairRemovalNotice): Bran
 
 export function persistBranchPairRemovalNotice(notice: BranchPairRemovalNotice): void {
   try {
-    sessionStorage.setItem(BRANCH_PAIR_RECEIPT_KEY, JSON.stringify(normalizeBranchPairRemovalNotice(notice)));
+    sessionStorage.setItem(accountStorageKey(BRANCH_PAIR_RECEIPT_KEY), JSON.stringify(normalizeBranchPairRemovalNotice(notice)));
   } catch {
     /* ignore */
   }
@@ -107,7 +115,7 @@ export function persistBranchPairRemovalNotice(notice: BranchPairRemovalNotice):
 
 export function readPersistedBranchPairRemovalNotice(): BranchPairRemovalNotice | null {
   try {
-    const raw = sessionStorage.getItem(BRANCH_PAIR_RECEIPT_KEY);
+    const raw = sessionStorage.getItem(accountStorageKey(BRANCH_PAIR_RECEIPT_KEY));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as BranchPairRemovalNotice;
     if (parsed.outcome !== 'completed' && parsed.outcome !== 'in_progress') return null;
@@ -119,8 +127,37 @@ export function readPersistedBranchPairRemovalNotice(): BranchPairRemovalNotice 
 
 export function clearPersistedBranchPairRemovalNotice(): void {
   try {
-    sessionStorage.removeItem(BRANCH_PAIR_RECEIPT_KEY);
+    sessionStorage.removeItem(accountStorageKey(BRANCH_PAIR_RECEIPT_KEY));
   } catch {
     /* ignore */
   }
+}
+
+
+/** Keep the initiating owner through the parent read and the destructive send. */
+export async function removeBranchPairForView(
+  input: { viewedId: string; target: { id: string; parent_id: string }; options: { delete_git?: boolean; delete_svn?: boolean } },
+  owner: { assertCurrent(): void },
+  transport: { lookupParent(id: string): Promise<unknown>; remove(id: string, options: { delete_git?: boolean; delete_svn?: boolean }): Promise<BranchPairRemovalResult> },
+) {
+  owner.assertCurrent();
+  const { viewedId, target, options } = input;
+  let parentExists: boolean | null = null;
+  if (target.id === viewedId) {
+    try {
+      await transport.lookupParent(target.parent_id);
+      owner.assertCurrent(); parentExists = true;
+    } catch (error) {
+      // Retirement/abort must never be downgraded to an uncertain destination.
+      owner.assertCurrent();
+      if (error instanceof RetiredSessionError || (error as { name?: string } | null)?.name === 'AbortError') throw error;
+      parentExists = isNotFoundError(error) ? false : null;
+    }
+  }
+  const destination = removalDestination({ viewedId, targetId: target.id, parentId: target.parent_id, parentExists });
+  owner.assertCurrent();
+  const result = await transport.remove(target.id, options);
+  const outcome = branchPairRemovalOutcome(result);
+  if (outcome === 'rejected') throw new Error(result.message || 'Branch pair was not removed');
+  return { result, destination, outcome };
 }

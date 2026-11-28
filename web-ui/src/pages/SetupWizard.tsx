@@ -1,8 +1,15 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
+import { clientSession } from '../session';
+import { getStoredUser } from '../utils/auth';
+import ImportProgressMeter from '../components/ImportProgressMeter';
+import { useId } from 'react';
+import { useState, useRef, useEffect, useCallback, type ReactNode } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { api, type AuthorMapping, type ImportStatus, type WizardSetupConfig } from '../api';
 import ImportPhaseGraphic from '../components/ImportPhaseGraphic';
 import ServerMonitor from '../components/ServerMonitor';
+import { importPhaseLabel, importStateLabel } from '../importProgress';
+import { canCancelSetupImport, canStartSetupImport, useSetupImport } from '../useSetupImport';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -135,6 +142,8 @@ const STEPS = [
 
 type Errors = Record<string, string>;
 
+// Each check runs on the step that shows its field, so its error appears next to that field
+// (#264, G12.9). Step 3 is Sync Settings, step 4 Identity Mapping, step 5 Server & Auth.
 function validateStep(step: number, data: WizardData): Errors {
   const errors: Errors = {};
 
@@ -156,12 +165,13 @@ function validateStep(step: number, data: WizardData): Errors {
   }
 
   if (step === 3) {
-    if (data.daemon_poll_interval < 1) errors.daemon_poll_interval = 'Poll interval must be at least 1 second';
+    if (data.lfs_threshold_mb !== undefined && data.lfs_threshold_mb < 0)
+      errors.lfs_threshold_mb = 'LFS threshold must be non-negative';
   }
 
   if (step === 4) {
-    if (data.lfs_threshold_mb !== undefined && data.lfs_threshold_mb < 0)
-      errors.lfs_threshold_mb = 'LFS threshold must be non-negative';
+    if (data.identity_email_domain && !/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(data.identity_email_domain.trim()))
+      errors.identity_email_domain = 'Must be a valid domain (e.g. company.com)';
   }
 
   if (step === 5) {
@@ -172,25 +182,126 @@ function validateStep(step: number, data: WizardData): Errors {
     if (!data.daemon_data_dir.trim()) errors.daemon_data_dir = 'Data directory is required';
     if ((data.web_auth_mode === 'simple' || data.web_auth_mode === 'both') && !data.web_admin_password_env.trim())
       errors.web_admin_password_env = 'Admin password env var is required for simple auth';
-    if (data.identity_email_domain && !/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(data.identity_email_domain.trim()))
-      errors.identity_email_domain = 'Must be a valid domain (e.g. company.com)';
   }
 
   return errors;
 }
 
 // ---------------------------------------------------------------------------
+// Saved configuration read (#264, G12.10)
+// ---------------------------------------------------------------------------
+
+/** The read of the saved configuration: still reading, read, or failed with the client's error text. */
+export type SavedConfigRead =
+  | { status: 'reading' }
+  | { status: 'loaded' }
+  | { status: 'failed'; error: string; retrying: boolean };
+
+/** After a failed read the form is turned off; Save is offered only after a successful read. */
+function savedConfigView(status: SavedConfigRead['status']): { formOff: boolean; canSave: boolean } {
+  return { formOff: status === 'failed', canSave: status === 'loaded' };
+}
+
+/** Wizard fields taken from the saved configuration (unchanged mapping, shared by the first read and Retry). */
+function savedConfigFields(cfg: WizardSetupConfig): {
+  fields: Partial<WizardData>;
+  svnPasswordSet: boolean;
+  gitTokenSet: boolean;
+  adminPasswordSet: boolean;
+} {
+  const merged: Partial<WizardData> = {};
+
+  if (cfg.svn_url) merged.svn_url = cfg.svn_url;
+  if (cfg.svn_username) merged.svn_username = cfg.svn_username;
+  if (cfg.svn_layout) merged.svn_layout = cfg.svn_layout as WizardData['svn_layout'];
+  if (cfg.svn_trunk_path) merged.svn_trunk_path = cfg.svn_trunk_path;
+
+  if (cfg.git_provider) merged.git_provider = cfg.git_provider as WizardData['git_provider'];
+  if (cfg.git_api_url) merged.git_api_url = cfg.git_api_url;
+  if (cfg.git_repo) merged.git_repo = cfg.git_repo;
+  if (cfg.git_branch) merged.git_default_branch = cfg.git_branch;
+
+  if (cfg.sync_mode) merged.sync_mode = cfg.sync_mode as WizardData['sync_mode'];
+  if (cfg.auto_merge !== undefined) merged.sync_auto_merge = cfg.auto_merge;
+  if (cfg.sync_tags !== undefined) merged.sync_tags = cfg.sync_tags;
+  if (cfg.lfs_threshold > 0) merged.lfs_threshold_mb = cfg.lfs_threshold / (1024 * 1024);
+
+  if (cfg.email_domain) merged.identity_email_domain = cfg.email_domain;
+
+  if (cfg.listen) merged.web_listen = cfg.listen;
+  if (cfg.auth_mode) merged.web_auth_mode = cfg.auth_mode as WizardData['web_auth_mode'];
+  if (cfg.poll_interval > 0) merged.daemon_poll_interval = cfg.poll_interval;
+  if (cfg.log_level) merged.daemon_log_level = cfg.log_level;
+  if (cfg.data_dir) merged.daemon_data_dir = cfg.data_dir;
+
+  return {
+    fields: merged,
+    svnPasswordSet: !!cfg.svn_password_set,
+    gitTokenSet: !!cfg.git_token_set,
+    adminPasswordSet: !!cfg.admin_password_set,
+  };
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export { DEFAULT_DATA, validateStep, savedConfigView, savedConfigFields, testConnectionClass, type WizardData };
+
+// ---------------------------------------------------------------------------
 // Main Component
 // ---------------------------------------------------------------------------
 
 export default function SetupWizard() {
+  // The authenticated route owns missing-session navigation. Do not mount any
+  // administrative queries, effects or forms without the current admin role.
+  const session = clientSession().snapshot();
+  const currentUser = getStoredUser();
+  // Single-password login intentionally omits user; /auth/me resolves its
+  // existing legacy-admin identity. Never infer admin from an absent role.
+  const identity = useQuery({
+    queryKey: ['admin-page-identity', session.epoch],
+    queryFn: api.getMe,
+    // Verify once per session epoch without discarding in-progress admin edits.
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    enabled: !!session.token && !currentUser,
+    retry: false,
+  });
+  if (!currentUser && session.token && (identity.isPending || identity.isFetching)) {
+    return <div role="status" className="text-center py-12 text-gray-400">Verifying administrator access…</div>;
+  }
+  const verifiedIdentity = session.token && identity.isSuccess && !identity.isFetching ? identity.data : null;
+  if ((currentUser ?? verifiedIdentity)?.role !== 'admin') {
+    return (
+      <div className="text-center py-12" role="alert">
+        <h2 className="rs-heading text-xl font-semibold text-gray-100 mb-2">Access Denied</h2>
+        <p className="text-gray-400">You need admin privileges to view this page.</p>
+      </div>
+    );
+  }
+  return <AdminSetupWizard />;
+}
+
+function AdminSetupWizard() {
   const navigate = useNavigate();
-  const [step, setStep] = useState(0);
+  const location = useLocation();
+  const resumeImport = location.state?.setupImportOpen === true;
+  const [checkingOnEntry, setCheckingOnEntry] = useState(!resumeImport);
+  const [step, setStep] = useState(() => resumeImport ? 7 : 0);
+  // Reload this history entry on the same step even if the worker stopped while away.
+  useEffect(() => {
+    const open = step === 7;
+    if (open !== resumeImport) {
+      navigate({ pathname: location.pathname, search: location.search, hash: location.hash }, {
+        replace: true, state: { ...location.state, setupImportOpen: open },
+      });
+    }
+  }, [step, resumeImport, navigate, location]);
   const [data, setData] = useState<WizardData>({ ...DEFAULT_DATA });
   const [errors, setErrors] = useState<Errors>({});
   const [configSaved, setConfigSaved] = useState(false);
   const [saveError, setSaveError] = useState('');
   const [saveWarnings, setSaveWarnings] = useState<string[]>([]);
+  const [configRead, setConfigRead] = useState<SavedConfigRead>({ status: 'reading' });
   const stepRef = useRef<HTMLDivElement>(null);
 
   // Track whether secrets are already saved on the server
@@ -207,78 +318,51 @@ export default function SetupWizard() {
     [],
   );
 
-  // Auto-detect running import on page load — jump to Import step
-  useEffect(() => {
-    (async () => {
-      try {
-        const status: ImportStatus = await api.getImportStatus();
-        const running =
-          status.phase === 'importing' ||
-          status.phase === 'connecting' ||
-          status.phase === 'verifying' ||
-          status.phase === 'final_push' ||
-          status.busy === true ||
-          status.lifecycle === 'queued' ||
-          status.lifecycle === 'running' ||
-          status.lifecycle === 'cancel_requested' ||
-          status.lifecycle === 'cancelling';
-        if (running) {
-          setStep(7); // Jump to Import step
-        }
-      } catch {
-        // No import running or API not available — stay on Welcome
-      }
-    })();
+  const onEntryStatus = useCallback((status: ImportStatus) => {
+    setCheckingOnEntry(false);
+    const needsAttention = status.busy ||
+      ['connecting', 'importing', 'verifying', 'final_push'].includes(status.phase) ||
+      ['queued', 'running', 'cancel_requested', 'cancelling', 'reconciliation_required'].includes(status.lifecycle ?? '');
+    if (needsAttention) setStep(current => current === 0 ? 7 : current);
   }, []);
 
-  // Pre-populate wizard from saved config (if any)
-  useEffect(() => {
-    (async () => {
-      try {
-        const cfg: WizardSetupConfig = await api.getSetupConfig();
-        const merged: Partial<WizardData> = {};
-
-        if (cfg.svn_url) merged.svn_url = cfg.svn_url;
-        if (cfg.svn_username) merged.svn_username = cfg.svn_username;
-        if (cfg.svn_layout) merged.svn_layout = cfg.svn_layout as WizardData['svn_layout'];
-        if (cfg.svn_trunk_path) merged.svn_trunk_path = cfg.svn_trunk_path;
-        if (cfg.svn_password_set) setSvnPasswordSaved(true);
-
-        if (cfg.git_provider) merged.git_provider = cfg.git_provider as WizardData['git_provider'];
-        if (cfg.git_api_url) merged.git_api_url = cfg.git_api_url;
-        if (cfg.git_repo) merged.git_repo = cfg.git_repo;
-        if (cfg.git_branch) merged.git_default_branch = cfg.git_branch;
-        if (cfg.git_token_set) setGitTokenSaved(true);
-
-        if (cfg.sync_mode) merged.sync_mode = cfg.sync_mode as WizardData['sync_mode'];
-        if (cfg.auto_merge !== undefined) merged.sync_auto_merge = cfg.auto_merge;
-        if (cfg.sync_tags !== undefined) merged.sync_tags = cfg.sync_tags;
-        if (cfg.lfs_threshold > 0) merged.lfs_threshold_mb = cfg.lfs_threshold / (1024 * 1024);
-
-        if (cfg.email_domain) merged.identity_email_domain = cfg.email_domain;
-
-        if (cfg.listen) merged.web_listen = cfg.listen;
-        if (cfg.auth_mode) merged.web_auth_mode = cfg.auth_mode as WizardData['web_auth_mode'];
-        if (cfg.poll_interval > 0) merged.daemon_poll_interval = cfg.poll_interval;
-        if (cfg.log_level) merged.daemon_log_level = cfg.log_level;
-        if (cfg.data_dir) merged.daemon_data_dir = cfg.data_dir;
-        if (cfg.admin_password_set) setAdminPasswordSaved(true);
-
-        setData(prev => ({ ...prev, ...merged }));
-      } catch {
-        // Endpoint not available yet (404) or other error — keep DEFAULT_DATA
-      }
-    })();
+  // Pre-populate wizard from saved config. A failed read is shown as failed and turns the
+  // form off until a read succeeds (#264, G12.10); Retry reads again.
+  const readSavedConfig = useCallback(async () => {
+    try {
+      const cfg: WizardSetupConfig = await api.getSetupConfig();
+      const saved = savedConfigFields(cfg);
+      if (saved.svnPasswordSet) setSvnPasswordSaved(true);
+      if (saved.gitTokenSet) setGitTokenSaved(true);
+      if (saved.adminPasswordSet) setAdminPasswordSaved(true);
+      setData(prev => ({ ...prev, ...saved.fields }));
+      setConfigRead({ status: 'loaded' });
+    } catch (e: unknown) {
+      setConfigRead({ status: 'failed', error: e instanceof Error ? e.message : 'Unknown error', retrying: false });
+    }
   }, []);
+
+  useEffect(() => {
+    void readSavedConfig();
+  }, [readSavedConfig]);
+
+  const retrySavedConfig = () => {
+    setConfigRead(prev => (prev.status === 'failed' ? { ...prev, retrying: true } : prev));
+    void readSavedConfig();
+  };
+
+  const { formOff, canSave } = savedConfigView(configRead.status);
 
   useEffect(() => {
     stepRef.current?.querySelector<HTMLInputElement>('input, select, textarea')?.focus();
   }, [step]);
 
   const goNext = () => {
+    if (formOff) return;
     const errs = validateStep(step, data);
     setErrors(errs);
     if (Object.keys(errs).length > 0) return;
+    setCheckingOnEntry(false);
     setStep(s => Math.min(s + 1, STEPS.length - 1));
   };
 
@@ -288,6 +372,7 @@ export default function SetupWizard() {
   };
 
   const handleSaveConfig = async () => {
+    if (!canSave) return;
     setSaveError('');
     setSaveWarnings([]);
     try {
@@ -339,7 +424,7 @@ export default function SetupWizard() {
       case 0: return <WelcomeStep />;
       case 1: return <SvnStep data={data} update={update} errors={errors} svnPasswordSaved={svnPasswordSaved} svnPasswordDirty={svnPasswordDirty} onSvnPasswordChange={() => setSvnPasswordDirty(true)} />;
       case 2: return <GitStep data={data} update={update} errors={errors} gitTokenSaved={gitTokenSaved} gitTokenDirty={gitTokenDirty} onGitTokenChange={() => setGitTokenDirty(true)} />;
-      case 3: return <SyncStep data={data} update={update} />;
+      case 3: return <SyncStep data={data} update={update} errors={errors} />;
       case 4: return <IdentityStep data={data} update={update} errors={errors} />;
       case 5: return <ServerAuthStep data={data} update={update} errors={errors} />;
       case 6: return (
@@ -349,6 +434,7 @@ export default function SetupWizard() {
           saveError={saveError}
           saveWarnings={saveWarnings}
           onSave={handleSaveConfig}
+          readStatus={configRead.status}
         />
       );
       case 7: return <ImportStep />;
@@ -361,7 +447,7 @@ export default function SetupWizard() {
       <div className="max-w-7xl mx-auto">
         {/* Header */}
         <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold text-gray-100 tracking-wider font-display">RepoSync Setup</h1>
+          <h1 className="rs-title text-3xl font-bold text-gray-100 tracking-wider font-display">RepoSync Setup</h1>
           <p className="text-gray-400 mt-2">Configure your SVN-to-Git synchronization in a few steps</p>
         </div>
 
@@ -369,15 +455,22 @@ export default function SetupWizard() {
         <StepIndicator currentStep={step} steps={STEPS} onStepClick={(i) => { if (i < step) setStep(i); }} />
 
         {/* Step Content */}
-        <div ref={stepRef} className="mt-8 bg-gray-800 rounded-xl shadow-lg border border-gray-700 p-8">
-          {renderStep()}
+        <div ref={stepRef} className="rs-sec mt-8 bg-gray-800 rounded-xl shadow-lg border border-gray-700 p-8">
+          {step === 0 && checkingOnEntry && <WelcomeImportCheck onStatus={onEntryStatus} />}
+          {step === STEPS.length - 1 ? (
+            renderStep()
+          ) : (
+            <SavedConfigGate read={configRead} onRetry={retrySavedConfig}>
+              {renderStep()}
+            </SavedConfigGate>
+          )}
         </div>
 
         {/* Navigation */}
         <div className="mt-6 flex items-center justify-between">
           <div className="flex items-center space-x-3">
             {step > 0 && step < STEPS.length - 1 && (
-              <button onClick={goBack} className="px-5 py-2.5 border border-gray-600 text-gray-300 hover:bg-gray-700 rounded-lg text-sm font-medium transition-colors">
+              <button onClick={goBack} className="rs-btn rs-btn--quiet px-5 py-2.5 border border-gray-600 text-gray-300 hover:bg-gray-700 rounded-lg text-sm font-medium transition-colors">
                 Back
               </button>
             )}
@@ -387,12 +480,12 @@ export default function SetupWizard() {
               {step === 0 ? 'Skip to Login' : 'Exit to Dashboard'}
             </button>
             {step < STEPS.length - 2 && (
-              <button onClick={goNext} className="px-6 py-2.5 bg-blue-600 text-white hover:bg-blue-700 rounded-lg text-sm font-medium transition-colors shadow-sm">
+              <button onClick={goNext} disabled={formOff} className="rs-btn rs-btn--primary px-6 py-2.5 bg-blue-600 rs-text-on-accent hover:bg-blue-700 rounded-lg text-sm font-medium transition-colors shadow-sm disabled:opacity-50">
                 {step === 0 ? 'Get Started' : 'Next'}
               </button>
             )}
             {step === STEPS.length - 2 && configSaved && (
-              <button onClick={goNext} className="px-6 py-2.5 bg-blue-600 text-white hover:bg-blue-700 rounded-lg text-sm font-medium transition-colors shadow-sm">
+              <button onClick={goNext} className="rs-btn rs-btn--primary px-6 py-2.5 bg-blue-600 rs-text-on-accent hover:bg-blue-700 rounded-lg text-sm font-medium transition-colors shadow-sm">
                 Next: Import History
               </button>
             )}
@@ -423,6 +516,7 @@ function StepIndicator({
         {steps.map((s, i) => (
           <div key={i} className="flex items-center flex-1 last:flex-none">
             <button
+              aria-current={i === currentStep ? 'step' : undefined}
               onClick={() => onStepClick(i)}
               disabled={i > currentStep}
               className="flex flex-col items-center group"
@@ -430,10 +524,10 @@ function StepIndicator({
               <div
                 className={`w-9 h-9 rounded-full flex items-center justify-center text-sm font-semibold border-2 transition-all duration-200 ${
                   i < currentStep
-                    ? 'bg-blue-600 border-blue-600 text-white'
+                    ? 'bg-blue-600 border-blue-600 rs-text-on-accent'
                     : i === currentStep
                       ? 'border-blue-500 text-blue-400 bg-blue-500/10'
-                      : 'border-gray-600 text-gray-500 bg-gray-800'
+                      : 'border-gray-600 text-gray-300 bg-gray-800'
                 }`}
               >
                 {i < currentStep ? (
@@ -446,7 +540,7 @@ function StepIndicator({
               </div>
               <span
                 className={`mt-1.5 text-xs font-medium transition-colors ${
-                  i <= currentStep ? 'text-gray-300' : 'text-gray-500'
+                  i <= currentStep ? 'text-gray-300' : 'text-gray-300'
                 }`}
               >
                 {s.short}
@@ -506,7 +600,7 @@ function FormField({
     <div>
       <label htmlFor={name} className="block text-sm font-medium text-gray-300 mb-1">
         {label}
-        {required && <span className="text-red-400 ml-1">*</span>}
+        {required && <span aria-hidden="true" className="text-red-400 ml-1">*</span>}
       </label>
       <input
         id={name}
@@ -516,16 +610,18 @@ function FormField({
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
         disabled={disabled}
-        className={`w-full rounded-lg border bg-gray-700 text-gray-100 placeholder-gray-500 px-3 py-2.5 text-sm transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 ${
+        className={`rs-in w-full rounded-lg border bg-gray-700 text-gray-100 placeholder-gray-500 px-3 py-2.5 text-sm transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 ${
           error ? 'border-red-500' : 'border-gray-600'
         } ${mono ? 'font-mono' : ''} ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+        aria-invalid={error ? true : undefined}
+        aria-required={required || undefined}
         aria-describedby={error ? `${name}-error` : help ? `${name}-help` : undefined}
       />
       {error && (
-        <p id={`${name}-error`} className="text-red-400 text-xs mt-1">{error}</p>
+        <p id={`${name}-error`} role="alert" className="text-red-400 text-xs mt-1">{error}</p>
       )}
       {help && !error && (
-        <p id={`${name}-help`} className="text-gray-500 text-xs mt-1">{help}</p>
+        <p id={`${name}-help`} className="text-gray-300 text-xs mt-1">{help}</p>
       )}
     </div>
   );
@@ -554,13 +650,13 @@ function FormSelect({
         name={name}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-lg border border-gray-600 bg-gray-700 text-gray-100 px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500"
+        className="rs-in w-full rounded-lg border border-gray-600 bg-gray-700 text-gray-100 px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500"
       >
         {options.map(o => (
           <option key={o.value} value={o.value}>{o.label}</option>
         ))}
       </select>
-      {help && <p className="text-gray-500 text-xs mt-1">{help}</p>}
+      {help && <p className="text-gray-300 text-xs mt-1">{help}</p>}
     </div>
   );
 }
@@ -588,14 +684,14 @@ function ToggleSwitch({
         }`}
       >
         <span
-          className={`inline-block h-4 w-4 rounded-full bg-white transition-transform ${
+          className={`inline-block h-4 w-4 rounded-full rs-knob transition-transform ${
             checked ? 'translate-x-6' : 'translate-x-1'
           }`}
         />
       </button>
       <div>
         <span className="text-sm font-medium text-gray-300">{label}</span>
-        {help && <p className="text-gray-500 text-xs mt-0.5">{help}</p>}
+        {help && <p className="text-gray-300 text-xs mt-0.5">{help}</p>}
       </div>
     </div>
   );
@@ -608,7 +704,7 @@ function SectionHeading({ title, description, color = 'blue' }: { title: string;
   };
   return (
     <div className="mb-5">
-      <h2 className="text-lg font-semibold text-gray-100 flex items-center space-x-2">
+      <h2 className="rs-heading text-lg font-semibold text-gray-100 flex items-center space-x-2">
         <span className={`w-2 h-2 rounded-full ${dotColors[color] ?? dotColors.blue}`} />
         <span>{title}</span>
       </h2>
@@ -617,8 +713,24 @@ function SectionHeading({ title, description, color = 'blue' }: { title: string;
   );
 }
 
+type TestConnectionState = 'idle' | 'loading' | 'success' | 'error';
+
+/**
+ * The connection test button: quiet while idle or testing, and its own success or failure
+ * colours after a result. It is never styled as a destructive action.
+ */
+function testConnectionClass(state: TestConnectionState): string {
+  const tone =
+    state === 'success'
+      ? 'bg-emerald-600/20 text-emerald-400 border border-emerald-600'
+      : state === 'error'
+        ? 'bg-red-600/20 text-red-400 border border-red-600'
+        : 'rs-btn--quiet bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600';
+  return `rs-btn px-4 py-2 rounded-lg text-sm font-medium transition-colors ${tone} disabled:opacity-50`;
+}
+
 function TestConnectionButton({ onTest }: { onTest: () => Promise<{ ok: boolean; message: string }> }) {
-  const [state, setState] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+  const [state, setState] = useState<TestConnectionState>('idle');
   const [msg, setMsg] = useState('');
 
   const handleTest = async () => {
@@ -639,13 +751,7 @@ function TestConnectionButton({ onTest }: { onTest: () => Promise<{ ok: boolean;
       <button
         onClick={handleTest}
         disabled={state === 'loading'}
-        className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-          state === 'success'
-            ? 'bg-emerald-600/20 text-emerald-400 border border-emerald-600'
-            : state === 'error'
-              ? 'bg-red-600/20 text-red-400 border border-red-600'
-              : 'bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600'
-        } disabled:opacity-50`}
+        className={testConnectionClass(state)}
       >
         {state === 'loading' ? (
           <span className="flex items-center space-x-2">
@@ -670,6 +776,69 @@ function TestConnectionButton({ onTest }: { onTest: () => Promise<{ ok: boolean;
   );
 }
 
+/** Marks fields the page collects but does not send today (#264, G12.4 and G12.6). */
+function NotSentMarker({ detail }: { detail?: string }) {
+  return (
+    <p className="flex flex-wrap items-center gap-2 text-xs">
+      <span className="rs-mark inline-flex items-center px-2 py-0.5 rounded border border-dashed border-orange-700/50 text-xs font-medium text-orange-300">
+        Collected but not sent today
+      </span>
+      {detail && <span className="text-gray-400">{detail}</span>}
+    </p>
+  );
+}
+
+/**
+ * Wraps the configuration steps. After a failed read of the saved configuration it shows the
+ * failure with the client's error text and turns the form off until a read succeeds (#264, G12.10).
+ * The fieldset is always rendered so the steps inside keep their state when the read settles.
+ */
+export function SavedConfigGate({
+  read,
+  onRetry,
+  children,
+}: {
+  read: SavedConfigRead;
+  onRetry: () => void;
+  children: ReactNode;
+}) {
+  const failureId = useId();
+  const { formOff } = savedConfigView(read.status);
+  return (
+    <>
+      {read.status === 'failed' && (
+        <div className="rs-bn rs-bn--danger mb-6 bg-red-900/30 border border-red-700 rounded-lg p-4 text-sm text-red-300">
+          <div id={failureId} role="alert">
+            <p className="font-semibold">The saved configuration could not be loaded</p>
+            <p className="mt-1 break-words">{read.error}</p>
+            <p className="mt-1">The form is turned off until the saved configuration is read.</p>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={onRetry}
+              disabled={read.retrying}
+              className="rs-btn rs-btn--quiet px-4 py-2 border border-gray-600 text-gray-300 hover:bg-gray-700 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+            >
+              Retry
+            </button>
+            <span role="status" className="text-xs text-gray-400">
+              {read.retrying ? 'Reading the saved configuration…' : ''}
+            </span>
+          </div>
+        </div>
+      )}
+      <fieldset
+        disabled={formOff}
+        aria-describedby={formOff ? failureId : undefined}
+        className="min-w-0 disabled:opacity-60"
+      >
+        {children}
+      </fieldset>
+    </>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Step 0: Welcome
 // ---------------------------------------------------------------------------
@@ -685,7 +854,7 @@ function WelcomeStep() {
           <circle cx="34" cy="32" r="3" fill="currentColor" opacity="0.5" />
         </svg>
       </div>
-      <h2 className="text-2xl font-bold text-gray-100 mb-3 font-display tracking-wide">Welcome to RepoSync</h2>
+      <h2 className="rs-heading text-2xl font-bold text-gray-100 mb-3 font-display tracking-wide">Welcome to RepoSync</h2>
       <p className="text-gray-400 max-w-lg mx-auto leading-relaxed">
         This wizard will guide you through setting up bidirectional synchronization
         between your SVN repository and Git. At the end, you'll get a configuration
@@ -713,7 +882,7 @@ function WelcomeStep() {
 // Step 1: SVN
 // ---------------------------------------------------------------------------
 
-function SvnStep({
+export function SvnStep({
   data,
   update,
   errors,
@@ -728,6 +897,7 @@ function SvnStep({
   svnPasswordDirty: boolean;
   onSvnPasswordChange: () => void;
 }) {
+  const fieldId = useId();
   return (
     <div className="space-y-6">
       <SectionHeading
@@ -760,15 +930,15 @@ function SvnStep({
           required
         />
         <div>
-          <label className="block text-sm font-medium text-gray-300 mb-1">Password</label>
+          <label className="block text-sm font-medium text-gray-300 mb-1" htmlFor={`${fieldId}-1`}>Password</label>
           <input
             type="password"
             value={data.svn_password}
             onChange={e => { update({ svn_password: e.target.value }); onSvnPasswordChange(); }}
-            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-            placeholder={svnPasswordSaved && !svnPasswordDirty ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (saved)' : 'Enter SVN password'}
+            className="rs-in w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            placeholder={svnPasswordSaved && !svnPasswordDirty ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (saved)' : 'Enter SVN password'} id={`${fieldId}-1`}
           />
-          <p className="text-xs text-gray-500 mt-1">Stored securely on the server — never written to config files</p>
+          <p className="text-xs text-gray-300 mt-1">Stored securely on the server — never written to config files</p>
         </div>
       </div>
 
@@ -784,7 +954,7 @@ function SvnStep({
           ]}
           help="Standard layout uses trunk/, branches/, and tags/ under the repo root"
         />
-        <div className={`mt-4 grid grid-cols-1 md:grid-cols-3 gap-4 ${data.svn_layout === 'standard' ? 'opacity-50' : ''}`}>
+        <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
           <FormField
             label="Trunk Path"
             name="svn_trunk_path"
@@ -825,7 +995,7 @@ function SvnStep({
 // Step 2: Git Provider
 // ---------------------------------------------------------------------------
 
-function GitStep({
+export function GitStep({
   data,
   update,
   errors,
@@ -840,6 +1010,7 @@ function GitStep({
   gitTokenDirty: boolean;
   onGitTokenChange: () => void;
 }) {
+  const fieldId = useId();
   const handleProviderChange = (provider: string) => {
     const p = provider as 'github' | 'gitea';
     const apiUrl = p === 'github' ? 'https://api.github.com' : data.git_api_url;
@@ -859,11 +1030,12 @@ function GitStep({
         {(['github', 'gitea'] as const).map(p => (
           <button
             key={p}
+            aria-pressed={data.git_provider === p}
             onClick={() => handleProviderChange(p)}
-            className={`flex-1 py-3 px-4 rounded-lg border text-sm font-medium transition-all ${
+            className={`rs-btn flex-1 py-3 px-4 rounded-lg border text-sm font-medium transition-all ${
               data.git_provider === p
-                ? 'border-blue-500 bg-blue-600/10 text-blue-400'
-                : 'border-gray-600 bg-gray-700/50 text-gray-400 hover:bg-gray-700'
+                ? 'rs-btn--primary border-blue-500 bg-blue-600/10 text-blue-400'
+                : 'rs-btn--quiet border-gray-600 bg-gray-700/50 text-gray-400 hover:bg-gray-700'
             }`}
           >
             {p === 'github' ? 'GitHub / GitHub Enterprise' : 'Gitea'}
@@ -906,15 +1078,15 @@ function GitStep({
         />
         <div className="md:col-span-2">
           <div>
-            <label className="block text-sm font-medium text-gray-300 mb-1">Personal Access Token</label>
+            <label className="block text-sm font-medium text-gray-300 mb-1" htmlFor={`${fieldId}-2`}>Personal Access Token</label>
             <input
               type="password"
               value={data.git_token}
               onChange={e => { update({ git_token: e.target.value }); onGitTokenChange(); }}
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              placeholder={gitTokenSaved && !gitTokenDirty ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (saved)' : 'ghp_xxxxxxxxxxxx or giteaToken'}
+              className="rs-in w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              placeholder={gitTokenSaved && !gitTokenDirty ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (saved)' : 'ghp_xxxxxxxxxxxx or giteaToken'} id={`${fieldId}-2`}
             />
-            <p className="text-xs text-gray-500 mt-1">Needs <code className="text-gray-400">repo</code> scope. Stored securely on the server.</p>
+            <p className="text-xs text-gray-300 mt-1">Needs <code className="text-gray-400">repo</code> scope. Stored securely on the server.</p>
           </div>
         </div>
       </div>
@@ -932,13 +1104,17 @@ function GitStep({
 // Step 3: Sync Settings
 // ---------------------------------------------------------------------------
 
-function SyncStep({
+export function SyncStep({
   data,
   update,
+  errors,
 }: {
   data: WizardData;
   update: (f: Partial<WizardData>) => void;
+  errors: Errors;
 }) {
+  const fieldId = useId();
+  const lfsThresholdError = errors.lfs_threshold_mb;
   return (
     <div className="space-y-6">
       <SectionHeading
@@ -949,14 +1125,14 @@ function SyncStep({
 
       {/* Mode selection */}
       <div>
-        <label className="block text-sm font-medium text-gray-300 mb-2">Sync Mode</label>
-        <div className="flex space-x-3">
+        <p id={`${fieldId}-sync-mode`} className="block text-sm font-medium text-gray-300 mb-2">Sync Mode</p>
+        <div role="group" aria-labelledby={`${fieldId}-sync-mode`} className="flex space-x-3">
           <button
-            onClick={() => update({ sync_mode: 'direct' })}
-            className={`flex-1 py-3 px-4 rounded-lg border text-left transition-all ${
+            aria-pressed={data.sync_mode === 'direct'} onClick={() => update({ sync_mode: 'direct' })}
+            className={`rs-btn rs-choice flex-1 py-3 px-4 rounded-lg border text-left transition-all ${
               data.sync_mode === 'direct'
-                ? 'border-blue-500 bg-blue-600/10'
-                : 'border-gray-600 bg-gray-700/50 hover:bg-gray-700'
+                ? 'rs-btn--primary border-blue-500 bg-blue-600/10'
+                : 'rs-btn--quiet border-gray-600 bg-gray-700/50 hover:bg-gray-700'
             }`}
           >
             <div className={`text-sm font-medium ${data.sync_mode === 'direct' ? 'text-blue-400' : 'text-gray-300'}`}>
@@ -965,11 +1141,11 @@ function SyncStep({
             <p className="text-xs text-gray-400 mt-1">Commits are pushed directly to the target branch</p>
           </button>
           <button
-            onClick={() => update({ sync_mode: 'pr' })}
-            className={`flex-1 py-3 px-4 rounded-lg border text-left transition-all ${
+            aria-pressed={data.sync_mode === 'pr'} onClick={() => update({ sync_mode: 'pr' })}
+            className={`rs-btn rs-choice flex-1 py-3 px-4 rounded-lg border text-left transition-all ${
               data.sync_mode === 'pr'
-                ? 'border-blue-500 bg-blue-600/10'
-                : 'border-gray-600 bg-gray-700/50 hover:bg-gray-700'
+                ? 'rs-btn--primary border-blue-500 bg-blue-600/10'
+                : 'rs-btn--quiet border-gray-600 bg-gray-700/50 hover:bg-gray-700'
             }`}
           >
             <div className={`text-sm font-medium ${data.sync_mode === 'pr' ? 'text-blue-400' : 'text-gray-300'}`}>
@@ -997,29 +1173,35 @@ function SyncStep({
 
       {/* File Policy & LFS */}
       <div className="border-t border-gray-700 pt-5 space-y-4">
-        <h3 className="text-sm font-semibold text-gray-200">File Policy & Large File Storage (LFS)</h3>
+        <h3 className="rs-heading text-sm font-semibold text-gray-200">File Policy & Large File Storage (LFS)</h3>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <label className="block text-sm font-medium text-gray-300 mb-1">LFS Threshold (MB)</label>
+            <label className="block text-sm font-medium text-gray-300 mb-1" htmlFor={`${fieldId}-3`}>LFS Threshold (MB)</label>
             <input
               type="number"
               min="0"
               value={data.lfs_threshold_mb}
               onChange={e => update({ lfs_threshold_mb: Number(e.target.value) || 0 })}
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              placeholder="0 = disabled"
+              className={`rs-in w-full px-3 py-2 bg-gray-700 border ${lfsThresholdError ? 'border-red-500' : 'border-gray-600'} rounded-lg text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent`}
+              placeholder="0 = disabled" id={`${fieldId}-3`}
+              aria-invalid={lfsThresholdError ? true : undefined}
+              aria-describedby={lfsThresholdError ? `${fieldId}-3-error` : `${fieldId}-3-help`}
             />
-            <p className="text-xs text-gray-400 mt-1">Files larger than this are tracked via Git LFS. Set 0 to disable.</p>
+            {lfsThresholdError ? (
+              <p id={`${fieldId}-3-error`} role="alert" className="text-red-400 text-xs mt-1">{lfsThresholdError}</p>
+            ) : (
+              <p id={`${fieldId}-3-help`} className="text-xs text-gray-400 mt-1">Files larger than this are tracked via Git LFS. Set 0 to disable.</p>
+            )}
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-300 mb-1">Max File Size (MB)</label>
+            <label className="block text-sm font-medium text-gray-300 mb-1" htmlFor={`${fieldId}-4`}>Max File Size (MB)</label>
             <input
               type="number"
               min="0"
               value={data.max_file_size_mb}
               onChange={e => update({ max_file_size_mb: Number(e.target.value) || 0 })}
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              placeholder="0 = no limit"
+              className="rs-in w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              placeholder="0 = no limit" id={`${fieldId}-4`}
             />
             <p className="text-xs text-gray-400 mt-1">Files larger than this are skipped entirely. Set 0 for no limit.</p>
           </div>
@@ -1045,7 +1227,7 @@ function SyncStep({
       {/* PR-specific settings */}
       {data.sync_mode === 'pr' && (
         <div className="border-t border-gray-700 pt-5 space-y-4">
-          <h3 className="text-sm font-semibold text-gray-200">Pull Request Settings</h3>
+          <h3 className="rs-heading text-sm font-semibold text-gray-200">Pull Request Settings</h3>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <FormField
               label="PR Title Prefix"
@@ -1079,6 +1261,7 @@ function SyncStep({
               />
             </div>
           </div>
+          <NotSentMarker />
         </div>
       )}
     </div>
@@ -1089,7 +1272,7 @@ function SyncStep({
 // Step 4: Identity
 // ---------------------------------------------------------------------------
 
-function IdentityStep({
+export function IdentityStep({
   data,
   update,
   errors,
@@ -1141,10 +1324,10 @@ function IdentityStep({
 
       {/* Inline mappings table */}
       <div className="border-t border-gray-700 pt-5">
-        <h3 className="text-sm font-semibold text-gray-200 mb-3">Inline Author Mappings</h3>
+        <h3 className="rs-heading text-sm font-semibold text-gray-200 mb-3">Inline Author Mappings</h3>
         {data.identity_mappings.length > 0 && (
           <div className="overflow-x-auto mb-4">
-            <table className="min-w-full divide-y divide-gray-700">
+            <table className="rs-tbl min-w-full divide-y divide-gray-700">
               <thead>
                 <tr>
                   <th className="px-3 py-2 text-left text-xs font-medium text-gray-400 uppercase">SVN Username</th>
@@ -1172,27 +1355,27 @@ function IdentityStep({
         )}
         <div className="flex space-x-2">
           <input
-            placeholder="SVN username"
+            aria-label="Mapping SVN username" placeholder="SVN username"
             value={newMapping.svn_username}
             onChange={(e) => setNewMapping({ ...newMapping, svn_username: e.target.value })}
-            className="flex-1 rounded-lg border border-gray-600 bg-gray-700 text-gray-100 placeholder-gray-500 px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 focus:outline-none font-mono"
+            className="rs-in flex-1 rounded-lg border border-gray-600 bg-gray-700 text-gray-100 placeholder-gray-500 px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 focus:outline-none font-mono"
           />
           <input
-            placeholder="Full Name"
+            aria-label="Mapping full name" placeholder="Full Name"
             value={newMapping.name}
             onChange={(e) => setNewMapping({ ...newMapping, name: e.target.value })}
-            className="flex-1 rounded-lg border border-gray-600 bg-gray-700 text-gray-100 placeholder-gray-500 px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 focus:outline-none"
+            className="rs-in flex-1 rounded-lg border border-gray-600 bg-gray-700 text-gray-100 placeholder-gray-500 px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 focus:outline-none"
           />
           <input
-            placeholder="email@company.com"
+            aria-label="Mapping email" placeholder="email@company.com"
             value={newMapping.email}
             onChange={(e) => setNewMapping({ ...newMapping, email: e.target.value })}
-            className="flex-1 rounded-lg border border-gray-600 bg-gray-700 text-gray-100 placeholder-gray-500 px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 focus:outline-none"
+            className="rs-in flex-1 rounded-lg border border-gray-600 bg-gray-700 text-gray-100 placeholder-gray-500 px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 focus:outline-none"
           />
           <button
             onClick={addMapping}
             disabled={!newMapping.svn_username || !newMapping.name || !newMapping.email}
-            className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
+            className="rs-btn rs-btn--primary px-4 py-2 bg-blue-600 rs-text-on-accent rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
           >
             Add
           </button>
@@ -1206,7 +1389,7 @@ function IdentityStep({
 // Step 5: Server & Auth
 // ---------------------------------------------------------------------------
 
-function ServerAuthStep({
+export function ServerAuthStep({
   data,
   update,
   errors,
@@ -1287,6 +1470,9 @@ function ServerAuthStep({
             </div>
           </div>
         )}
+        <div className="mt-4">
+          <NotSentMarker detail="Authentication mode and the OAuth fields" />
+        </div>
       </div>
 
       {/* Daemon */}
@@ -1369,6 +1555,9 @@ function ServerAuthStep({
             />
           </div>
         </div>
+        <div className="mt-4">
+          <NotSentMarker />
+        </div>
       </div>
     </div>
   );
@@ -1378,22 +1567,26 @@ function ServerAuthStep({
 // Step 6: Review & Save
 // ---------------------------------------------------------------------------
 
-function ReviewStep({
+export function ReviewStep({
   data,
   configSaved,
   saveError,
   saveWarnings,
   onSave,
+  readStatus,
 }: {
   data: WizardData;
   configSaved: boolean;
   saveError: string;
   saveWarnings: string[];
   onSave: () => void;
+  readStatus: SavedConfigRead['status'];
 }) {
   const [saving, setSaving] = useState(false);
+  const { canSave } = savedConfigView(readStatus);
 
   const handleSave = async () => {
+    if (!canSave) return;
     setSaving(true);
     await onSave();
     setSaving(false);
@@ -1459,12 +1652,12 @@ function ReviewStep({
       {/* Save button */}
       <div className="border-t border-gray-700 pt-5">
         {saveError && (
-          <div className="mb-4 bg-red-900/30 border border-red-700 rounded-lg p-4 text-sm text-red-300">
+          <div className="rs-bn rs-bn--danger mb-4 bg-red-900/30 border border-red-700 rounded-lg p-4 text-sm text-red-300">
             <span className="font-semibold">Error: </span>{saveError}
           </div>
         )}
         {saveWarnings.length > 0 && (
-          <div className="mb-4 bg-yellow-900/30 border border-yellow-700 rounded-lg p-4 text-sm text-yellow-300">
+          <div className="rs-bn rs-bn--warn mb-4 bg-yellow-900/30 border border-yellow-700 rounded-lg p-4 text-sm text-yellow-300">
             <span className="font-semibold">Warnings:</span>
             <ul className="list-disc list-inside mt-1">
               {saveWarnings.map((w, i) => <li key={i}>{w}</li>)}
@@ -1472,24 +1665,29 @@ function ReviewStep({
           </div>
         )}
         {configSaved ? (
-          <div className="bg-emerald-900/30 border border-emerald-700 rounded-lg p-5 text-center">
+          <div className="rs-bn rs-bn--ok bg-emerald-900/30 border border-emerald-700 rounded-lg p-5 text-center">
             <div className="text-3xl mb-2">✓</div>
-            <h3 className="text-lg font-semibold text-emerald-300">Configuration Saved</h3>
+            <h3 className="rs-heading text-lg font-semibold text-emerald-300">Configuration Saved</h3>
             <p className="text-sm text-gray-400 mt-1">Click "Next: Import History" to import your SVN repository.</p>
           </div>
         ) : (
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            className="w-full py-3 bg-blue-600 text-white hover:bg-blue-700 rounded-lg text-sm font-medium transition-colors shadow-sm disabled:opacity-50"
-          >
-            {saving ? (
-              <span className="flex items-center justify-center space-x-2">
-                <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
-                <span>Saving Configuration...</span>
-              </span>
-            ) : 'Save Configuration to Server'}
-          </button>
+          <>
+            {readStatus === 'reading' && (
+              <p role="status" className="mb-4 text-sm text-gray-400">Waiting for the saved configuration to be read.</p>
+            )}
+            <button
+              onClick={handleSave}
+              disabled={saving || !canSave}
+              className="rs-btn rs-btn--primary w-full py-3 bg-blue-600 rs-text-on-accent hover:bg-blue-700 rounded-lg text-sm font-medium transition-colors shadow-sm disabled:opacity-50"
+            >
+              {saving ? (
+                <span className="flex items-center justify-center space-x-2">
+                  <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                  <span>Saving Configuration...</span>
+                </span>
+              ) : 'Save Configuration to Server'}
+            </button>
+          </>
         )}
       </div>
     </div>
@@ -1500,37 +1698,20 @@ function ReviewStep({
 // Step 7: Import
 // ---------------------------------------------------------------------------
 
+function WelcomeImportCheck({ onStatus }: { onStatus: (status: ImportStatus) => void }) {
+  const { status, statusError } = useSetupImport();
+  useEffect(() => {
+    if (status && !statusError) onStatus(status);
+  }, [onStatus, status, statusError]);
+  return statusError ? <p role="alert" className="mb-4 text-yellow-300">{statusError} Checking again automatically.</p> : null;
+}
+
 function ImportStep() {
   const navigate = useNavigate();
-  const [status, setStatus] = useState<ImportStatus | null>(null);
-  const [starting, setStarting] = useState(false);
-  const [startError, setStartError] = useState('');
+  const { status, statusError, actionError, actionMessage, starting, cancelling, awaitingStatus, start, cancel } = useSetupImport();
+  const actionsDisabled = starting || cancelling || awaitingStatus || !!statusError;
   const logRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
-
-  // Poll import status
-  useEffect(() => {
-    let interval: ReturnType<typeof setInterval> | null = null;
-
-    const poll = async () => {
-      try {
-        const s = await api.getImportStatus();
-        setStatus(s);
-      } catch {
-        // ignore poll errors
-      }
-    };
-
-    // Initial fetch
-    poll();
-
-    // Poll while running
-    interval = setInterval(poll, 1500);
-
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, []);
 
   // Auto-scroll log
   useEffect(() => {
@@ -1539,51 +1720,31 @@ function ImportStep() {
     }
   }, [status?.log_lines, autoScroll]);
 
-  const handleStart = async () => {
-    setStarting(true);
-    setStartError('');
-    try {
-      const result = await api.startImport();
-      if (!result.ok) {
-        setStartError(result.message);
-      }
-    } catch (e: unknown) {
-      setStartError(e instanceof Error ? e.message : 'Failed to start import');
-    }
-    setStarting(false);
-  };
-
-  const handleCancel = async () => {
-    try {
-      await api.cancelImport();
-    } catch {
-      // ignore
-    }
-  };
-
   const handleLogScroll = () => {
     if (!logRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = logRef.current;
     setAutoScroll(scrollHeight - scrollTop - clientHeight < 50);
   };
 
-  const phase = status?.phase ?? 'idle';
-  const isCancelling =
-    status?.lifecycle === 'cancel_requested' ||
-    status?.lifecycle === 'cancelling' ||
-    status?.cancelling === true;
-  const isActive =
-    ['connecting', 'importing', 'verifying', 'final_push'].includes(phase) ||
-    status?.busy === true ||
-    isCancelling;
-  const isComplete = phase === 'completed';
-  const isFailed = phase === 'failed';
-  const isCancelled = phase === 'cancelled';
-  const isIdle = !status || phase === 'idle';
-  const percentage = status && status.total_revs > 0
-    ? Math.round((status.current_rev / status.total_revs) * 100)
-    : 0;
-
+  const identified = !!(status?.operation_id && status.lifecycle);
+  const lifecycle = identified ? status?.lifecycle : undefined;
+  const needsReconciliation = lifecycle === 'reconciliation_required';
+  const isComplete = lifecycle === 'completed';
+  const isFailed = lifecycle === 'failed';
+  const isCancelled = lifecycle === 'cancelled';
+  const isTerminal = isComplete || isFailed || isCancelled || needsReconciliation;
+  const isCancelling = lifecycle === 'cancel_requested' || lifecycle === 'cancelling';
+  const reportedPhase = status?.phase ?? 'idle';
+  const hasWorkerPhase = ['connecting', 'importing', 'verifying', 'final_push'].includes(reportedPhase);
+  const isActive = !isTerminal && (hasWorkerPhase || status?.busy === true ||
+    lifecycle === 'queued' || lifecycle === 'running' || isCancelling);
+  const startRepository = status?.start_repository_id;
+  const startName = status?.start_repository_name || startRepository;
+  const changedRepository = status?.operation_repository_id && status.operation_repository_id !== startRepository;
+  const isLegacyOutcome = !identified && ['completed', 'cancelled', 'failed'].includes(reportedPhase);
+  // The journal owns outcomes. The worker supplies only the current execution phase.
+  const phase: ImportStatus['phase'] = isComplete ? 'completed' : isCancelled ? 'cancelled'
+    : isFailed || needsReconciliation ? 'failed' : hasWorkerPhase ? reportedPhase : 'idle';
   // Elapsed time for push phase
   const pushElapsed = (() => {
     if (!status?.push_started_at) return '';
@@ -1602,69 +1763,61 @@ function ImportStep() {
         color="blue"
       />
 
-      {/* Phase state machine graphic */}
-      <ImportPhaseGraphic currentPhase={phase} />
+      {statusError && <p role="alert" className="text-yellow-300">{statusError} {status && 'Showing the last reported status.'}</p>}
+      {actionError && <p role="alert" className="text-red-300">{actionError}</p>}
+      {actionMessage && <p role="status" className="text-blue-300">{actionMessage}</p>}
+      {!status && !statusError && <p role="status">Reading import status…</p>}
+      {status && !isLegacyOutcome && !status.historical_phase && !needsReconciliation && <ImportPhaseGraphic currentPhase={phase} />}
+      {status?.historical_phase && (
+        <p>Interrupted setup history. The previous session last reported “{importPhaseLabel(status.historical_phase)}”.
+          Its final outcome and publication are unknown.</p>
+      )}
+      {isLegacyOutcome && <p>Legacy import progress reported “{reportedPhase}”. A durable operation outcome and publication checkpoint are unavailable.</p>}
+      {status?.start_blocked_reason && !canStartSetupImport(status) && <p className="text-yellow-300">{status.start_blocked_reason}</p>}
+      {status && !status.start_blocked_reason && !isLegacyOutcome && !isActive && !isTerminal && !canStartSetupImport(status) &&
+        <p>The server has not made a new setup import available.</p>}
 
-      {/* Action buttons */}
-      {isIdle && (
+      {canStartSetupImport(status) && startRepository && (
         <div className="text-center py-4">
-          {startError && (
-            <div className="mb-4 bg-red-900/30 border border-red-700 rounded-lg p-4 text-sm text-red-300">
-              {startError}
-            </div>
-          )}
           <button
-            onClick={handleStart}
-            disabled={starting}
-            className="px-8 py-3 bg-blue-600 text-white hover:bg-blue-700 rounded-lg text-base font-medium transition-colors shadow-lg disabled:opacity-50"
+            onClick={() => { void start(startRepository); }}
+            disabled={actionsDisabled}
+            className="rs-btn rs-btn--primary px-8 py-3 bg-blue-600 rs-text-on-accent hover:bg-blue-700 rounded-lg text-base font-medium transition-colors shadow-lg disabled:opacity-50"
           >
-            {starting ? (
-              <span className="flex items-center space-x-2">
-                <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
-                <span>Starting Import...</span>
-              </span>
-            ) : '▶ Start Full Import'}
+            {starting ? 'Starting import…' : changedRepository ? `Start import for ${startName}`
+              : isFailed ? 'Retry Import' : isCancelled ? 'Restart Import' : 'Start Full Import'}
           </button>
-          <p className="text-xs text-gray-500 mt-3">This will import all SVN revisions as individual Git commits.</p>
+          <p className="text-xs text-gray-300 mt-3">This will import all SVN revisions for {startName} as individual Git commits.</p>
         </div>
       )}
 
-      {/* Progress section */}
-      {(isActive || isComplete || isFailed || isCancelled) && (
+      {status && (isActive || isTerminal) && (
         <div className="space-y-4">
-          {/* Progress bar */}
-          <div className="relative">
-            <div className="w-full h-8 bg-gray-700 rounded-lg overflow-hidden">
-              <div
-                className={`h-full transition-all duration-500 ease-out ${
-                  isComplete ? 'bg-emerald-500' :
-                  isFailed ? 'bg-red-500' :
-                  isCancelled ? 'bg-yellow-500' :
-                  'bg-blue-500'
-                }`}
-                style={{ width: `${isComplete ? 100 : percentage}%` }}
-              />
-            </div>
-            <div className="absolute inset-0 flex items-center justify-center text-sm font-medium text-white drop-shadow">
-              {isComplete ? 'Complete' :
-               isFailed ? 'Failed' :
-               isCancelled ? 'Cancelled' :
-               `${percentage}%`}
-            </div>
-          </div>
+          <ImportProgressMeter status={{ ...status, phase }} name="Setup import" />
+          <p className="text-sm text-gray-200">{lifecycle === 'running' && phase === 'idle' ? 'Running' : importStateLabel({ phase, lifecycle })}</p>
+          {status.operation_id && <p className="text-xs text-gray-400 font-mono">Operation {status.operation_id}</p>}
+          {isTerminal && status.busy && <p>Outcome recorded. The repository is still busy.</p>}
+          {identified && (
+            <dl className="grid gap-3 sm:grid-cols-2">
+              <ImportCheckpoint label="Local progress" revision={status.last_local_svn_rev} sha={status.last_local_git_sha} />
+              <ImportCheckpoint label="Confirmed publication" revision={status.last_confirmed_svn_rev} sha={status.last_confirmed_git_sha} />
+            </dl>
+          )}
 
           {/* Stats row */}
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-            <StatCard label="Revisions" value={`${status?.current_rev ?? 0} / ${status?.total_revs ?? 0}`} />
-            <StatCard label="Commits Created" value={String(status?.commits_created ?? 0)} />
-            <StatCard label="Current Files" value={String(status?.current_file_count ?? 0)} />
-            <StatCard label="LFS Files" value={String(status?.lfs_unique_count ?? 0)} />
-            <StatCard label="Batches Pushed" value={String(status?.batches_pushed ?? 0)} />
-          </div>
+          {status.has_worker_progress !== false && (
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+              <StatCard label="Revisions" value={`${status.current_rev ?? 0} / ${status.total_revs ?? 0}`} />
+              <StatCard label="Commits Created" value={String(status.commits_created ?? 0)} />
+              <StatCard label="Current Files" value={String(status.current_file_count ?? 0)} />
+              <StatCard label="LFS Files" value={String(status.lfs_unique_count ?? 0)} />
+              <StatCard label="Batches Pushed" value={String(status.batches_pushed ?? 0)} />
+            </div>
+          )}
 
           {/* Verification status */}
           {phase === 'verifying' && (
-            <div className="bg-blue-900/20 border border-blue-700 rounded-lg p-4 flex items-center space-x-3">
+            <div className="rs-bn rs-bn--info bg-blue-900/20 border border-blue-700 rounded-lg p-4 flex items-center space-x-3">
               <svg className="w-5 h-5 text-blue-400 animate-spin flex-shrink-0" viewBox="0 0 24 24" fill="none">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
@@ -1678,7 +1831,7 @@ function ImportStep() {
 
           {/* Final push progress */}
           {phase === 'final_push' && (
-            <div className="bg-purple-900/20 border border-purple-700 rounded-lg p-4 flex items-center space-x-3">
+            <div className="rs-bn rs-bn--git bg-purple-900/20 border border-purple-700 rounded-lg p-4 flex items-center space-x-3">
               <svg className="w-5 h-5 text-purple-400 animate-spin flex-shrink-0" viewBox="0 0 24 24" fill="none">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
@@ -1692,23 +1845,22 @@ function ImportStep() {
             </div>
           )}
 
-          {/* Cancel / cancelling */}
           {isActive && (
             <div className="text-center space-y-2">
-              {status?.operation_id && (
-                <p className="text-xs text-gray-400 font-mono">Operation {status.operation_id}</p>
-              )}
               {isCancelling ? (
                 <p className="text-sm text-yellow-300">
-                  Cancellation requested — stopping. Published history is not undone.
+                  Stop requested. Waiting for the worker to finish. Published commits remain in place.
                 </p>
-              ) : (
+              ) : identified && canCancelSetupImport(status) && status.operation_id ? (
                 <button
-                  onClick={handleCancel}
-                  className="px-4 py-2 border border-red-600 text-red-400 hover:bg-red-900/30 rounded-lg text-sm transition-colors"
+                  onClick={() => { if (status.operation_id) void cancel(status.operation_id); }}
+                  disabled={actionsDisabled}
+                  className="rs-btn rs-btn--quiet px-4 py-2 border border-red-600 text-red-400 hover:bg-red-900/30 rounded-lg text-sm transition-colors disabled:opacity-50"
                 >
                   Cancel Import
                 </button>
+              ) : (
+                <p>This import is read-only here. {identified ? 'The setup worker cannot confirm it can stop this operation.' : 'The server has not identified a setup operation to stop.'}</p>
               )}
             </div>
           )}
@@ -1718,7 +1870,7 @@ function ImportStep() {
       {/* Operation log */}
       <div className="relative">
         <div className="flex items-center justify-between mb-2">
-          <h3 className="text-sm font-semibold text-gray-300">Operation Log</h3>
+          <h3 className="rs-heading text-sm font-semibold text-gray-300">Operation Log</h3>
           {!autoScroll && (
             <button
               onClick={() => {
@@ -1733,11 +1885,12 @@ function ImportStep() {
         </div>
         <div
           ref={logRef}
+          aria-label="Import operation log" aria-live="off"
           onScroll={handleLogScroll}
           className="bg-gray-950 border border-gray-700 rounded-lg p-4 h-[400px] overflow-y-auto font-mono text-sm leading-relaxed"
         >
           {(!status?.log_lines || status.log_lines.length === 0) ? (
-            <p className="text-gray-600 italic">Waiting for import to start...</p>
+            <p className="text-gray-400 italic">No worker log reported.</p>
           ) : (
             status.log_lines.map((line, i) => (
               <div key={i} className={`whitespace-pre-wrap ${getLogLineColor(line)}`}>
@@ -1751,32 +1904,27 @@ function ImportStep() {
       {/* Server Monitor — visible during active import */}
       {(isActive || isComplete || isFailed) && <ServerMonitor />}
 
-      {/* Error display */}
-      {isFailed && status?.errors && status.errors.length > 0 && (
-        <div className="bg-red-900/30 border border-red-700 rounded-lg p-5">
-          <h3 className="text-sm font-semibold text-red-300 mb-2">Errors</h3>
-          {status.errors.map((err, i) => (
+      {(isFailed || needsReconciliation) && (
+        <div className="rs-bn rs-bn--danger bg-red-900/30 border border-red-700 rounded-lg p-5">
+          <h3 className="rs-heading text-sm font-semibold text-red-300 mb-2">{needsReconciliation ? 'Reconciliation required' : 'Import failed'}</h3>
+          {needsReconciliation && <p>Review the recorded outcome and confirm the published Git history before starting another import.</p>}
+          {status?.outcome_detail && <p>{status.outcome_detail}</p>}
+          {status?.errors.filter(error => error !== status.outcome_detail).map((err, i) => (
             <p key={i} className="text-sm text-red-200">{err}</p>
           ))}
-          <button
-            onClick={handleStart}
-            className="mt-3 px-4 py-2 bg-red-600 text-white hover:bg-red-700 rounded-lg text-sm transition-colors"
-          >
-            Retry Import
-          </button>
         </div>
       )}
 
       {/* Success state */}
       {isComplete && (
-        <div className="bg-emerald-900/30 border border-emerald-700 rounded-lg p-6 text-center">
+        <div className="rs-bn rs-bn--ok bg-emerald-900/30 border border-emerald-700 rounded-lg p-6 text-center">
           <div className="text-4xl mb-3">✓</div>
-          <h3 className="text-xl font-semibold text-emerald-300">Import Complete</h3>
-          <p className="text-gray-400 mt-2">
+          <h3 className="rs-heading text-xl font-semibold text-emerald-300">{status?.busy ? 'Completion recorded' : 'Import Complete'}</h3>
+          {status?.has_worker_progress !== false && <p className="text-gray-400 mt-2">
             {status?.commits_created} commit{status?.commits_created !== 1 ? 's' : ''} imported from {status?.total_revs} SVN revision{status?.total_revs !== 1 ? 's' : ''}
-          </p>
+          </p>}
           {(status?.lfs_unique_count ?? 0) > 0 && (
-            <p className="text-gray-500 text-sm mt-1">{status?.lfs_unique_count} unique files tracked via Git LFS</p>
+            <p className="text-gray-300 text-sm mt-1">{status?.lfs_unique_count} unique files tracked via Git LFS</p>
           )}
           {status?.verification && (
             <div className={`mt-3 text-sm ${status.verification.ok ? 'text-emerald-400' : 'text-yellow-400'}`}>
@@ -1785,7 +1933,7 @@ function ImportStep() {
           )}
           <button
             onClick={() => navigate('/login')}
-            className="mt-4 px-8 py-3 bg-emerald-600 text-white hover:bg-emerald-700 rounded-lg text-base font-medium transition-colors shadow-lg"
+            className="rs-btn rs-btn--state mt-4 px-8 py-3 bg-emerald-600 rs-text-on-state hover:bg-emerald-700 rounded-lg text-base font-medium transition-colors shadow-lg"
           >
             Go to Dashboard →
           </button>
@@ -1794,25 +1942,32 @@ function ImportStep() {
 
       {/* Cancelled state */}
       {isCancelled && (
-        <div className="bg-yellow-900/30 border border-yellow-700 rounded-lg p-5 text-center">
-          <h3 className="text-lg font-semibold text-yellow-300">Import Cancelled</h3>
-          <p className="text-gray-400 mt-1">{status?.commits_created} commits were imported before cancellation.</p>
+        <div className="rs-bn rs-bn--warn bg-yellow-900/30 border border-yellow-700 rounded-lg p-5 text-center">
+          <h3 className="rs-heading text-lg font-semibold text-yellow-300">{status?.busy ? 'Cancellation recorded' : 'Import Cancelled'}</h3>
+          <p className="text-gray-400 mt-1">Published commits remain in place.</p>
           <div className="flex justify-center space-x-3 mt-3">
             <button
-              onClick={handleStart}
-              className="px-4 py-2 bg-blue-600 text-white hover:bg-blue-700 rounded-lg text-sm transition-colors"
-            >
-              Restart Import
-            </button>
-            <button
               onClick={() => navigate('/login')}
-              className="px-4 py-2 border border-gray-600 text-gray-300 hover:bg-gray-700 rounded-lg text-sm transition-colors"
+              className="rs-btn rs-btn--quiet px-4 py-2 border border-gray-600 text-gray-300 hover:bg-gray-700 rounded-lg text-sm transition-colors"
             >
               Go to Dashboard
             </button>
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function ImportCheckpoint({ label, revision, sha }: { label: string; revision?: number | null; sha?: string | null }) {
+  return (
+    <div className="rounded-lg border border-gray-700 p-3">
+      <dt className="text-sm font-semibold">{label}</dt>
+      <dd className="break-all text-sm text-gray-300">
+        {revision != null && <span>SVN r{revision} </span>}
+        {sha && <code>{sha}</code>}
+        {revision == null && !sha && 'No checkpoint reported'}
+      </dd>
     </div>
   );
 }
@@ -1825,7 +1980,7 @@ function getLogLineColor(line: string): string {
   if (stripped.startsWith('[ok]')) return 'text-emerald-400';
   if (stripped.startsWith('[error]')) return 'text-red-400';
   if (stripped.startsWith('[warn]')) return 'text-yellow-400';
-  if (stripped.startsWith('[skip]')) return 'text-gray-500';
+  if (stripped.startsWith('[skip]')) return 'text-gray-300';
   if (stripped.startsWith('[info]')) return 'text-blue-400';
   return 'text-gray-400';
 }
@@ -1834,7 +1989,7 @@ function StatCard({ label, value }: { label: string; value: string }) {
   return (
     <div className="bg-gray-700/30 rounded-lg p-3 border border-gray-700 text-center">
       <div className="text-lg font-bold text-gray-100 font-mono">{value}</div>
-      <div className="text-xs text-gray-500 mt-0.5">{label}</div>
+      <div className="text-xs text-gray-300 mt-0.5">{label}</div>
     </div>
   );
 }
@@ -1857,7 +2012,7 @@ function SummaryCard({ title, color, items }: { title: string; color: string; it
       <dl className="space-y-1.5">
         {items.map(([label, value]) => (
           <div key={label} className="flex justify-between text-xs">
-            <dt className="text-gray-500">{label}</dt>
+            <dt className="text-gray-300">{label}</dt>
             <dd className="text-gray-300 font-mono truncate ml-3 max-w-[60%] text-right">{value || '-'}</dd>
           </div>
         ))}

@@ -201,10 +201,10 @@ fn deferred_v12_hard_delete_rolls_back_partial_history_on_targeted_failure() {
 }
 
 #[test]
-fn ordinary_v13_hard_delete_rolls_back_partial_history_on_targeted_failure() {
+fn ordinary_hard_delete_rolls_back_partial_history_on_targeted_failure() {
     let tmp = TempDir::new().unwrap();
     let db = ordinary_file_db(&tmp, false);
-    assert_hard_delete_rolls_back_partial_history(&tmp, &db, 13);
+    assert_hard_delete_rolls_back_partial_history(&tmp, &db, schema::CURRENT_SCHEMA_VERSION);
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn multi_repository_hard_delete_rolls_back_partial_history_on_targeted_failure()
     let tmp = TempDir::new().unwrap();
     let db = ordinary_file_db(&tmp, true);
     assert!(db.get_repository("pair_g2").unwrap().is_some());
-    assert_hard_delete_rolls_back_partial_history(&tmp, &db, 13);
+    assert_hard_delete_rolls_back_partial_history(&tmp, &db, schema::CURRENT_SCHEMA_VERSION);
 }
 
 #[test]

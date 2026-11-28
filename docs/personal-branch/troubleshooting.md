@@ -14,6 +14,7 @@ Common issues and solutions for RepoSync Personal Branch Mode.
 - [Daemon Won't Start](#daemon-wont-start)
 - [PR Not Syncing to SVN](#pr-not-syncing-to-svn)
 - [Files Skipped by Policy](#files-skipped-by-policy)
+- [Git LFS](#git-lfs)
 - [How to Reset Sync State](#how-to-reset-sync-state)
 - [Log File Location and Verbosity](#log-file-location-and-verbosity)
 - [Getting Help](#getting-help)
@@ -55,6 +56,7 @@ The doctor checks:
 5. **SVN working copy** -- checks for `data_dir/svn-wc` (created on first Git-to-SVN sync)
 6. **Daemon status** -- verifies the daemon process is alive
 7. **Watermark consistency** -- ensures both SVN and Git watermarks are set and consistent
+8. **Git LFS** -- when a threshold or pattern enables LFS, checks `git lfs version` and local filters in the personal Git repository
 
 ## Sync Stopped Working
 
@@ -479,6 +481,24 @@ reposync personal start --foreground
 ```
 
 Watch the output for messages about the PR being detected, skipped, or encountering errors.
+
+## Git LFS
+
+LFS is on when `options.lfs_threshold` is greater than 0 or `options.lfs_patterns` lists globs. Both defaults leave it off.
+
+**Symptom**: import or sync stops with `git-lfs is not available` or `git lfs install --local failed`.
+
+Install `git-lfs`, run `git lfs version`, then in the personal repository (`data_dir/git-repo`) run `git lfs install --local`. `reposync personal doctor` must show the tool version and `LFS Repository Ready` before the next import.
+
+**Symptom**: a Git commit that should be a pointer still contains the raw file.
+
+The clean filter did not run. Confirm `.gitattributes` contains `filter=lfs` for that pattern and that `git config --local --get filter.lfs.clean` is set. Sync refuses to advance the watermark when a qualifying path was committed as a regular blob.
+
+**Symptom**: Git→SVN stops with `LFS pointer for '<path>' could not be resolved` and an `lfs_resolution_failed` audit row.
+
+The pointer is in Git and the bytes are not in `.git/lfs/objects`. The SVN working copy does not receive the pointer text. From the personal Git repository run `git lfs fetch` and `git lfs pull` for that commit, confirm the object file exists, then run sync again. Do not hand-edit the pointer into SVN.
+
+Audit actions for these decisions are `lfs_tracked`, `lfs_skipped`, and `lfs_resolution_failed`.
 
 ## Files Skipped by Policy
 

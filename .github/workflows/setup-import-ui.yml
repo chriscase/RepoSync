@@ -1,0 +1,47 @@
+name: Setup import UI
+
+on:
+  push:
+    paths:
+      - '.github/workflows/setup-import-ui.yml'
+      - 'web-ui/a11y/fixture.mjs'
+      - 'web-ui/a11y/setupImport19.test.mjs'
+      - 'web-ui/package*.json'
+      - 'web-ui/src/api.ts'
+      - 'web-ui/src/pages/SetupWizard.tsx'
+      - 'web-ui/src/useSetupImport*.ts'
+      - 'crates/web/src/api/setup.rs'
+      - 'crates/web/tests/setup_wizard_busy.rs'
+      - 'crates/core/src/import.rs'
+      - 'crates/core/src/db/import_operations.rs'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/setup-import-ui.yml'
+      - 'web-ui/**'
+      - 'crates/web/src/api/setup.rs'
+      - 'crates/web/tests/setup_wizard_busy.rs'
+      - 'crates/core/src/import.rs'
+      - 'crates/core/src/db/import_operations.rs'
+
+jobs:
+  setup-import-ui:
+    name: Setup import controller and browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    defaults:
+      run:
+        working-directory: web-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test -- --run src/useSetupImport.test.ts
+      - run: node --test --test-concurrency=1 a11y/setupImport19.test.mjs
+        env:
+          REPOSYNC_A11Y_BROWSER: /usr/bin/google-chrome

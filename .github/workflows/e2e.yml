@@ -31,11 +31,14 @@ jobs:
       - name: Reliability #62 acceptance matrix
         run: python3 scripts/reliability-acceptance-matrix.py --self-test && python3 scripts/reliability-acceptance-matrix.py --check --report
 
-      - name: Build project
-        run: cargo build --workspace
+      - name: Build project and integration test binaries
+        timeout-minutes: 15
+        run: |
+          cargo build --workspace
+          cargo test --workspace --test '*' --no-run
 
       - name: Run E2E tests
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           set -euo pipefail
           # The resource-leak test measures process-wide FDs while making 1,000

@@ -1,3 +1,4 @@
+import { clientSession } from '../session';
 export interface StoredUser {
   id: string;
   username: string;
@@ -8,7 +9,7 @@ export interface StoredUser {
 
 export function getStoredUser(): StoredUser | null {
   try {
-    const stored = localStorage.getItem('user');
+    const stored = clientSession().snapshot().user;
     return stored ? JSON.parse(stored) : null;
   } catch {
     return null;

@@ -269,7 +269,7 @@ async fn qualified_real_engine_receipt_restart_worker() -> Result<()> {
             );
             continue;
         }
-        let approval = if stage == "completed" {
+        let (preparation_id, approval_digest) = if stage == "completed" {
             let receipt = match prepared? {
                 RefreshResponse::Receipt(value) => value,
                 other => anyhow::bail!("unexpected {other:?}"),
@@ -279,25 +279,13 @@ async fn qualified_real_engine_receipt_restart_worker() -> Result<()> {
             assert_eq!(receipt.svn_revision, Some(5));
             let saved: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(root.join("original-approval.json"))?)?;
-            crate::pair_refresh::service::RefreshApprovalView {
-                version: 1,
-                expires_at: saved["expires_at"]
-                    .as_str()
-                    .context("original expiry")?
-                    .into(),
-                preparation_id: uuid::Uuid::parse_str(
-                    saved["preparation_id"].as_str().context("preparation id")?,
-                )?,
-                operation_id: id,
-                request_id: request.clone(),
-                child_id: "child".into(),
-                parent_id: "parent".into(),
-                approval_digest: saved["approval_digest"]
+            (
+                uuid::Uuid::parse_str(saved["preparation_id"].as_str().context("preparation id")?)?,
+                saved["approval_digest"]
                     .as_str()
                     .context("original approval digest")?
-                    .into(),
-                kind: "integration".into(),
-            }
+                    .to_owned(),
+            )
         } else {
             let approval = match prepared? {
                 RefreshResponse::Approval(value) => value,
@@ -305,15 +293,17 @@ async fn qualified_real_engine_receipt_restart_worker() -> Result<()> {
             };
             assert_eq!(approval.operation_id, id);
             assert_eq!(approval.kind, "recovery");
-            approval
+            assert_eq!(approval.git_tips.child, baseline);
+            assert_eq!(approval.git_tips.parent, parent_tip);
+            (approval.preparation_id, approval.approval_digest)
         };
         let completed = service
             .act(
                 "real-engine-session".into(),
                 "child",
                 &request,
-                approval.preparation_id,
-                approval.approval_digest.clone(),
+                preparation_id,
+                approval_digest.clone(),
                 RefreshAction::Execute,
             )
             .await?;
@@ -329,8 +319,8 @@ async fn qualified_real_engine_receipt_restart_worker() -> Result<()> {
                 "real-engine-session".into(),
                 "child",
                 &request,
-                approval.preparation_id,
-                approval.approval_digest,
+                preparation_id,
+                approval_digest,
                 RefreshAction::Execute,
             )
             .await?;

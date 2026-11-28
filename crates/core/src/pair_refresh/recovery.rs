@@ -152,6 +152,17 @@ impl OwnedRecoveredRefresh {
     }
 }
 
+/// Resume a local file:// refresh or re-anchor from its journal. A completed
+/// request returns the original receipt. This does not replay a recorded SVN
+/// revision or Git commit.
+pub async fn resume_local_refresh(
+    engine: &SyncEngine,
+    child_id: &str,
+    request: super::local_operations::LocalRequest,
+) -> Result<super::local_operations::LocalReceipt> {
+    super::local_operations::run_local(engine, child_id, request).await
+}
+
 pub fn prepare_owned_refresh_recovery(
     engine: &SyncEngine,
     actor: &LiveRefreshActorPolicy<'_>,

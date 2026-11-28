@@ -114,12 +114,19 @@ pub(crate) fn verify_svn_no_target_receipt(
     svn_rev: i64,
     projection: &str,
     current_generation: i64,
+    expected_scope_uuid: Option<&str>,
 ) -> NoTargetReceiptVerdict {
     if record["repo_id"] != repo_id
         || record["svn_revision"].as_i64() != Some(svn_rev)
         || svn_rev <= 0
     {
         return NoTargetReceiptVerdict::RepoOrShaMismatch;
+    }
+    if let Some(expected) = expected_scope_uuid {
+        match record.get("scope_uuid").and_then(|value| value.as_str()) {
+            Some(found) if found == expected => {}
+            _ => return NoTargetReceiptVerdict::UnverifiedOutcome,
+        }
     }
     if record["projection"] != projection {
         return NoTargetReceiptVerdict::ProjectionMismatch;
@@ -343,6 +350,10 @@ pub fn classify_incoming_git_commit(
     }
 }
 
+fn managed_receipt_scope(db: &Database, repo_id: &str) -> Result<String, DatabaseError> {
+    crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), repo_id)
+}
+
 fn verified_svn_no_target_receipt(
     ctx: &TeamEchoContext<'_>,
     svn_rev: i64,
@@ -351,12 +362,14 @@ fn verified_svn_no_target_receipt(
         return Ok(false);
     };
     let generation = repo_echo_generation(ctx.db, ctx.repo_id)?;
+    let scope = managed_receipt_scope(ctx.db, ctx.repo_id)?;
     Ok(verify_svn_no_target_receipt(
         &record,
         ctx.repo_id,
         svn_rev,
         ctx.no_target_projection,
         generation,
+        Some(&scope),
     ) == NoTargetReceiptVerdict::Accepted)
 }
 
@@ -389,15 +402,14 @@ fn verified_git_no_target_receipt(
         return Ok(false);
     };
     let generation = repo_echo_generation(ctx.db, ctx.repo_id)?;
-    let scope =
-        crate::db::repo_scope_identity::repository_scope_uuid(&ctx.db.conn(), ctx.repo_id).ok();
+    let scope = managed_receipt_scope(ctx.db, ctx.repo_id)?;
     Ok(verify_no_target_receipt(
         &record,
         ctx.repo_id,
         sha,
         ctx.no_target_projection,
         generation,
-        scope.as_deref(),
+        Some(&scope),
     ) == NoTargetReceiptVerdict::Accepted)
 }
 
@@ -462,12 +474,14 @@ fn verified_svn_no_target_receipt_personal(
             continue;
         };
         let generation = repo_echo_generation(ctx.db, repo_id)?;
+        let scope = managed_receipt_scope(ctx.db, repo_id)?;
         if verify_svn_no_target_receipt(
             &record,
             repo_id,
             svn_rev,
             ctx.no_target_projection,
             generation,
+            Some(&scope),
         ) == NoTargetReceiptVerdict::Accepted
         {
             return Ok(true);
@@ -485,15 +499,14 @@ fn verified_git_no_target_receipt_personal(
             continue;
         };
         let generation = repo_echo_generation(ctx.db, repo_id)?;
-        let scope =
-            crate::db::repo_scope_identity::repository_scope_uuid(&ctx.db.conn(), repo_id).ok();
+        let scope = managed_receipt_scope(ctx.db, repo_id)?;
         if verify_no_target_receipt(
             &record,
             repo_id,
             sha,
             ctx.no_target_projection,
             generation,
-            scope.as_deref(),
+            Some(&scope),
         ) == NoTargetReceiptVerdict::Accepted
         {
             return Ok(true);
@@ -1008,6 +1021,136 @@ mod tests {
         assert_eq!(
             classify_incoming_svn_revision(&ctx(&db, "repo-a"), weak_rev, "no marker").unwrap(),
             EchoDisposition::ApplyGenuine
+        );
+
+        let fieldless = serde_json::json!({
+            "version": 1,
+            "repo_id": "repo-a",
+            "svn_revision": svn_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        });
+        assert_eq!(
+            verify_svn_no_target_receipt(
+                &fieldless,
+                "repo-a",
+                svn_rev,
+                projection,
+                1,
+                Some(&scope_a)
+            ),
+            NoTargetReceiptVerdict::UnverifiedOutcome
+        );
+    }
+
+    #[test]
+    fn svn_receipt_scope_lookup_failure_does_not_suppress_genuine_work() {
+        let db = setup_db();
+        let svn_rev = 14_i64;
+        let projection = "{}";
+        let scope_a =
+            crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), "repo-a").unwrap();
+        let generation = crate::echo_receipt_scope::repo_echo_generation(&db, "repo-a").unwrap();
+        let key = crate::echo_receipt_scope::handled_svn_no_target_state_key(
+            &scope_a, generation, svn_rev,
+        );
+        let fieldless = serde_json::json!({
+            "version": 1,
+            "repo_id": "repo-a",
+            "svn_revision": svn_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+            "generation": generation,
+        });
+        db.set_state(&key, &fieldless.to_string()).unwrap();
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "repo-a"), svn_rev, "no marker").unwrap(),
+            EchoDisposition::ApplyGenuine,
+            "field-less managed receipts must not suppress genuine work"
+        );
+
+        let foreign = serde_json::json!({
+            "version": 1,
+            "repo_id": "repo-a",
+            "svn_revision": svn_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+            "generation": generation,
+            "scope_uuid": "00000000-0000-0000-0000-000000000000",
+        });
+        db.set_state(&key, &foreign.to_string()).unwrap();
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "repo-a"), svn_rev, "no marker").unwrap(),
+            EchoDisposition::ApplyGenuine,
+            "foreign-scope receipts must not suppress genuine work"
+        );
+
+        db.conn()
+            .execute(
+                "ALTER TABLE repositories RENAME COLUMN scope_uuid TO scope_uuid_hidden",
+                [],
+            )
+            .unwrap();
+        let err = classify_incoming_svn_revision(&ctx(&db, "repo-a"), svn_rev, "no marker");
+        assert!(
+            err.is_err(),
+            "scope lookup failure must propagate, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn git_receipt_scope_lookup_failure_does_not_suppress_genuine_work() {
+        let db = setup_db();
+        let sha = "e".repeat(40);
+        let projection = "{}";
+        let scope_a =
+            crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), "repo-a").unwrap();
+        let generation = crate::echo_receipt_scope::repo_echo_generation(&db, "repo-a").unwrap();
+        let key =
+            crate::echo_receipt_scope::handled_git_no_target_state_key(&scope_a, generation, &sha);
+        let fieldless = serde_json::json!({
+            "version": 1,
+            "repo_id": "repo-a",
+            "git_sha": sha,
+            "outcome": "filtered",
+            "projection": projection,
+            "generation": generation,
+        });
+        db.set_state(&key, &fieldless.to_string()).unwrap();
+        assert_eq!(
+            classify_incoming_git_commit(&ctx(&db, "repo-a"), &sha, "no marker")
+                .unwrap()
+                .unwrap(),
+            EchoDisposition::ApplyGenuine
+        );
+
+        let foreign = serde_json::json!({
+            "version": 1,
+            "repo_id": "repo-a",
+            "git_sha": sha,
+            "outcome": "filtered",
+            "projection": projection,
+            "generation": generation,
+            "scope_uuid": "00000000-0000-0000-0000-000000000000",
+        });
+        db.set_state(&key, &foreign.to_string()).unwrap();
+        assert_eq!(
+            classify_incoming_git_commit(&ctx(&db, "repo-a"), &sha, "no marker")
+                .unwrap()
+                .unwrap(),
+            EchoDisposition::ApplyGenuine
+        );
+
+        db.conn()
+            .execute(
+                "ALTER TABLE repositories RENAME COLUMN scope_uuid TO scope_uuid_hidden",
+                [],
+            )
+            .unwrap();
+        let err = classify_incoming_git_commit(&ctx(&db, "repo-a"), &sha, "no marker");
+        assert!(
+            err.is_err(),
+            "git scope lookup failure must propagate, got {err:?}"
         );
     }
 

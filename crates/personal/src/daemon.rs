@@ -67,7 +67,28 @@ pub fn is_process_alive(pid: u32) -> bool {
     }
 }
 
+/// Inspect the recorded PID and liveness without deleting stale evidence.
+/// Read/parse errors remain errors for status and diagnostics to report.
+pub fn inspect_pid_file(data_dir: &Path) -> Result<Option<(u32, bool)>> {
+    let contents = match fs::read_to_string(pid_file_path(data_dir)) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("failed to inspect PID file"),
+    };
+    let pid: u32 = contents
+        .trim()
+        .parse()
+        .context("PID file contains invalid data")?;
+    anyhow::ensure!(
+        pid != 0 && pid <= i32::MAX as u32,
+        "PID file contains invalid process identity"
+    );
+    Ok(Some((pid, is_process_alive(pid))))
+}
+
 /// Check if the daemon is currently running.
+/// Legacy cleanup helper; startup and inspection retain stale PID evidence.
+#[allow(dead_code)]
 pub fn is_running(data_dir: &Path) -> Result<Option<u32>> {
     let pid_path = pid_file_path(data_dir);
     match read_pid_file(&pid_path)? {

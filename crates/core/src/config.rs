@@ -444,7 +444,9 @@ pub struct SyncConfig {
     #[serde(default = "default_true")]
     pub auto_merge: bool,
 
-    /// Branch names to synchronize (empty = all).
+    /// Branch names to synchronize.
+    ///
+    /// An empty list selects every branch. It does not disable synchronization.
     #[serde(default)]
     pub sync_branches: Vec<String>,
 
@@ -490,6 +492,16 @@ impl Default for SyncConfig {
             lfs_patterns: Vec::new(),
             ignore_patterns: Vec::new(),
         }
+    }
+}
+
+impl SyncConfig {
+    /// Whether `sync_branches` selects every branch.
+    ///
+    /// Empty means all branches. A non-empty list is a restriction.
+    /// Neither value turns synchronization off.
+    pub fn selects_all_branches(&self) -> bool {
+        self.sync_branches.is_empty()
     }
 }
 
@@ -933,5 +945,82 @@ token_env = "GH_TOKEN"
         assert_eq!(config.web.listen, "127.0.0.1:3000");
         assert_eq!(config.sync.mode, SyncMode::Direct);
         assert!(config.sync.auto_merge);
+        assert!(config.sync.selects_all_branches());
+    }
+
+    fn docker_ui_fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn docker_ui_synthetic_fixture_loads_empty_branches_as_all() {
+        let path = docker_ui_fixture("docker-ui-qualify-synthetic.toml");
+        let config = AppConfig::load_and_resolve(&path)
+            .expect("synthetic qualification fixture loads through AppConfig");
+        assert!(
+            config.svn.url.starts_with("file://"),
+            "svn stays on a synthetic file URL"
+        );
+        assert!(
+            config.github.api_url.starts_with("http://127.0.0.1:"),
+            "github stays on loopback"
+        );
+        assert!(
+            !config.github.api_url.contains("github.com"),
+            "fixture does not name a live GitHub host"
+        );
+        assert!(config.sync.sync_branches.is_empty());
+        assert!(
+            config.sync.selects_all_branches(),
+            "empty sync_branches selects every branch and does not disable sync"
+        );
+
+        let mut restricted = config.sync.clone();
+        restricted.sync_branches = vec!["only-one".into()];
+        assert!(!restricted.selects_all_branches());
+    }
+
+    #[test]
+    fn sync_branches_false_does_not_deserialize() {
+        let mut text =
+            std::fs::read_to_string(docker_ui_fixture("docker-ui-qualify-synthetic.toml")).unwrap();
+        assert!(text.contains("sync_branches = []"));
+        text = text.replace("sync_branches = []", "sync_branches = false");
+        let parsed = toml::from_str::<AppConfig>(&text);
+        assert!(
+            parsed.is_err(),
+            "a boolean is not a branch list and does not disable synchronization"
+        );
+    }
+
+    #[test]
+    fn docker_ui_invalid_fixture_is_zero_poll_not_missing_file() {
+        let path = docker_ui_fixture("docker-ui-qualify-invalid.toml");
+        let config = AppConfig::load_from_file(&path).expect("invalid fixture still parses");
+        let err = config
+            .validate()
+            .expect_err("zero poll interval is invalid");
+        match err {
+            ConfigError::InvalidValue { field, detail } => {
+                assert_eq!(field, "daemon.poll_interval_secs");
+                assert!(detail.contains("poll interval must be > 0"));
+                let rendered = ConfigError::InvalidValue { field, detail }.to_string();
+                assert!(rendered.contains("daemon.poll_interval_secs"));
+                assert!(!rendered.contains("configuration file not found"));
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_qualification_config_is_file_not_found() {
+        let err = AppConfig::load_from_file("/etc/reposync/missing.toml")
+            .expect_err("missing path does not load");
+        let rendered = err.to_string();
+        assert!(matches!(err, ConfigError::FileNotFound(_)));
+        assert!(rendered.contains("configuration file not found: /etc/reposync/missing.toml"));
+        assert!(!rendered.contains("poll interval must be > 0"));
     }
 }

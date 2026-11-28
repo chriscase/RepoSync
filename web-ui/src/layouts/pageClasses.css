@@ -1,0 +1,373 @@
+/*
+ * #264 page styling under data-rs-bridge: every layout in light, and Ledger, Console and
+ * Guide in dark. Classic, Individual and Team in dark never match these rules.
+ */
+
+.rs-layout-shell[data-rs-bridge] {
+  color: var(--rs-text);
+}
+
+.rs-layout-shell[data-rs-bridge] :focus-visible {
+  outline-color: var(--rs-focus);
+}
+
+.rs-layout-shell[data-rs-bridge] .rs-slot-nav :focus-visible {
+  outline-color: var(--rs-shell-focus);
+}
+
+/* Native dialog backdrop follows the page scrim. */
+.rs-layout-shell[data-rs-bridge] .app-dialog::backdrop {
+  background: var(--rs-scrim);
+}
+
+/* Diff viewer palette from the page tokens (see components/DiffViewer.tsx). */
+.rs-layout-shell[data-rs-bridge] {
+  --rs-diff-bg: var(--rs-code-bg);
+  --rs-diff-text: var(--rs-code-text);
+  --rs-diff-added-bg: var(--rs-add-bg);
+  --rs-diff-removed-bg: var(--rs-del-bg);
+  --rs-diff-changed-bg: var(--rs-warn-soft);
+  --rs-diff-word-added-bg: color-mix(in srgb, var(--rs-ok) 30%, var(--rs-add-bg));
+  --rs-diff-word-removed-bg: color-mix(in srgb, var(--rs-danger) 30%, var(--rs-del-bg));
+  --rs-diff-added-gutter-bg: color-mix(in srgb, var(--rs-ok) 18%, var(--rs-add-bg));
+  --rs-diff-removed-gutter-bg: color-mix(in srgb, var(--rs-danger) 18%, var(--rs-del-bg));
+  --rs-diff-gutter-bg: var(--rs-surface-2);
+  --rs-diff-gutter-bg-dark: var(--rs-surface-3);
+  --rs-diff-highlight-bg: var(--rs-warn-soft);
+  --rs-diff-highlight-gutter-bg: var(--rs-warn-soft);
+  --rs-diff-fold-gutter-bg: var(--rs-accent-soft);
+  --rs-diff-fold-bg: var(--rs-surface-2);
+  --rs-diff-empty-bg: var(--rs-surface-2);
+  --rs-diff-gutter-text: var(--rs-text-2);
+  --rs-diff-title-bg: var(--rs-surface-2);
+  --rs-diff-title-border: var(--rs-line);
+}
+
+/*
+ * Shared presentational classes (implementation map step 6), styled only in Ledger,
+ * Console and Guide. The classes are in the markup of every layout; Classic, Individual
+ * and Team have no rule for them. Values come from the option's tokens in pageTokens.css.
+ */
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-slot-main {
+  font-family: var(--rs-font-ui);
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) :is(.rs-title, .rs-heading) {
+  font-family: var(--rs-font-display);
+  font-weight: var(--rs-display-weight);
+  text-wrap: balance;
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-title {
+  font-size: var(--rs-h1);
+  line-height: 1.2;
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-sec {
+  background-color: var(--rs-surface);
+  border: 1px solid var(--rs-line);
+  border-radius: var(--rs-radius-lg);
+  box-shadow: none;
+  min-width: 0;
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-dlg {
+  background-color: var(--rs-surface);
+  border: 1px solid var(--rs-line-strong);
+  border-radius: var(--rs-radius-lg);
+  box-shadow: var(--rs-shadow);
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-tbl th {
+  font: 650 0.76em/1.3 var(--rs-font-ui);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--rs-text-3);
+  border-bottom: 1px solid var(--rs-line-strong);
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-tbl td {
+  border-bottom: 1px solid var(--rs-line);
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-btn {
+  min-height: var(--rs-control-h);
+  border-radius: var(--rs-radius);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-btn--quiet {
+  background-color: var(--rs-surface);
+  border: 1px solid var(--rs-line-strong);
+  color: var(--rs-text);
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-btn--quiet:hover:not(:disabled) {
+  background-color: var(--rs-surface-2);
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-btn--primary {
+  background-color: var(--rs-accent);
+  border: 1px solid var(--rs-accent);
+  color: var(--rs-accent-text);
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-btn--primary:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+/* A selected choice is filled with the accent: its inner text takes the button's text colour. */
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-btn--primary[aria-pressed='true'] :is(div, p, span) {
+  color: inherit;
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-btn--danger {
+  background-color: var(--rs-danger-solid);
+  border: 1px solid var(--rs-danger-solid);
+  color: var(--rs-danger-solid-text);
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-in {
+  min-height: var(--rs-control-h);
+  border: 1px solid var(--rs-line-strong);
+  border-radius: var(--rs-radius);
+  background-color: var(--rs-surface);
+  color: var(--rs-text);
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) textarea.rs-in {
+  min-height: calc(var(--rs-control-h) * 2);
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-bn {
+  border-radius: var(--rs-radius);
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-mark {
+  border-radius: var(--rs-radius);
+}
+
+/* ---- Ledger: ruled sections instead of boxes, ink as the only accent, stamps for state ---- */
+.rs-layout-shell[data-rs-layout='ledger'] .rs-title { letter-spacing: -0.01em; }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-sec {
+  background-color: transparent;
+  border: 0;
+  border-top: 1px solid var(--rs-text);
+  border-radius: 0;
+  padding-left: 0;
+  padding-right: 0;
+  padding-bottom: 8px;
+}
+.rs-layout-shell[data-rs-layout='ledger'] .rs-sec .rs-sec {
+  border-top-color: var(--rs-line);
+}
+.rs-layout-shell[data-rs-layout='ledger'] .rs-tbl th { border-bottom-color: var(--rs-text); }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-mark {
+  border-radius: 2px;
+  text-transform: uppercase;
+  font-size: 0.68rem;
+  letter-spacing: 0.07em;
+}
+.rs-layout-shell[data-rs-layout='ledger'] .rs-bn {
+  border-width: 1px 0;
+  border-color: var(--rs-line-strong);
+  border-radius: 0;
+}
+.rs-layout-shell[data-rs-layout='ledger'] .rs-dlg { border-color: var(--rs-text); }
+
+/* ---- Console: dense tables, small uppercase section headings, state on the left edge ---- */
+.rs-layout-shell[data-rs-layout='console'] .rs-slot-main :is(.text-sm, .text-base) { font-size: 13px; line-height: 1.45; }
+.rs-layout-shell[data-rs-layout='console'] .rs-sec { padding: 14px 16px; }
+.rs-layout-shell[data-rs-layout='console'] h2.rs-heading {
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-size: 0.8rem;
+  color: var(--rs-text-2);
+}
+.rs-layout-shell[data-rs-layout='console'] .rs-tbl :is(th, td) { padding: 6px 10px; }
+.rs-layout-shell[data-rs-layout='console'] .rs-tbl tbody tr:nth-child(even) td { background-color: var(--rs-surface-2); }
+.rs-layout-shell[data-rs-layout='console'] .rs-bn { border-width: 1px 1px 1px 3px; }
+.rs-layout-shell[data-rs-layout='console'] .rs-bn--ok { border-left-color: var(--rs-ok); }
+.rs-layout-shell[data-rs-layout='console'] .rs-bn--warn { border-left-color: var(--rs-warn); }
+.rs-layout-shell[data-rs-layout='console'] .rs-bn--held { border-left-color: var(--rs-held); }
+.rs-layout-shell[data-rs-layout='console'] .rs-bn--danger { border-left-color: var(--rs-danger); }
+.rs-layout-shell[data-rs-layout='console'] :is(.rs-bn--run, .rs-bn--info) { border-left-color: var(--rs-run); }
+.rs-layout-shell[data-rs-layout='console'] .rs-btn { padding-top: 0; padding-bottom: 0; }
+
+/* ---- Guide: large targets, pill controls, roomy cards ---- */
+.rs-layout-shell[data-rs-layout='guide'] .rs-btn {
+  border-radius: 999px;
+  padding: 0 1.1em;
+}
+.rs-layout-shell[data-rs-layout='guide'] .rs-in { padding-left: 0.8em; padding-right: 0.8em; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-sec { box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05); }
+.rs-layout-shell[data-rs-layout='guide'] .rs-bn {
+  border-color: transparent;
+  border-radius: var(--rs-radius-lg);
+}
+.rs-layout-shell[data-rs-layout='guide'] .rs-tbl th {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.86em;
+  border-bottom-color: var(--rs-line);
+}
+.rs-layout-shell[data-rs-layout='guide'] .rs-mark { border-radius: 999px; }
+
+/*
+ * Page regions (contracts/page-regions.md, decisions D7, D8, D12, D15). Pages render one
+ * region tree in every layout. Derived regions and the repository section navigation are
+ * hidden in Classic, Individual and Team (not seen, not reached by keyboard, not read).
+ * In Ledger, Console and Guide the repository page shows the current section's regions;
+ * the others stay mounted and hidden, so drafts, dialogs and requests survive.
+ */
+.rs-layout-shell:is([data-rs-layout='classic'], [data-rs-layout='individual'], [data-rs-layout='team']) [data-rs-derived],
+.rs-layout-shell:is([data-rs-layout='classic'], [data-rs-layout='individual'], [data-rs-layout='team']) .rs-page-sections {
+  display: none !important;
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) [data-rs-page='repo'][data-rs-section='overview'] [data-rs-sections]:not([data-rs-sections~='overview']):not(:has(dialog[open])) { display: none; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) [data-rs-page='repo'][data-rs-section='activity'] [data-rs-sections]:not([data-rs-sections~='activity']):not(:has(dialog[open])) { display: none; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) [data-rs-page='repo'][data-rs-section='branches'] [data-rs-sections]:not([data-rs-sections~='branches']):not(:has(dialog[open])) { display: none; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) [data-rs-page='repo'][data-rs-section='operations'] [data-rs-sections]:not([data-rs-sections~='operations']):not(:has(dialog[open])) { display: none; }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) [data-rs-page='repo'][data-rs-section='settings'] [data-rs-sections]:not([data-rs-sections~='settings']):not(:has(dialog[open])) { display: none; }
+
+/* The same region shown short on Overview: records and pairs (not a second copy). */
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) [data-rs-page='repo'][data-rs-section='overview'] [data-rs-region='records'] [data-rs-list] > :nth-child(n+6),
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) [data-rs-page='repo'][data-rs-section='overview'] [data-rs-region='pairs'] :is(tbody tr, li):nth-child(n+6) {
+  display: none;
+}
+
+/* Section navigation. */
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-page-sections {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  font-weight: 600;
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-page-sections a {
+  padding: 0.45em 0.8em;
+  color: var(--rs-text-2);
+  white-space: nowrap;
+  text-decoration: none;
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-page-sections a:hover { color: var(--rs-text); }
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-page-sections a[aria-current] { color: var(--rs-text); }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-page-sections { border-bottom: 1px solid var(--rs-line); }
+.rs-layout-shell[data-rs-layout='ledger'] .rs-page-sections a[aria-current] { box-shadow: inset 0 -2px 0 var(--rs-accent); }
+.rs-layout-shell[data-rs-layout='console'] .rs-page-sections { border-bottom: 1px solid var(--rs-line); gap: 0; }
+.rs-layout-shell[data-rs-layout='console'] .rs-page-sections a { border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.rs-layout-shell[data-rs-layout='console'] .rs-page-sections a[aria-current] { border-bottom-color: var(--rs-accent); }
+.rs-layout-shell[data-rs-layout='guide'] .rs-page-sections { gap: 8px; padding-bottom: 2px; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-page-sections a { border: 1px solid var(--rs-line-strong); border-radius: 999px; background: var(--rs-surface); padding: 0.45em 1em; }
+.rs-layout-shell[data-rs-layout='guide'] .rs-page-sections a[aria-current] { background: var(--rs-accent); border-color: var(--rs-accent); color: var(--rs-accent-text); }
+
+/* Dashboard (page-regions.md): "Needs attention" is first in the document. From 1101 px
+   Console puts it in a left column and the rest beside it, in the same document order. */
+@media (min-width: 1101px) {
+  .rs-layout-shell[data-rs-layout='console'] [data-rs-page='dashboard'] {
+    display: grid;
+    grid-template-columns: 330px minmax(0, 1fr);
+    column-gap: 20px;
+    row-gap: 18px;
+    align-items: start;
+  }
+  .rs-layout-shell[data-rs-layout='console'] [data-rs-page='dashboard'] > * {
+    grid-column: 2;
+    min-width: 0;
+    margin-top: 0 !important;
+  }
+  .rs-layout-shell[data-rs-layout='console'] [data-rs-page='dashboard'] > [data-rs-region='scope'] {
+    grid-column: 1 / -1;
+  }
+  .rs-layout-shell[data-rs-layout='console'] [data-rs-page='dashboard'] > [data-rs-region='attention'] {
+    grid-column: 1;
+    grid-row: 2 / span 40;
+    position: sticky;
+    top: 12px;
+  }
+}
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) [data-rs-region='attention'] ul {
+  display: grid;
+  gap: var(--rs-gap);
+}
+.rs-layout-shell[data-rs-layout='guide'] [data-rs-region='attention'] ul[aria-label='Pairs that need attention'] {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+}
+
+/* The shell status mark (S03): a mark and the health word, coloured by state. */
+.rs-layout-shell .rs-shell-status .rs-mark[data-rs-health] { display: inline-flex; align-items: center; gap: 4px; }
+
+/* At phone widths in the new layouts, rows of controls inside a page wrap instead of widening
+   the page (the repository header's actions, for example). Items wrap only when they do not fit. */
+@media (max-width: 860px) {
+  .rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-slot-main .flex:not(.flex-col):not(.flex-nowrap) {
+    flex-wrap: wrap;
+  }
+}
+
+/* Documentation at phone widths in the new layouts: the section list above the content. */
+@media (max-width: 860px) {
+  .rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-docs { flex-direction: column; }
+  .rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-docs-nav { width: auto; }
+  .rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-docs-nav > div { position: static; }
+}
+
+/* Repository page arrangements (prototype g04-*). Same document order in every layout; the
+   grid only places regions. Row gaps are 0 and spacing is on margins, so the column that
+   spans rows adds no empty height. The grid applies only to the loaded page whose head comes
+   first (a notice above the head, or the not-found and loading views, keep one column), and
+   never to an open dialog, which keeps its own centring. */
+@media (min-width: 1101px) {
+  /* Console keeps the status beside the content. */
+  .rs-layout-shell[data-rs-layout='console'] [data-rs-page='repo']:has(> [data-rs-region='head']:first-child):has(> .rs-page-sections) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 300px;
+    column-gap: 20px;
+    row-gap: 0;
+    align-items: start;
+  }
+  .rs-layout-shell[data-rs-layout='console'] [data-rs-page='repo']:has(> [data-rs-region='head']:first-child):has(> .rs-page-sections) > :not(dialog) {
+    grid-column: 1;
+    margin-top: 0 !important;
+    margin-bottom: 1.25rem;
+    min-width: 0;
+  }
+  .rs-layout-shell[data-rs-layout='console'] [data-rs-page='repo']:has(> [data-rs-region='head']:first-child):has(> .rs-page-sections) > [data-rs-region='head'] { grid-column: 1 / -1; margin-bottom: 0.75rem; }
+  .rs-layout-shell[data-rs-layout='console'] [data-rs-page='repo']:has(> [data-rs-region='head']:first-child):has(> .rs-page-sections) > .rs-page-sections { grid-column: 1 / -1; grid-row: 3; }
+  .rs-layout-shell[data-rs-layout='console'] [data-rs-page='repo']:has(> [data-rs-region='head']:first-child):has(> .rs-page-sections) > [data-rs-region='status-line'] {
+    grid-column: 2;
+    grid-row: 4 / span 30;
+    position: sticky;
+    top: 12px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+}
+@media (min-width: 861px) {
+  /* Ledger lists the sections in a ruled column beside the content. */
+  .rs-layout-shell[data-rs-layout='ledger'] [data-rs-page='repo']:has(> [data-rs-region='head']:first-child):has(> .rs-page-sections) {
+    display: grid;
+    grid-template-columns: 200px minmax(0, 1fr);
+    column-gap: 28px;
+    row-gap: 0;
+    align-items: start;
+  }
+  .rs-layout-shell[data-rs-layout='ledger'] [data-rs-page='repo']:has(> [data-rs-region='head']:first-child):has(> .rs-page-sections) > :not(dialog) {
+    grid-column: 2;
+    margin-top: 0 !important;
+    margin-bottom: 1.5rem;
+    min-width: 0;
+  }
+  .rs-layout-shell[data-rs-layout='ledger'] [data-rs-page='repo']:has(> [data-rs-region='head']:first-child):has(> .rs-page-sections) > :is([data-rs-region='head'], [data-rs-region='status-line']) { grid-column: 1 / -1; }
+  .rs-layout-shell[data-rs-layout='ledger'] [data-rs-page='repo']:has(> [data-rs-region='head']:first-child):has(> .rs-page-sections) > .rs-page-sections {
+    grid-column: 1;
+    grid-row: 4 / span 30;
+    position: sticky;
+    top: 12px;
+    flex-direction: column;
+    gap: 0;
+    overflow: visible;
+    border-bottom: 0;
+    border-left: 1px solid var(--rs-line);
+  }
+  .rs-layout-shell[data-rs-layout='ledger'] [data-rs-page='repo']:has(> [data-rs-region='head']:first-child):has(> .rs-page-sections) > .rs-page-sections a { padding: 0.4em 0.9em; margin-left: -1px; border-left: 2px solid transparent; }
+  .rs-layout-shell[data-rs-layout='ledger'] [data-rs-page='repo']:has(> [data-rs-region='head']:first-child):has(> .rs-page-sections) > .rs-page-sections a[aria-current] { border-left-color: var(--rs-accent); box-shadow: none; font-weight: 750; }
+}
+
+/* A choice card (a title with a description, e.g. the setup sync mode) stays stacked and
+   left-aligned in the new layouts, as in the existing ones. */
+.rs-layout-shell:is([data-rs-layout='ledger'], [data-rs-layout='console'], [data-rs-layout='guide']) .rs-btn.rs-choice {
+  display: block;
+  text-align: left;
+  padding: 0.75rem 1rem;
+  border-radius: var(--rs-radius-lg);
+}

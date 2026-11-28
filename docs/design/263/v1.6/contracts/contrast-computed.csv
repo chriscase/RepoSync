@@ -1,0 +1,241 @@
+option,theme,pair,foreground_token,background_token,ratio,target,meets_target
+ledger,light,Body text on page,text,bg,17.13,4.5,yes
+ledger,light,Body text on surface,text,surface,17.76,4.5,yes
+ledger,light,Secondary text on surface,text-2,surface,10.1,4.5,yes
+ledger,light,Muted text on page,text-3,bg,6.1,4.5,yes
+ledger,light,Muted text on surface,text-3,surface,6.32,4.5,yes
+ledger,light,Muted text on inset,text-3,surface-2,5.68,4.5,yes
+ledger,light,Link on surface,link,surface,7.8,4.5,yes
+ledger,light,Primary button label,accent-text,accent,17.76,4.5,yes
+ledger,light,Danger button label,danger-solid-text,danger-solid,6.54,4.5,yes
+ledger,light,OK state on surface,ok,surface,6.99,4.5,yes
+ledger,light,Running state on surface,run,surface,6.46,4.5,yes
+ledger,light,Warning state on surface,warn,surface,6.31,4.5,yes
+ledger,light,Held state on surface,held,surface,6.11,4.5,yes
+ledger,light,Danger state on surface,danger,surface,6.54,4.5,yes
+ledger,light,Neutral state on surface,off,surface,6.32,4.5,yes
+ledger,light,OK text on its tint,text,ok-soft,15.22,4.5,yes
+ledger,light,Warning state on its tint,warn,warn-soft,5.45,4.5,yes
+ledger,light,Held state on its tint,held,held-soft,5.06,4.5,yes
+ledger,light,Danger state on its tint,danger,danger-soft,5.38,4.5,yes
+ledger,light,SVN reference on surface,svn,surface,6.46,4.5,yes
+ledger,light,Git reference on surface,git,surface,6.65,4.5,yes
+ledger,light,Code text on code background,code-text,code-bg,15.67,4.5,yes
+ledger,light,Control border on surface,line-strong,surface,3.26,3.0,yes
+ledger,light,Focus ring on surface,focus,surface,7.8,3.0,yes
+ledger,light,Shell link on chrome,shell:text-muted,shell:chrome,7.93,4.5,yes
+ledger,light,Shell active text on chrome,shell:text-strong,shell:chrome,17.13,4.5,yes
+ledger,light,Shell active label on accent,shell:accent-text,shell:accent,17.76,4.5,yes
+ledger,light,Conflict count,shell:alert-text,shell:alert,6.54,4.5,yes
+ledger,light,Chooser notice on chrome,shell:notice-text,shell:chrome,6.88,4.5,yes
+ledger,light,Shell focus ring on chrome,shell:focus,shell:chrome,7.53,3.0,yes
+ledger,dark,Body text on page,text,bg,15.31,4.5,yes
+ledger,dark,Body text on surface,text,surface,14.18,4.5,yes
+ledger,dark,Secondary text on surface,text-2,surface,9.67,4.5,yes
+ledger,dark,Muted text on page,text-3,bg,6.94,4.5,yes
+ledger,dark,Muted text on surface,text-3,surface,6.42,4.5,yes
+ledger,dark,Muted text on inset,text-3,surface-2,5.91,4.5,yes
+ledger,dark,Link on surface,link,surface,8.5,4.5,yes
+ledger,dark,Primary button label,accent-text,accent,15.31,4.5,yes
+ledger,dark,Danger button label,danger-solid-text,danger-solid,5.16,4.5,yes
+ledger,dark,OK state on surface,ok,surface,9.31,4.5,yes
+ledger,dark,Running state on surface,run,surface,7.92,4.5,yes
+ledger,dark,Warning state on surface,warn,surface,8.94,4.5,yes
+ledger,dark,Held state on surface,held,surface,7.33,4.5,yes
+ledger,dark,Danger state on surface,danger,surface,7.47,4.5,yes
+ledger,dark,Neutral state on surface,off,surface,6.42,4.5,yes
+ledger,dark,OK text on its tint,text,ok-soft,11.82,4.5,yes
+ledger,dark,Warning state on its tint,warn,warn-soft,7.05,4.5,yes
+ledger,dark,Held state on its tint,held,held-soft,6.29,4.5,yes
+ledger,dark,Danger state on its tint,danger,danger-soft,6.61,4.5,yes
+ledger,dark,SVN reference on surface,svn,surface,7.92,4.5,yes
+ledger,dark,Git reference on surface,git,surface,8.07,4.5,yes
+ledger,dark,Code text on code background,code-text,code-bg,15.93,4.5,yes
+ledger,dark,Control border on surface,line-strong,surface,3.4,3.0,yes
+ledger,dark,Focus ring on surface,focus,surface,8.5,3.0,yes
+ledger,dark,Shell link on chrome,shell:text-muted,shell:chrome,8.68,4.5,yes
+ledger,dark,Shell active text on chrome,shell:text-strong,shell:chrome,15.31,4.5,yes
+ledger,dark,Shell active label on accent,shell:accent-text,shell:accent,15.31,4.5,yes
+ledger,dark,Conflict count,shell:alert-text,shell:alert,8.1,4.5,yes
+ledger,dark,Chooser notice on chrome,shell:notice-text,shell:chrome,9.66,4.5,yes
+ledger,dark,Shell focus ring on chrome,shell:focus,shell:chrome,9.18,3.0,yes
+console,light,Body text on page,text,bg,16.49,4.5,yes
+console,light,Body text on surface,text,surface,17.87,4.5,yes
+console,light,Secondary text on surface,text-2,surface,10.26,4.5,yes
+console,light,Muted text on page,text-3,bg,5.67,4.5,yes
+console,light,Muted text on surface,text-3,surface,6.14,4.5,yes
+console,light,Muted text on inset,text-3,surface-2,5.42,4.5,yes
+console,light,Link on surface,link,surface,6.92,4.5,yes
+console,light,Primary button label,accent-text,accent,5.87,4.5,yes
+console,light,Danger button label,danger-solid-text,danger-solid,6.57,4.5,yes
+console,light,OK state on surface,ok,surface,5.78,4.5,yes
+console,light,Running state on surface,run,surface,5.85,4.5,yes
+console,light,Warning state on surface,warn,surface,6.31,4.5,yes
+console,light,Held state on surface,held,surface,6.11,4.5,yes
+console,light,Danger state on surface,danger,surface,6.57,4.5,yes
+console,light,Neutral state on surface,off,surface,6.14,4.5,yes
+console,light,OK text on its tint,text,ok-soft,15.3,4.5,yes
+console,light,Warning state on its tint,warn,warn-soft,5.4,4.5,yes
+console,light,Held state on its tint,held,held-soft,5.02,4.5,yes
+console,light,Danger state on its tint,danger,danger-soft,5.37,4.5,yes
+console,light,SVN reference on surface,svn,surface,5.85,4.5,yes
+console,light,Git reference on surface,git,surface,6.51,4.5,yes
+console,light,Code text on code background,code-text,code-bg,15.32,4.5,yes
+console,light,Control border on surface,line-strong,surface,3.43,3.0,yes
+console,light,Focus ring on surface,focus,surface,5.87,3.0,yes
+console,light,Shell link on chrome,shell:text-muted,shell:chrome,6.29,4.5,yes
+console,light,Shell active text on chrome,shell:text-strong,shell:chrome,15.19,4.5,yes
+console,light,Shell active label on accent,shell:accent-text,shell:accent,5.87,4.5,yes
+console,light,Conflict count,shell:alert-text,shell:alert,6.57,4.5,yes
+console,light,Chooser notice on chrome,shell:notice-text,shell:chrome,6.06,4.5,yes
+console,light,Shell focus ring on chrome,shell:focus,shell:chrome,4.99,3.0,yes
+console,dark,Body text on page,text,bg,15.65,4.5,yes
+console,dark,Body text on surface,text,surface,14.53,4.5,yes
+console,dark,Secondary text on surface,text-2,surface,9.49,4.5,yes
+console,dark,Muted text on page,text-3,bg,6.61,4.5,yes
+console,dark,Muted text on surface,text-3,surface,6.13,4.5,yes
+console,dark,Muted text on inset,text-3,surface-2,5.61,4.5,yes
+console,dark,Link on surface,link,surface,9.85,4.5,yes
+console,dark,Primary button label,accent-text,accent,7.67,4.5,yes
+console,dark,Danger button label,danger-solid-text,danger-solid,5.02,4.5,yes
+console,dark,OK state on surface,ok,surface,7.75,4.5,yes
+console,dark,Running state on surface,run,surface,7.81,4.5,yes
+console,dark,Warning state on surface,warn,surface,8.82,4.5,yes
+console,dark,Held state on surface,held,surface,6.78,4.5,yes
+console,dark,Danger state on surface,danger,surface,6.02,4.5,yes
+console,dark,Neutral state on surface,off,surface,6.13,4.5,yes
+console,dark,OK text on its tint,text,ok-soft,12.1,4.5,yes
+console,dark,Warning state on its tint,warn,warn-soft,6.76,4.5,yes
+console,dark,Held state on its tint,held,held-soft,5.74,4.5,yes
+console,dark,Danger state on its tint,danger,danger-soft,5.2,4.5,yes
+console,dark,SVN reference on surface,svn,surface,7.99,4.5,yes
+console,dark,Git reference on surface,git,surface,7.49,4.5,yes
+console,dark,Code text on code background,code-text,code-bg,16.38,4.5,yes
+console,dark,Control border on surface,line-strong,surface,3.13,3.0,yes
+console,dark,Focus ring on surface,focus,surface,9.85,3.0,yes
+console,dark,Shell link on chrome,shell:text-muted,shell:chrome,7.89,4.5,yes
+console,dark,Shell active text on chrome,shell:text-strong,shell:chrome,16.38,4.5,yes
+console,dark,Shell active label on accent,shell:accent-text,shell:accent,7.67,4.5,yes
+console,dark,Conflict count,shell:alert-text,shell:alert,6.86,4.5,yes
+console,dark,Chooser notice on chrome,shell:notice-text,shell:chrome,9.94,4.5,yes
+console,dark,Shell focus ring on chrome,shell:focus,shell:chrome,11.1,3.0,yes
+guide,light,Body text on page,text,bg,16.25,4.5,yes
+guide,light,Body text on surface,text,surface,17.9,4.5,yes
+guide,light,Secondary text on surface,text-2,surface,9.92,4.5,yes
+guide,light,Muted text on page,text-3,bg,5.63,4.5,yes
+guide,light,Muted text on surface,text-3,surface,6.2,4.5,yes
+guide,light,Muted text on inset,text-3,surface-2,5.83,4.5,yes
+guide,light,Link on surface,link,surface,6.67,4.5,yes
+guide,light,Primary button label,accent-text,accent,5.92,4.5,yes
+guide,light,Danger button label,danger-solid-text,danger-solid,6.57,4.5,yes
+guide,light,OK state on surface,ok,surface,6.13,4.5,yes
+guide,light,Running state on surface,run,surface,6.67,4.5,yes
+guide,light,Warning state on surface,warn,surface,6.31,4.5,yes
+guide,light,Held state on surface,held,surface,6.11,4.5,yes
+guide,light,Danger state on surface,danger,surface,6.57,4.5,yes
+guide,light,Neutral state on surface,off,surface,6.2,4.5,yes
+guide,light,OK text on its tint,text,ok-soft,15.46,4.5,yes
+guide,light,Warning state on its tint,warn,warn-soft,5.45,4.5,yes
+guide,light,Held state on its tint,held,held-soft,5.06,4.5,yes
+guide,light,Danger state on its tint,danger,danger-soft,5.37,4.5,yes
+guide,light,SVN reference on surface,svn,surface,5.94,4.5,yes
+guide,light,Git reference on surface,git,surface,6.66,4.5,yes
+guide,light,Code text on code background,code-text,code-bg,15.81,4.5,yes
+guide,light,Control border on surface,line-strong,surface,3.14,3.0,yes
+guide,light,Focus ring on surface,focus,surface,5.92,3.0,yes
+guide,light,Shell link on chrome,shell:text-muted,shell:chrome,7.48,4.5,yes
+guide,light,Shell active text on chrome,shell:text-strong,shell:chrome,17.9,4.5,yes
+guide,light,Shell active label on accent,shell:accent-text,shell:accent,5.92,4.5,yes
+guide,light,Conflict count,shell:alert-text,shell:alert,6.57,4.5,yes
+guide,light,Chooser notice on chrome,shell:notice-text,shell:chrome,7.13,4.5,yes
+guide,light,Shell focus ring on chrome,shell:focus,shell:chrome,5.92,3.0,yes
+guide,dark,Body text on page,text,bg,16.14,4.5,yes
+guide,dark,Body text on surface,text,surface,14.73,4.5,yes
+guide,dark,Secondary text on surface,text-2,surface,10.03,4.5,yes
+guide,dark,Muted text on page,text-3,bg,7.2,4.5,yes
+guide,dark,Muted text on surface,text-3,surface,6.57,4.5,yes
+guide,dark,Muted text on inset,text-3,surface-2,5.95,4.5,yes
+guide,dark,Link on surface,link,surface,8.49,4.5,yes
+guide,dark,Primary button label,accent-text,accent,7.65,4.5,yes
+guide,dark,Danger button label,danger-solid-text,danger-solid,5.02,4.5,yes
+guide,dark,OK state on surface,ok,surface,8.82,4.5,yes
+guide,dark,Running state on surface,run,surface,6.73,4.5,yes
+guide,dark,Warning state on surface,warn,surface,9.04,4.5,yes
+guide,dark,Held state on surface,held,surface,7.6,4.5,yes
+guide,dark,Danger state on surface,danger,surface,7.55,4.5,yes
+guide,dark,Neutral state on surface,off,surface,6.57,4.5,yes
+guide,dark,OK text on its tint,text,ok-soft,12.57,4.5,yes
+guide,dark,Warning state on its tint,warn,warn-soft,7.23,4.5,yes
+guide,dark,Held state on its tint,held,held-soft,6.53,4.5,yes
+guide,dark,Danger state on its tint,danger,danger-soft,6.76,4.5,yes
+guide,dark,SVN reference on surface,svn,surface,7.94,4.5,yes
+guide,dark,Git reference on surface,git,surface,8.08,4.5,yes
+guide,dark,Code text on code background,code-text,code-bg,16.83,4.5,yes
+guide,dark,Control border on surface,line-strong,surface,3.37,3.0,yes
+guide,dark,Focus ring on surface,focus,surface,8.49,3.0,yes
+guide,dark,Shell link on chrome,shell:text-muted,shell:chrome,7.81,4.5,yes
+guide,dark,Shell active text on chrome,shell:text-strong,shell:chrome,15.23,4.5,yes
+guide,dark,Shell active label on accent,shell:accent-text,shell:accent,7.65,4.5,yes
+guide,dark,Conflict count,shell:alert-text,shell:alert,8.38,4.5,yes
+guide,dark,Chooser notice on chrome,shell:notice-text,shell:chrome,9.35,4.5,yes
+guide,dark,Shell focus ring on chrome,shell:focus,shell:chrome,8.77,3.0,yes
+existing layouts,light,Body text on page,text,bg,16.12,4.5,yes
+existing layouts,light,Body text on surface,text,surface,17.74,4.5,yes
+existing layouts,light,Secondary text on surface,text-2,surface,10.31,4.5,yes
+existing layouts,light,Muted text on page,text-3,bg,6.87,4.5,yes
+existing layouts,light,Muted text on surface,text-3,surface,7.56,4.5,yes
+existing layouts,light,Muted text on inset,text-3,surface-2,6.87,4.5,yes
+existing layouts,light,Link on surface,link,surface,6.7,4.5,yes
+existing layouts,light,Primary button label,accent-text,accent,5.17,4.5,yes
+existing layouts,light,Danger button label,danger-solid-text,danger-solid,6.47,4.5,yes
+existing layouts,light,OK state on surface,ok,surface,5.02,4.5,yes
+existing layouts,light,Running state on surface,run,surface,6.7,4.5,yes
+existing layouts,light,Warning state on surface,warn,surface,6.12,4.5,yes
+existing layouts,light,Held state on surface,held,surface,5.65,4.5,yes
+existing layouts,light,Danger state on surface,danger,surface,6.47,4.5,yes
+existing layouts,light,Neutral state on surface,off,surface,7.56,4.5,yes
+existing layouts,light,OK text on its tint,text,ok-soft,16.15,4.5,yes
+existing layouts,light,Warning state on its tint,warn,warn-soft,5.7,4.5,yes
+existing layouts,light,Held state on its tint,held,held-soft,4.93,4.5,yes
+existing layouts,light,Danger state on its tint,danger,danger-soft,5.3,4.5,yes
+existing layouts,light,SVN reference on surface,svn,surface,6.7,4.5,yes
+existing layouts,light,Git reference on surface,git,surface,6.98,4.5,yes
+existing layouts,light,Code text on code background,code-text,code-bg,16.12,4.5,yes
+existing layouts,light,Control border on surface,line-strong,surface,3.5,3.0,yes
+existing layouts,light,Focus ring on surface,focus,surface,6.7,3.0,yes
+existing layouts,light,Shell link on chrome,shell:text-muted,shell:chrome,7.56,4.5,yes
+existing layouts,light,Shell active text on chrome,shell:text-strong,shell:chrome,17.74,4.5,yes
+existing layouts,light,Shell active label on accent,shell:accent-text,shell:accent,5.17,4.5,yes
+existing layouts,light,Conflict count,shell:alert-text,shell:alert,6.47,4.5,yes
+existing layouts,light,Chooser notice on chrome,shell:notice-text,shell:chrome,7.09,4.5,yes
+existing layouts,light,Shell focus ring on chrome,shell:focus,shell:chrome,6.7,3.0,yes
+existing layouts,dark,Body text on page,text,bg,16.12,4.5,yes
+existing layouts,dark,Body text on surface,text,surface,13.34,4.5,yes
+existing layouts,dark,Secondary text on surface,text-2,surface,9.96,4.5,yes
+existing layouts,dark,Muted text on page,text-3,bg,6.99,4.5,yes
+existing layouts,dark,Muted text on surface,text-3,surface,5.78,4.5,yes
+existing layouts,dark,Muted text on inset,text-3,surface-2,4.06,4.5,no
+existing layouts,dark,Link on surface,link,surface,5.77,4.5,yes
+existing layouts,dark,Primary button label,accent-text,accent,5.17,4.5,yes
+existing layouts,dark,Danger button label,danger-solid-text,danger-solid,4.83,4.5,yes
+existing layouts,dark,OK state on surface,ok,surface,8.42,4.5,yes
+existing layouts,dark,Running state on surface,run,surface,5.77,4.5,yes
+existing layouts,dark,Warning state on surface,warn,surface,9.59,4.5,yes
+existing layouts,dark,Held state on surface,held,surface,6.49,4.5,yes
+existing layouts,dark,Danger state on surface,danger,surface,5.31,4.5,yes
+existing layouts,dark,Neutral state on surface,off,surface,5.78,4.5,yes
+existing layouts,dark,OK text on its tint,text,ok-soft,11.25,4.5,yes
+existing layouts,dark,Warning state on its tint,warn,warn-soft,8.13,4.5,yes
+existing layouts,dark,Held state on its tint,held,held-soft,5.97,4.5,yes
+existing layouts,dark,Danger state on its tint,danger,danger-soft,5.02,4.5,yes
+existing layouts,dark,SVN reference on surface,svn,surface,5.77,4.5,yes
+existing layouts,dark,Git reference on surface,git,surface,5.56,4.5,yes
+existing layouts,dark,Code text on code background,code-text,code-bg,16.26,4.5,yes
+existing layouts,dark,Control border on surface,line-strong,surface,1.94,3.0,no
+existing layouts,dark,Focus ring on surface,focus,surface,8.14,3.0,yes
+existing layouts,dark,Shell link on chrome,shell:text-muted,shell:chrome,7.93,4.5,yes
+existing layouts,dark,Shell active text on chrome,shell:text-strong,shell:chrome,20.13,4.5,yes
+existing layouts,dark,Shell active label on accent,shell:accent-text,shell:accent,5.17,4.5,yes
+existing layouts,dark,Conflict count,shell:alert-text,shell:alert,3.95,4.5,no
+existing layouts,dark,Chooser notice on chrome,shell:notice-text,shell:chrome,16.17,4.5,yes
+existing layouts,dark,Shell focus ring on chrome,shell:focus,shell:chrome,11.17,3.0,yes

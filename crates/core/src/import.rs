@@ -25,10 +25,12 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::db::import_operations::{
-    import_target_fingerprint, ImportOperation, ImportOperationState,
+    import_operation_has_retained_effects, import_target_fingerprint, ImportOperation,
+    ImportOperationState,
 };
+use crate::db::lineage_checkpoints::{record_live_svn_uuid_or_hold_unproved, LiveSvnIdentity};
 use crate::db::Database;
-use crate::errors::DatabaseError;
+use crate::errors::{DatabaseError, SyncError};
 use crate::file_policy::{FilePolicy, FilePolicyDecision};
 use crate::git::remote_url;
 use crate::git::GitClient;
@@ -96,6 +98,9 @@ pub struct ImportProgress {
     pub push_started_at: Option<String>,
     pub completed_at: Option<String>,
     pub verification: Option<VerificationResult>,
+    /// Setup operation owning this in-process progress and cancellation signal.
+    #[serde(skip)]
+    pub setup_operation_id: Option<String>,
     /// Set to true to request cancellation.
     #[serde(skip)]
     pub cancel_requested: bool,
@@ -123,6 +128,7 @@ impl Default for ImportProgress {
             push_started_at: None,
             completed_at: None,
             verification: None,
+            setup_operation_id: None,
             cancel_requested: false,
             cancel_signal: Arc::new(AtomicBool::new(false)),
             lfs_seen: HashSet::new(),
@@ -191,7 +197,17 @@ pub fn copy_tree_with_policy(
     policy: &FilePolicy,
     db: &Database,
 ) -> Result<CopyStats> {
+    // Validate the complete source before the first destination write. A bad
+    // entry late in traversal must not turn an earlier copied file into a
+    // partially accepted export.
     let mut stats = CopyStats::default();
+    let source = independent_tree_manifest(src)?;
+    for (path, entry) in &source.entries {
+        if matches!(entry, ManifestEntry::Unsupported { kind, .. } if kind == "hardlink") {
+            reject_hardlink_alias(db, &mut stats, path)?;
+        }
+    }
+    validate_export_manifest(&source)?;
     let mut visited = HashSet::new();
     admit_export_root(src, &mut visited)?;
     let mut ctx = CopyTreePolicyCtx {
@@ -203,6 +219,17 @@ pub fn copy_tree_with_policy(
         visited: &mut visited,
     };
     copy_tree_policy_inner(src, dst, &mut ctx)?;
+    let selected: Vec<String> = stats
+        .lfs_paths
+        .iter()
+        .map(|path| crate::lfs::exact_lfs_pattern(path))
+        .collect();
+    crate::lfs::replace_engine_lfs_patterns(dst, &selected).with_context(|| {
+        format!(
+            "failed to record the current LFS selection in {}",
+            dst.display()
+        )
+    })?;
     if stats.lfs_tracked > 0 {
         refresh_export_present_engine_lfs(dst, src)?;
     }
@@ -282,6 +309,37 @@ fn record_copy_exclusions(db: &Database, stats: &CopyStats) {
             true,
         );
     }
+    if !stats.lfs_paths.is_empty() {
+        let _ = db.insert_audit_log(
+            "lfs_tracked",
+            Some("svn_to_git"),
+            None,
+            None,
+            None,
+            Some(&format!(
+                "Tracked {} file(s) with Git LFS: {}",
+                stats.lfs_paths.len(),
+                stats.lfs_paths.join(", ")
+            )),
+            true,
+        );
+    }
+    if !stats.lfs_skipped_paths.is_empty() {
+        let shown = stats.lfs_skipped_paths.len().min(20);
+        let _ = db.insert_audit_log(
+            "lfs_skipped",
+            Some("svn_to_git"),
+            None,
+            None,
+            None,
+            Some(&format!(
+                "Left {} file(s) as ordinary blobs; they are under the LFS threshold and match no LFS pattern: {}",
+                stats.lfs_skipped_paths.len(),
+                stats.lfs_skipped_paths[..shown].join(", ")
+            )),
+            true,
+        );
+    }
     if stats.reserved_excluded > 0 {
         let reserved: Vec<&str> = stats
             .exclusions
@@ -311,6 +369,10 @@ pub struct CopyStats {
     pub copied: usize,
     pub skipped: usize,
     pub lfs_tracked: usize,
+    /// Paths stored through Git LFS on this copy.
+    pub lfs_paths: Vec<String>,
+    /// Paths copied as ordinary blobs while LFS is enabled.
+    pub lfs_skipped_paths: Vec<String>,
     /// Deliberate reserved-VCS exclusions (not file-policy skips).
     pub reserved_excluded: usize,
     /// Every deliberate exclusion, e.g. `reserved:.svn` or `policy:ignored:tmp.log`.
@@ -349,11 +411,7 @@ fn copy_tree_policy_inner(src: &Path, dst: &Path, ctx: &mut CopyTreePolicyCtx<'_
         let file_name = entry.file_name();
         let src_path = entry.path();
         let dst_path = dst.join(&file_name);
-        let rel = src_path
-            .strip_prefix(ctx.export_root)
-            .unwrap_or(&src_path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = export_relative_path(ctx.export_root, &src_path)?;
 
         let meta = std::fs::symlink_metadata(&src_path).with_context(|| {
             format!(
@@ -411,28 +469,26 @@ fn copy_tree_policy_inner(src: &Path, dst: &Path, ctx: &mut CopyTreePolicyCtx<'_
             FilePolicyDecision::Allow => {
                 copy_regular_file_no_follow(&src_path, ctx.dst_root, &dst_path, &meta)?;
                 ctx.stats.copied += 1;
+                if ctx.policy.lfs_enabled() {
+                    ctx.stats.lfs_skipped_paths.push(rel.clone());
+                }
             }
             FilePolicyDecision::LfsTrack { size, threshold } => {
                 copy_regular_file_no_follow(&src_path, ctx.dst_root, &dst_path, &meta)?;
-                let pattern = crate::lfs::pattern_for_path(&rel);
-                if let Err(e) = crate::lfs::ensure_lfs_tracked(ctx.dst_root, &pattern) {
-                    warn!(
-                        path = rel.as_str(),
-                        pattern = pattern.as_str(),
-                        error = %e,
-                        "failed to update .gitattributes for LFS tracking"
-                    );
-                } else {
-                    info!(
-                        path = rel.as_str(),
-                        size,
-                        threshold,
-                        pattern = pattern.as_str(),
-                        "LFS: file copied and .gitattributes updated"
-                    );
-                }
+                let pattern = crate::lfs::exact_lfs_pattern(&rel);
+                crate::lfs::ensure_lfs_tracked(ctx.dst_root, &pattern).with_context(|| {
+                    format!("failed to record LFS tracking for {rel} ({pattern})")
+                })?;
+                info!(
+                    path = rel.as_str(),
+                    size,
+                    threshold,
+                    pattern = pattern.as_str(),
+                    "LFS: file copied and .gitattributes updated"
+                );
                 ctx.stats.copied += 1;
                 ctx.stats.lfs_tracked += 1;
+                ctx.stats.lfs_paths.push(rel.clone());
             }
             FilePolicyDecision::Ignored { pattern } => {
                 warn!(
@@ -521,6 +577,15 @@ fn open_no_follow_read(path: &Path) -> Result<std::fs::File> {
                 libc::close(fd);
             }
             bail!("refusing to read non-regular file at {}", path.display());
+        }
+        if st.st_nlink != 1 {
+            unsafe {
+                libc::close(fd);
+            }
+            bail!(
+                "unsupported hardlink at {}: nlink>1 (not read)",
+                path.display()
+            );
         }
         let current = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if current >= 0 && (current & libc::O_NONBLOCK) != 0 {
@@ -1379,6 +1444,39 @@ pub fn independent_tree_manifest(root: &Path) -> Result<IndependentTreeManifest>
     Ok(manifest)
 }
 
+/// Inventory the source independently of the copier, refusing every entry
+/// whose bytes cannot be admitted. Reserved metadata is an explicit exclusion.
+pub fn require_supported_export(root: &Path) -> Result<IndependentTreeManifest> {
+    let manifest = independent_tree_manifest(root)?;
+    validate_export_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn validate_export_manifest(manifest: &IndependentTreeManifest) -> Result<()> {
+    for (path, entry) in &manifest.entries {
+        if let ManifestEntry::Unsupported { kind, detail } = entry {
+            if path == ".gitattributes" && kind == "symlink" {
+                bail!("unsupported symlink at exported .gitattributes: refusing to follow outside the export root");
+            }
+            bail!("unsupported {kind} at '{path}': {detail}");
+        }
+    }
+    Ok(())
+}
+
+fn export_relative_path(root: &Path, path: &Path) -> Result<String> {
+    path.strip_prefix(root)?
+        .components()
+        .map(|part| {
+            part.as_os_str()
+                .to_str()
+                .map(str::to_owned)
+                .context("non-UTF8 export path is unsupported; refusing lossy alias")
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join("/"))
+}
+
 fn independent_manifest_inner(
     dir: &Path,
     root: &Path,
@@ -1391,11 +1489,7 @@ fn independent_manifest_inner(
         let entry = entry?;
         let name = entry.file_name();
         let path = entry.path();
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = export_relative_path(root, &path)?;
         let meta = std::fs::symlink_metadata(&path).with_context(|| {
             format!("failed to stat {} for independent manifest", path.display())
         })?;
@@ -1590,7 +1684,98 @@ pub fn verify_against_independent_manifest(
 }
 
 fn file_exec_bit(mode: u32) -> bool {
-    mode & 0o111 != 0
+    // Git's canonical executable mode is based on owner execute.
+    mode & 0o100 != 0
+}
+
+/// Policy projection of a raw, independently inventoried SVN export. This
+/// function never materializes an expected tree with the copier. The only
+/// generated content is the existing engine-owned root LFS attribute file;
+/// source file hashes and executable bits always come from the raw export.
+pub fn independent_export_projection(
+    source: &Path,
+    destination: &Path,
+    policy: &FilePolicy,
+) -> Result<IndependentTreeManifest> {
+    let mut expected = require_supported_export(source)?;
+    let mut lfs_paths = Vec::new();
+    expected.entries.retain(|path, entry| {
+        let ManifestEntry::File { size, .. } = entry else {
+            return true;
+        };
+        match policy.evaluate(path, *size) {
+            FilePolicyDecision::Allow => true,
+            FilePolicyDecision::LfsTrack { .. } => {
+                lfs_paths.push(path.clone());
+                true
+            }
+            FilePolicyDecision::Ignored { .. } | FilePolicyDecision::Oversize { .. } => false,
+        }
+    });
+    if lfs_paths.iter().any(|path| path == ".gitattributes") {
+        bail!("LFS tracking of the root .gitattributes itself is unsupported");
+    }
+    let engine = crate::lfs::engine_gitattributes_body(destination)?;
+    // Check each independently derived required rule. Merely trusting a
+    // marker written by the copier would conceal a missing tracking rule.
+    for path in &lfs_paths {
+        let rule = crate::lfs::lfs_tracking_line(&crate::lfs::exact_lfs_pattern(path));
+        if !engine
+            .as_deref()
+            .is_some_and(|body| body.lines().any(|line| line == rule))
+        {
+            bail!("missing engine LFS provenance for '{path}'");
+        }
+    }
+    let source_attributes = expected.entries.contains_key(".gitattributes");
+    let generated = if source_attributes && !lfs_paths.is_empty() {
+        let export_body = read_regular_file_no_follow(&source.join(".gitattributes"))?;
+        Some(crate::lfs::merge_export_present_gitattributes(
+            &export_body,
+            None,
+            engine.as_deref(),
+            true,
+        ))
+    } else if !source_attributes {
+        engine
+    } else {
+        None
+    };
+    if let Some(body) = generated {
+        expected.entries.insert(
+            ".gitattributes".into(),
+            ManifestEntry::File {
+                mode: 0o644,
+                size: body.len() as u64,
+                sha256: hex::encode(Sha256::digest(body.as_bytes())),
+            },
+        );
+    }
+    Ok(expected)
+}
+
+/// Check the complete materialized workdir against raw source facts before
+/// committing or publishing. Empty directories are checked in a workdir;
+/// reserved metadata remains deliberately excluded at every depth.
+pub fn verify_export_projection(
+    source: &Path,
+    destination: &Path,
+    policy: &FilePolicy,
+) -> Result<VerificationResult> {
+    let expected = independent_export_projection(source, destination, policy)?;
+    verify_against_independent_manifest(destination, &expected, &FilePolicy::new(0, Vec::new()))?;
+    let files = expected
+        .entries
+        .values()
+        .filter(|e| matches!(e, ManifestEntry::File { .. }))
+        .count() as u64;
+    Ok(VerificationResult {
+        files_checked: files,
+        files_matched: files,
+        sample_hashed: files,
+        verified: true,
+        ..VerificationResult::default()
+    })
 }
 
 /// Remove files from `dst` (Git working tree) that no longer exist in `src`
@@ -1603,6 +1788,7 @@ fn file_exec_bit(mode: u32) -> bool {
 /// `.gitattributes` files are ordinary and can be stale-removed. Ordinary
 /// root dotfiles such as `.gitignore` can be stale-removed.
 pub fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
+    require_supported_export(src)?;
     remove_stale_inner(src, dst, true)
 }
 
@@ -1859,6 +2045,23 @@ fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Pat
             );
         }
         if src_meta.file_type().is_file() {
+            // The copier has already published this exact ordinary export
+            // file. Do not normalize its whitespace, line endings or mode,
+            // even if a historical engine LFS marker exists. Current LFS
+            // generation has a different body and still takes the explicit
+            // merge path below. Check bytes without decoding ordinary data.
+            if dst_kind.is_file {
+                let dest_meta = std::fs::symlink_metadata(dst_path)?;
+                if !is_hardlink_alias(&dest_meta)
+                    && hash_regular_file_no_follow(dst_path)?
+                        == hash_regular_file_no_follow(src_path)?
+                {
+                    // Keep the copier's actual mode too: a current generated
+                    // LFS attributes file is 0644 even when its bytes happen
+                    // to equal an executable source attributes file.
+                    return Ok(true);
+                }
+            }
             let dest_was_symlink = dst_kind.is_symlink;
             let dest_body = if dst_kind.is_file {
                 Some(read_regular_file_no_follow(dst_path).with_context(|| {
@@ -2100,6 +2303,107 @@ fn without_http_credentials(url: &str) -> String {
         .rfind('@')
         .map_or(rest, |at| &rest[at + 1..]);
     format!("{scheme}{host_path}")
+}
+
+/// Compare the service's clone destination to a checkout's effective fetch and
+/// push destinations. Git's get-url commands only expand local configuration;
+/// they do not open a transport, run the importer, or modify credentials.
+pub fn setup_checkout_matches(workdir: &std::path::Path, expected: &str) -> bool {
+    fn endpoint(value: &str) -> Option<reqwest::Url> {
+        let url = reqwest::Url::parse(&without_http_credentials(value))
+            .ok()
+            .or_else(|| reqwest::Url::from_file_path(value).ok())?;
+        if url.query().is_some() || url.fragment().is_some() {
+            return None;
+        }
+        Some(url)
+    }
+    let Some(target) = endpoint(expected) else {
+        return false;
+    };
+    let same = |output: std::process::Output| {
+        if !output.status.success() {
+            return false;
+        }
+        let Ok(text) = std::str::from_utf8(&output.stdout) else {
+            return false;
+        };
+        let mut urls = text.lines();
+        urls.next().and_then(endpoint).as_ref() == Some(&target) && urls.next().is_none()
+    };
+    if let Ok(meta) = std::fs::symlink_metadata(workdir) {
+        if !meta.is_dir() {
+            return false;
+        }
+    }
+    let git_dir = workdir.join(".git");
+    if !git_dir.exists() {
+        if workdir.exists()
+            && !std::fs::read_dir(workdir).is_ok_and(|mut entries| entries.next().is_none())
+        {
+            return false;
+        }
+        // A pushInsteadOf rule only takes effect after cloning, so a fetch
+        // URL expansion alone cannot qualify a fresh checkout's future push.
+        let Ok(rules) = std::process::Command::new("git")
+            .args([
+                "config",
+                "--null",
+                "--get-regexp",
+                r"^url\..*\.pushinsteadof$",
+            ])
+            .output()
+        else {
+            return false;
+        };
+        match rules.status.code() {
+            Some(1) => {}
+            Some(0) => {
+                let Ok(text) = std::str::from_utf8(&rules.stdout) else {
+                    return false;
+                };
+                if !text.split_terminator('\0').all(|entry| {
+                    entry
+                        .split_once('\n')
+                        .is_some_and(|(_, prefix)| !expected.starts_with(prefix))
+                }) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        // A new clone can also be redirected by global insteadOf rules.
+        return std::process::Command::new("git")
+            .args(["ls-remote", "--get-url", "--", expected])
+            .output()
+            .is_ok_and(same);
+    }
+    if !std::fs::symlink_metadata(&git_dir).is_ok_and(|meta| meta.is_dir()) {
+        return false;
+    }
+    let Ok(repository) = git2::Repository::open(workdir) else {
+        return false;
+    };
+    if repository
+        .workdir()
+        .and_then(|path| path.canonicalize().ok())
+        != workdir.canonicalize().ok()
+    {
+        return false;
+    }
+    for push in [false, true] {
+        let mut command = std::process::Command::new("git");
+        command
+            .current_dir(workdir)
+            .args(["remote", "get-url", "--all"]);
+        if push {
+            command.arg("--push");
+        }
+        if !command.arg("origin").output().is_ok_and(same) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Read-only local proof for a held import. Reject missing/replaced managed
@@ -2826,6 +3130,19 @@ pub async fn run_snapshot_import(
             pin.history_boundary()
         ));
     }
+    if pin.svn_uuid.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "snapshot pin did not report a repository UUID"
+        ));
+    }
+    if let Some(repo) = repo_id.as_deref() {
+        crate::db::lineage_checkpoints::record_independently_established_svn_uuid(
+            db,
+            repo,
+            &pin.svn_uuid,
+        )
+        .context("failed to record independently established SVN UUID")?;
+    }
 
     let repo_path = {
         let git = git_client.lock().unwrap_or_else(|p| p.into_inner());
@@ -3042,6 +3359,7 @@ fn persist_legacy_personal_import_watermarks_tx(
     ] {
         tx.execute("INSERT INTO watermarks(source,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(source) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", rusqlite::params![source,value,now])?;
     }
+    Database::record_personal_pr_import_boundary_tx(tx, git_sha)?;
     Ok(())
 }
 
@@ -3184,6 +3502,55 @@ pub async fn run_full_import(
         }
         Err(e) => return Err(e).context("failed to get SVN info"),
     };
+    if svn_info.uuid.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "live SVN info did not report a repository UUID"
+        ));
+    }
+    let existing_op = match (repo_id.as_deref(), operation_id.as_deref()) {
+        (Some(repo), Some(op_id)) => db
+            .get_import_operation(repo, op_id)
+            .context("failed to load import operation before identity admission")?,
+        _ => None,
+    };
+    let retained_effects = existing_op
+        .as_ref()
+        .is_some_and(import_operation_has_retained_effects);
+    if let Some(repo) = repo_id.as_deref() {
+        let live = LiveSvnIdentity {
+            uuid: svn_info.uuid.clone(),
+            root_url: svn_info.root_url.clone(),
+            url: svn_info.url.trim_end_matches('/').to_string(),
+            branch_path: String::new(),
+            incarnation_created_rev: svn_info.latest_rev.max(1),
+            copy_from_path: None,
+            copy_from_rev: None,
+        };
+        if let Err(error) = record_live_svn_uuid_or_hold_unproved(db, repo, &live, retained_effects)
+        {
+            match error {
+                SyncError::HistoryBlocked { reason, detail } => {
+                    if let Some(op_id) = operation_id.as_deref() {
+                        let held = format!("{reason}: {detail}");
+                        db.finish_import_operation(
+                            repo,
+                            op_id,
+                            ImportOperationState::ReconciliationRequired,
+                            &held,
+                        )
+                        .context("failed to hold import after unproved SVN identity")?;
+                    }
+                    return Ok(ImportOutcome::ReconciliationRequired {
+                        commits: 0,
+                        reason: format!("{reason}: {detail}"),
+                    });
+                }
+                other => {
+                    return Err(other).context("SVN identity admission refused");
+                }
+            }
+        }
+    }
     let head_rev = svn_info.latest_rev;
 
     {
@@ -3477,6 +3844,23 @@ pub async fn run_full_import(
                 }
             }
         };
+
+        if used_incremental {
+            // An applied patch is not an independent expectation. Re-export
+            // this numeric revision before any commit/publication so the
+            // optimization cannot bypass file policy, types or mode checks.
+            if let Err(e) = svn_client.export("", rev, export_dir.path()).await {
+                if matches!(&e, crate::errors::SvnError::IoError(io)
+                    if crate::process::confirmed_cancelled(io))
+                    && stop_requested(&progress, cancel_signal.as_ref()).await
+                {
+                    return Ok(ImportOutcome::Cancelled { commits: count });
+                }
+                return Err(e).context("independent incremental-import export failed");
+            }
+        }
+        verify_export_projection(export_dir.path(), &repo_path, file_policy)
+            .context("independent full-import projection verification failed")?;
 
         // Update file stats — use current file count (not cumulative)
         info!(
@@ -4988,7 +5372,7 @@ mod tests {
 
         remove_stale_files(src.path(), dst.path()).unwrap();
         let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
-        assert_eq!(after, "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+        assert_eq!(after, "/model.bin filter=lfs diff=lfs merge=lfs -text\n");
         assert!(
             !after.contains("evil"),
             "planted filter rules must not remain: {after}"
@@ -5066,7 +5450,7 @@ mod tests {
         let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
         assert_eq!(
             after,
-            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+            "* text=auto\n/model.bin filter=lfs diff=lfs merge=lfs -text\n"
         );
         assert!(
             !after.contains("evil"),
@@ -5297,7 +5681,7 @@ mod tests {
         let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
         assert_eq!(
             after,
-            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+            "* text=auto\n/model.bin filter=lfs diff=lfs merge=lfs -text\n"
         );
         assert!(
             !after.lines().any(|line| line.trim() == "* filter=lfs"),
@@ -5404,5 +5788,200 @@ mod directory_iteration_tests {
 
         assert_eq!(read_dirat(&dir).unwrap(), vec![OsString::from("owned")]);
         assert_eq!(std::fs::read(outside.join("canary")).unwrap(), b"outside");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod rs88_production_projection_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn db() -> Database {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db
+    }
+
+    #[test]
+    fn rs88_stale_reconciliation_preserves_ordinary_attributes_and_requires_current_lfs_rules() {
+        for historical in [false, true] {
+            for body in [
+                b"* text=auto\n\n".as_slice(),
+                b"* text=auto\r\n",
+                b"* text=auto",
+                b"* text=auto\n* text=auto\n",
+                b"# opaque \xff\n",
+            ] {
+                let source = tempfile::tempdir().unwrap();
+                let dest = tempfile::tempdir().unwrap();
+                std::fs::create_dir(dest.path().join(".git")).unwrap();
+                if historical {
+                    crate::lfs::ensure_lfs_tracked(dest.path(), "*.old").unwrap();
+                }
+                std::fs::write(source.path().join(".gitattributes"), body).unwrap();
+                std::fs::set_permissions(
+                    source.path().join(".gitattributes"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+                let policy = FilePolicy::new(0, vec![]);
+                copy_tree_with_policy(source.path(), dest.path(), &policy, &db()).unwrap();
+                remove_stale_files(source.path(), dest.path()).unwrap();
+                assert!(verify_export_projection(source.path(), dest.path(), &policy).is_ok());
+                assert_eq!(
+                    std::fs::read(dest.path().join(".gitattributes")).unwrap(),
+                    body
+                );
+                assert_ne!(
+                    std::fs::metadata(dest.path().join(".gitattributes"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o100,
+                    0
+                );
+            }
+        }
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dest.path().join(".git")).unwrap();
+        std::fs::write(source.path().join("payload.bin"), b"large payload").unwrap();
+        std::fs::write(
+            source.path().join(".gitattributes"),
+            b"*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            source.path().join(".gitattributes"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let policy = FilePolicy::with_lfs(0, vec![], 0, &["*.bin".into()]);
+        copy_tree_with_policy(source.path(), dest.path(), &policy, &db()).unwrap();
+        remove_stale_files(source.path(), dest.path()).unwrap();
+        assert!(verify_export_projection(source.path(), dest.path(), &policy).is_ok());
+        assert_eq!(
+            std::fs::metadata(dest.path().join(".gitattributes"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o100,
+            0
+        );
+        std::fs::remove_file(
+            dest.path()
+                .join(".git")
+                .join(crate::lfs::ENGINE_LFS_PATTERN_MARKER),
+        )
+        .unwrap();
+        assert!(
+            verify_export_projection(source.path(), dest.path(), &policy)
+                .unwrap_err()
+                .to_string()
+                .contains("missing engine LFS provenance")
+        );
+    }
+
+    #[test]
+    fn rs88_complete_source_preflight_preserves_destination_before_any_mutation() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("a-first"), b"new").unwrap();
+        std::fs::write(dest.path().join("a-first"), b"old").unwrap();
+        std::fs::write(dest.path().join("stale"), b"keep-on-refusal").unwrap();
+        std::fs::write(outside.path().join("secret"), b"do-not-read").unwrap();
+        symlink(outside.path().join("secret"), source.path().join("z-last")).unwrap();
+        let before = independent_tree_manifest(dest.path()).unwrap();
+        assert!(copy_tree_with_policy(
+            source.path(),
+            dest.path(),
+            &FilePolicy::new(0, vec![]),
+            &db()
+        )
+        .is_err());
+        assert_eq!(independent_tree_manifest(dest.path()).unwrap(), before);
+        assert!(remove_stale_files(source.path(), dest.path()).is_err());
+        assert_eq!(independent_tree_manifest(dest.path()).unwrap(), before);
+        let observed = independent_tree_manifest(source.path()).unwrap();
+        assert!(!observed.contains_file_digest_of(b"do-not-read"));
+        assert_eq!(
+            std::fs::read(outside.path().join("secret")).unwrap(),
+            b"do-not-read"
+        );
+    }
+
+    #[test]
+    fn rs88_projection_records_reserved_and_policy_exclusions_and_preserves_literal_paths() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        for directory in [".github", "nested/.editorconfig.d", "nested/.svn", ".git"] {
+            std::fs::create_dir_all(source.path().join(directory)).unwrap();
+        }
+        for (name, bytes) in [
+            (".gitignore", b"target/".as_slice()),
+            (".editorconfig", b"root=true"),
+            (".github/workflow", b"workflow"),
+            ("nested/.editorconfig.d/item", b"nested"),
+            ("nested/.svn/secret", b"reserved"),
+            (".git/config", b"not-copied"),
+            ("binary", b"\0\xff\x01"),
+            ("ignored.tmp", b"ignore"),
+            ("literal\\name", b"literal-backslash"),
+        ] {
+            std::fs::write(source.path().join(name), bytes).unwrap();
+        }
+        let policy = FilePolicy::new(0, vec!["*.tmp".into()]);
+        let database = db();
+        let stats = copy_tree_with_policy(source.path(), dest.path(), &policy, &database).unwrap();
+        assert_eq!(stats.reserved_excluded, 2);
+        assert!(stats.exclusions.contains(&"reserved:.git".to_string()));
+        assert!(stats
+            .exclusions
+            .contains(&"reserved:nested/.svn".to_string()));
+        assert!(stats
+            .exclusions
+            .contains(&"policy:ignored:ignored.tmp".to_string()));
+        assert!(
+            verify_export_projection(source.path(), dest.path(), &policy)
+                .unwrap()
+                .verified
+        );
+        assert_eq!(
+            std::fs::read(dest.path().join("literal\\name")).unwrap(),
+            b"literal-backslash"
+        );
+        assert!(!dest.path().join("literal/name").exists());
+        assert!(!dest.path().join(".git").exists());
+        std::fs::write(dest.path().join("ignored.tmp"), b"must-not-publish").unwrap();
+        assert!(verify_export_projection(source.path(), dest.path(), &policy).is_err());
+    }
+
+    #[test]
+    fn rs88_independent_workdir_verification_checks_owner_execute_and_extra_bytes() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let policy = FilePolicy::new(0, vec![]);
+        std::fs::write(source.path().join("run"), b"same").unwrap();
+        std::fs::set_permissions(
+            source.path().join("run"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        copy_tree_with_policy(source.path(), dest.path(), &policy, &db()).unwrap();
+        assert!(verify_export_projection(source.path(), dest.path(), &policy).is_ok());
+        std::fs::set_permissions(
+            dest.path().join("run"),
+            std::fs::Permissions::from_mode(0o654),
+        )
+        .unwrap();
+        assert!(verify_export_projection(source.path(), dest.path(), &policy).is_err());
+        std::fs::set_permissions(
+            dest.path().join("run"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(dest.path().join("extra"), b"not-in-source").unwrap();
+        assert!(verify_export_projection(source.path(), dest.path(), &policy).is_err());
     }
 }

@@ -1,0 +1,24 @@
+name: Docker UI qualification
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-ui-qualification-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  qualify-docker-ui:
+    name: Docker UI qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Build the product image and qualify UI and API startup
+        run: bash scripts/qualify_docker_ui.sh

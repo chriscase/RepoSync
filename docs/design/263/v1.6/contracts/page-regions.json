@@ -1,0 +1,331 @@
+{
+ "revisions": {
+  "epic/reposync-partial-52": "b2b055a72657824fd6662b451f69718d73405aa5",
+  "epic/reposync-reliability-61": "5853a8884496d294ce21898415d7d2718b73bf7c"
+ },
+ "pages": {
+  "/": [
+   {
+    "id": "scope",
+    "today": "Repository scope select",
+    "text": "aria-label=\"Repository scope\"",
+    "line_partial52": 107,
+    "line_reliability61": 106,
+    "matrix_rows": "G02.1",
+    "new_options": "Page head",
+    "note": "none",
+    "order_today": 1
+   },
+   {
+    "id": "imports",
+    "today": "Import progress cards",
+    "text": "<ImportProgressCard",
+    "line_partial52": 123,
+    "line_reliability61": 122,
+    "matrix_rows": "G02.2",
+    "new_options": "In flight",
+    "note": "Running operations from the status read are listed with them",
+    "order_today": 2
+   },
+   {
+    "id": "repositories",
+    "today": "“Repositories” overview",
+    "text": "Repositories Overview",
+    "line_partial52": 130,
+    "line_reliability61": 129,
+    "matrix_rows": "G02.3",
+    "new_options": "Repositories",
+    "note": "A table in every option",
+    "order_today": 3
+   },
+   {
+    "id": "health",
+    "today": "Sync health panel and the count cards",
+    "text": "<StatusObservationPanel view={statusView}/>",
+    "line_partial52": 196,
+    "line_reliability61": 195,
+    "matrix_rows": "G02.4, G02.5",
+    "new_options": "Sync health",
+    "note": "Keeps the error acknowledgement",
+    "order_today": 4
+   },
+   {
+    "id": "position",
+    "today": "“Sync Position” (one repository in scope)",
+    "text": "Sync Position",
+    "line_partial52": 248,
+    "line_reliability61": 247,
+    "matrix_rows": "G02.6",
+    "new_options": "Sync health and position",
+    "note": "none",
+    "order_today": 5
+   },
+   {
+    "id": "records",
+    "today": "“Recent Sync Records”",
+    "text": "Recent Sync Records",
+    "line_partial52": 296,
+    "line_reliability61": 295,
+    "matrix_rows": "G02.7",
+    "new_options": "Recent sync records",
+    "note": "none",
+    "order_today": 6
+   },
+   {
+    "id": "commit-map",
+    "today": "“Commit Map (SVN ↔ Git)”",
+    "text": "Commit Map (SVN",
+    "line_partial52": 331,
+    "line_reliability61": 330,
+    "matrix_rows": "G02.8",
+    "new_options": "Commit map",
+    "note": "none",
+    "order_today": 7
+   },
+   {
+    "id": "activity",
+    "today": "“Recent Activity”",
+    "text": "Recent Activity",
+    "line_partial52": 380,
+    "line_reliability61": 381,
+    "matrix_rows": "G02.9",
+    "new_options": "Recent activity",
+    "note": "none",
+    "order_today": 8
+   },
+   {
+    "id": "server",
+    "today": "Server panel",
+    "text": "<ServerMonitor",
+    "line_partial52": 407,
+    "line_reliability61": 408,
+    "matrix_rows": "G02.10",
+    "new_options": "Server",
+    "note": "none",
+    "order_today": 9
+   },
+   {
+    "id": "attention",
+    "today": "none: new, derived from the same status reads",
+    "text": "none",
+    "line_partial52": null,
+    "line_reliability61": null,
+    "matrix_rows": "G02.11",
+    "new_options": "Needs attention: first, under the page head",
+    "note": "Read-only; links only. In the tree of every layout and hidden in Classic, Individual and Team",
+    "order_today": "not in the page today"
+   }
+  ],
+  "/repos/:id": [
+   {
+    "id": "head",
+    "today": "Name, sync switch, Edit, Git Hook, Trigger Sync",
+    "text": "Trigger Sync",
+    "line_partial52": 1085,
+    "line_reliability61": 1078,
+    "matrix_rows": "G04.1, G04.7",
+    "new_options": "Page head, on every section",
+    "note": "none",
+    "order_today": 1
+   },
+   {
+    "id": "svn",
+    "today": "“SVN Configuration”",
+    "text": "SVN Configuration",
+    "line_partial52": 1105,
+    "line_reliability61": 1098,
+    "matrix_rows": "G04.2, G04.4",
+    "new_options": "Settings: SVN source",
+    "note": "The password field stays inside this region",
+    "order_today": 2
+   },
+   {
+    "id": "git",
+    "today": "“Git Configuration”",
+    "text": "Git Configuration",
+    "line_partial52": 1154,
+    "line_reliability61": 1147,
+    "matrix_rows": "G04.3, G04.4",
+    "new_options": "Settings: Git target",
+    "note": "The token field stays inside this region",
+    "order_today": 3
+   },
+   {
+    "id": "sync",
+    "today": "“Sync Settings”",
+    "text": "Sync Settings",
+    "line_partial52": 1208,
+    "line_reliability61": 1201,
+    "matrix_rows": "G04.5",
+    "new_options": "Settings: Sync policy",
+    "note": "none",
+    "order_today": 4
+   },
+   {
+    "id": "about",
+    "today": "“Quick Stats”",
+    "text": "Quick Stats",
+    "line_partial52": 1257,
+    "line_reliability61": 1268,
+    "matrix_rows": "G04.8",
+    "new_options": "Settings: About",
+    "note": "none",
+    "order_today": 5
+   },
+   {
+    "id": "paused",
+    "today": "Paused-after-error banner",
+    "text": "Circuit Breaker: Error Paused Banner",
+    "line_partial52": 1283,
+    "line_reliability61": 1294,
+    "matrix_rows": "G04.9, G04.10",
+    "new_options": "Overview, first, while paused",
+    "note": "none",
+    "order_today": 6
+   },
+   {
+    "id": "status",
+    "today": "Status panel and cards",
+    "text": "<StatusObservationPanel view={statusView}/>",
+    "line_partial52": 1380,
+    "line_reliability61": 1391,
+    "matrix_rows": "G04.11, G04.30",
+    "new_options": "Overview: “What this status proves” and “Errors”",
+    "note": "Keeps the error acknowledgement",
+    "order_today": 7
+   },
+   {
+    "id": "import",
+    "today": "Import notice and import card",
+    "text": "<ImportHistoryNotice fields={baselineNoticeFields}",
+    "line_partial52": 1424,
+    "line_reliability61": 1435,
+    "matrix_rows": "G04.12, G04.13, G04.14",
+    "new_options": "Operations; the current operation also shows on Overview",
+    "note": "One region shown in two sections",
+    "order_today": 8
+   },
+   {
+    "id": "records",
+    "today": "“Sync Records”",
+    "text": "{/* Sync Records",
+    "line_partial52": 1437,
+    "line_reliability61": 1448,
+    "matrix_rows": "G04.15",
+    "new_options": "Activity; also shown short on Overview",
+    "note": "One region shown in two sections, not two copies",
+    "order_today": 9
+   },
+   {
+    "id": "commit-map",
+    "today": "“Commit Map (SVN ↔ Git)”",
+    "text": "Commit Map (SVN",
+    "line_partial52": 1461,
+    "line_reliability61": 1472,
+    "matrix_rows": "G04.16",
+    "new_options": "Activity",
+    "note": "none",
+    "order_today": 10
+   },
+   {
+    "id": "audit",
+    "today": "“Recent Audit Log”",
+    "text": "Recent Audit Log",
+    "line_partial52": 1506,
+    "line_reliability61": 1519,
+    "matrix_rows": "G04.17",
+    "new_options": "Activity",
+    "note": "none",
+    "order_today": 11
+   },
+   {
+    "id": "refresh",
+    "today": "“Update pair from parent”",
+    "text": "Update pair from parent",
+    "line_partial52": 1609,
+    "line_reliability61": 1622,
+    "matrix_rows": "G04.18",
+    "new_options": "Branch pairs, first",
+    "note": "Held under #69; preview only; not moved out of that owner's code",
+    "order_today": 12
+   },
+   {
+    "id": "reanchor",
+    "today": "“Re-anchor pair (not implemented)”",
+    "text": "reanchor-not-implemented",
+    "line_partial52": 1627,
+    "line_reliability61": 1640,
+    "matrix_rows": "G04.19",
+    "new_options": "Branch pairs, second",
+    "note": "Held",
+    "order_today": 13
+   },
+   {
+    "id": "pairs",
+    "today": "“Branch Pairs”",
+    "text": "{/* Branch Pairs",
+    "line_partial52": 1678,
+    "line_reliability61": 1691,
+    "matrix_rows": "G04.20, G04.21, G04.25",
+    "new_options": "Branch pairs, third; also shown short on Overview",
+    "note": "One region shown in two sections",
+    "order_today": 14
+   },
+   {
+    "id": "server",
+    "today": "Server panel",
+    "text": "<ServerMonitor />",
+    "line_partial52": 1949,
+    "line_reliability61": 1962,
+    "matrix_rows": "G04.29",
+    "new_options": "Overview, last, collapsed",
+    "note": "none",
+    "order_today": 15
+   },
+   {
+    "id": "stop-remove",
+    "today": "“Danger Zone”",
+    "text": "Danger Zone - admin only",
+    "line_partial52": 1951,
+    "line_reliability61": 1964,
+    "matrix_rows": "G04.22, G04.23, G04.24, G04.26",
+    "new_options": "Settings: Stop or remove, last",
+    "note": "none",
+    "order_today": 16
+   },
+   {
+    "id": "policy",
+    "today": "Path policy (inside the edit form)",
+    "text": "none",
+    "line_partial52": null,
+    "line_reliability61": null,
+    "matrix_rows": "G04.6",
+    "new_options": "Settings: Path policy",
+    "note": "The #56 editor on partial-52; two text areas on reliability-61",
+    "order_today": "inside the edit form"
+   },
+   {
+    "id": "status-line",
+    "today": "none: new, derived from the status read",
+    "text": "none",
+    "line_partial52": null,
+    "line_reliability61": null,
+    "matrix_rows": "G04.32",
+    "new_options": "Under the page head, on every section",
+    "note": "Read-only: state, observed time, last sync, position and a link to the evidence. Hidden in the existing three layouts",
+    "order_today": "not in the page today"
+   },
+   {
+    "id": "credentials",
+    "today": "none: new, derived from the credential read",
+    "text": "none",
+    "line_partial52": null,
+    "line_reliability61": null,
+    "matrix_rows": "G04.4, S23, S24",
+    "new_options": "Settings: Credentials, after Git target",
+    "note": "A summary. “Replace…” opens the field in its own region and sends nothing itself. Hidden in the existing three layouts",
+    "order_today": "not in the page today"
+   }
+  ]
+ }
+}

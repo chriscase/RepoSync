@@ -26,7 +26,7 @@ Full bidirectional sync for entire teams. Runs as a server daemon on a VM with a
 
 ### Personal Branch Mode
 
-Individual developer SVN-to-Git bridge. Runs on your laptop, imports SVN history into a GitHub repo, and uses a PR-based workflow so every SVN sync is reviewable before merging. No server required. This is the right choice when you want to work in Git personally while your team stays on SVN.
+Personal mode runs on your laptop. It mirrors SVN changes to your Git branch and sends changes from merged GitHub pull requests back to SVN.
 
 See [docs/personal-branch/](docs/personal-branch/) for the full Personal Branch Mode documentation.
 
@@ -47,15 +47,21 @@ See [docs/personal-branch/](docs/personal-branch/) for the full Personal Branch 
 
 ## Personal Branch Mode -- Quick Start
 
-Get up and running in three commands:
+Create your Personal configuration with the interactive wizard.
 
 ```bash
-reposync personal init                           # Interactive setup wizard
-reposync personal import --full                  # Import SVN history to GitHub
-reposync personal start                          # Start sync daemon
+reposync personal init
 ```
 
-The `init` wizard walks you through connecting your SVN repo and GitHub repo, configuring branch names, and setting up your identity mapping. Once `import --full` completes, `start` launches a background sync daemon on your laptop that watches for new SVN commits and creates PRs in your GitHub repo.
+Before your first import, edit `~/.config/reposync/personal.toml`. Under `[personal]`, set `data_dir` to an absolute path you can write, such as `/home/alex/.local/share/reposync` for user `alex`. This directory holds your database and Git checkout. In the shell where you will run the bridge, set the environment variables named by the wizard.
+
+Run the import command printed by the wizard. Its default, `reposync personal import --snapshot`, starts with the current SVN tree. Choose `reposync personal import --full` if you want the revision history. Once the import completes, start polling.
+
+```bash
+reposync personal start --foreground
+```
+
+`start` runs in the foreground. From another terminal, run `reposync personal status` to inspect the bridge or `reposync personal stop` to stop it. [Personal quick start](docs/personal-branch/quickstart.md)
 
 ## Team Mode -- Quick Start
 
@@ -77,7 +83,14 @@ curl -fsSL https://github.com/chriscase/RepoSync/releases/latest/download/instal
 git clone https://github.com/chriscase/RepoSync.git
 cd RepoSync
 cargo build --release
+npm ci --prefix web-ui
+npm run build --prefix web-ui
+mkdir -p target/release/static
+cp -R web-ui/dist/. target/release/static/
+export PATH="$PWD/target/release:$PATH"
 ```
+
+The dashboard build uses Node.js 22 and npm. If you move the daemon, put the built `static/` directory beside its executable.
 
 **Docker:**
 ```bash
@@ -86,18 +99,19 @@ docker pull ghcr.io/chriscase/reposync:latest
 
 ### Configure
 
+These commands assume the binaries are on your `PATH`. A source build places them in `target/release/`. To generate a new configuration, choose an existing directory you can write. The examples use `/etc/reposync`. If you already have a configuration file, edit it directly.
+
 ```bash
-# Generate a default config file
-reposync init --config /etc/reposync/config.toml
-
-# Edit with your SVN and GitHub details
+reposync init --output /etc/reposync/config.toml
 $EDITOR /etc/reposync/config.toml
-
-# Set up author mappings
-$EDITOR /etc/reposync/authors.toml
+reposync validate --config /etc/reposync/config.toml
 ```
 
+Set your SVN and GitHub details before validation. To use an author mapping file, set `mapping_file = "/etc/reposync/authors.toml"` in `[identity]` and create that file with your mappings. The full example includes this optional setting. [Example configuration](config.example.toml) · [Team getting started](docs/getting-started.md)
+
 ### Run
+
+Before the first start on a fresh database, supply a unique, nonempty `REPOSYNC_ADMIN_PASSWORD` in the daemon's environment. The daemon uses it to create the initial `admin` account. Later starts keep the existing account password. The supplied systemd unit and the Docker command below read `/etc/reposync/env`. For a direct run, export the variable in the invoking shell.
 
 **As a systemd service:**
 ```bash
@@ -122,9 +136,13 @@ docker run -d \
 reposync-daemon --config /etc/reposync/config.toml
 ```
 
-### Access the Dashboard
+The daemon runs in the foreground and takes the environment variables named in the configuration from its shell. The supplied systemd service reads `/etc/reposync/env` for service launches. Use a second terminal for CLI commands and pass the same configuration path.
 
-Open `http://your-server:8080` in your browser. Log in with the configured password or GitHub OAuth.
+### Import the First Repository
+
+Open the dashboard at the address configured by `[web].listen`. The generated configuration uses `http://127.0.0.1:3000` on the daemon host. The example below uses port 8080. Log in with the configured password or GitHub OAuth.
+
+On a fresh Team database the daemon registers the SVN and Git repository from the configuration. As an administrator, open **Repositories**, select that registration, and find **SVN Import** on **Overview**. Use an empty Git repository for the new mirror. Choose **Start full history import** and wait for **SVN Import Complete**. Normal polling begins once RepoSync has verified the SVN revision and its Git commit. [Team import and verification](docs/getting-started.md#step-8-import-and-verify)
 
 ## Configuration
 
@@ -203,9 +221,67 @@ reposync status                              # Show sync status
 reposync conflicts list                      # List active conflicts
 reposync conflicts resolve <id> --accept git # Resolve from CLI
 reposync sync now                            # Trigger immediate sync
-reposync identity list                       # Show author mappings
+reposync identity lookup jsmith              # Look up one SVN user's Git identity
 reposync audit --limit 20                    # Recent sync history
 ```
+
+### Inspect an installed Team database before upgrading
+
+Run the candidate CLI against a **consistent offline SQLite backup** from `legacy/team-install` or `legacy/team-install-hotfix`. These branches share the same database layout. Keep the original database and its sidecars together. A database file copied on its own from a live WAL-mode installation can omit committed history. Supply a checkpointed backup that includes those commits. Discarding journal files can invalidate a snapshot.
+
+```bash
+reposync upgrade-preflight --database /backups/team/reposync.db
+```
+
+The report identifies the installed v13 or v14 catalog and lists each registration by ID. It checks for retained Git/SVN checkpoints, mappings, sync records, revision-bearing audit entries and import progress. An exit status of zero means these checks found no retained or unattributed history. The command returns a failure status for missing historical identity, evidence of unknown origin or an unreadable, changed or unsupported snapshot. A poll timestamp alone is inconclusive. Both old daemons recorded one after empty and failed polls. Check the old deployment’s records for published work in this case. The command reads the supplied snapshot offline, without loading configuration or connecting to either remote.
+
+For a pair with retained history, keep it paused. If the known-good installation is still available, rehearse the planned cutover below. If it has already been replaced, recovery needs an independently attributable pre-upgrade SVN backup, its original service URL and the matching team Git history. A saved SVN working copy can corroborate the original URL and UUID. [Historical Team upgrade follow-up](https://github.com/chriscase/RepoSync/issues/316)
+
+### Rehearse SVN continuity for a Team upgrade
+
+Use `recover-svn-lineage` to rehearse an upgrade for a pair that brings changes from company SVN into the team’s Git repository. Qualification covers both historical Team binaries against disposable repositories and a private-CA HTTPS fixture using Apache Subversion and Git smart HTTP with separate credentials. A company’s actual tenant, permissions, credential stores, branch history and cutover duration still need on-site rehearsal.
+
+For a **planned cutover**, begin while you can identify the working old installation, its company SVN repository and the team’s Git repository. This live pair is the starting point for continuity going forward. You can use it without a historical SVN backup. Arrange a maintenance window. Pause the pair, stop the supervised RepoSync service and hold other CLI jobs or automation that can still write on behalf of this installation. Confirm the service and its children have exited and in-flight work has finished. Keep company SVN and team Git reachable. Ordinary new SVN revisions above the retained revision can wait for resumed sync. The named team Git ref must still point to the reviewed commit during this workflow. A changed Git ref, replaced SVN branch or changed historical evidence requires investigation. This workflow covers direct, unfiltered SVN-to-Git imports with a linear Git history. It holds copied branch origins, incomplete mappings with unproved changes, and other unsupported histories for separate review.
+
+Keep a checkpointed copy of the old database before applying changes. Set `DATABASE` to the stopped installation’s `reposync.db`, `PAIR` to its registration UUID from `upgrade-preflight`, and `GIT_MIRROR` to a complete local **bare Git mirror** containing the configured branch and its full history. To prepare one, set `TEAM_GIT_URL` to the registered team repository and run `git clone --mirror --no-local "$TEAM_GIT_URL" "$GIT_MIRROR"` into a new directory. The bridge’s normal working checkout, a shallow clone, and mirrors that borrow objects from another directory do not qualify. These paths depend on the installation. The tool reads the registered company SVN location and branch from that database. Rehearse on an independently consistent database copy first. Measure preview and apply against repositories that represent the full imported history. Verification checks every relevant SVN branch revision through the original import boundary. It compares the complete versioned tree with each mapped Git tree. An empty initial trunk or later SVN revision without a Git commit is accepted only when its unchanged Git projection is independently verified. Preview reads them once. Apply repeats that work before and during the database transaction and keeps the local writer lock through the final pass. With a historical restore, each pass also reads the restored SVN tree. Use those measured times to plan the pause. Large imports can take substantially longer than the examples. The SVN client gives each native command up to five minutes, so a single large checkout or history request can also cause the preview to stop.
+
+If the old bridge uses registered HTTPS credentials and has no existing credential review key, create a private key for this review. Use a private directory outside the stopped installation, SVN repository and Git mirror. This key allows the CLI to check that the same credentials were in use at review and apply without printing them or changing them in the original database.
+
+```bash
+mkdir -p -m 700 "$HOME/.local/state/reposync-review"
+REVIEW_KEY="$HOME/.local/state/reposync-review/maintenance.key"
+reposync recover-svn-lineage create-review-key --output "$REVIEW_KEY"
+```
+
+When using this key, append `--review-key-file "$REVIEW_KEY"` to both commands below. Keep that file private for the duration of the review. A different key or changed registered credentials invalidate the token. Local `file://` rehearsals require no key.
+
+```bash
+reposync recover-svn-lineage preview \
+  --database "$DATABASE" --pair "$PAIR" --git-mirror "$GIT_MIRROR"
+```
+
+Preview is read-only. It checks the database, SVN and Git evidence and prints the verified revisions, full Git commit and tree IDs, a history digest, and one review token in the form `r<revision>.<sha256>`. Review those findings against the installation you intend to replace. If its provenance is uncertain, keep the pair paused. For an isolated apply rehearsal, set `REVIEWED_DIGEST` to the entire token you reviewed. Its revision is the lowest live SVN revision that apply may accept. A normal advance can proceed, while a rollback below that revision invalidates the review. Keep writers stopped throughout.
+
+```bash
+reposync recover-svn-lineage apply \
+  --database "$DATABASE" --pair "$PAIR" --git-mirror "$GIT_MIRROR" \
+  --reviewed-digest "$REVIEWED_DIGEST" --confirm-stopped-writers --attest-known-good-install
+```
+
+For **recovery after migration**, supply the migrated `reposync.db` and a separate SVN repository restored from an independently trusted pre-upgrade backup. Obtain `HISTORICAL_ROOT_URL` from records that tie the backup to the old service. Use its original repository root URL without credentials. A new copy of today’s repository cannot supply that provenance. Use the same backup and original URL for both commands.
+
+```bash
+reposync recover-svn-lineage preview \
+  --database "$DATABASE" --pair "$PAIR" --git-mirror "$GIT_MIRROR" \
+  --svn-backup "$RESTORED_SVN" --historical-root-url "$HISTORICAL_ROOT_URL"
+
+reposync recover-svn-lineage apply \
+  --database "$DATABASE" --pair "$PAIR" --git-mirror "$GIT_MIRROR" \
+  --svn-backup "$RESTORED_SVN" --historical-root-url "$HISTORICAL_ROOT_URL" \
+  --reviewed-digest "$REVIEWED_DIGEST" --confirm-stopped-writers --attest-trusted-backup
+```
+
+Planned apply performs the first migration of the old database and records the selected pair’s verified SVN identity in the same transaction. The single-pair workflow requires any other registrations to have no retained or ambiguous history requiring their own capture. If another pair needs continuity proof, the upgrade must preserve the original database until those pairs can be handled together. In restored-backup mode, apply records verified continuity on an already-migrated database. A changed digest or incomplete evidence requires a new review. The pair stays paused after apply. Review the result and check the expected SVN revision and team Git commit before using the normal pair controls to re-enable sync. Keep the database backup and reviewed evidence for the cutover record.
 
 ### Personal Mode Commands
 

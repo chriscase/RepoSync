@@ -383,25 +383,11 @@ pub(crate) fn inspect_fetched_history_with_refresh_baseline(
             "incoming Git tree could not be inspected"
         ),
     };
-    let ignored_paths = ignored
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty());
-    let target_paths: Vec<&[u8]> = target
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .collect();
-    for ignored in ignored_paths {
-        let ignored = ignored.strip_suffix(b"/").unwrap_or(ignored);
-        if target_paths.iter().any(|tracked| {
-            *tracked == ignored
-                || (tracked.starts_with(ignored) && tracked.get(ignored.len()) == Some(&b'/'))
-                || (ignored.starts_with(tracked) && ignored.get(tracked.len()) == Some(&b'/'))
-        }) {
-            blocked!(
-                "ignored_path_collision",
-                "incoming tracked paths overlap ignored bridge data"
-            );
-        }
+    if ignored_checkout_path_collision(&ignored, &target) {
+        blocked!(
+            "ignored_path_collision",
+            "incoming tracked paths overlap ignored bridge data"
+        );
     }
 
     let checkpoint = match p.as_deref() {
@@ -509,6 +495,25 @@ pub(crate) fn inspect_fetched_history_with_refresh_baseline(
         checkpoint: checkpoint.to_string(),
         remote_tip: fetched,
     })
+}
+
+/// Pure path comparison shared by inspection and the last pre-checkout check.
+pub(crate) fn ignored_checkout_path_collision(ignored: &[u8], target: &[u8]) -> bool {
+    let target_paths: Vec<&[u8]> = target
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect();
+    ignored
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .any(|path| {
+            let path = path.strip_suffix(b"/").unwrap_or(path);
+            target_paths.iter().any(|tracked| {
+                *tracked == path
+                    || (tracked.starts_with(path) && tracked.get(path.len()) == Some(&b'/'))
+                    || (path.starts_with(tracked) && path.get(tracked.len()) == Some(&b'/'))
+            })
+        })
 }
 
 /// Repository-owned Git cursor for personal mode without borrowing global state.

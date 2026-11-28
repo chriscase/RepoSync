@@ -8,6 +8,9 @@
 
 mod personal;
 mod status;
+mod svn_recovery;
+mod svn_recovery_args;
+mod upgrade_preflight;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -50,6 +53,19 @@ struct Cli {
 enum Commands {
     /// Show current synchronization status.
     Status,
+
+    /// Inspect a quiesced pre-upgrade Team database for missing historical SVN identity.
+    UpgradePreflight {
+        /// Checkpointed standalone snapshot of the legacy reposync.db.
+        #[arg(long)]
+        database: PathBuf,
+    },
+
+    /// Rehearse or record SVN continuity for a stopped legacy Team installation.
+    RecoverSvnLineage {
+        #[command(subcommand)]
+        action: svn_recovery_args::RecoveryAction,
+    },
 
     /// Manage sync conflicts.
     Conflicts {
@@ -146,14 +162,20 @@ enum IdentityAction {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // Minimal logging for CLI
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("warn"))
-        .with_target(false)
-        .without_time()
-        .init();
-
     let cli = Cli::parse();
+    let logging = tracing_subscriber::fmt().with_target(false).without_time();
+    if matches!(cli.command, Commands::RecoverSvnLineage { .. }) {
+        // Long historical tree checks have numeric progress messages. Keep
+        // those on stderr so the reviewed evidence remains usable on stdout.
+        logging
+            .with_env_filter(EnvFilter::new(
+                "warn,reposync_core::legacy_svn_recovery=info",
+            ))
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        logging.with_env_filter(EnvFilter::new("warn")).init();
+    }
 
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -167,21 +189,33 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init { output } => cmd_init(&output),
+        Commands::UpgradePreflight { database } => upgrade_preflight::run(&database),
+        Commands::RecoverSvnLineage { action } => svn_recovery::run(action).await,
         Commands::Validate => cmd_validate(&cli.config),
         Commands::Personal {
             personal_config,
             action,
         } => personal::run_personal(action, &personal_config).await,
+        Commands::Identity { action } => {
+            let config = load_config(&cli.config)?;
+            cmd_identity(&config, action)
+        }
         _ => {
             // All other commands need the team-mode config and database
             let config = load_config(&cli.config)?;
-            let db = open_database(&config)?;
+            let writer = matches!(
+                &cli.command,
+                Commands::Sync { .. }
+                    | Commands::Conflicts {
+                        action: ConflictsAction::Resolve { .. }
+                    }
+            );
+            let db = open_database(&config, writer)?;
 
             match cli.command {
                 Commands::Status => cmd_status(&db),
                 Commands::Conflicts { action } => cmd_conflicts(&db, action),
-                Commands::Sync { action } => cmd_sync(&db, &config, action).await,
-                Commands::Identity { action } => cmd_identity(&config, action),
+                Commands::Sync { action } => cmd_sync(db, &config, action).await,
                 Commands::Audit { limit } => cmd_audit(&db, limit),
                 _ => unreachable!(),
             }
@@ -202,11 +236,14 @@ fn load_config(path: &PathBuf) -> Result<AppConfig> {
     Ok(config)
 }
 
-fn open_database(config: &AppConfig) -> Result<Database> {
-    let db_path = config.daemon.data_dir.join("reposync.db");
-    let db = Database::new(&db_path).context("failed to open database")?;
-    db.initialize().context("failed to initialize database")?;
-    Ok(db)
+fn open_database(config: &AppConfig, writer: bool) -> Result<Database> {
+    if writer {
+        Database::open_cli_writer(&config.daemon.data_dir)
+            .context("CLI startup writer admission refused")
+    } else {
+        Database::open_existing_read_only(config.daemon.data_dir.join("reposync.db"))
+            .context("failed to open existing database for inspection")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +282,7 @@ email_domain = "example.com"
 [web]
 listen = "127.0.0.1:3000"
 auth_mode = "simple"
-admin_password_env = "ADMIN_PASSWORD"
+admin_password_env = "REPOSYNC_ADMIN_PASSWORD"
 
 [notifications]
 # slack_webhook_url_env = "SLACK_WEBHOOK_URL"
@@ -483,7 +520,7 @@ fn cmd_conflicts(db: &Database, action: ConflictsAction) -> Result<()> {
     }
 }
 
-async fn cmd_sync(_db: &Database, config: &AppConfig, action: SyncAction) -> Result<()> {
+async fn cmd_sync(db: Database, config: &AppConfig, action: SyncAction) -> Result<()> {
     match action {
         SyncAction::Now => {
             println!("Triggering immediate sync cycle...");
@@ -502,15 +539,9 @@ async fn cmd_sync(_db: &Database, config: &AppConfig, action: SyncAction) -> Res
             let identity = IdentityMapper::new(&config.identity)
                 .context("failed to initialize identity mapper")?;
 
-            // Open a dedicated database connection for the sync engine
-            let engine_db = {
-                let db_path = config.daemon.data_dir.join("reposync.db");
-                Database::new(&db_path).context("failed to open engine database")?
-            };
-
             let engine = reposync_core::sync_engine::SyncEngine::new(
                 config.clone(),
-                engine_db,
+                db,
                 svn_client,
                 git_client,
                 Arc::new(identity),

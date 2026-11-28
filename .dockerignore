@@ -1,9 +1,13 @@
 *
+!config.example.toml
 !Cargo.toml
+!Cargo.lock
 !crates/
 !crates/**
 !web-ui/
 !web-ui/**
+web-ui/node_modules
+web-ui/dist
 !scripts/
 !scripts/reliability-prep.py
 !scripts/reliability-runtime.py
