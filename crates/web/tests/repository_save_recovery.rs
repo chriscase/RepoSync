@@ -713,3 +713,35 @@ async fn pair_lfs_threshold_must_be_within_bounds() {
     );
     server.abort();
 }
+
+/// A pair stored before branch names were checked cannot start or resume an
+/// import: the stored name would reach `git push` as an argument.
+#[tokio::test]
+async fn import_refuses_a_stored_branch_git_would_misread() {
+    let (addr, state, server, _tmp) = save_fixture(&[]).await;
+    let client = authed_client();
+    let created = create(
+        &client,
+        addr,
+        &create_body(&uuid::Uuid::new_v4().to_string()),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap();
+    let mut legacy = state.db.get_repository(id).unwrap().unwrap();
+    legacy.git_branch = "--force".into();
+    state.db.update_repository(&legacy).unwrap();
+
+    for path in [
+        format!("http://{addr}/api/repos/{id}/import"),
+        format!("http://{addr}/api/repos/{id}/import/no-such-operation/resume"),
+    ] {
+        let response = client.post(&path).send().await.unwrap();
+        assert_eq!(response.status(), 400, "{path}");
+        let text = response.text().await.unwrap();
+        assert!(text.contains("git_branch"), "{path}: {text}");
+    }
+    let after = state.db.get_repository(id).unwrap().unwrap();
+    assert_eq!(after.sync_status, legacy.sync_status);
+    assert!(state.db.active_import_operation(id).unwrap().is_none());
+    server.abort();
+}

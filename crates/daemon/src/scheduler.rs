@@ -949,6 +949,20 @@ impl Scheduler {
                 continue;
             }
 
+            // A row saved before branch names were checked can still hold a
+            // name Git would misread, such as one starting with '-'. Refuse
+            // it before any Git command receives it.
+            if let Some(problem) = reposync_core::git::git_branch_name_problem(&repo.git_branch) {
+                warn!(
+                    repo_name = %repo_name,
+                    repo_id = %repo_id,
+                    setting = "git_branch",
+                    problem,
+                    "Git branch name is not usable; skipping sync until the pair is corrected"
+                );
+                continue;
+            }
+
             // RS-C07 (#64): acquire exclusive writer ownership before any
             // mutable prep that touches this repo's Git/SVN working tree.
             let busy_guard = match reposync_core::busy::try_acquire(&repo_id) {
@@ -2268,6 +2282,10 @@ mod blocked_patterns_tests;
 #[cfg(test)]
 #[path = "scheduler/allowed_paths_tests.rs"]
 mod allowed_paths_tests;
+
+#[cfg(test)]
+#[path = "scheduler/git_branch_guard_tests.rs"]
+mod git_branch_guard_tests;
 
 #[cfg(test)]
 #[path = "scheduler/pair_engine_config_tests.rs"]

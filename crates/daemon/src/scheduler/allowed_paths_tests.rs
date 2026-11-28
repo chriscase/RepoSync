@@ -47,7 +47,7 @@ impl Write for LogWriter {
     }
 }
 
-fn capture() -> (Arc<Mutex<String>>, tracing::subscriber::DefaultGuard) {
+pub(super) fn capture() -> (Arc<Mutex<String>>, tracing::subscriber::DefaultGuard) {
     let buf = Arc::new(Mutex::new(String::new()));
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
@@ -58,19 +58,19 @@ fn capture() -> (Arc<Mutex<String>>, tracing::subscriber::DefaultGuard) {
     (buf, guard)
 }
 
-fn logged(buf: &str, message: &str, repo_name: &str) -> bool {
+pub(super) fn logged(buf: &str, message: &str, repo_name: &str) -> bool {
     buf.lines()
         .any(|line| line.contains(message) && line.contains(repo_name))
 }
 
-struct DueRepo {
-    id: &'static str,
-    name: &'static str,
-    allowed_paths: Option<&'static str>,
-    blocked_patterns: Option<&'static str>,
+pub(super) struct DueRepo {
+    pub(super) id: &'static str,
+    pub(super) name: &'static str,
+    pub(super) allowed_paths: Option<&'static str>,
+    pub(super) blocked_patterns: Option<&'static str>,
 }
 
-fn due_scheduler(repos: &[DueRepo]) -> (tempfile::TempDir, Scheduler) {
+pub(super) fn due_scheduler(repos: &[DueRepo]) -> (tempfile::TempDir, Scheduler) {
     let tmp = tempfile::tempdir().unwrap();
     let config_file = tmp.path().join("config.toml");
     std::fs::write(
@@ -279,7 +279,7 @@ async fn join_spawned(handles: Vec<tokio::task::JoinHandle<()>>) -> Result<usize
     join_spawned_within(handles, SPAWN_JOIN_LIMIT, SPAWN_DRAIN_LIMIT).await
 }
 
-async fn spawned(scheduler: &Scheduler) -> Result<usize, String> {
+pub(super) async fn spawned(scheduler: &Scheduler) -> Result<usize, String> {
     let handles = scheduler.sync_handles.lock().await.drain(..).collect();
     join_spawned(handles).await
 }
@@ -385,7 +385,7 @@ fn assert_admitted_worker_did_not_sync(scheduler: &Scheduler, repo_id: &str) {
     );
 }
 
-fn stored(scheduler: &Scheduler, repo_id: &str) -> Repository {
+pub(super) fn stored(scheduler: &Scheduler, repo_id: &str) -> Repository {
     scheduler
         .db
         .get_repository(repo_id)
