@@ -6728,7 +6728,7 @@
         "Repeat the triggering request. Assert no duplicate revision or commit."
       ],
       "product_contract": "SUPPORTED",
-      "contract_source": "GOAL R17. allowlist R17_SVNSERVE_NOTIFICATION_ISOLATION.",
+      "contract_source": "GOAL R17. Scenario R17_SVNSERVE_NOTIFICATION_ISOLATION (PASS required).",
       "evidence": "PARTIAL",
       "evidence_basis": "CI_REAL_ENGINE",
       "existing_tests": [
@@ -6737,7 +6737,7 @@
         "team_mode_e2e::candidate_r17_repository_cursors_remain_scoped"
       ],
       "assertion_gaps": [
-        "Notification isolation is allowlisted PARTIAL because the engine does not deliver per-repo Teams webhooks on svnserve cycles. Do not call R17 PASS."
+        "Concurrent parent/child credential reload beyond loopback svnserve remains open. Notification isolation now PASSes: notifications use one global Teams channel, so no per-pair destination needs qualifying. Do not call R17 PASS."
       ],
       "required_new_scenario": "Two svnserve repos, both with r3 and branch main, different bytes. Sync both. Assert mappings and files do not cross.",
       "expected_results": {

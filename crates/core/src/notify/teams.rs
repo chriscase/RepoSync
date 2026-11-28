@@ -838,4 +838,41 @@ mod tests {
             .expect("listener stops when the channel closes")
             .unwrap();
     }
+
+    // R17: notifications use one global channel. Interleaved events from two
+    // pairs each produce one card in that channel, naming only their own pair.
+    #[tokio::test]
+    async fn interleaved_pair_events_each_post_one_card_naming_their_pair() {
+        let (channel, mut rx) = capture().await;
+        let (tx, events) = tokio::sync::broadcast::channel(16);
+        let url = channel.clone();
+        let task = tokio::spawn(run_listener(events, move || Some(url.clone())));
+        let completed = |name: &str| {
+            json!({"type":"repo_sync_completed","repo_name":name,"svn_to_git":1,"git_to_svn":0})
+                .to_string()
+        };
+        for event in [
+            completed("pair-alpha"),
+            failed_event("pair-beta"),
+            completed("pair-beta"),
+            failed_event("pair-alpha"),
+        ] {
+            tx.send(event).unwrap();
+        }
+        for own in ["pair-alpha", "pair-beta", "pair-beta", "pair-alpha"] {
+            let other = if own == "pair-alpha" {
+                "pair-beta"
+            } else {
+                "pair-alpha"
+            };
+            let body = next(&mut rx).await;
+            assert!(body.contains(own) && !body.contains(other), "{body}");
+        }
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("listener stops when the channel closes")
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "one card per event");
+    }
 }

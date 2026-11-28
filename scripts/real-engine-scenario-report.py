@@ -18,12 +18,9 @@ REAL_ENGINE_BINARY = "real_engine_scenarios"
 POST_WRITE_RECOVERY = "R01_SVNSERVE_POST_WRITE_RECOVERY"
 FINALIZED_HISTORY_CASES = ("historical_hold", "mirror_recovery", "contradictory_mirror_hold")
 
-PINNED_CI_PARTIAL_ALLOWLIST_IDS = frozenset(
-    {
-        POST_WRITE_RECOVERY,
-        "R17_SVNSERVE_NOTIFICATION_ISOLATION",
-    }
-)
+NOTIFICATION_ISOLATION = "R17_SVNSERVE_NOTIFICATION_ISOLATION"
+
+PINNED_CI_PARTIAL_ALLOWLIST_IDS = frozenset({POST_WRITE_RECOVERY})
 
 
 def load_expected_real_engine_tests() -> dict[str, str]:
@@ -449,10 +446,10 @@ def run_self_test() -> None:
         for invalid_stamp in (None, "not-a-time", "20260231T140000Z"):
             check_controlled(passing, "PASS", "0", "FAIL", timestamp=invalid_stamp)
         # The hosted workflow calls ci-gate directly, not controlled-status.
-        # Both must reject the same incomplete receipts, even for an allowlisted PARTIAL.
+        # Both must reject the same incomplete receipts.
         for scenario_id, overall, suite_exit in (
             ("R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP", "PASS", "0"),
-            ("R17_SVNSERVE_NOTIFICATION_ISOLATION", "PARTIAL", "3"),
+            (NOTIFICATION_ISOLATION, "PASS", "0"),
         ):
             rows = full_pass_rows()
             row = next(row for row in rows if row["id"] == scenario_id)
@@ -520,10 +517,10 @@ def run_self_test() -> None:
         check_controlled(not_run_rows[:-1], "NOT RUN", "2", "FAIL")
         check_controlled([not_run_rows[0], *passing[1:]], "PASS", "0", "FAIL")
         check_controlled([passing[0], *not_run_rows[1:]], "NOT RUN", "2", "FAIL")
-        # The receiving suite reports the legacy R01 and R17 gaps as PARTIAL.
+        # The receiving suite reports the legacy R01 gap as PARTIAL.
         receiving_rows = full_pass_rows()
         for row in receiving_rows:
-            if row["id"] in (POST_WRITE_RECOVERY, "R17_SVNSERVE_NOTIFICATION_ISOLATION"):
+            if row["id"] == POST_WRITE_RECOVERY:
                 row["status"] = "PARTIAL"
             if row["id"] == POST_WRITE_RECOVERY:
                 row["detail"].update(recovery_ok=False, final_watermark=1, mapping_count=0, mapped_git_sha=None)
@@ -657,6 +654,20 @@ def run_self_test() -> None:
         code, errs = ci_gate(write_summary(tmp, surprise, "PARTIAL"), allowlist_path)
         assert code != 0 and errs, (code, errs)
         check_controlled(surprise, "PARTIAL", "3", "FAIL")
+
+        # Notifications use one global channel, so pair confinement is fully
+        # observed and notification isolation must PASS; it is no longer an
+        # allowed PARTIAL.
+        assert NOTIFICATION_ISOLATION not in allowed, allowed
+        notification_partial = full_pass_rows()
+        for row in notification_partial:
+            if row["id"] == NOTIFICATION_ISOLATION:
+                row["status"] = "PARTIAL"
+        code, errs = ci_gate(write_summary(tmp, notification_partial, "PARTIAL"), allowlist_path)
+        assert code == 1 and (
+            f"{NOTIFICATION_ISOLATION}: PARTIAL not on CI allowlist ({allowlist_path.name})" in errs
+        ), (code, errs)
+        check_controlled(notification_partial, "PARTIAL", "3", "FAIL")
 
         # SVN remote recreation is blocked by the identity gate and must PASS;
         # it is no longer an allowed PARTIAL.

@@ -2,11 +2,9 @@
   "suite": "real-engine-scenarios",
   "description": "Scenario IDs whose PARTIAL status is expected on loopback svnserve CI and must not fail the Build & Test gate when they are the only non-PASS rows.",
   "allowed_partial_scenario_ids": [
-    "R01_SVNSERVE_POST_WRITE_RECOVERY",
-    "R17_SVNSERVE_NOTIFICATION_ISOLATION"
+    "R01_SVNSERVE_POST_WRITE_RECOVERY"
   ],
   "rationale": {
-    "R01_SVNSERVE_POST_WRITE_RECOVERY": "The historical drill rewinds the repository checkpoint and removes its applied SVN\u2192Git receipt. Recovery remains held with ambiguous_checkpoint because the legacy Git cursor lacks scoped provenance.",
-    "R17_SVNSERVE_NOTIFICATION_ISOLATION": "SyncEngine does not read per-repo teams_webhook_url or deliver Notifier events on svnserve cycles; only webhook-field persistence and sync_status/audit confinement are observed."
+    "R01_SVNSERVE_POST_WRITE_RECOVERY": "The historical drill rewinds the repository checkpoint and removes its applied SVN\u2192Git receipt. Recovery remains held with ambiguous_checkpoint because the legacy Git cursor lacks scoped provenance."
   }
 }

@@ -3788,19 +3788,18 @@ async fn scenario_r16_svnserve_git_remote_recreation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scenario_r17_svnserve_notification_isolation() {
+    // Notifications go to one global Teams channel (decided 2026-11-28): no
+    // pair has its own destination, so isolation means each pair's status,
+    // audit trail and counters stay its own. The events the scheduler
+    // publishes for concurrent pairs, and the cards the single listener
+    // posts for them, are checked in the daemon and notify::teams tests.
     if !require_toolchain(CASE_NOTIFICATION_ISOLATION) {
         return;
     }
     let fixture = DualRepoFixture::new();
-    let db = setup_db(&fixture.db_path);
-    let alpha_hook = "https://notify.invalid/repo-alpha-only";
-    let beta_hook = "https://notify.invalid/repo-beta-only";
-    let mut alpha_repo = db.get_repository("repo_alpha").unwrap().unwrap();
-    alpha_repo.teams_webhook_url = Some(alpha_hook.into());
-    db.update_repository(&alpha_repo).unwrap();
-    let mut beta_repo = db.get_repository("repo_beta").unwrap().unwrap();
-    beta_repo.teams_webhook_url = Some(beta_hook.into());
-    db.update_repository(&beta_repo).unwrap();
+    // Open (and migrate) the database before both engines start, as the
+    // other two-pair scenarios do.
+    let _db = setup_db(&fixture.db_path);
     let ready = Arc::new(tokio::sync::Barrier::new(2));
     let (alpha_result, beta_result) = tokio::join!(
         async {
@@ -3821,15 +3820,30 @@ async fn scenario_r17_svnserve_notification_isolation() {
     let db = setup_db(&fixture.db_path);
     let alpha_row = db.get_repository("repo_alpha").unwrap().unwrap();
     let beta_row = db.get_repository("repo_beta").unwrap().unwrap();
-    let webhook_crossover = repo_teams_webhook(&db, "repo_alpha").as_deref() != Some(alpha_hook)
-        || repo_teams_webhook(&db, "repo_beta").as_deref() != Some(beta_hook);
+    let alpha_url = fixture.repos[0].svn_url.clone();
+    let beta_url = fixture.repos[1].svn_url.clone();
     let sync_status_crossover =
         alpha_row.sync_status.contains("repo_beta") || beta_row.sync_status.contains("repo_alpha");
-    let audit_crossover: i64 = db.conn().query_row(
-        "SELECT COUNT(*) FROM audit_log WHERE (repo_id = 'repo_alpha' AND details LIKE '%repo-beta-only%') OR (repo_id = 'repo_beta' AND details LIKE '%repo-alpha-only%')",
-        [],
-        |row| row.get(0),
-    ).unwrap();
+    let audit_crossover: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE \
+             (repo_id = 'repo_alpha' AND (details LIKE '%repo_beta%' OR instr(details, ?2) > 0)) \
+             OR (repo_id = 'repo_beta' AND (details LIKE '%repo_alpha%' OR instr(details, ?1) > 0))",
+            rusqlite::params![alpha_url, beta_url],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let audit_rows = |repo_id: &str| -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE repo_id = ?1",
+                [repo_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let audit_rows_per_repo = [audit_rows("repo_alpha"), audit_rows("repo_beta")];
     let imports_ok = match (&alpha_result, &beta_result) {
         (Ok(alpha_stats), Ok(beta_stats)) => {
             alpha_stats.svn_to_git_count == 1 && beta_stats.svn_to_git_count == 1
@@ -3837,31 +3851,28 @@ async fn scenario_r17_svnserve_notification_isolation() {
         _ => false,
     };
     let per_repo_sync_counters = alpha_row.total_syncs >= 1 && beta_row.total_syncs >= 1;
-    let webhook_fields_persist = !webhook_crossover;
-    let confinement_ok = webhook_fields_persist && !sync_status_crossover && audit_crossover == 0;
-    let notification_delivery_observed = false;
-    let case_status = if !confinement_ok {
-        "FAIL"
-    } else if notification_delivery_observed {
+    let confinement_ok = !sync_status_crossover && audit_crossover == 0;
+    let case_status = if confinement_ok && imports_ok && per_repo_sync_counters {
         "PASS"
     } else {
-        "PARTIAL"
+        "FAIL"
     };
     emit_evidence(
         CASE_NOTIFICATION_ISOLATION,
         case_status,
         serde_json::json!({
-            "teams_webhook_crossover": webhook_crossover,
+            "notification_routing": "single_global_channel",
             "sync_status_crossover": sync_status_crossover,
             "audit_log_crossover": audit_crossover,
+            "audit_rows_per_repo": audit_rows_per_repo,
             "per_repo_sync_counters": per_repo_sync_counters,
             "alpha_total_syncs": alpha_row.total_syncs,
             "beta_total_syncs": beta_row.total_syncs,
             "imports_ok": imports_ok,
-            "webhook_fields_persist": webhook_fields_persist,
+            "alpha_error": alpha_result.as_ref().err().map(|e| e.to_string()),
+            "beta_error": beta_result.as_ref().err().map(|e| e.to_string()),
             "confinement_ok": confinement_ok,
-            "notification_delivery_observed": notification_delivery_observed,
-            "note": "SyncEngine does not read per-repo teams_webhook_url or invoke Notifier on svnserve cycles; webhook URL persistence and sync_status/audit confinement only",
+            "note": "one global Teams channel, no per-pair destination; scheduler event and listener card confinement are covered by daemon notification_isolation_tests and notify::teams tests",
         }),
     );
 }
