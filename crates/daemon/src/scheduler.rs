@@ -1255,7 +1255,7 @@ impl Scheduler {
             }
             let make_sync = || {
                 if manual_request {
-                    if let Err(error) = self.db.clear_manual_sync_request(&repo_id) {
+                    if let Err(error) = self.db.start_requested_manual_sync(&repo_id) {
                         warn!(repo_id = %repo_id, %error, "could not clear the manual sync request");
                     }
                 }

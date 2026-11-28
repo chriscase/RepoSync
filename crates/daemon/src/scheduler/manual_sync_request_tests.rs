@@ -102,3 +102,66 @@ async fn an_expired_request_is_dropped_without_a_cycle() {
         None
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_request_waits_out_the_gap_after_a_requested_cycle_starts() {
+    use reposync_core::db::queries::{ManualSyncRequest, MANUAL_SYNC_MIN_GAP_SECS};
+    let id = "manual-gap";
+    let (_tmp, scheduler) = not_due(id);
+    assert_eq!(
+        scheduler.db.request_manual_sync(id).unwrap(),
+        ManualSyncRequest::Recorded
+    );
+    assert_eq!(
+        scheduler.db.request_manual_sync(id).unwrap(),
+        ManualSyncRequest::AlreadyWaiting
+    );
+
+    let log = tick(&scheduler).await;
+    assert!(logged(&log, "starting per-repo sync cycle", id), "{log}");
+
+    // Straight after the requested cycle started, a new request is refused
+    // and nothing is recorded.
+    match scheduler.db.request_manual_sync(id).unwrap() {
+        ManualSyncRequest::TooSoon { retry_after_secs } => {
+            assert!((1..=MANUAL_SYNC_MIN_GAP_SECS).contains(&retry_after_secs));
+        }
+        other => panic!("expected TooSoon, got {other:?}"),
+    }
+    assert!(!scheduler.db.manual_sync_requested(id));
+
+    // Once the gap has passed, a request is accepted again.
+    let earlier = Utc::now() - chrono::Duration::seconds(MANUAL_SYNC_MIN_GAP_SECS + 1);
+    scheduler
+        .db
+        .set_state(&format!("manual_sync_started_{id}"), &earlier.to_rfc3339())
+        .unwrap();
+    assert_eq!(
+        scheduler.db.request_manual_sync(id).unwrap(),
+        ManualSyncRequest::Recorded
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_ordinary_cycle_does_not_start_the_gap() {
+    use reposync_core::db::queries::ManualSyncRequest;
+    let id = "manual-ordinary";
+    let (_tmp, scheduler) = due_scheduler(&[DueRepo {
+        id,
+        name: id,
+        allowed_paths: None,
+        blocked_patterns: None,
+    }]);
+    let _ = tick(&scheduler).await;
+    assert_eq!(
+        scheduler
+            .db
+            .get_state(&format!("manual_sync_started_{id}"))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        scheduler.db.request_manual_sync(id).unwrap(),
+        ManualSyncRequest::Recorded
+    );
+}

@@ -837,7 +837,39 @@ async fn manual_sync_queues_a_request_only_for_a_pair_that_can_sync() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["queued"], true);
     assert!(state.db.manual_sync_requested(id));
-    state.db.clear_manual_sync_request(id).unwrap();
+
+    // A second call while the first waits is covered by it.
+    let body: serde_json::Value = client
+        .post(&url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["queued"], true);
+    assert_eq!(body["retry_after_secs"], serde_json::Value::Null);
+
+    // Straight after the requested cycle starts, a new call is not queued
+    // and says how long to wait.
+    state.db.start_requested_manual_sync(id).unwrap();
+    let body: serde_json::Value = client
+        .post(&url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["queued"], false);
+    assert!(body["retry_after_secs"].as_i64().unwrap() >= 1, "{body}");
+    assert_ne!(body["message"], "Sync triggered");
+    assert!(!state.db.manual_sync_requested(id));
+    state
+        .db
+        .delete_kv_state(&format!("manual_sync_started_{id}"))
+        .unwrap();
 
     // Sync turned off: the request is acknowledged but not queued.
     let mut off = state.db.get_repository(id).unwrap().unwrap();

@@ -1244,30 +1244,42 @@ async fn trigger_sync(
 
     // Ask the scheduler to sync this pair without waiting out the poll
     // interval, then wake it. A pair with sync turned off is not queued: it
-    // would run the moment sync is turned back on. A request that is already
-    // waiting is not recorded again, so its expiry counts from the first ask.
+    // would run the moment sync is turned back on.
+    use reposync_core::db::queries::ManualSyncRequest;
+    let mut retry_after_secs = None;
     let queued = repo.enabled
-        && (db.manual_sync_requested(&id)
-            || match db.request_manual_sync(&id) {
-                Ok(()) => true,
-                Err(error) => {
-                    warn!(repo_id = %id, %error, "could not record the manual sync request");
-                    false
-                }
-            });
+        && match db.request_manual_sync(&id) {
+            Ok(ManualSyncRequest::Recorded | ManualSyncRequest::AlreadyWaiting) => true,
+            Ok(ManualSyncRequest::TooSoon {
+                retry_after_secs: wait,
+            }) => {
+                retry_after_secs = Some(wait);
+                false
+            }
+            Err(error) => {
+                warn!(repo_id = %id, %error, "could not record the manual sync request");
+                false
+            }
+        };
     if queued {
         // Wakes are folded by the scheduler. Full: a queued inspection will
         // see the request. Closed: the scheduler is stopping, and the stored
         // request expires.
         let _ = state.sync_trigger.try_send(());
     }
+    let message = if retry_after_secs.is_some() {
+        "A requested sync for this repository started moments ago"
+    } else {
+        "Sync triggered"
+    };
 
     Ok(Json(serde_json::json!({
         "ok": true,
-        "message": "Sync triggered",
+        "message": message,
         "repo_name": repo.name,
         "enabled": repo.enabled,
         "queued": queued,
+        "retry_after_secs": retry_after_secs,
         "import_phase": import_phase,
     })))
 }

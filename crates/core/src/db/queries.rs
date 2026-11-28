@@ -1682,9 +1682,33 @@ impl Database {
     }
 
     /// Record that an operator asked for this pair to sync now. The
-    /// scheduler honors it once, at the pair's next inspection.
-    pub fn request_manual_sync(&self, repo_id: &str) -> Result<(), DatabaseError> {
-        self.set_state(&manual_sync_request_key(repo_id), &Utc::now().to_rfc3339())
+    /// scheduler honors it once, at the pair's next inspection. A request
+    /// that is already waiting is left as it is, so its expiry counts from
+    /// the first ask, and a new one is refused for
+    /// [`MANUAL_SYNC_MIN_GAP_SECS`] after a requested cycle started.
+    pub fn request_manual_sync(&self, repo_id: &str) -> Result<ManualSyncRequest, DatabaseError> {
+        if self.manual_sync_requested(repo_id) {
+            return Ok(ManualSyncRequest::AlreadyWaiting);
+        }
+        if let Some(started_at) = self.get_state(&manual_sync_started_key(repo_id))? {
+            if let Ok(at) = DateTime::parse_from_rfc3339(&started_at) {
+                let age = Utc::now().signed_duration_since(at).num_seconds();
+                if (0..MANUAL_SYNC_MIN_GAP_SECS).contains(&age) {
+                    return Ok(ManualSyncRequest::TooSoon {
+                        retry_after_secs: MANUAL_SYNC_MIN_GAP_SECS - age,
+                    });
+                }
+            }
+        }
+        self.set_state(&manual_sync_request_key(repo_id), &Utc::now().to_rfc3339())?;
+        Ok(ManualSyncRequest::Recorded)
+    }
+
+    /// The requested cycle is starting: use up the request and remember
+    /// when, so the next request waits out the minimum gap.
+    pub fn start_requested_manual_sync(&self, repo_id: &str) -> Result<(), DatabaseError> {
+        self.set_state(&manual_sync_started_key(repo_id), &Utc::now().to_rfc3339())?;
+        self.clear_manual_sync_request(repo_id)
     }
 
     /// Whether a manual sync request is waiting for this pair. A request
@@ -1711,7 +1735,7 @@ impl Database {
         fresh
     }
 
-    /// Forget this pair's manual sync request once its cycle starts.
+    /// Forget this pair's waiting manual sync request.
     pub fn clear_manual_sync_request(&self, repo_id: &str) -> Result<(), DatabaseError> {
         self.delete_kv_state(&manual_sync_request_key(repo_id))
     }
@@ -1912,6 +1936,12 @@ impl Database {
 
             for cred_key in super::managed_remove::owned_secret_keys(repo_id) {
                 conn.execute("DELETE FROM kv_state WHERE key = ?1", params![cred_key])?;
+            }
+            for key in [
+                manual_sync_request_key(repo_id),
+                manual_sync_started_key(repo_id),
+            ] {
+                conn.execute("DELETE FROM kv_state WHERE key = ?1", params![key])?;
             }
 
             crate::db::repo_scope_identity::delete_repository_registration_row(conn, repo_id)?;
@@ -4344,6 +4374,25 @@ impl Database {
             Ok(receipt)
         }
     }
+}
+
+/// What became of a manual sync request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualSyncRequest {
+    /// A new request was recorded.
+    Recorded,
+    /// An earlier request is still waiting; it covers this one.
+    AlreadyWaiting,
+    /// A requested cycle started moments ago; nothing was recorded.
+    TooSoon { retry_after_secs: i64 },
+}
+
+/// The shortest time between one requested cycle starting and the next
+/// request being accepted for the same pair.
+pub const MANUAL_SYNC_MIN_GAP_SECS: i64 = 30;
+
+fn manual_sync_started_key(repo_id: &str) -> String {
+    format!("manual_sync_started_{repo_id}")
 }
 
 /// How long a manual sync request stays valid while the pair cannot start.
