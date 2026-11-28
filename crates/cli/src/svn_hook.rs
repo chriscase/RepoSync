@@ -6,9 +6,11 @@
 //! * It writes its script to `hooks/reposync-post-commit`, a file it owns.
 //! * It creates `hooks/post-commit` only when none exists, or replaces one
 //!   that carries its marker. A hook it does not manage is never changed;
-//!   the operator is told the one line to add instead.
+//!   the operator is told the one line to add instead. Symlinks at either
+//!   path are refused rather than replaced or followed.
 //! * The shared secret is read at commit time from a file, never written into
-//!   the hook, and is passed to curl on stdin rather than on its command line.
+//!   the hook, and is passed to curl as a config file on stdin (`-K -`, which
+//!   old curl releases support) rather than on its command line.
 //!   SVN runs hooks with an empty environment, so an environment variable
 //!   would not reach the hook.
 
@@ -103,8 +105,13 @@ fn endpoint(server_url: &str) -> Result<String> {
         .or_else(|| base.strip_prefix("https://"))
         .with_context(|| format!("server URL must start with http:// or https://: {base}"))?;
     let host = rest.split('/').next().unwrap_or_default();
-    if host.is_empty() || host.contains('@') || rest.chars().any(char::is_whitespace) {
-        bail!("server URL needs a host and no credentials or spaces: {base}");
+    if host.is_empty()
+        || host.contains('@')
+        || rest
+            .chars()
+            .any(|c| c.is_whitespace() || c == '?' || c == '#')
+    {
+        bail!("server URL needs a host and no credentials, spaces, query or fragment: {base}");
     }
     let url = format!("{base}/webhook/svn");
     check_shell_safe("server URL", &url)?;
@@ -112,32 +119,33 @@ fn endpoint(server_url: &str) -> Result<String> {
 }
 
 /// The script installed as `hooks/reposync-post-commit`.
-pub fn script(url: &str, secret_file: Option<&Path>) -> String {
-    let secret = secret_file
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
+pub fn script(url: &str, secret_file: Option<&str>) -> String {
+    let secret = secret_file.unwrap_or_default();
     format!(
         r#"#!/bin/sh
 {MARKER}
 # Asks RepoSync for an early poll after each commit. A lost or late
-# notification changes nothing. Managed by `reposync svn-hook install`.
+# notification changes nothing, and this never delays or fails a commit.
+# Managed by `reposync svn-hook install`.
 REPOS="$1"
 REV="$2"
 URL='{url}'
 SECRET_FILE='{secret}'
 case "$REV" in ''|*[!0-9]*) exit 0 ;; esac
 command -v curl >/dev/null 2>&1 || exit 0
-SECRET=""
+# A short, ASCII delivery ID for this repository and revision.
+ID="svn-$(printf '%s' "$REPOS" | cksum | cut -d' ' -f1)-$REV"
+CONFIG=""
 if [ -n "$SECRET_FILE" ] && [ -r "$SECRET_FILE" ]; then
-  SECRET=$(cat "$SECRET_FILE")
+  SECRET=$(head -n 1 "$SECRET_FILE" | tr -d '\r' | sed 's/[\\"]/\\&/g')
+  CONFIG="header = \"X-Webhook-Secret: $SECRET\""
 fi
-REPOS_JSON=$(printf '%s' "$REPOS" | sed 's/[\\"]/\\&/g')
-# The secret goes to curl on stdin, not on its command line.
-printf 'X-Webhook-Secret: %s\n' "$SECRET" | curl -s -o /dev/null -m 5 -X POST "$URL" \
-  -H @- \
+# The secret reaches curl as a config file on stdin, never on its command
+# line (printf is a shell builtin, so it does not appear in ps either).
+printf '%s\n' "$CONFIG" | curl -s -o /dev/null -m 5 -K - -X POST "$URL" \
   -H "Content-Type: application/json" \
-  -H "X-Webhook-Delivery: $REPOS@$REV" \
-  --data "{{\"repository\": \"$REPOS_JSON\", \"revision\": $REV}}" >/dev/null 2>&1 &
+  -H "X-Webhook-Delivery: $ID" \
+  --data "{{\"revision\": $REV}}" >/dev/null 2>&1 &
 exit 0
 "#
     )
@@ -146,22 +154,46 @@ exit 0
 /// The `hooks/post-commit` wrapper created when the repository has none.
 pub fn wrapper() -> String {
     format!(
-        "#!/bin/sh\n{MARKER}\n# Created by `reposync svn-hook install`. Add other post-commit steps below.\n\"$1/hooks/{SCRIPT_NAME}\" \"$1\" \"$2\"\n"
+        "#!/bin/sh\n{MARKER}\n# Created by `reposync svn-hook install`. Add other post-commit steps below.\n{}\n",
+        call_line()
     )
 }
 
+/// The call added to a post-commit hook. It does nothing once the script is
+/// removed, so it never makes the hook fail.
 fn call_line() -> String {
-    format!("\"$1/hooks/{SCRIPT_NAME}\" \"$1\" \"$2\"")
+    format!("[ -x \"$1/hooks/{SCRIPT_NAME}\" ] && \"$1/hooks/{SCRIPT_NAME}\" \"$1\" \"$2\" || :")
+}
+
+fn read_lossy(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Whether anything (including a dangling symlink) is at `path`.
+fn occupied(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+fn refuse_symlink(path: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!(
+            "{} is a symbolic link; RepoSync does not replace or follow it. Point it at a regular file or remove it first.",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn is_managed(path: &Path) -> Result<bool> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(text.lines().take(3).any(|l| l.trim() == MARKER))
+    Ok(read_lossy(path)?
+        .lines()
+        .take(3)
+        .any(|l| l.trim() == MARKER))
 }
 
 fn calls_script(path: &Path) -> bool {
-    std::fs::read_to_string(path)
+    read_lossy(path)
         .map(|t| t.contains(&format!("hooks/{SCRIPT_NAME}")))
         .unwrap_or(false)
 }
@@ -196,35 +228,51 @@ pub fn install(
                 "--secret-file must be an absolute path: hooks run from an unspecified directory"
             );
         }
-        check_shell_safe("secret file path", &file.display().to_string())?;
+        let text = file
+            .to_str()
+            .context("--secret-file must be a UTF-8 path")?;
+        check_shell_safe("secret file path", text)?;
         if !file.is_file() {
             bail!("secret file {} does not exist", file.display());
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(file)?.permissions().mode();
-            if mode & 0o004 != 0 {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let meta = std::fs::metadata(file)?;
+            if meta.permissions().mode() & 0o004 != 0 {
                 writeln!(
                     out,
                     "warning: {} is readable by every account; restrict it to the account that runs SVN hooks.",
                     file.display()
                 )?;
             }
+            let repo_owner = std::fs::metadata(repository.join("db"))?.uid();
+            if meta.uid() != repo_owner && meta.permissions().mode() & 0o044 == 0 {
+                writeln!(
+                    out,
+                    "warning: {} is owned by another account than the repository (uid {repo_owner}) and is not group-readable; the hook may not be able to read it, and would then send no secret.",
+                    file.display()
+                )?;
+            }
         }
     }
+    let secret_text = secret_file.and_then(Path::to_str);
 
     let script_path = hooks.join(SCRIPT_NAME);
     let hook_path = hooks.join(HOOK_NAME);
-    if script_path.exists() && !is_managed(&script_path)? {
+    refuse_symlink(&script_path)?;
+    refuse_symlink(&hook_path)?;
+    if occupied(&script_path) && !is_managed(&script_path)? {
         bail!(
             "{} exists and was not written by RepoSync; move it aside first",
             script_path.display()
         );
     }
-    let hook_plan = if !hook_path.exists() {
+    // Only an unchanged wrapper is rewritten; one the operator extended is
+    // left as it is.
+    let hook_plan = if !occupied(&hook_path) {
         HookPlan::Create
-    } else if is_managed(&hook_path)? {
+    } else if read_lossy(&hook_path)? == wrapper() {
         HookPlan::Replace
     } else if calls_script(&hook_path) {
         HookPlan::AlreadyCalls
@@ -234,7 +282,7 @@ pub fn install(
 
     let verb = if dry_run { "Would write" } else { "Wrote" };
     if !dry_run {
-        write_executable(&script_path, &script(&url, secret_file))?;
+        write_executable(&script_path, &script(&url, secret_text))?;
     }
     writeln!(out, "{verb} {} (notifies {url})", script_path.display())?;
     match hook_plan {
@@ -280,10 +328,12 @@ pub fn remove(repository: &Path, dry_run: bool, out: &mut dyn Write) -> Result<(
     let hooks = hooks_dir(repository)?;
     let verb = if dry_run { "Would remove" } else { "Removed" };
     let hook_path = hooks.join(HOOK_NAME);
-    if hook_path.exists() {
+    let script_path = hooks.join(SCRIPT_NAME);
+    refuse_symlink(&hook_path)?;
+    refuse_symlink(&script_path)?;
+    if occupied(&hook_path) {
         if is_managed(&hook_path)? {
-            let text = std::fs::read_to_string(&hook_path)?;
-            if text == wrapper() {
+            if read_lossy(&hook_path)? == wrapper() {
                 if !dry_run {
                     std::fs::remove_file(&hook_path)?;
                 }
@@ -291,7 +341,7 @@ pub fn remove(repository: &Path, dry_run: bool, out: &mut dyn Write) -> Result<(
             } else {
                 writeln!(
                     out,
-                    "{} was created by RepoSync but has other steps now; left in place. Remove this line from it:\n  {}",
+                    "{} was created by RepoSync but has other steps now; left in place. The line below now does nothing and can be removed:\n  {}",
                     hook_path.display(),
                     call_line()
                 )?;
@@ -299,14 +349,13 @@ pub fn remove(repository: &Path, dry_run: bool, out: &mut dyn Write) -> Result<(
         } else if calls_script(&hook_path) {
             writeln!(
                 out,
-                "{} is not managed by RepoSync; remove this line from it:\n  {}",
+                "{} is not managed by RepoSync; the line below now does nothing and can be removed:\n  {}",
                 hook_path.display(),
                 call_line()
             )?;
         }
     }
-    let script_path = hooks.join(SCRIPT_NAME);
-    if script_path.exists() {
+    if occupied(&script_path) {
         if !is_managed(&script_path)? {
             bail!(
                 "{} was not written by RepoSync; left unchanged",
@@ -355,6 +404,8 @@ mod tests {
             "http://user:pw@host",
             "http://host/it's",
             "http://host/a b",
+            "http://host/?a=b",
+            "http://host/#x",
         ] {
             assert!(
                 install(repo.path(), url, None, false, &mut out).is_err(),
@@ -449,6 +500,45 @@ mod tests {
         remove(repo.path(), true, &mut out).unwrap();
         assert!(repo.path().join("hooks").join(SCRIPT_NAME).exists());
         assert!(repo.path().join("hooks").join(HOOK_NAME).exists());
+    }
+
+    #[test]
+    fn reinstall_keeps_a_wrapper_the_operator_extended() {
+        let repo = fake_repo();
+        run_install(repo.path(), None, false).unwrap();
+        let hook = repo.path().join("hooks").join(HOOK_NAME);
+        let extended = format!("{}/usr/local/bin/mail-commit \"$1\" \"$2\"\n", wrapper());
+        std::fs::write(&hook, &extended).unwrap();
+        let out = run_install(repo.path(), None, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), extended);
+        assert!(out.contains("already calls"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_at_either_path_are_refused_and_kept() {
+        for name in [HOOK_NAME, SCRIPT_NAME] {
+            let repo = fake_repo();
+            let link = repo.path().join("hooks").join(name);
+            std::os::unix::fs::symlink("/nonexistent/shared-hook", &link).unwrap();
+            assert!(run_install(repo.path(), None, false).is_err(), "{name}");
+            let mut out = Vec::new();
+            assert!(remove(repo.path(), false, &mut out).is_err(), "{name}");
+            assert!(std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+    }
+
+    #[test]
+    fn a_non_utf8_hook_is_treated_as_foreign() {
+        let repo = fake_repo();
+        let hook = repo.path().join("hooks").join(HOOK_NAME);
+        std::fs::write(&hook, b"\x7fELF\xff\xfe binary").unwrap();
+        let out = run_install(repo.path(), None, false).unwrap();
+        assert!(out.contains("Add this line"), "{out}");
+        assert_eq!(std::fs::read(&hook).unwrap(), b"\x7fELF\xff\xfe binary");
     }
 
     #[test]

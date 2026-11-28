@@ -81,7 +81,7 @@ fn installed_hook_notifies_on_a_real_commit_with_the_secret_from_a_file() {
     let repo = tmp.path().join("repo");
     run(Command::new("svnadmin").arg("create").arg(&repo));
     let secret = tmp.path().join("svn-webhook-secret");
-    std::fs::write(&secret, "file-secret-71\n").unwrap();
+    std::fs::write(&secret, "file\"secret\\71\r\n").unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -102,20 +102,21 @@ fn installed_hook_notifies_on_a_real_commit_with_the_secret_from_a_file() {
         .recv_timeout(Duration::from_secs(20))
         .expect("the post-commit hook did not notify RepoSync");
     assert!(head.starts_with("POST /webhook/svn "), "{head}");
-    let lower = head.to_ascii_lowercase();
     assert!(
-        lower.contains("x-webhook-secret: file-secret-71\r\n"),
+        head.contains("X-Webhook-Secret: file\"secret\\71\r\n"),
         "{head}"
     );
+    let cksum = run(Command::new("sh")
+        .arg("-c")
+        .arg("printf '%s' \"$1\" | cksum | cut -d' ' -f1")
+        .arg("sh")
+        .arg(&repo));
     assert!(
-        lower.contains(
-            &format!("x-webhook-delivery: {}@1\r\n", repo.display()).to_ascii_lowercase()
-        ),
+        head.contains(&format!("X-Webhook-Delivery: svn-{}-1\r\n", cksum.trim())),
         "{head}"
     );
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["revision"], 1, "{body}");
-    assert_eq!(json["repository"], repo.display().to_string(), "{body}");
+    assert_eq!(json, serde_json::json!({"revision": 1}), "{body}");
 
     // Removing it takes both files away again.
     run(Command::new(env!("CARGO_BIN_EXE_reposync"))
@@ -123,4 +124,33 @@ fn installed_hook_notifies_on_a_real_commit_with_the_secret_from_a_file() {
         .arg(&repo));
     assert!(!repo.join("hooks/post-commit").exists());
     assert!(!repo.join("hooks/reposync-post-commit").exists());
+}
+
+#[test]
+fn an_unresponsive_server_does_not_delay_the_commit() {
+    if !(have("svnadmin") && have("svn") && have("curl")) {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "svnadmin, svn and curl are required in CI"
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    run(Command::new("svnadmin").arg("create").arg(&repo));
+    // Accepts connections (backlog) but never answers.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    run(Command::new(env!("CARGO_BIN_EXE_reposync"))
+        .args(["svn-hook", "install", "--repository"])
+        .arg(&repo)
+        .args(["--server-url", &format!("http://127.0.0.1:{port}")]));
+    let started = std::time::Instant::now();
+    commit_file(&repo, &tmp.path().join("wc"));
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "checkout + commit took {:?}; the hook must not wait for the server",
+        started.elapsed()
+    );
+    drop(listener);
 }

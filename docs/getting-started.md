@@ -93,17 +93,21 @@ prints the one line to add to it. Use `--dry-run` to see the plan first, and
 
 SVN runs hooks with an empty environment, so the secret cannot come from an
 environment variable. Put the same value the server reads through
-`svn.webhook_secret_env` in the `--secret-file`, readable only by the account
-that runs SVN hooks. The hook reads it at commit time and passes it to curl on
-standard input, so it does not appear on a command line. Without a secret
-file, notifications carry no secret and a server with `svn.webhook_secret_env`
-set refuses them.
+`svn.webhook_secret_env` on the first line of the `--secret-file`, readable
+by the account that runs SVN hooks (the installer warns when that looks
+unlikely). The hook reads it at commit time and hands it to curl as a config
+file on standard input, so it never appears on a command line. Without a
+readable secret file, notifications carry no secret and a server with
+`svn.webhook_secret_env` set refuses them.
 
-The hook sends `X-Webhook-Delivery: <repository path>@<revision>`; RepoSync
-uses it only when a secret is configured, acknowledging a repeated value
-without starting another inspection. The notification only asks for an early
-poll, so a lost or late one changes nothing, and the hook never delays or
-fails a commit.
+The hook sends `X-Webhook-Delivery: svn-<checksum of the repository path>-<revision>`.
+RepoSync uses it only when a secret is configured, acknowledging a repeated
+value without starting another inspection while the server keeps running. The
+notification only asks for an early poll, so a lost, late or deduplicated one
+changes nothing, and the hook never delays or fails a commit. Symbolic links
+at `hooks/post-commit` or `hooks/reposync-post-commit` are refused rather
+than replaced; re-running `install` rewrites only files it wrote and left
+unchanged.
 
 ## Step 3: Prepare Your GitHub Repository
 

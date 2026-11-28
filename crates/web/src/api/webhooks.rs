@@ -57,9 +57,9 @@ struct GitHubRepoPayload {
 // SVN webhook types
 // ---------------------------------------------------------------------------
 
-/// SVN post-commit notification. Only `revision` is required: the hook in
-/// `docs/getting-started.md` sends `repository` and `revision` only. Every
-/// field is a hint; the inspection reads SVN itself.
+/// SVN post-commit notification. Only `revision` is required: the hook that
+/// `reposync svn-hook install` writes sends only `revision`. Every field is a
+/// hint; the inspection reads SVN itself.
 #[derive(Debug, Deserialize)]
 struct SvnPostCommitPayload {
     revision: i64,
