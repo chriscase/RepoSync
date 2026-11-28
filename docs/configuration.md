@@ -80,9 +80,10 @@ These keys are accepted but have no effect, because PR-gated sync is not impleme
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `require_approval` | boolean | `true` | Require PR approval before SVN sync |
-| `auto_merge_approved` | boolean | `true` | Auto-merge approved PRs |
-| `reviewers` | array | `[]` | Default PR reviewers |
+| `title_prefix` | string | `"[svn-sync]"` | Title prefix for a sync PR |
+| `labels` | array of strings | `[]` | Labels for a sync PR |
+| `reviewers` | array of strings | `[]` | Reviewers to request |
+| `auto_merge` | boolean | `false` | Merge the PR when checks pass |
 
 ## Authors Mapping File
 
