@@ -2566,7 +2566,7 @@ const markClass = 'rs-mark inline-flex items-center px-2.5 py-0.5 rounded text-x
 /** What the head button shows for a few seconds after a Sync Now reply. */
 function syncReplyLabel(reply: { queued?: boolean; retry_after_secs?: number | null }): string {
   if (reply.queued !== false) return 'Sync Triggered';
-  return reply.retry_after_secs ? `Just synced, wait ${reply.retry_after_secs}s` : 'Not queued';
+  return reply.retry_after_secs ? `Sync just started, wait ${reply.retry_after_secs}s` : 'Not queued';
 }
 
 function observedClock(iso: string): string {

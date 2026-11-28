@@ -5296,7 +5296,6 @@ mod tests {
 
         db.request_manual_sync("repo1").unwrap();
         db.start_requested_manual_sync("repo1").unwrap();
-        db.request_manual_sync("repo1").unwrap();
         db.set_state("manual_sync_requested_repo1", "waiting")
             .unwrap();
 

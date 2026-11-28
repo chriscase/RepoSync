@@ -7,7 +7,7 @@ describe('Sync Now reply label', () => {
     expect(syncReplyLabel({})).toBe('Sync Triggered');
   });
   it('names the wait when a requested sync just started', () => {
-    expect(syncReplyLabel({ queued: false, retry_after_secs: 12 })).toBe('Just synced, wait 12s');
+    expect(syncReplyLabel({ queued: false, retry_after_secs: 12 })).toBe('Sync just started, wait 12s');
   });
   it('does not claim a sync for a pair that was not queued', () => {
     expect(syncReplyLabel({ queued: false, retry_after_secs: null })).toBe('Not queued');
