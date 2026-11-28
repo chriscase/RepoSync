@@ -200,6 +200,19 @@ pub fn routes() -> Router<Arc<AppState>> {
 // Get saved config for wizard pre-population
 // ---------------------------------------------------------------------------
 
+/// The repository pair the setup wizard edits: `apply` updates the first
+/// listed pair, or creates one when none exists.
+fn wizard_repository(
+    state: &AppState,
+) -> Result<Option<reposync_core::models::Repository>, AppError> {
+    Ok(state
+        .db
+        .list_repositories()
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
+        .into_iter()
+        .next())
+}
+
 async fn get_setup_config(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -231,8 +244,9 @@ async fn get_setup_config(
         || cfg.github.token.is_some();
 
     let admin_password_set = crate::api::auth::admin_password(&state)?.is_some();
+    let pair = wizard_repository(&state)?;
 
-    Ok(Json(SetupConfigResponse {
+    let mut response = SetupConfigResponse {
         svn_url: cfg.svn.url.clone(),
         svn_username: cfg.svn.username.clone(),
         svn_layout: if cfg.svn.trunk_path.is_empty() {
@@ -272,7 +286,21 @@ async fn get_setup_config(
         admin_password_set,
 
         config_exists: true,
-    }))
+    };
+    // Apply stores these on the pair, never in the file, and no target
+    // check compares them with the file. Show the saved values so applying
+    // the reopened form unchanged does not revert the pair. The SVN and Git
+    // target stay the file's: setup import requires the pair to match them,
+    // and saving the form is how a pair is brought back in line.
+    if let Some(repo) = pair {
+        response.sync_mode = repo.sync_mode;
+        response.auto_merge = repo.auto_merge;
+        if repo.poll_interval_secs > 0 {
+            response.poll_interval = repo.poll_interval_secs as u64;
+        }
+        response.lfs_threshold = (repo.lfs_threshold_mb.max(0) as u64).saturating_mul(1024 * 1024);
+    }
+    Ok(Json(response))
 }
 
 // ---------------------------------------------------------------------------
@@ -761,8 +789,8 @@ async fn apply_config(
         let auto_merge = body.sync_auto_merge.unwrap_or(true);
 
         // Check if a default repository already exists (update it), otherwise create one.
-        let existing_repos = db.list_repositories().unwrap_or_default();
-        if let Some(existing) = existing_repos.into_iter().next() {
+        // A read error must not look like "no pair yet" and add a second one.
+        if let Some(existing) = wizard_repository(&state)? {
             let updated = reposync_core::models::Repository {
                 svn_url: body.svn_url.clone(),
                 svn_branch: body.svn_trunk_path.clone().unwrap_or_default(),

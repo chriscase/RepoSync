@@ -74,12 +74,27 @@ fn repo_root() -> PathBuf {
 }
 
 fn accepts_strip_types(bin: &Path) -> bool {
-    let probe = Command::new(bin)
-        .args(["--experimental-strip-types", "-e", "process.exit(0)"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output();
+    // A fixture script written just now can briefly be busy: another test's
+    // child process may still hold the inherited write descriptor between
+    // fork and exec. Retry that case instead of reporting no runtime.
+    let mut attempts = 0;
+    let probe = loop {
+        let result = Command::new(bin)
+            .args(["--experimental-strip-types", "-e", "process.exit(0)"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output();
+        match result {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 =>
+            {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => break other,
+        }
+    };
     match probe {
         Ok(output) if output.status.success() => true,
         Ok(output) => {

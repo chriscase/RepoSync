@@ -438,3 +438,85 @@ async fn an_invalid_git_branch_is_refused_before_anything_is_written() {
         "release/2.x"
     );
 }
+
+async fn setup_config(f: &Fixture) -> Value {
+    reqwest::Client::new()
+        .get(format!("http://{}/api/setup/config", f.addr))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Apply stores sync mode, auto-merge, poll interval and the LFS threshold on
+/// the repository row, not in the file. Reopening the wizard must show those
+/// saved values, so applying the form again unchanged keeps them instead of
+/// reverting them to the file's. The SVN and Git target still come from the
+/// file, which setup import requires the pair to match.
+#[tokio::test]
+async fn the_wizard_reopens_with_the_pair_settings_it_saved() {
+    let f = fixture(None).await;
+    let before = setup_config(&f).await;
+    assert_eq!(before["sync_mode"], "direct", "{before}");
+    assert_eq!(before["lfs_threshold"], 0, "{before}");
+
+    let mut body = apply_body(None, json!([]));
+    for (key, value) in [
+        ("git_repo", json!("saved/repo")),
+        ("sync_mode", json!("pr")),
+        ("sync_auto_merge", json!(false)),
+        ("daemon_poll_interval", json!(120)),
+        ("lfs_threshold", json!(5 * 1024 * 1024)),
+    ] {
+        body[key] = value;
+    }
+    let (status, json) = apply(&f, body).await;
+    assert_eq!(status, 200, "{json}");
+
+    let cfg = setup_config(&f).await;
+    for (key, expected) in [
+        ("sync_mode", json!("pr")),
+        ("auto_merge", json!(false)),
+        ("poll_interval", json!(120)),
+        ("lfs_threshold", json!(5 * 1024 * 1024)),
+        // The target is still the file's.
+        ("git_repo", json!("test/repo")),
+        ("git_branch", json!("main")),
+    ] {
+        assert_eq!(cfg[key], expected, "{key}: {cfg}");
+    }
+
+    // Sending the reopened form back unchanged keeps the saved settings.
+    let mut again = apply_body(None, json!([]));
+    for (to, from) in [
+        ("sync_mode", "sync_mode"),
+        ("sync_auto_merge", "auto_merge"),
+        ("daemon_poll_interval", "poll_interval"),
+        ("lfs_threshold", "lfs_threshold"),
+    ] {
+        again[to] = cfg[from].clone();
+    }
+    let (status, json) = apply(&f, again).await;
+    assert_eq!(status, 200, "{json}");
+    let after = f.state.db.list_repositories().unwrap();
+    assert_eq!(after.len(), 1, "{after:?}");
+    let pair = &after[0];
+    assert_eq!(
+        (
+            pair.sync_mode.as_str(),
+            pair.auto_merge,
+            pair.poll_interval_secs,
+            pair.lfs_threshold_mb
+        ),
+        ("pr", false, 120, 5)
+    );
+
+    // A threshold too large to convert does not overflow the response.
+    let mut huge = pair.clone();
+    huge.lfs_threshold_mb = i64::MAX;
+    f.state.db.update_repository(&huge).unwrap();
+    assert_eq!(setup_config(&f).await["lfs_threshold"], json!(u64::MAX));
+}
