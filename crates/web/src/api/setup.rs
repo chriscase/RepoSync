@@ -873,6 +873,7 @@ fn setup_repository(db: &Database) -> Result<Repository, AppError> {
 }
 
 const AMBIGUOUS_SETUP: &str = "A previous import holds a repository and its setup ownership cannot be verified. Review the held import before starting or stopping setup.";
+const INVALID_DEFAULT_BRANCH: &str = "The server configuration's github.default_branch is not a branch name Git accepts. Correct it in the configuration file before starting setup.";
 const TARGET_MISMATCH: &str = "The selected registration does not uniquely match the service configuration and checkout. Review the SVN branch, Git target and existing origin before starting setup.";
 
 fn setup_workdir_key(state: &AppState) -> String {
@@ -884,8 +885,13 @@ fn setup_workdir_key(state: &AppState) -> String {
 
 /// Parse only the file configuration. Secret resolution stays in the worker.
 fn setup_config(state: &AppState) -> Result<AppConfig, AppError> {
-    AppConfig::load_from_file(&state.config_path)
-        .map_err(|_| AppError::Internal("could not read setup service configuration".into()))
+    let config = AppConfig::load_from_file(&state.config_path)
+        .map_err(|_| AppError::Internal("could not read setup service configuration".into()))?;
+    // Setup import and Reset & Reimport initialize and push this branch.
+    config
+        .validate_default_branch()
+        .map_err(|e| AppError::BadRequest(format!("server configuration: {e}")))?;
+    Ok(config)
 }
 
 fn target_matches(
@@ -1453,11 +1459,20 @@ async fn import_status(
                 .map_err(import_read_error)?
             {
                 false
-            } else if target_matches(&state, repo, &setup_config(&state)?)? {
-                true
             } else {
-                start_blocked_reason = Some(TARGET_MISMATCH);
-                false
+                match setup_config(&state) {
+                    Ok(config) if target_matches(&state, repo, &config)? => true,
+                    Ok(_) => {
+                        start_blocked_reason = Some(TARGET_MISMATCH);
+                        false
+                    }
+                    // Keep the status readable; the start itself refuses too.
+                    Err(AppError::BadRequest(_)) => {
+                        start_blocked_reason = Some(INVALID_DEFAULT_BRANCH);
+                        false
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
         _ => false,

@@ -210,7 +210,6 @@ async fn run(cli: Cli) -> Result<()> {
         }
         _ => {
             // All other commands need the team-mode config and database
-            let config = load_config(&cli.config)?;
             let writer = matches!(
                 &cli.command,
                 Commands::Sync { .. }
@@ -218,6 +217,7 @@ async fn run(cli: Cli) -> Result<()> {
                         action: ConflictsAction::Resolve { .. }
                     }
             );
+            let config = load_config_for(&cli.config, writer)?;
             let db = open_database(&config, writer)?;
 
             match cli.command {
@@ -241,6 +241,19 @@ fn load_config(path: &PathBuf) -> Result<AppConfig> {
     config
         .resolve_env_vars()
         .context("failed to resolve environment variables")?;
+    Ok(config)
+}
+
+/// Writer commands (`sync`, `conflicts resolve`) fetch and push
+/// `github.default_branch`, so they refuse one Git cannot use. Read-only
+/// commands still load such a file so an operator can investigate.
+fn load_config_for(path: &PathBuf, writer: bool) -> Result<AppConfig> {
+    let config = load_config(path)?;
+    if writer {
+        config
+            .validate_default_branch()
+            .context("configuration validation failed")?;
+    }
     Ok(config)
 }
 
@@ -638,5 +651,37 @@ fn truncate(s: &str, max_len: usize) -> String {
         s.to_string()
     } else {
         format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
+#[cfg(test)]
+mod load_config_tests {
+    use super::load_config_for;
+
+    fn write_config(dir: &std::path::Path, branch: &str) -> std::path::PathBuf {
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[daemon]\n[svn]\nurl = \"https://svn.example.com/repo\"\nusername = \"u\"\n\
+                 [github]\nrepo = \"acme/repo\"\ndefault_branch = \"{branch}\"\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn writer_commands_refuse_an_unusable_default_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = write_config(dir.path(), "refs/heads/main");
+        let error = load_config_for(&bad, true).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("github.default_branch"),
+            "{error:#}"
+        );
+        // Read-only commands still load it, so status and audit keep working.
+        load_config_for(&bad, false).unwrap();
+        load_config_for(&write_config(dir.path(), "main"), true).unwrap();
     }
 }
