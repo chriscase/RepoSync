@@ -86,6 +86,7 @@ Two later changes, newer than that pin:
 - For a pair with sync turned on, it records a request and wakes the scheduler. The
   pair's poll wait is skipped once, when its next cycle starts. Every hold, pause and
   busy check still applies, and a request that cannot start within 15 minutes expires.
+  Calling again while a request waits wakes the scheduler but does not extend it.
   The reply's `"queued": true` says the request was recorded, not that a cycle ran or
   finished. With sync turned off the reply says `"queued": false`.
 

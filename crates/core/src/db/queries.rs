@@ -1701,7 +1701,12 @@ impl Database {
             (0..=MANUAL_SYNC_REQUEST_MAX_AGE_SECS).contains(&age)
         });
         if !fresh {
-            let _ = self.clear_manual_sync_request(repo_id);
+            // Remove only the value just read, so a request recorded in the
+            // meantime is not lost.
+            let _ = self.conn().execute(
+                "DELETE FROM kv_state WHERE key = ?1 AND value = ?2",
+                params![manual_sync_request_key(repo_id), requested_at],
+            );
         }
         fresh
     }
