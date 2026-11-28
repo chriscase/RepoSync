@@ -404,3 +404,37 @@ async fn lfs_threshold_is_stored_on_the_pair_in_megabytes() {
         assert_eq!(repos[0].lfs_threshold_mb, mb, "{bytes} bytes");
     }
 }
+
+/// The wizard's Git branch becomes the pair's branch. A name Git refuses is
+/// refused before anything is written, including mappings and secrets.
+#[tokio::test]
+async fn an_invalid_git_branch_is_refused_before_anything_is_written() {
+    let f = fixture(None).await;
+    for branch in ["", "main ", "refs/heads/main", "-x", "a..b"] {
+        let mut body = apply_body(None, hostile());
+        body["git_default_branch"] = json!(branch);
+        let (status, json) = apply(&f, body).await;
+        assert_eq!(status, 400, "{branch:?}: {json}");
+        assert!(
+            json.to_string().contains("Git branch"),
+            "{branch:?}: {json}"
+        );
+    }
+    assert!(f.state.db.list_repositories().unwrap().is_empty());
+    assert!(!f.tmp.path().join("identity-mappings.toml").exists());
+    assert!(f
+        .state
+        .db
+        .get_state("secret_admin_password_hash")
+        .unwrap()
+        .is_none());
+
+    let mut body = apply_body(None, json!([]));
+    body["git_default_branch"] = json!("release/2.x");
+    let (status, json) = apply(&f, body).await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(
+        f.state.db.list_repositories().unwrap()[0].git_branch,
+        "release/2.x"
+    );
+}

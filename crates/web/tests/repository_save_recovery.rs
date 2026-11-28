@@ -548,3 +548,90 @@ async fn rs115_http_receipts_and_writes_are_actor_bound_and_unknown_credentials_
         .is_none());
     server.abort();
 }
+
+/// A pair's Git branch is fetched and pushed as `refs/heads/<name>`, so a name
+/// Git refuses is refused when the pair is created or edited, and nothing is
+/// stored.
+#[tokio::test]
+async fn pair_git_branch_must_be_a_branch_git_accepts() {
+    let (addr, state, server, _tmp) = save_fixture(&[]).await;
+    let client = authed_client();
+    for branch in [
+        "",
+        " ",
+        "main ",
+        "refs/heads/main",
+        "-main",
+        "a..b",
+        "HEAD",
+        "x.lock",
+    ] {
+        let mut body = create_body(&uuid::Uuid::new_v4().to_string());
+        body["git_branch"] = serde_json::json!(branch);
+        let response = client
+            .post(format!("http://{addr}/api/repos"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "{branch:?}");
+        let text = response.text().await.unwrap();
+        assert!(text.contains("git_branch"), "{branch:?}: {text}");
+    }
+    assert!(state.db.list_repositories().unwrap().is_empty());
+
+    let mut body = create_body(&uuid::Uuid::new_v4().to_string());
+    body["git_branch"] = serde_json::json!("release/2.x");
+    let created = create(&client, addr, &body).await;
+    let id = created["id"].as_str().unwrap();
+    let endpoint = format!("http://{addr}/api/repos/{id}");
+    for branch in ["", "feature branch", "refs/heads/release/2.x"] {
+        let edit = serde_json::json!({"save_request_id":uuid::Uuid::new_v4().to_string(),
+            "expected_updated_at":created["updated_at"],"git_branch":branch});
+        let response = client.put(&endpoint).json(&edit).send().await.unwrap();
+        assert_eq!(response.status(), 400, "{branch:?}");
+    }
+    assert_eq!(
+        state.db.get_repository(id).unwrap().unwrap().git_branch,
+        "release/2.x"
+    );
+    // An edit that sets a valid branch saves.
+    let edit = serde_json::json!({"save_request_id":uuid::Uuid::new_v4().to_string(),
+        "expected_updated_at":created["updated_at"],"git_branch":"develop"});
+    let response = client.put(&endpoint).json(&edit).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let edited: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        state.db.get_repository(id).unwrap().unwrap().git_branch,
+        "develop"
+    );
+
+    // A pair stored before this check with a branch Git refuses can still have
+    // its other settings saved, with or without its stored branch in the
+    // request (the edit form always sends it). Changing it to another invalid
+    // name is still refused.
+    let mut legacy = state.db.get_repository(id).unwrap().unwrap();
+    legacy.git_branch = "main ".into();
+    legacy.updated_at = edited["updated_at"].as_str().unwrap().into();
+    state.db.update_repository(&legacy).unwrap();
+    let mut expected = edited["updated_at"].clone();
+    for edit in [
+        serde_json::json!({"name":"Renamed"}),
+        serde_json::json!({"name":"Renamed again","git_branch":"main "}),
+    ] {
+        let mut edit = edit;
+        edit["save_request_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+        edit["expected_updated_at"] = expected.clone();
+        let response = client.put(&endpoint).json(&edit).send().await.unwrap();
+        assert_eq!(response.status(), 200, "{edit}");
+        let saved: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(saved["name"], edit["name"]);
+        assert_eq!(saved["git_branch"], "main ");
+        expected = saved["updated_at"].clone();
+    }
+    let edit = serde_json::json!({"save_request_id":uuid::Uuid::new_v4().to_string(),
+        "expected_updated_at":expected,"git_branch":"main  "});
+    let response = client.put(&endpoint).json(&edit).send().await.unwrap();
+    assert_eq!(response.status(), 400);
+    server.abort();
+}

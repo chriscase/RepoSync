@@ -3725,6 +3725,11 @@ pub struct RepositorySettingsUpdate {
 }
 
 impl RepositorySettingsUpdate {
+    /// The Git branch this edit sets, if it sets one.
+    pub fn git_branch(&self) -> Option<&str> {
+        self.git_branch.as_deref()
+    }
+
     fn apply(self, existing: models::Repository) -> models::Repository {
         models::Repository {
             name: self.name.unwrap_or(existing.name),
