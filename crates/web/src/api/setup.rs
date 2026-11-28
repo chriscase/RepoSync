@@ -350,12 +350,12 @@ async fn get_setup_config(
     // target stay the file's: setup import requires the pair to match them,
     // and saving the form is how a pair is brought back in line.
     if let Some(repo) = pair {
+        response.lfs_threshold = repo.lfs_threshold_bytes();
         response.sync_mode = repo.sync_mode;
         response.auto_merge = repo.auto_merge;
         if repo.poll_interval_secs > 0 {
             response.poll_interval = repo.poll_interval_secs as u64;
         }
-        response.lfs_threshold = (repo.lfs_threshold_mb.max(0) as u64).saturating_mul(1024 * 1024);
     }
     Ok(Json(response))
 }
@@ -672,6 +672,15 @@ async fn apply_config(
         if let Some(problem) = reposync_core::git::git_branch_name_problem(branch) {
             return Err(AppError::BadRequest(format!("Git branch {}", problem)));
         }
+    }
+    if let Some(problem) = body
+        .lfs_threshold
+        .map(|bytes| bytes.div_ceil(1024 * 1024))
+        .and_then(|mb| {
+            reposync_core::models::lfs_threshold_mb_problem(i64::try_from(mb).unwrap_or(i64::MAX))
+        })
+    {
+        return Err(AppError::BadRequest(format!("LFS threshold {problem}")));
     }
     let mut warnings = Vec::new();
 

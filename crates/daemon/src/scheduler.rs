@@ -1146,7 +1146,7 @@ impl Scheduler {
             );
             engine.set_repo_id(repo.id.clone());
             if repo.lfs_threshold_mb > 0 {
-                let threshold_bytes = (repo.lfs_threshold_mb as u64) * 1024 * 1024;
+                let threshold_bytes = repo.lfs_threshold_bytes();
                 engine.set_lfs_threshold_bytes(threshold_bytes);
                 debug!(
                     repo_name = %repo.name,

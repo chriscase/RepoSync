@@ -629,3 +629,24 @@ async fn an_edited_target_keeps_the_wizard_on_the_same_pair() {
     assert_eq!(untouched.poll_interval_secs, older.poll_interval_secs);
     assert_eq!(f.state.db.list_repositories().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn an_out_of_range_lfs_threshold_is_refused_before_anything_is_written() {
+    let f = fixture(None).await;
+    let max_bytes = (reposync_core::models::MAX_LFS_THRESHOLD_MB as u64) * 1024 * 1024;
+    let mut body = apply_body(None, json!([]));
+    body["lfs_threshold"] = json!(max_bytes + 1);
+    let (status, json) = apply(&f, body).await;
+    assert_eq!(status, 400, "{json}");
+    assert!(f.state.db.list_repositories().unwrap().is_empty());
+
+    let mut body = apply_body(None, json!([]));
+    body["lfs_threshold"] = json!(max_bytes);
+    let (status, json) = apply(&f, body).await;
+    assert_eq!(status, 200, "{json}");
+    let pair = f.state.db.list_repositories().unwrap().remove(0);
+    assert_eq!(
+        pair.lfs_threshold_mb,
+        reposync_core::models::MAX_LFS_THRESHOLD_MB
+    );
+}

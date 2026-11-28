@@ -409,6 +409,32 @@ fn default_sync_status() -> String {
     "idle".to_string()
 }
 
+/// The largest LFS threshold a pair accepts: 1 TiB, far above any file a
+/// repository would hold, and small enough that the byte value cannot
+/// overflow.
+pub const MAX_LFS_THRESHOLD_MB: i64 = 1024 * 1024;
+
+/// Why `mb` is not a usable LFS threshold, if it is not. Zero disables LFS.
+pub fn lfs_threshold_mb_problem(mb: i64) -> Option<String> {
+    if mb < 0 {
+        Some("must not be negative (0 disables LFS)".into())
+    } else if mb > MAX_LFS_THRESHOLD_MB {
+        Some(format!("must be at most {MAX_LFS_THRESHOLD_MB} MB"))
+    } else {
+        None
+    }
+}
+
+impl Repository {
+    /// The LFS threshold in bytes; 0 when LFS is disabled. A stored value
+    /// from before the bound saturates instead of overflowing.
+    pub fn lfs_threshold_bytes(&self) -> u64 {
+        u64::try_from(self.lfs_threshold_mb)
+            .unwrap_or(0)
+            .saturating_mul(1024 * 1024)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Personal Branch Mode types
 // ---------------------------------------------------------------------------
@@ -484,5 +510,35 @@ impl MergeStrategy {
             "rebase" => Self::Rebase,
             _ => Self::Unknown,
         }
+    }
+}
+
+#[cfg(test)]
+mod lfs_threshold_tests {
+    use super::*;
+
+    #[test]
+    fn the_lfs_threshold_bound_and_byte_conversion() {
+        assert!(lfs_threshold_mb_problem(0).is_none());
+        assert!(lfs_threshold_mb_problem(MAX_LFS_THRESHOLD_MB).is_none());
+        assert!(lfs_threshold_mb_problem(-1).is_some());
+        assert!(lfs_threshold_mb_problem(MAX_LFS_THRESHOLD_MB + 1).is_some());
+        let bytes = |mb: i64| {
+            let mut repo: Repository = serde_json::from_value(serde_json::json!({
+                "id": "r", "name": "r", "svn_url": "u", "svn_branch": "", "svn_username": "",
+                "git_provider": "github", "git_api_url": "", "git_repo": "", "git_branch": "main",
+                "sync_mode": "direct", "poll_interval_secs": 60, "lfs_threshold_mb": 0,
+                "auto_merge": true, "enabled": true, "created_by": null,
+                "created_at": "", "updated_at": ""
+            }))
+            .unwrap();
+            repo.lfs_threshold_mb = mb;
+            repo.lfs_threshold_bytes()
+        };
+        assert_eq!(bytes(0), 0);
+        assert_eq!(bytes(-3), 0);
+        assert_eq!(bytes(5), 5 * 1024 * 1024);
+        assert_eq!(bytes(MAX_LFS_THRESHOLD_MB), 1 << 40);
+        assert_eq!(bytes(i64::MAX), u64::MAX);
     }
 }

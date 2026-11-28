@@ -3748,6 +3748,11 @@ impl RepositorySettingsUpdate {
         self.git_branch.as_deref()
     }
 
+    /// The LFS threshold in MB this edit sets, if it sets one.
+    pub fn lfs_threshold_mb(&self) -> Option<i64> {
+        self.lfs_threshold_mb
+    }
+
     fn apply(self, existing: models::Repository) -> models::Repository {
         models::Repository {
             name: self.name.unwrap_or(existing.name),
