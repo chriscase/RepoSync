@@ -224,6 +224,33 @@ pub struct Scheduler {
     sync_task_spawns: Arc<AtomicU64>,
 }
 
+/// The daemon memory limit in bytes. A value too large to convert means no
+/// practical limit, never a wrapped (tiny or zero) one.
+fn memory_limit_bytes(memory_limit_mb: u64) -> u64 {
+    memory_limit_mb.saturating_mul(1024 * 1024)
+}
+
+/// The configuration a pair's sync engine runs with: the service
+/// configuration with the pair's own settings applied.
+fn pair_engine_config(
+    app_config: &AppConfig,
+    repo: &reposync_core::models::Repository,
+) -> AppConfig {
+    let mut config = app_config.clone();
+    // The trunk_path must be empty because the branch path is already
+    // baked into the SVN URL (svn_url + svn_branch).
+    config.svn.trunk_path = String::new();
+    config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    // The engine pulls the pair's branch (child branch pairs have a
+    // different git_branch than the service default_branch).
+    config.github.default_branch = repo.git_branch.clone();
+    // A pair with auto-merge turned off holds every conflict for review.
+    // The service setting stays a master switch: a pair cannot turn
+    // auto-merge on when the service configuration turns it off.
+    config.sync.auto_merge = app_config.sync.auto_merge && repo.auto_merge;
+    config
+}
+
 impl Scheduler {
     pub fn new(
         sync_engine: Arc<SyncEngine>,
@@ -234,7 +261,7 @@ impl Scheduler {
         db: Database,
         app_config: AppConfig,
     ) -> Self {
-        let memory_limit_bytes = app_config.daemon.memory_limit_mb * 1024 * 1024;
+        let memory_limit_bytes = memory_limit_bytes(app_config.daemon.memory_limit_mb);
         Self {
             sync_engine,
             poll_interval,
@@ -1126,16 +1153,7 @@ impl Scheduler {
                 }
             };
 
-            // Override global config with per-repo settings.
-            // The trunk_path must be empty because the branch path is already
-            // baked into the SVN URL (svn_url + svn_branch).
-            let mut repo_config = self.app_config.clone();
-            repo_config.svn.trunk_path = String::new();
-            repo_config.svn.layout = reposync_core::config::SvnLayout::Custom;
-            // Override the git branch so the sync engine pulls the correct branch
-            // for this repo (child branch pairs have a different git_branch than
-            // the global config's default_branch).
-            repo_config.github.default_branch = repo.git_branch.clone();
+            let repo_config = pair_engine_config(&self.app_config, &repo);
 
             let mut engine = SyncEngine::new(
                 repo_config,
@@ -2262,6 +2280,10 @@ mod blocked_patterns_tests;
 #[cfg(test)]
 #[path = "scheduler/allowed_paths_tests.rs"]
 mod allowed_paths_tests;
+
+#[cfg(test)]
+#[path = "scheduler/pair_engine_config_tests.rs"]
+mod pair_engine_config_tests;
 
 #[cfg(all(test, unix))]
 #[path = "scheduler/notification_isolation_tests.rs"]
