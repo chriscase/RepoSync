@@ -531,6 +531,42 @@ fn truncate_for_card(text: &str, limit: usize) -> String {
     format!("{}…", &text[..end])
 }
 
+/// Forward broadcast events to Teams for as long as the channel is open.
+///
+/// `webhook_url` is asked for the current address before each event, so a
+/// URL saved, replaced or removed in Settings applies to the next event
+/// without a restart. `None` (or an empty URL) sends nothing.
+pub async fn run_listener<F>(mut events: tokio::sync::broadcast::Receiver<String>, webhook_url: F)
+where
+    F: Fn() -> Option<String>,
+{
+    use tokio::sync::broadcast::error::RecvError;
+    let mut current: Option<TeamsNotifier> = None;
+    loop {
+        let msg = match events.recv().await {
+            Ok(msg) => msg,
+            Err(RecvError::Lagged(n)) => {
+                warn!(skipped = n, "Teams listener lagged, missed events");
+                continue;
+            }
+            Err(RecvError::Closed) => {
+                info!("Teams listener: broadcast channel closed, shutting down");
+                break;
+            }
+        };
+        let Some(url) = webhook_url().filter(|u| !u.trim().is_empty()) else {
+            current = None;
+            continue;
+        };
+        if current.as_ref().map(|n| n.webhook_url.as_str()) != Some(url.as_str()) {
+            current = Some(TeamsNotifier::new(url));
+        }
+        if let Some(notifier) = &current {
+            notifier.process_event(&msg).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,5 +709,124 @@ mod tests {
                 format!("{}…", "x".repeat(limit))
             );
         }
+    }
+    /// Accept HTTP requests on a loopback listener and report each body.
+    async fn capture() -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                            let len = head
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap_or(0);
+                            if body.len() >= len {
+                                let _ = stream
+                                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                                    .await;
+                                let _ = tx.send(body.to_string());
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (url, rx)
+    }
+
+    fn failed_event(repo: &str) -> String {
+        json!({"type":"repo_sync_failed","repo_name":repo,"error":"boom"}).to_string()
+    }
+
+    async fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no Teams delivery")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn listener_follows_the_current_url_without_a_restart() {
+        let (first, mut first_rx) = capture().await;
+        let (second, mut second_rx) = capture().await;
+        let url = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let (source, counter) = (url.clone(), asked.clone());
+        let task = tokio::spawn(run_listener(rx, move || {
+            let current = source.lock().unwrap().clone();
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            current
+        }));
+        // Wait until the listener has looked up the URL for `n` events, so a
+        // change made after that applies only to later events.
+        let handled = |n: usize| {
+            let asked = asked.clone();
+            async move {
+                for _ in 0..500 {
+                    if asked.load(std::sync::atomic::Ordering::SeqCst) >= n {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("listener did not handle event {n}");
+            }
+        };
+
+        // No URL: nothing is sent.
+        tx.send(failed_event("none-set")).unwrap();
+        handled(1).await;
+        *url.lock().unwrap() = Some(first.clone());
+        tx.send(failed_event("alpha")).unwrap();
+        let body = next(&mut first_rx).await;
+        assert!(body.contains("alpha"), "{body}");
+
+        // A replaced URL takes effect on the next event.
+        *url.lock().unwrap() = Some(second.clone());
+        tx.send(failed_event("beta")).unwrap();
+        assert!(next(&mut second_rx).await.contains("beta"));
+
+        // A removed URL stops delivery; a filtered event sends nothing.
+        *url.lock().unwrap() = Some(String::new());
+        tx.send(failed_event("cleared")).unwrap();
+        handled(4).await;
+        *url.lock().unwrap() = Some(first.clone());
+        tx.send(
+            json!({"type":"repo_sync_completed","repo_name":"quiet","svn_to_git":0,"git_to_svn":0})
+                .to_string(),
+        )
+        .unwrap();
+        tx.send(failed_event("gamma")).unwrap();
+        let body = next(&mut first_rx).await;
+        assert!(body.contains("gamma"), "{body}");
+        assert!(first_rx.try_recv().is_err());
+        assert!(second_rx.try_recv().is_err());
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("listener stops when the channel closes")
+            .unwrap();
     }
 }

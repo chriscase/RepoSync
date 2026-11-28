@@ -273,13 +273,18 @@ async fn test_teams_notification(
         return Err(AppError::Forbidden("admin access required".into()));
     }
 
-    let db = &state.db;
-    let url = db
-        .get_state("teams_webhook_url")
-        .unwrap_or(None)
+    // The same URL notifications go to: the server configuration's, if set,
+    // otherwise the one saved here.
+    let url = state
+        .config
+        .notifications
+        .teams_webhook_url
+        .clone()
+        .filter(|u| !u.trim().is_empty())
+        .or_else(|| state.db.get_state("teams_webhook_url").unwrap_or(None))
         .unwrap_or_default();
 
-    if url.is_empty() {
+    if url.trim().is_empty() {
         return Err(AppError::BadRequest(
             "No Teams webhook URL configured".into(),
         ));
