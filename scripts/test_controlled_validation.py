@@ -42,6 +42,9 @@ def suite_summary(overall, timestamp):
                     "contradictory_mirror_hold": {**direct, "pr_registration": {**direct, "registration_mode": "pr"}},
                 },
             }
+            if status == "PARTIAL":
+                # A real PARTIAL receipt: recovery stays held.
+                detail.update(recovery_ok=False, final_watermark=1, mapping_count=0, mapped_git_sha=None)
         if status == "NOT RUN":
             detail = {"reason": "missing_tool", "tool": "svnserve"}
         rows.append({"id": entry["id"], "test": entry["test"], "status": status, "detail": detail})

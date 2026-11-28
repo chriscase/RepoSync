@@ -446,21 +446,27 @@ def run_self_test() -> None:
         for invalid_stamp in (None, "not-a-time", "20260231T140000Z"):
             check_controlled(passing, "PASS", "0", "FAIL", timestamp=invalid_stamp)
         # The hosted workflow calls ci-gate directly, not controlled-status.
-        # Both must reject the same incomplete receipts.
+        # Both must reject the same incomplete receipts, including for the
+        # allowlisted R01 PARTIAL. R01 keeps its own recovery detail, so a
+        # missing detail also reports its recovery errors after the receipt's.
         for scenario_id, overall, suite_exit in (
             ("R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP", "PASS", "0"),
             (NOTIFICATION_ISOLATION, "PASS", "0"),
+            (POST_WRITE_RECOVERY, "PARTIAL", "3"),
         ):
             rows = full_pass_rows()
             row = next(row for row in rows if row["id"] == scenario_id)
             row["status"] = overall
-            row["detail"] = {"nested": {"arbitrary": True}, "count": 0}
+            if scenario_id != POST_WRITE_RECOVERY:
+                row["detail"] = {"nested": {"arbitrary": True}, "count": 0}
             code, errors = ci_gate(write_summary(tmp, rows, overall), allowlist_path)
             assert (code, errors) == (0, []), (code, errors)
             check_controlled(rows, overall, suite_exit, overall)
             def check_invalid_receipt(reason: str) -> None:
                 code, errors = ci_gate(write_summary(tmp, rows, overall), allowlist_path)
-                assert (code, errors) == (1, [f"{scenario_id}: {reason}"]), (code, errors)
+                assert code == 1 and errors[:1] == [f"{scenario_id}: {reason}"], (code, errors)
+                if scenario_id != POST_WRITE_RECOVERY:
+                    assert len(errors) == 1, errors
                 check_controlled(rows, overall, suite_exit, "FAIL")
 
             for field, invalid_values, reason in (
@@ -522,7 +528,6 @@ def run_self_test() -> None:
         for row in receiving_rows:
             if row["id"] == POST_WRITE_RECOVERY:
                 row["status"] = "PARTIAL"
-            if row["id"] == POST_WRITE_RECOVERY:
                 row["detail"].update(recovery_ok=False, final_watermark=1, mapping_count=0, mapped_git_sha=None)
         check_controlled(receiving_rows, "PARTIAL", "3", "PARTIAL")
         check_controlled(receiving_rows, "PARTIAL", "0", "FAIL")
