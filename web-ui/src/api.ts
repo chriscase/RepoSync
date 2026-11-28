@@ -894,6 +894,9 @@ export interface WizardSetupConfig {
   svn_username: string;
   svn_layout: string;
   svn_trunk_path: string;
+  svn_branches_path?: string;
+  svn_tags_path?: string;
+  svn_password_env?: string;
   svn_password_set: boolean;
 
   // Git
@@ -901,6 +904,7 @@ export interface WizardSetupConfig {
   git_api_url: string;
   git_repo: string;
   git_branch: string;
+  git_token_env?: string;
   git_token_set: boolean;
 
   // Sync
@@ -908,6 +912,9 @@ export interface WizardSetupConfig {
   auto_merge: boolean;
   sync_tags: boolean;
   lfs_threshold: number;
+  max_file_size?: number;
+  lfs_patterns?: string[];
+  ignore_patterns?: string[];
 
   // Identity
   email_domain: string;
@@ -918,6 +925,7 @@ export interface WizardSetupConfig {
   poll_interval: number;
   log_level: string;
   data_dir: string;
+  admin_password_env?: string;
   admin_password_set: boolean;
 }
 

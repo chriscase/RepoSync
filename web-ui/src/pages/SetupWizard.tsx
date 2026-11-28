@@ -234,6 +234,17 @@ function savedConfigFields(cfg: WizardSetupConfig): {
   if (cfg.log_level) merged.daemon_log_level = cfg.log_level;
   if (cfg.data_dir) merged.daemon_data_dir = cfg.data_dir;
 
+  // Settings only the configuration file sets. Pre-filling them means an
+  // unchanged form does not report them as "not applied" on save.
+  if (cfg.svn_branches_path !== undefined) merged.svn_branches_path = cfg.svn_branches_path;
+  if (cfg.svn_tags_path !== undefined) merged.svn_tags_path = cfg.svn_tags_path;
+  if (cfg.svn_password_env !== undefined) merged.svn_password_env = cfg.svn_password_env;
+  if (cfg.git_token_env !== undefined) merged.git_token_env = cfg.git_token_env;
+  if (cfg.admin_password_env !== undefined) merged.web_admin_password_env = cfg.admin_password_env;
+  if (cfg.max_file_size !== undefined) merged.max_file_size_mb = cfg.max_file_size / (1024 * 1024);
+  if (cfg.lfs_patterns) merged.lfs_patterns = cfg.lfs_patterns.join(', ');
+  if (cfg.ignore_patterns) merged.ignore_patterns = cfg.ignore_patterns.join(', ');
+
   return {
     fields: merged,
     svnPasswordSet: !!cfg.svn_password_set,
